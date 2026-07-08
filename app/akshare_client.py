@@ -1,3 +1,4 @@
+import logging
 import os
 import random
 import time
@@ -9,6 +10,7 @@ from app.network import market_data_proxy_scope
 from app.storage import read_json, write_json
 
 
+logger = logging.getLogger(__name__)
 T = TypeVar("T")
 LOW_RETRY_ENDPOINTS = {
     "stock_board_industry_name_em",
@@ -132,6 +134,13 @@ def akshare_call(
                 return result
             except Exception as exc:
                 last_error = exc
+                logger.warning(
+                    "akshare %s attempt %d/%d failed: %s",
+                    endpoint,
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
                 if attempt >= max_attempts:
                     break
                 if max_elapsed and (time.monotonic() - started) >= max_elapsed:
@@ -153,6 +162,9 @@ def akshare_call(
         max_attempts,
         int((time.monotonic() - started) * 1000),
         last_error,
+    )
+    logger.error(
+        "akshare %s failed after %d attempts: %s", endpoint, max_attempts, last_error
     )
     if last_error is not None:
         raise last_error

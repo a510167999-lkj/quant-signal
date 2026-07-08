@@ -6,6 +6,7 @@ from datetime import date
 from app.a_share_universe import select_deep_scan_candidates
 from app.config import get_settings
 from app.industry_history import IndustryHistoryProvider
+from app.logging_setup import configure_logging
 from app.main import DATA_PROVIDER, DISCLAIMER
 from app.margin_eligibility import MarginEligibilityProvider
 from app.recommendations import RUN_SLOT_AUTO, RUN_SLOT_CONTEXTS, RecommendationService
@@ -273,6 +274,7 @@ def _compact_hold_sweep_result(hold_days: int, payload, sweep_payload, output_li
 
 
 def main() -> int:
+    configure_logging()
     parser = argparse.ArgumentParser(description="Quant signal scheduled jobs")
     subparsers = parser.add_subparsers(dest="command", required=True)
 

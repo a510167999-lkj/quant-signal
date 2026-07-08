@@ -12,6 +12,7 @@ from app.analysis import build_analysis
 from app.compat import model_to_dict
 from app.config import get_settings
 from app.holdings import build_holdings_snapshot, load_holdings, save_holdings
+from app.logging_setup import configure_logging
 from app.market_data import MarketDataError, build_market_data_provider
 from app.performance import evaluate_recommendation_performance
 from app.recommendations import RUN_SLOT_AUTO, RUN_SLOT_CONTEXTS, RecommendationService
@@ -58,6 +59,7 @@ def _build_analysis(request: AnalyzeRequest) -> AnalyzeResponse:
 
 
 def create_app() -> FastAPI:
+    configure_logging()
     app = FastAPI(title=SETTINGS.api_title, version=SETTINGS.api_version)
 
     if SETTINGS.cors_origins:
