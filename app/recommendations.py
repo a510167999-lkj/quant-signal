@@ -13,6 +13,7 @@ from app.analysis import build_analysis
 from app.announcement_context import AnnouncementContextProvider
 from app.compat import model_to_dict
 from app.config import Settings
+from app.execution import assess_entry_executability
 from app.fund_flow import FundFlowContextProvider
 from app.industry_history import IndustryHistoryProvider
 from app.industry_strength import IndustryStrengthProvider
@@ -1423,6 +1424,13 @@ class RecommendationService:
                         planned_exits.append(alert)
                         existing_ids.add(cg_alert_id)
 
+            entry_alert = self._entry_review_alert(item, today_date)
+            if entry_alert and entry_alert["id"] not in existing_ids:
+                append_jsonl(self.settings.alerts_path, entry_alert)
+                self._send_webhook(entry_alert)
+                planned_exits.append(entry_alert)
+                existing_ids.add(entry_alert["id"])
+
         return {
             "checked_at": moment.isoformat(),
             "skipped": False,
@@ -1430,6 +1438,61 @@ class RecommendationService:
             "next_trade_date": profit_lock_exit_date,
             "planned_exits": planned_exits,
             "errors": errors[:50],
+        }
+
+    def _entry_review_alert(self, item: Dict[str, Any], today_date) -> Optional[Dict[str, Any]]:
+        """盘后 entry 复核：对 entry 已完成的近期推荐评估次日入场可执行性，弱缺口
+        （gap_pct < -1，对齐回测 ``entry_gap_lt_neg1``）发 alert。T 日盘后复核 T-1 推荐
+        （entry_bar = T 日完整）。entry_date > today 的推荐跳过（entry 未完成）。
+        """
+        recommended_at = item.get("recommended_at")
+        if not recommended_at:
+            return None
+        try:
+            signal_date = datetime.fromisoformat(str(recommended_at)).date()
+        except Exception:
+            return None
+        entry_date = next_trade_date(signal_date)
+        if not entry_date or entry_date > today_date:
+            return None
+        symbol = item.get("symbol")
+        signal_iso = signal_date.isoformat()
+        entry_iso = entry_date.isoformat()
+        try:
+            frame, _source = self.data_provider.history(symbol, "a", lookback_days=120, adjust="qfq")
+        except Exception:
+            return None
+        if frame is None or frame.empty or "date" not in frame.columns:
+            return None
+        frame_dates = frame["date"].astype(str).str[:10]
+        if signal_iso not in frame_dates.values or entry_iso not in frame_dates.values:
+            return None
+        signal_bar = frame[frame_dates == signal_iso].iloc[0].to_dict()
+        entry_bar = frame[frame_dates == entry_iso].iloc[0].to_dict()
+        executability = assess_entry_executability(signal_bar, entry_bar)
+        gap_pct = executability.get("gap_pct")
+        if gap_pct is None or gap_pct >= -1:
+            return None
+        return {
+            "id": "entry_weak:%s:%s" % (entry_iso, symbol),
+            "created_at": now_cn().isoformat(),
+            "event_type": "planned_entry_weak",
+            "severity": "warning",
+            "symbol": symbol,
+            "market": "a",
+            "name": item.get("name"),
+            "title": "入场复核：弱缺口（回测应排除 entry_gap_lt_neg1）",
+            "message": (
+                "推荐 %s 的次日入场（%s）开盘缺口 %.2f%%，属回测达标切片应排除的弱入场，"
+                "实际入场可能已受损。" % (recommended_at, entry_iso, gap_pct)
+            ),
+            "entry_date": entry_iso,
+            "gap_pct": gap_pct,
+            "executable": executability.get("executable"),
+            "reasons": executability.get("reasons") or [],
+            "recommended_at": recommended_at,
+            "recommendation_action": item.get("action"),
+            "recommendation_score": item.get("score"),
         }
 
     def _recent_recommended_items(self, moment: datetime) -> List[Dict[str, Any]]:

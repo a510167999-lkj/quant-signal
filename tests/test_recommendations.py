@@ -1025,6 +1025,69 @@ def test_monitor_planned_exits_dedups_calendar_gap_by_exit_date(tmp_path, monkey
     assert second_gap == []
 
 
+def _entry_frame(signal_date, entry_date, signal_close, entry_open):
+    return pd.DataFrame(
+        [
+            {"date": signal_date.isoformat(), "open": signal_close, "high": signal_close, "low": signal_close, "close": signal_close},
+            {"date": entry_date.isoformat(), "open": entry_open, "high": entry_open, "low": entry_open, "close": entry_open},
+        ]
+    )
+
+
+def test_monitor_planned_exits_alerts_for_entry_weak_gap(tmp_path, monkeypatch):
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    signal_date = today - timedelta(days=3)
+    entry_date = today - timedelta(days=2)  # entry 已完成（< today）
+    settings = make_settings(tmp_path)
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    _write_profit_lock_history(settings, 100.0, signal_date)
+    frame = _entry_frame(signal_date, entry_date, signal_close=100, entry_open=97)  # gap=-3%
+    monkeypatch.setattr(service.data_provider, "history", lambda *a, **k: (frame, "fake"))
+    monkeypatch.setattr("app.recommendations.next_trade_date", lambda d: entry_date)
+    monkeypatch.setattr("app.recommendations.next_calendar_gap", lambda *a, **k: None)
+
+    result = service.monitor_planned_exits(force=True)
+
+    entry_alerts = [a for a in result["planned_exits"] if a["event_type"] == "planned_entry_weak"]
+    assert entry_alerts
+    alert = entry_alerts[0]
+    assert alert["symbol"] == "600519"
+    assert alert["gap_pct"] == -3.0
+    assert alert["entry_date"] == entry_date.isoformat()
+    assert alert["id"] == "entry_weak:%s:600519" % entry_date.isoformat()
+
+
+def test_monitor_planned_exits_no_entry_alert_when_gap_ok(tmp_path, monkeypatch):
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    signal_date = today - timedelta(days=3)
+    entry_date = today - timedelta(days=2)
+    settings = make_settings(tmp_path)
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    _write_profit_lock_history(settings, 100.0, signal_date)
+    frame = _entry_frame(signal_date, entry_date, signal_close=100, entry_open=102)  # gap=+2% >= -1
+    monkeypatch.setattr(service.data_provider, "history", lambda *a, **k: (frame, "fake"))
+    monkeypatch.setattr("app.recommendations.next_trade_date", lambda d: entry_date)
+    monkeypatch.setattr("app.recommendations.next_calendar_gap", lambda *a, **k: None)
+
+    result = service.monitor_planned_exits(force=True)
+
+    assert [a for a in result["planned_exits"] if a["event_type"] == "planned_entry_weak"] == []
+
+
+def test_monitor_planned_exits_skip_entry_review_when_not_completed(tmp_path, monkeypatch):
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    signal_date = today - timedelta(days=1)
+    settings = make_settings(tmp_path)
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    _write_profit_lock_history(settings, 100.0, signal_date)
+    monkeypatch.setattr("app.recommendations.next_trade_date", lambda d: today + timedelta(days=1))  # entry 未来
+    monkeypatch.setattr("app.recommendations.next_calendar_gap", lambda *a, **k: None)
+
+    result = service.monitor_planned_exits(force=True)
+
+    assert [a for a in result["planned_exits"] if a["event_type"] == "planned_entry_weak"] == []
+
+
 def test_generate_produces_three_recommendations_with_full_action_advice(tmp_path):
     """goal 证据：generate 在 3 只强信号输入下产出恰好 3 只 + 每只完整操作建议。"""
     settings = replace(make_settings(tmp_path), scan_result_limit=3)
