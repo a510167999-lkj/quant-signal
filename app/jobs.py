@@ -329,10 +329,7 @@ def main() -> int:
     research.add_argument("--min-prior-win-rate", type=float, default=None)
     research.add_argument("--min-prior-avg-return", type=float, default=None)
     research.add_argument("--max-prior-avg-adverse", type=float, default=None)
-    research.add_argument("--industry-rotation-context", action="store_true")
-    research.add_argument("--industry-rotation-max-boards", type=int, default=40)
     research.add_argument("--margin-eligibility-context", action="store_true")
-    research.add_argument("--dragon-tiger-context", action="store_true")
     research.add_argument("--include-qualified-trades", action="store_true")
     research.add_argument("--qualified-trades-output", default=None)
 
@@ -646,10 +643,7 @@ def main() -> int:
             min_prior_win_rate=args.min_prior_win_rate,
             min_prior_avg_return=args.min_prior_avg_return,
             max_prior_avg_adverse=args.max_prior_avg_adverse,
-            use_industry_rotation_context=args.industry_rotation_context,
-            industry_rotation_max_boards=args.industry_rotation_max_boards,
             use_margin_eligibility_context=args.margin_eligibility_context,
-            use_dragon_tiger_context=args.dragon_tiger_context,
             include_qualified_trades=bool(args.include_qualified_trades or args.qualified_trades_output),
         )
         if args.qualified_trades_output:
