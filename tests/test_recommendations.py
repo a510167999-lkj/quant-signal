@@ -236,6 +236,11 @@ def test_generate_daily_recommendations_from_a_share_universe(tmp_path):
     assert result["items"]
     assert result["items"][0]["symbol"] == "600519"
     assert result["items"][0]["market"] == "a"
+    # 操作建议完整性：每条推荐必须给出 action + levels(止损/止盈) + 入场区间 + 短线/长线计划
+    assert result["items"][0]["action"] in {"BUY", "WATCH", "HOLD", "REDUCE", "SELL"}
+    assert {"stop_loss", "take_profit"} <= set(result["items"][0]["levels"])
+    assert result["items"][0]["entry_zone"]
+    assert result["items"][0]["trade_plans"]
     assert result["items"][0]["industry"]["industry"] == "测试行业"
     assert result["items"][0]["news_context"]["level"] == "neutral"
     assert result["items"][0]["announcement_context"]["level"] == "neutral"
