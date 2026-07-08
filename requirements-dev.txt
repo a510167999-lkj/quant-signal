@@ -1,0 +1,3 @@
+# 开发/CI 依赖。生产部署只用 requirements.txt，不要把 ruff 装进 VPS 运行环境。
+-r requirements.txt
+ruff>=0.15

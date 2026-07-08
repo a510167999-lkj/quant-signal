@@ -1,0 +1,13 @@
+[Unit]
+Description=Warm A-share daily market-data cache
+After=network-online.target quant-signal.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/quant-signal
+EnvironmentFile=/home/ubuntu/quant-signal/.env
+ExecStart=/home/ubuntu/quant-signal/.venv/bin/python -m app.jobs warm-market-cache --max-deep 500 --workers 4 --lookback-days 620
+TimeoutStartSec=2h

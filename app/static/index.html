@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>A 股量化信号台</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand-block">
+        <div class="brand">A 股量化信号台</div>
+        <div id="lastRunValue" class="subtle">等待交易日扫描</div>
+      </div>
+      <div class="topbar-actions">
+        <div id="serviceStatus" class="status-pill">连接中</div>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="panel controls-panel" aria-label="分析控制">
+        <div class="panel-title">
+          <h2>标的分析</h2>
+          <span class="subtle">A 股 / ETF</span>
+        </div>
+        <form id="analyzeForm" class="control-grid">
+          <label>
+            <span>代码</span>
+            <input id="symbolInput" name="symbol" value="600519" autocomplete="off" />
+          </label>
+
+          <div>
+            <span class="field-label">市场</span>
+            <div class="segment" role="group" aria-label="市场">
+              <button type="button" class="segment-button active" data-market="a">A 股</button>
+              <button type="button" class="segment-button" data-market="etf">ETF</button>
+            </div>
+          </div>
+
+          <label>
+            <span>复权</span>
+            <select id="adjustSelect" name="adjust">
+              <option value="qfq">前复权</option>
+              <option value="">不复权</option>
+              <option value="hfq">后复权</option>
+            </select>
+          </label>
+
+          <label>
+            <span>区间</span>
+            <select id="lookbackSelect" name="lookback">
+              <option value="240">约 1 年</option>
+              <option value="360" selected>约 18 月</option>
+              <option value="720">约 3 年</option>
+              <option value="1200">约 5 年</option>
+            </select>
+          </label>
+
+          <button id="analyzeButton" class="primary-button" type="submit">分析</button>
+        </form>
+
+        <div class="watch-header">
+          <h2>观察池</h2>
+          <button id="scanButton" class="ghost-button" type="button">批量扫描</button>
+        </div>
+        <div id="watchlist" class="watchlist"></div>
+
+        <form id="watchForm" class="watch-form">
+          <input id="watchSymbol" placeholder="代码" autocomplete="off" />
+          <select id="watchMarket">
+            <option value="a">A 股</option>
+            <option value="etf">ETF</option>
+          </select>
+          <input id="watchName" placeholder="名称" autocomplete="off" />
+          <button class="icon-button" type="submit" aria-label="加入观察池">+</button>
+        </form>
+      </section>
+
+      <section class="main-stack">
+        <section class="summary-strip" aria-label="今日状态">
+          <div class="summary-tile">
+            <span>大盘环境</span>
+            <strong id="marketStateValue">--</strong>
+          </div>
+          <div class="summary-tile">
+            <span>热门板块</span>
+            <strong id="hotIndustryValue">--</strong>
+          </div>
+          <div class="summary-tile">
+            <span>深扫候选</span>
+            <strong id="candidateValue">--</strong>
+          </div>
+          <div class="summary-tile">
+            <span>入选机会</span>
+            <strong id="qualifiedValue">--</strong>
+          </div>
+          <div class="summary-tile">
+            <span>10日胜率</span>
+            <strong id="performanceWinValue">--</strong>
+          </div>
+          <div class="summary-tile">
+            <span>验证样本</span>
+            <strong id="performanceSampleValue">--</strong>
+          </div>
+          <div class="summary-tile">
+            <span>提醒</span>
+            <strong id="alertValue">--</strong>
+          </div>
+          <div class="summary-tile">
+            <span>持仓状态</span>
+            <strong id="holdingsStateValue">--</strong>
+          </div>
+        </section>
+
+        <section class="panel holdings-panel">
+          <div class="section-head">
+            <div>
+              <h2>持仓跟踪</h2>
+              <div id="holdingsMeta" class="subtle">持续追踪 159567 / 520700</div>
+            </div>
+            <button id="holdingsRefreshButton" class="ghost-button" type="button">刷新</button>
+          </div>
+          <div id="holdingsList" class="holdings-list"></div>
+        </section>
+
+        <section class="panel hot-industries-panel">
+          <div class="section-head">
+            <div>
+              <h2>热门板块</h2>
+              <div id="hotIndustryMeta" class="subtle">等待板块强度扫描</div>
+            </div>
+          </div>
+          <div id="hotIndustriesList" class="hot-industries-list"></div>
+        </section>
+
+        <section class="ops-grid">
+          <article class="panel ops-panel">
+            <div class="section-head">
+              <div>
+                <h2>今日机会池</h2>
+                <div id="recommendationMeta" class="subtle">等待调度生成</div>
+              </div>
+              <button id="runRecommendationsButton" class="ghost-button" type="button">立即扫描</button>
+            </div>
+            <div id="recommendationsList" class="recommendations-list"></div>
+          </article>
+
+          <article class="panel ops-panel">
+            <div class="section-head">
+              <div>
+                <h2>卖出 / 失效提醒</h2>
+                <div id="alertMeta" class="subtle">交易时段自动检查</div>
+              </div>
+              <button id="monitorButton" class="ghost-button" type="button">立即检查</button>
+            </div>
+            <div id="alertsList" class="alerts-list"></div>
+          </article>
+        </section>
+
+        <section class="panel performance-panel">
+          <div class="section-head">
+            <div>
+              <h2>推荐验证</h2>
+              <div id="performanceMeta" class="subtle">按推荐后一交易日开盘跟踪</div>
+            </div>
+          </div>
+          <div class="performance-summary">
+            <div>
+              <span>平均10日收益</span>
+              <strong id="performanceReturnValue">--</strong>
+            </div>
+            <div>
+              <span>平均不利波动</span>
+              <strong id="performanceAdverseValue">--</strong>
+            </div>
+          </div>
+          <div id="performanceList" class="performance-list"></div>
+        </section>
+
+        <section class="panel signal-panel">
+          <div class="signal-head">
+            <div>
+              <div id="resultTitle" class="result-title">等待分析</div>
+              <div id="resultMeta" class="subtle">输入代码后开始</div>
+            </div>
+            <div id="actionBadge" class="action-badge neutral">--</div>
+          </div>
+
+          <div class="metrics-grid">
+            <div class="metric">
+              <span>收盘价</span>
+              <strong id="lastClose">--</strong>
+            </div>
+            <div class="metric">
+              <span>评分</span>
+              <strong id="scoreValue">--</strong>
+            </div>
+            <div class="metric">
+              <span>信心</span>
+              <strong id="confidenceValue">--</strong>
+            </div>
+            <div class="metric">
+              <span>止损</span>
+              <strong id="stopLoss">--</strong>
+            </div>
+          </div>
+
+          <div class="chart-shell">
+            <canvas id="priceChart" width="960" height="420"></canvas>
+          </div>
+        </section>
+
+        <section class="detail-grid">
+          <article class="panel">
+            <h2>买卖区间</h2>
+            <dl class="levels">
+              <div><dt>入场</dt><dd id="entryZone">--</dd></div>
+              <div><dt>支撑</dt><dd id="supportLevel">--</dd></div>
+              <div><dt>压力</dt><dd id="resistanceLevel">--</dd></div>
+              <div><dt>止盈</dt><dd id="takeProfit">--</dd></div>
+            </dl>
+          </article>
+
+          <article class="panel">
+            <h2>短线计划</h2>
+            <dl class="levels">
+              <div><dt>周期</dt><dd id="shortPlanHorizon">--</dd></div>
+              <div><dt>动作</dt><dd id="shortPlanAction">--</dd></div>
+              <div><dt>止损</dt><dd id="shortPlanStop">--</dd></div>
+              <div><dt>止盈</dt><dd id="shortPlanTarget">--</dd></div>
+            </dl>
+            <ul id="shortPlanList" class="note-list"></ul>
+          </article>
+
+          <article class="panel">
+            <h2>长期计划</h2>
+            <dl class="levels">
+              <div><dt>周期</dt><dd id="longPlanHorizon">--</dd></div>
+              <div><dt>动作</dt><dd id="longPlanAction">--</dd></div>
+              <div><dt>建仓区</dt><dd id="longPlanZone">--</dd></div>
+              <div><dt>趋势止损</dt><dd id="longPlanStop">--</dd></div>
+            </dl>
+            <ul id="longPlanList" class="note-list"></ul>
+          </article>
+
+          <article class="panel">
+            <h2>信号原因</h2>
+            <ul id="reasonList" class="note-list"></ul>
+          </article>
+
+          <article class="panel">
+            <h2>风险提示</h2>
+            <ul id="riskList" class="note-list"></ul>
+          </article>
+
+          <article class="panel">
+            <h2>回测摘要</h2>
+            <dl class="levels">
+              <div><dt>策略收益</dt><dd id="btStrategy">--</dd></div>
+              <div><dt>持有收益</dt><dd id="btHold">--</dd></div>
+              <div><dt>最大回撤</dt><dd id="btDrawdown">--</dd></div>
+              <div><dt>交易次数</dt><dd id="btTrades">--</dd></div>
+            </dl>
+          </article>
+        </section>
+      </section>
+    </main>
+
+    <footer class="footer">仅供个人量化研究和交易辅助，不构成投资建议。</footer>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

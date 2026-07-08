@@ -1,0 +1,13 @@
+[Unit]
+Description=Run A-share open/close strategy scans on weekdays
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:00:00
+OnCalendar=Mon..Fri *-*-* 09:32:00
+OnCalendar=Mon..Fri *-*-* 14:55:00
+OnCalendar=Mon..Fri *-*-* 15:02:00
+Persistent=false
+Unit=quant-signal-recommend.service
+
+[Install]
+WantedBy=timers.target

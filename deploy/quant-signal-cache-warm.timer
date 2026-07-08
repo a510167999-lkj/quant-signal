@@ -1,0 +1,11 @@
+[Unit]
+Description=Warm A-share market-data cache before open and after close
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 08:35:00
+OnCalendar=Mon..Fri *-*-* 15:45:00
+Persistent=true
+Unit=quant-signal-cache-warm.service
+
+[Install]
+WantedBy=timers.target

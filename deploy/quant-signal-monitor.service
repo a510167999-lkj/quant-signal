@@ -1,0 +1,13 @@
+[Unit]
+Description=Monitor recent A-share recommendations for sell/invalid alerts
+After=network-online.target quant-signal.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/quant-signal
+EnvironmentFile=/home/ubuntu/quant-signal/.env
+ExecStart=/home/ubuntu/quant-signal/.venv/bin/python -m app.jobs monitor-recommendations
+TimeoutStartSec=20min

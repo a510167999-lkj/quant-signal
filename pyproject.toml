@@ -1,0 +1,8 @@
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+# 与首轮摸底口径一致：E4/E7/E9（语法/致命错误）+ F（pyflakes，如未用导入）。
+# 刻意保持最小集，零运行时风险；后续可按需收紧，不要一次铺开。
+select = ["E4", "E7", "E9", "F"]
