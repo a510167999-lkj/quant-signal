@@ -31,7 +31,7 @@ from app.signal_tags import (
     build_signal_tags,
 )
 from app.storage import append_jsonl, read_json, read_jsonl, unique_by_key, write_json
-from app.trading_calendar import is_a_share_trading_time, is_trade_day, now_cn
+from app.trading_calendar import is_a_share_trading_time, is_trade_day, next_trade_date, now_cn
 
 
 LOCK_STALE_SECONDS = 3 * 60 * 60
@@ -1309,6 +1309,82 @@ class RecommendationService:
             "errors": errors[:50],
         }
 
+    def monitor_planned_exits(self, force: bool = False) -> Dict[str, Any]:
+        """盘后日级：对近期推荐扫描 profit-lock 计划退出，发执行性 alert。
+
+        与盘中 ``monitor_recommendations`` 并列——计划性退出（利润保护 / 长假 /
+        前日高点）走日级（用已完成日线，含今日收盘），止损 / 支撑 / 盘中跌幅走
+        盘中实时。本方法只实现 profit-lock exit（PLAN.md 验证的达标功臣），退出
+        价口径严格对齐回测 ``_apply_partial_profit_lock``：T+1 开盘成交。
+        """
+        moment = now_cn()
+        monitored = self._recent_recommended_items(moment)
+        errors: List[Dict[str, Any]] = []
+        existing_ids = {item.get("id") for item in read_jsonl(self.settings.alerts_path, limit=3000)}
+        today_date = moment.date()
+        next_trade = next_trade_date(today_date)
+        exit_date = next_trade.isoformat() if next_trade else (today_date + timedelta(days=1)).isoformat()
+
+        planned_exits: List[Dict[str, Any]] = []
+        for item in monitored:
+            try:
+                context = self._profit_lock_alert_context(
+                    item, item.get("last_close"), include_today=True
+                )
+            except Exception as exc:
+                errors.append({"symbol": item.get("symbol"), "message": str(exc)})
+                continue
+            if not context:
+                continue
+            symbol = item["symbol"]
+            alert_id = "%s:%s:planned_profit_lock_exit" % (today_date.isoformat(), symbol)
+            if alert_id in existing_ids:
+                continue
+            activation_pct = context["activation_pct"]
+            alert = {
+                "id": alert_id,
+                "created_at": moment.isoformat(),
+                "event_type": "planned_profit_lock_exit",
+                "severity": "warning",
+                "symbol": symbol,
+                "market": "a",
+                "name": item.get("name"),
+                "title": "计划退出：利润保护（次日开盘）",
+                "message": (
+                    "已完成日线最高价 %.3f 较参考价 %.3f 达到 %.2f%% 利润保护阈值，"
+                    "按策略应于 %s 以开盘价退出。"
+                    % (
+                        context["prior_high"],
+                        context["reference_price"],
+                        activation_pct,
+                        exit_date,
+                    )
+                ),
+                "exit_date": exit_date,
+                "exit_price_type": "next_open",
+                "exit_price": None,
+                "reference_price": context["reference_price"],
+                "prior_high": context["prior_high"],
+                "trigger_price": context["trigger_price"],
+                "activation_pct": activation_pct,
+                "recommended_at": item.get("recommended_at"),
+                "recommendation_action": item.get("action"),
+                "recommendation_score": item.get("score"),
+            }
+            append_jsonl(self.settings.alerts_path, alert)
+            self._send_webhook(alert)
+            planned_exits.append(alert)
+            existing_ids.add(alert_id)
+
+        return {
+            "checked_at": moment.isoformat(),
+            "skipped": False,
+            "monitored_count": len(monitored),
+            "next_trade_date": exit_date,
+            "planned_exits": planned_exits,
+            "errors": errors[:50],
+        }
+
     def _recent_recommended_items(self, moment: datetime) -> List[Dict[str, Any]]:
         cutoff = moment - timedelta(days=self.settings.monitor_recent_days)
         history = read_jsonl(self.settings.recommendation_history_path, limit=500)
@@ -1436,6 +1512,7 @@ class RecommendationService:
         self,
         recommendation: Dict[str, Any],
         latest_price: Any,
+        include_today: bool = False,
     ) -> Dict[str, Any]:
         activation_pct = float(self.settings.monitor_profit_lock_activation_pct or 0.0)
         if activation_pct <= 0 or not latest_price:
@@ -1466,7 +1543,10 @@ class RecommendationService:
 
         completed = frame.copy()
         completed["date"] = completed["date"].astype(str).str[:10]
-        completed = completed[(completed["date"] > recommended_date) & (completed["date"] < today)]
+        if include_today:
+            completed = completed[(completed["date"] > recommended_date) & (completed["date"] <= today)]
+        else:
+            completed = completed[(completed["date"] > recommended_date) & (completed["date"] < today)]
         if completed.empty:
             return {}
         prior_high = float(completed["high"].max())

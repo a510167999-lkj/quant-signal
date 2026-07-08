@@ -58,6 +58,14 @@ def previous_trade_date(target: date) -> Optional[date]:
     return date.fromisoformat(max(selected))
 
 
+def next_trade_date(target: date) -> Optional[date]:
+    trade_dates = _load_trade_dates()
+    selected = [item for item in trade_dates if item > target.strftime("%Y-%m-%d")]
+    if not selected:
+        return None
+    return date.fromisoformat(min(selected))
+
+
 def is_a_share_trading_time(moment: datetime) -> bool:
     local = moment.astimezone(ZoneInfo("Asia/Shanghai"))
     if not is_trade_day(local.date()):

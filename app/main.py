@@ -217,6 +217,10 @@ def create_app() -> FastAPI:
     def monitor_alerts(force: bool = Query(False)):
         return RECOMMENDATIONS.monitor_recommendations(force=force)
 
+    @app.post("/api/alerts/planned-exits", dependencies=[Depends(require_basic_auth)])
+    def planned_exits_alerts(force: bool = Query(False)):
+        return RECOMMENDATIONS.monitor_planned_exits(force=force)
+
     @app.get("/", include_in_schema=False)
     def index():
         return FileResponse(static_dir / "index.html")

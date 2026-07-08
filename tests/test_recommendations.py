@@ -1,5 +1,5 @@
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -876,3 +876,101 @@ def test_recommendation_run_returns_current_status_when_already_running(tmp_path
     assert result["generated_at"] == started["generated_at"]
     assert result["summary"]["running"] is True
     assert result["summary"]["reason"] == "already_running"
+
+
+def _write_profit_lock_history(settings, last_close, rec_date):
+    append_jsonl(
+        settings.recommendation_history_path,
+        {
+            "generated_at": rec_date.isoformat() + "T09:00:00+08:00",
+            "items": [
+                {
+                    "symbol": "600519",
+                    "market": "a",
+                    "name": "测试股票",
+                    "action": "BUY",
+                    "score": 5,
+                    "last_close": last_close,
+                    "levels": {"stop_loss": 95, "support": 96, "take_profit": 108},
+                }
+            ],
+        },
+    )
+
+
+def test_monitor_planned_exits_alerts_when_profit_lock_activated(tmp_path, monkeypatch):
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    rec_date = today - timedelta(days=3)
+    settings = make_settings(tmp_path)
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    _write_profit_lock_history(settings, 100.0, rec_date)
+    frame = pd.DataFrame(
+        [
+            {"date": (rec_date - timedelta(days=1)).isoformat(), "open": 100, "high": 101, "low": 99, "close": 100},
+            {"date": (rec_date + timedelta(days=1)).isoformat(), "open": 101, "high": 120, "low": 100, "close": 119},
+            {"date": today.isoformat(), "open": 119, "high": 122, "low": 118, "close": 121},
+        ]
+    )
+    monkeypatch.setattr(service.data_provider, "history", lambda *a, **k: (frame, "fake"))
+    monkeypatch.setattr("app.recommendations.next_trade_date", lambda target: today + timedelta(days=1))
+
+    result = service.monitor_planned_exits(force=True)
+
+    assert result["planned_exits"]
+    alert = result["planned_exits"][0]
+    assert alert["event_type"] == "planned_profit_lock_exit"
+    assert alert["severity"] == "warning"
+    assert alert["symbol"] == "600519"
+    assert alert["exit_date"] == (today + timedelta(days=1)).isoformat()
+    assert alert["exit_price_type"] == "next_open"
+    assert alert["exit_price"] is None
+    assert alert["prior_high"] == 122.0
+    assert alert["trigger_price"] == 118.0
+    assert alert["reference_price"] == 100.0
+    assert "600519" in alert["id"]
+    # 执行性 alert 必须落盘
+    from app.storage import read_jsonl
+    persisted = read_jsonl(settings.alerts_path, limit=10)
+    assert any(item.get("event_type") == "planned_profit_lock_exit" for item in persisted)
+
+
+def test_monitor_planned_exits_no_alert_when_prior_high_below_trigger(tmp_path, monkeypatch):
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    rec_date = today - timedelta(days=3)
+    settings = make_settings(tmp_path)
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    _write_profit_lock_history(settings, 100.0, rec_date)
+    frame = pd.DataFrame(
+        [
+            {"date": (rec_date + timedelta(days=1)).isoformat(), "open": 101, "high": 105, "low": 100, "close": 104},
+            {"date": today.isoformat(), "open": 104, "high": 106, "low": 103, "close": 105},
+        ]
+    )
+    monkeypatch.setattr(service.data_provider, "history", lambda *a, **k: (frame, "fake"))
+
+    result = service.monitor_planned_exits(force=True)
+
+    assert result["planned_exits"] == []
+    assert result["monitored_count"] == 1
+
+
+def test_monitor_planned_exits_dedups_within_same_day(tmp_path, monkeypatch):
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    rec_date = today - timedelta(days=3)
+    settings = make_settings(tmp_path)
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    _write_profit_lock_history(settings, 100.0, rec_date)
+    frame = pd.DataFrame(
+        [
+            {"date": (rec_date + timedelta(days=1)).isoformat(), "open": 101, "high": 120, "low": 100, "close": 119},
+            {"date": today.isoformat(), "open": 119, "high": 122, "low": 118, "close": 121},
+        ]
+    )
+    monkeypatch.setattr(service.data_provider, "history", lambda *a, **k: (frame, "fake"))
+    monkeypatch.setattr("app.recommendations.next_trade_date", lambda target: today + timedelta(days=1))
+
+    first = service.monitor_planned_exits(force=True)
+    second = service.monitor_planned_exits(force=True)
+
+    assert len(first["planned_exits"]) == 1
+    assert second["planned_exits"] == []

@@ -301,6 +301,9 @@ def main() -> int:
     monitor = subparsers.add_parser("monitor-recommendations")
     monitor.add_argument("--force", action="store_true")
 
+    planned_exits = subparsers.add_parser("monitor-planned-exits")
+    planned_exits.add_argument("--force", action="store_true")
+
     research = subparsers.add_parser("research-backtest")
     research.add_argument("--start-date", default="2024-07-05")
     research.add_argument("--max-deep", type=int, default=120)
@@ -609,6 +612,11 @@ def main() -> int:
 
     if args.command == "monitor-recommendations":
         payload = service.monitor_recommendations(force=args.force)
+        _print_json(payload)
+        return 0
+
+    if args.command == "monitor-planned-exits":
+        payload = service.monitor_planned_exits(force=args.force)
         _print_json(payload)
         return 0
 
