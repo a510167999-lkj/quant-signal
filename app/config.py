@@ -86,6 +86,7 @@ class Settings:
     monitor_recent_days: int = 5
     monitor_intraday_drop_pct: float = 4.0
     monitor_profit_lock_activation_pct: float = 18.0
+    monitor_pre_exit_calendar_gap_days: int = 7
     alert_webhook_url: str = ""
 
 
@@ -194,6 +195,12 @@ def get_settings() -> Settings:
             18.0,
             0.0,
             100.0,
+        ),
+        monitor_pre_exit_calendar_gap_days=int_setting(
+            "MONITOR_PRE_EXIT_CALENDAR_GAP_DAYS",
+            7,
+            0,
+            30,
         ),
         alert_webhook_url=os.getenv("ALERT_WEBHOOK_URL", ""),
     )

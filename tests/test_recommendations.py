@@ -913,6 +913,7 @@ def test_monitor_planned_exits_alerts_when_profit_lock_activated(tmp_path, monke
     )
     monkeypatch.setattr(service.data_provider, "history", lambda *a, **k: (frame, "fake"))
     monkeypatch.setattr("app.recommendations.next_trade_date", lambda target: today + timedelta(days=1))
+    monkeypatch.setattr("app.recommendations.next_calendar_gap", lambda *a, **k: None)
 
     result = service.monitor_planned_exits(force=True)
 
@@ -947,6 +948,7 @@ def test_monitor_planned_exits_no_alert_when_prior_high_below_trigger(tmp_path, 
         ]
     )
     monkeypatch.setattr(service.data_provider, "history", lambda *a, **k: (frame, "fake"))
+    monkeypatch.setattr("app.recommendations.next_calendar_gap", lambda *a, **k: None)
 
     result = service.monitor_planned_exits(force=True)
 
@@ -968,9 +970,111 @@ def test_monitor_planned_exits_dedups_within_same_day(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(service.data_provider, "history", lambda *a, **k: (frame, "fake"))
     monkeypatch.setattr("app.recommendations.next_trade_date", lambda target: today + timedelta(days=1))
+    monkeypatch.setattr("app.recommendations.next_calendar_gap", lambda *a, **k: None)
 
     first = service.monitor_planned_exits(force=True)
     second = service.monitor_planned_exits(force=True)
 
     assert len(first["planned_exits"]) == 1
     assert second["planned_exits"] == []
+
+
+def _write_calendar_gap_history(settings, rec_date):
+    append_jsonl(
+        settings.recommendation_history_path,
+        {
+            "generated_at": rec_date.isoformat() + "T09:00:00+08:00",
+            "items": [
+                {
+                    "symbol": "600519",
+                    "market": "a",
+                    "name": "测试股票",
+                    "action": "BUY",
+                    "score": 5,
+                    "last_close": 100.0,
+                    "levels": {"stop_loss": 95, "support": 96, "take_profit": 108},
+                }
+            ],
+        },
+    )
+
+
+def _low_high_frame(rec_date, today):
+    # high 远低于 profit-lock 触发价（100×1.18=118），确保 profit-lock 不激活以隔离长假测试
+    return pd.DataFrame(
+        [
+            {"date": (rec_date + timedelta(days=1)).isoformat(), "open": 100, "high": 101, "low": 99, "close": 100},
+            {"date": today.isoformat(), "open": 100, "high": 102, "low": 99, "close": 101},
+        ]
+    )
+
+
+def test_monitor_planned_exits_alerts_for_calendar_gap(tmp_path, monkeypatch):
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    rec_date = today - timedelta(days=3)
+    settings = make_settings(tmp_path)
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    _write_calendar_gap_history(settings, rec_date)
+    monkeypatch.setattr(
+        service.data_provider, "history", lambda *a, **k: (_low_high_frame(rec_date, today), "fake")
+    )
+    # 构造 7 日历日休市跳空：假前最后一交易日 = today+5，假后首日 = today+12
+    monkeypatch.setattr(
+        "app.recommendations.next_calendar_gap",
+        lambda target, min_gap: (today + timedelta(days=5), today + timedelta(days=12)),
+    )
+
+    result = service.monitor_planned_exits(force=True)
+
+    gap_alerts = [a for a in result["planned_exits"] if a["event_type"] == "planned_calendar_gap_exit"]
+    assert gap_alerts
+    alert = gap_alerts[0]
+    assert alert["symbol"] == "600519"
+    assert alert["severity"] == "warning"
+    assert alert["exit_date"] == (today + timedelta(days=5)).isoformat()
+    assert alert["exit_price_type"] == "close"
+    assert alert["exit_price"] is None
+    assert alert["calendar_gap_days"] == 7
+    assert alert["id"] == "calendar_gap_exit:%s:600519" % (today + timedelta(days=5)).isoformat()
+
+
+def test_monitor_planned_exits_no_calendar_gap_alert_when_disabled(tmp_path, monkeypatch):
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    rec_date = today - timedelta(days=3)
+    settings = replace(make_settings(tmp_path), monitor_pre_exit_calendar_gap_days=0)
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    _write_calendar_gap_history(settings, rec_date)
+    monkeypatch.setattr(
+        service.data_provider, "history", lambda *a, **k: (_low_high_frame(rec_date, today), "fake")
+    )
+    monkeypatch.setattr(
+        "app.recommendations.next_calendar_gap",
+        lambda target, min_gap: (today + timedelta(days=5), today + timedelta(days=12)),
+    )
+
+    result = service.monitor_planned_exits(force=True)
+
+    assert [a for a in result["planned_exits"] if a["event_type"] == "planned_calendar_gap_exit"] == []
+
+
+def test_monitor_planned_exits_dedups_calendar_gap_by_exit_date(tmp_path, monkeypatch):
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    rec_date = today - timedelta(days=3)
+    settings = make_settings(tmp_path)
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    _write_calendar_gap_history(settings, rec_date)
+    monkeypatch.setattr(
+        service.data_provider, "history", lambda *a, **k: (_low_high_frame(rec_date, today), "fake")
+    )
+    monkeypatch.setattr(
+        "app.recommendations.next_calendar_gap",
+        lambda target, min_gap: (today + timedelta(days=5), today + timedelta(days=12)),
+    )
+
+    first = service.monitor_planned_exits(force=True)
+    second = service.monitor_planned_exits(force=True)
+
+    first_gap = [a for a in first["planned_exits"] if a["event_type"] == "planned_calendar_gap_exit"]
+    second_gap = [a for a in second["planned_exits"] if a["event_type"] == "planned_calendar_gap_exit"]
+    assert len(first_gap) == 1
+    assert second_gap == []

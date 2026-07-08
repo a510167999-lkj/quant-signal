@@ -1,6 +1,6 @@
 import os
 from datetime import date, datetime, time
-from typing import Optional, Set
+from typing import Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
 from app.akshare_client import akshare_call
@@ -64,6 +64,24 @@ def next_trade_date(target: date) -> Optional[date]:
     if not selected:
         return None
     return date.fromisoformat(min(selected))
+
+
+def next_calendar_gap(
+    target: date, min_gap_days: int
+) -> Optional[Tuple[date, date]]:
+    """从 target(含) 向后扫交易日序列，返回首个相邻日历差 >= min_gap_days 的
+    休市跳空 (last_trade_before_gap, first_trade_after_gap)；无则 None。
+    min_gap_days<=0 直接返回 None。
+    """
+    if min_gap_days <= 0:
+        return None
+    target_str = target.strftime("%Y-%m-%d")
+    future = sorted(item for item in _load_trade_dates() if item >= target_str)
+    for left_str, right_str in zip(future, future[1:]):
+        gap = (date.fromisoformat(right_str) - date.fromisoformat(left_str)).days
+        if gap >= min_gap_days:
+            return (date.fromisoformat(left_str), date.fromisoformat(right_str))
+    return None
 
 
 def is_a_share_trading_time(moment: datetime) -> bool:
