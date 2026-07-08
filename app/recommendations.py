@@ -1483,20 +1483,6 @@ class RecommendationService:
             severity = "warning"
             title = "跌破支撑"
             reason = "现价 %.3f 已低于推荐时支撑 %.3f。" % (float(latest_price), float(support))
-        elif (profit_lock := self._profit_lock_alert_context(recommendation, latest_price)):
-            event_type = "profit_lock_exit"
-            severity = "info"
-            title = "触发利润保护"
-            reason = (
-                "已完成日线最高价 %.3f 较参考价 %.3f 达到 %.2f%% 利润保护阈值，"
-                "现价 %.3f，可按策略锁定收益或退出。"
-                % (
-                    profit_lock["prior_high"],
-                    profit_lock["reference_price"],
-                    profit_lock["activation_pct"],
-                    float(latest_price),
-                )
-            )
         elif take_profit and latest_price and float(latest_price) >= float(take_profit):
             event_type = "take_profit"
             severity = "info"

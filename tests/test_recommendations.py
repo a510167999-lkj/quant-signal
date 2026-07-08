@@ -29,17 +29,6 @@ class GapProvider:
         return frame, "fake-provider"
 
 
-class ProfitLockProvider:
-    def history(self, symbol, market, lookback_days=360, adjust="qfq"):
-        return pd.DataFrame(
-            [
-                {"date": "2026-07-02", "open": 100, "high": 102, "low": 99, "close": 101, "volume": 1000},
-                {"date": "2026-07-03", "open": 103, "high": 119, "low": 102, "close": 116, "volume": 1000},
-                {"date": "2026-07-06", "open": 115, "high": 117, "low": 113, "close": 114, "volume": 1000},
-            ]
-        ), "profit-lock-provider"
-
-
 class FakeUniverse:
     def __init__(self, snapshot):
         self._snapshot = snapshot
@@ -810,55 +799,6 @@ def test_monitor_recommendations_uses_l1_quotes_before_snapshot(tmp_path):
     assert result["alerts"]
     assert result["alerts"][0]["event_type"] == "stop_loss"
     assert result["alerts"][0]["latest_price"] == 94
-
-
-def test_monitor_recommendations_alerts_when_profit_lock_triggered(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "app.recommendations.now_cn",
-        lambda: datetime(2026, 7, 6, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
-    )
-    settings = make_settings(tmp_path)
-    service = RecommendationService(settings, ProfitLockProvider(), "risk")
-    service.industry = FakeIndustry()
-    service.news = FakeNews()
-    service.announcements = FakeAnnouncement()
-    service.fund_flow = FakeFundFlow()
-    append_jsonl(
-        settings.recommendation_history_path,
-        {
-            "generated_at": "2026-07-02T09:00:00+08:00",
-            "items": [
-                {
-                    "symbol": "600519",
-                    "market": "a",
-                    "name": "测试股票",
-                    "action": "BUY",
-                    "score": 5,
-                    "last_close": 100,
-                    "levels": {"stop_loss": 92, "support": 95, "take_profit": 130},
-                }
-            ],
-        },
-    )
-    service.universe = FakeUniverse(
-        [
-            {
-                "symbol": "600519",
-                "market": "a",
-                "name": "测试股票",
-                "latest": 115,
-                "amount": 100000000,
-                "change_pct": 1,
-            }
-        ]
-    )
-
-    result = service.monitor_recommendations(force=True)
-
-    assert result["alerts"]
-    assert result["alerts"][0]["event_type"] == "profit_lock_exit"
-    assert result["alerts"][0]["severity"] == "info"
-    assert "18.00%" in result["alerts"][0]["message"]
 
 
 def test_recommendation_run_returns_current_status_when_already_running(tmp_path):
