@@ -55,7 +55,14 @@ python -m app.jobs research-sweep-file          # 从落盘的 qualified-trades 
 - `indicators.py` → `signals.py`：趋势结构、MACD、RSI、20 日突破、ATR 风控。
 - `signal_tags.py`（最大模块之一）：把横截面特征转成 `breadth_*`、`proxy_*`、`price_*`、`rs*`、`margin_*`、`lhb_*`、`industry_*` 等标签，供生产推荐和历史 sweep 共用同一套门槛。
 - `backtest.py`：**信号日次日开盘入场**，避免同 K 线回填偏差。
-- `research_backtest.py`（约 2100 行）+ `research_sweep.py`：严格历史回测引擎，支持资本模型（`slot-exit` / `slot-daily` 逐日盯市）、暴露倍数、相关性预算、前日高点保护止损、分批止盈、长假前退出等。研究目标：70% 单笔胜率 / 5% 最大回撤 / 200% 一年组合收益——是研究标尺，不是实盘承诺。
+- `research_backtest.py`（约 1150 行）+ `research_sweep.py`（约 1130 行）：严格历史回测引擎，支持资本模型（`slot-exit` / `slot-daily` 逐日盯市）、暴露倍数、相关性预算、前日高点保护止损、分批止盈、长假前退出等。研究目标：70% 单笔胜率 / 5% 最大回撤 / 200% 一年组合收益——是研究标尺，不是实盘承诺。
+- `research_backtest` 的纯计算层已按职责拆成子模块，`research_backtest` 本身只负责回测编排与 payload 构造，并**反向 import 这些子模块**以保持内部调用点与测试路径稳定（改调用方前先看这条约定）：
+  - `research_equity.py`：权益曲线 / 资本模型数学（`slot-exit` / `slot-daily` 逐日盯市、最大回撤）。
+  - `research_context.py`：信号日上下文计算（大盘强度 / 代理收益 / 相对强度 / K 线形态 / 市场宽度 / 行业轮动 / 历史质量）。
+  - `research_stats.py`：trades 统计聚合与各维度分桶（`_research_group_stats` 等）。
+  - `research_portfolio.py`：组合管理（滚动窗口权益、按信号日选股与仓位控制）与单笔交易实现（止损/止盈/移动止损 + mark-to-market）。
+  - `research_cache.py`：K 线与公告的 JSON 文件缓存 fetcher（miss 时拉外部源）。
+  - `research_common.py`：底层无依赖 helper（`_num` / `_date_value` / `_date_yyyymmdd`），其他 research_* 模块共享。
 
 **推荐服务（生产路径）**
 
