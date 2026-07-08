@@ -160,7 +160,7 @@ def test_research_backtest_announcement_context_blocks_known_risk(tmp_path, monk
         "confidence": 90,
     })
     monkeypatch.setattr(
-        "app.research_backtest.fetch_cninfo_announcements",
+        "app.research_cache.fetch_cninfo_announcements",
         lambda symbol, start_date, end_date: [
             {
                 "title": "测试股票关于收到行政处罚决定书的公告",
@@ -224,7 +224,7 @@ def test_research_backtest_announcement_context_ignores_future_risk(tmp_path, mo
         "confidence": 90,
     })
     monkeypatch.setattr(
-        "app.research_backtest.fetch_cninfo_announcements",
+        "app.research_cache.fetch_cninfo_announcements",
         lambda symbol, start_date, end_date: [
             {
                 "title": "测试股票关于收到行政处罚决定书的公告",
@@ -288,7 +288,7 @@ def test_research_backtest_can_require_announcement_event(tmp_path, monkeypatch)
         "confidence": 90,
     })
     monkeypatch.setattr(
-        "app.research_backtest.fetch_cninfo_announcements",
+        "app.research_cache.fetch_cninfo_announcements",
         lambda symbol, start_date, end_date: [
             {
                 "title": "测试股票关于回购公司股份进展的公告",

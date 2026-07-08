@@ -1,12 +1,11 @@
 from collections import defaultdict
 from datetime import datetime, timedelta
 import json
-from pathlib import Path
 from typing import Any, Dict, List
 
 import pandas as pd
 
-from app.announcement_context import build_announcement_context, fetch_cninfo_announcements
+from app.announcement_context import build_announcement_context
 from app.a_share_universe import AShareUniverseProvider, select_deep_scan_candidates
 from app.config import Settings
 from app.dragon_tiger import DragonTigerProvider, OFFICIAL_SOURCE_CAVEAT as DRAGON_TIGER_CAVEAT
@@ -14,6 +13,10 @@ from app.execution import assess_entry_executability
 from app.indicators import add_indicators
 from app.margin_eligibility import MarginEligibilityProvider
 from app.market_data import AkshareDataProvider
+from app.research_cache import (
+    _announcements_with_file_cache,
+    _history_with_file_cache,
+)
 from app.research_common import _date_value, _date_yyyymmdd, _num
 from app.research_context import (
     _historical_market_breadth,
@@ -38,7 +41,7 @@ from app.research_stats import (
 )
 from app.signal_tags import build_candidate_context_tags
 from app.signals import evaluate_signal
-from app.storage import read_json, write_json
+from app.storage import read_json
 
 
 MARKET_PROXY_SYMBOLS = [
@@ -236,55 +239,6 @@ def _realized_trade_from_future(
         if entry and len(realized_future)
         else 0,
     }
-
-
-def _history_with_file_cache(
-    provider: AkshareDataProvider,
-    market: str,
-    symbol: str,
-    lookback_days: int,
-    adjust: str,
-    cache_dir: str,
-):
-    cache_path = Path(cache_dir) / ("%s_%s_%s_%s.json" % (market, symbol, lookback_days, adjust or "none"))
-    cached = read_json(str(cache_path), {})
-    if isinstance(cached, dict) and cached.get("records"):
-        return pd.DataFrame(cached["records"]), cached.get("source", "research-cache")
-
-    frame, source = provider.history(symbol, market, lookback_days=lookback_days, adjust=adjust)
-    write_json(
-        str(cache_path),
-        {
-            "source": source,
-            "records": frame.to_dict(orient="records"),
-        },
-    )
-    return frame, source
-
-
-def _announcements_with_file_cache(
-    symbol: str,
-    start_date: str,
-    end_date: str,
-    cache_dir: str,
-) -> List[Dict[str, Any]]:
-    cache_path = Path(cache_dir) / ("announcements_%s_%s_%s.json" % (symbol, start_date, end_date))
-    cached = read_json(str(cache_path), {})
-    if isinstance(cached, dict) and isinstance(cached.get("items"), list):
-        return cached["items"]
-
-    items = fetch_cninfo_announcements(symbol, start_date, end_date)
-    write_json(
-        str(cache_path),
-        {
-            "source": "CNINFO stock_zh_a_disclosure_report_cninfo",
-            "symbol": symbol,
-            "start_date": start_date,
-            "end_date": end_date,
-            "items": items,
-        },
-    )
-    return items
 
 
 def _compact_announcement_context(payload: Dict[str, Any]) -> Dict[str, Any]:
