@@ -87,6 +87,7 @@ class Settings:
     monitor_intraday_drop_pct: float = 4.0
     monitor_profit_lock_activation_pct: float = 18.0
     monitor_pre_exit_calendar_gap_days: int = 7
+    performance_strategy_hold_days: int = 5
     alert_webhook_url: str = ""
 
 
@@ -202,5 +203,6 @@ def get_settings() -> Settings:
             0,
             30,
         ),
+        performance_strategy_hold_days=int_setting("PERFORMANCE_STRATEGY_HOLD_DAYS", 5, 1, 30),
         alert_webhook_url=os.getenv("ALERT_WEBHOOK_URL", ""),
     )

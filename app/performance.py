@@ -1,6 +1,8 @@
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from app.research_portfolio import _realized_trade_from_future
+from app.research_sweep import _apply_partial_profit_lock, _truncate_trade_before_calendar_gap
 from app.storage import read_jsonl
 
 
@@ -46,6 +48,7 @@ def _recommendation_rows(history_path: str, limit: int) -> List[Dict[str, Any]]:
 def evaluate_recommendation_performance(
     history_path: str,
     data_provider,
+    settings,
     limit: int = 500,
 ) -> Dict[str, Any]:
     tracked = []
@@ -75,6 +78,7 @@ def evaluate_recommendation_performance(
             max_adverse = None
             if window:
                 max_adverse = _pct(min(float(row.get("low") or entry_price) for row in window) / entry_price - 1)
+            strategy_exit = _compute_strategy_exit(frame, entry_index, settings)
             tracked.append(
                 {
                     "symbol": symbol,
@@ -89,6 +93,7 @@ def evaluate_recommendation_performance(
                     "source": source,
                     "status": "matured_10d" if "return_10d_pct" in returns else "pending_10d",
                     **returns,
+                    "strategy_exit": strategy_exit,
                 }
             )
         except Exception as exc:
@@ -96,6 +101,31 @@ def evaluate_recommendation_performance(
 
     summary = _summarize(tracked)
     return {"summary": summary, "items": tracked[-200:][::-1], "errors": errors[:50]}
+
+
+def _compute_strategy_exit(frame, entry_index: int, settings) -> Optional[Dict[str, Any]]:
+    """对单条推荐按回测退出规则算策略退出收益，对齐 sweep_qualified_trades 口径：
+    time_exit(hold_days 兜底) → profit-lock(@activation, F=1.0 全仓) → 长假前退出(gap≥N)。
+    行情不足 hold_days 时返回 None（pending）。组合资本模型口径不在单笔跟踪范围内。
+    """
+    hold_days = settings.performance_strategy_hold_days
+    if entry_index + hold_days > len(frame) - 1:
+        return None
+    exit_index = entry_index + hold_days
+    trade = _realized_trade_from_future(frame, entry_index, exit_index)
+    trade = _apply_partial_profit_lock(
+        trade, settings.monitor_profit_lock_activation_pct, 1.0
+    )
+    trade = _truncate_trade_before_calendar_gap(
+        trade, settings.monitor_pre_exit_calendar_gap_days
+    )
+    return {
+        "return_pct": trade.get("return_pct"),
+        "exit_reason": trade.get("exit_reason"),
+        "exit_date": trade.get("exit_date"),
+        "holding_days": trade.get("holding_days"),
+        "max_adverse_pct": trade.get("max_adverse_pct"),
+    }
 
 
 def _pending_item(item: Dict[str, Any], signal_date: str, status: str) -> Dict[str, Any]:
@@ -124,6 +154,18 @@ def _summarize(items: List[Dict[str, Any]]) -> Dict[str, Any]:
         if adverse_items
         else 0
     )
+    strategy_items = [item for item in items if item.get("strategy_exit")]
+    strategy_returns = [
+        item["strategy_exit"]["return_pct"]
+        for item in strategy_items
+        if item["strategy_exit"].get("return_pct") is not None
+    ]
+    strategy_wins = [value for value in strategy_returns if value > 0]
+    reason_counts: Dict[str, int] = {}
+    for item in strategy_items:
+        reason = item["strategy_exit"].get("exit_reason")
+        if reason:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
     return {
         "total_recommendations": len(items),
         "matured_10d_count": len(matured_10d),
@@ -131,4 +173,13 @@ def _summarize(items: List[Dict[str, Any]]) -> Dict[str, Any]:
         "win_rate_10d_pct": round(len(wins_10d) / len(matured_10d) * 100, 2) if matured_10d else None,
         "avg_return_10d_pct": round(avg_10d, 2) if matured_10d else None,
         "avg_adverse_10d_pct": round(avg_adverse, 2) if adverse_items else None,
+        "strategy_matured_count": len(strategy_returns),
+        "strategy_pending_count": len(items) - len(strategy_returns),
+        "strategy_win_rate_pct": round(len(strategy_wins) / len(strategy_returns) * 100, 2)
+        if strategy_returns
+        else None,
+        "strategy_avg_return_pct": round(sum(strategy_returns) / len(strategy_returns), 2)
+        if strategy_returns
+        else None,
+        "strategy_exit_reason_counts": reason_counts,
     }

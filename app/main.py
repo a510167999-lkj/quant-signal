@@ -168,6 +168,7 @@ def create_app() -> FastAPI:
         return evaluate_recommendation_performance(
             SETTINGS.recommendation_history_path,
             DATA_PROVIDER,
+            SETTINGS,
             limit=limit,
         )
 
