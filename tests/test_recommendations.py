@@ -1023,3 +1023,60 @@ def test_monitor_planned_exits_dedups_calendar_gap_by_exit_date(tmp_path, monkey
     second_gap = [a for a in second["planned_exits"] if a["event_type"] == "planned_calendar_gap_exit"]
     assert len(first_gap) == 1
     assert second_gap == []
+
+
+def test_generate_produces_three_recommendations_with_full_action_advice(tmp_path):
+    """goal 证据：generate 在 3 只强信号输入下产出恰好 3 只 + 每只完整操作建议。"""
+    settings = replace(make_settings(tmp_path), scan_result_limit=3)
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    service.industry = FakeIndustry()
+    service.industry_history = FakeIndustryHistory()
+    service.news = FakeNews()
+    service.announcements = FakeAnnouncement()
+    service.fund_flow = FakeFundFlow()
+    service.margin_eligibility = FakeMarginEligibility()
+    service.universe = FakeUniverse(
+        [
+            {
+                "symbol": "000001",
+                "market": "a",
+                "name": "甲测试",
+                "latest": 100,
+                "amount": 10 ** 9,
+                "change_pct": 5.0,
+                "volume": 10 ** 5,
+                "industry": "测试行业",
+            },
+            {
+                "symbol": "000002",
+                "market": "a",
+                "name": "乙测试",
+                "latest": 100,
+                "amount": 10 ** 9,
+                "change_pct": 5.0,
+                "volume": 10 ** 5,
+                "industry": "测试行业",
+            },
+            {
+                "symbol": "000003",
+                "market": "a",
+                "name": "丙测试",
+                "latest": 100,
+                "amount": 10 ** 9,
+                "change_pct": 5.0,
+                "volume": 10 ** 5,
+                "industry": "测试行业",
+            },
+        ]
+    )
+
+    result = service.generate_daily_recommendations(force=True)
+
+    assert len(result["items"]) == 3
+    returned_symbols = {item["symbol"] for item in result["items"]}
+    assert returned_symbols == {"000001", "000002", "000003"}
+    for item in result["items"]:
+        assert item["action"] in {"BUY", "WATCH", "HOLD", "REDUCE", "SELL"}
+        assert {"stop_loss", "take_profit"} <= set(item["levels"])
+        assert item["entry_zone"]
+        assert item["trade_plans"]
