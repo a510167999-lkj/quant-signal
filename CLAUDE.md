@@ -34,6 +34,7 @@ pytest -k dragon_tiger                    # 按名筛选
 python -m app.jobs generate-recommendations --force --run-slot post_close
 python -m app.jobs warm-market-cache --max-deep 500 --workers 4 --lookback-days 620
 python -m app.jobs monitor-recommendations --force
+python -m app.jobs monitor-planned-exits --force   # 盘后日级计划退出（profit-lock / 长假）
 python -m app.jobs research-backtest            # 严格历史回测
 python -m app.jobs research-historical-sweep    # 标签/暴露/资本模型 sweep
 python -m app.jobs research-sweep-file          # 从落盘的 qualified-trades 重跑 sweep
@@ -69,13 +70,14 @@ python -m app.jobs research-sweep-file          # 从落盘的 qualified-trades 
 - `recommendations.py`（约 1500 行）：`RecommendationService` 负责全市场扫描。流程是**先预筛全市场快照，再对行业分层候选池深扫**，叠加市场环境过滤（`market_regime.py`）、行业强弱（`industry_strength.py`）、历史信号质量、消息/公告/资金流风险叠加，最后用 `RECOMMENDATION_*` 环境变量定义的强信号门槛过滤。
 - 跨进程互斥锁（`RECOMMENDATION_LOCK_PATH`）：扫描运行中再次触发返回当前状态，不重复开扫。
 - 四个 run slot（`pre_open` 09:00 / `open_confirm` 09:32 / `pre_close` 14:55 / `post_close` 15:02）口径不同，盘前跳过 L1 确认，非交易日经交易日历跳过。
-- `performance.py`：跟踪已推荐标的 1/3/5/10 日收益与胜率，落盘 `recommendations_history.jsonl`。
+- 退出 alert **双轨**：盘中 `monitor_recommendations`（止损/支撑/盘中跌幅/信号转弱，实时）+ 盘后日级 `monitor_planned_exits`（计划性退出：profit-lock exit 按 T+1 开盘口径、长假前退出按收盘口径，均执行性 alert，对齐回测 `_apply_partial_profit_lock` / `_truncate_trade_before_calendar_gap`）。阈值 `MONITOR_PROFIT_LOCK_ACTIVATION_PCT` / `MONITOR_PRE_EXIT_CALENDAR_GAP_DAYS`。
+- `performance.py`：跟踪已推荐标的的 1/3/5/10 日固定收益（选股 alpha baseline）**及** `strategy_exit`（复用回测退出管线 `_realized_trade_from_future`→profit-lock→长假`，单笔退出语义与回测标尺可比；组合资本模型口径不在单笔跟踪范围）。落盘 `recommendations_history.jsonl`。
 - `execution.py`：可执行性过滤（剔除高开过大、一字板、入场振幅过大等难成交样本）。
 
 **API / 前端**
 
 - `main.py`：`create_app()` 构造 FastAPI。所有 `/api/*` 端点走 `require_basic_auth`（`BASIC_AUTH_USER/PASSWORD` 都空时禁用）；`MarketDataError` 统一映射 502。SPA fallback 把非 api 路径都回 `static/index.html`。
-- 关键端点：`POST /api/analyze`（单标的）、`POST /api/recommendations/run`（后台触发扫描）、`GET /api/recommendations/latest`、`GET /api/performance/recommendations`、`POST /api/alerts/monitor`。
+- 关键端点：`POST /api/analyze`（单标的）、`POST /api/recommendations/run`（后台触发扫描）、`GET /api/recommendations/latest`、`GET /api/performance/recommendations`、`POST /api/alerts/monitor`（盘中实时）、`POST /api/alerts/planned-exits`（盘后日级计划退出）。
 - 前端是 `app/static/` 下的原生 HTML/CSS/JS（无构建步骤），直接调上述 API。
 
 **运行时数据**：全部落 `data/` 目录（K 线 SQLite、推荐 JSON/jsonl、各上下文缓存、alerts）。已 gitignore，不要提交。

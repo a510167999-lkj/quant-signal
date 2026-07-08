@@ -77,12 +77,14 @@ python -m app.jobs generate-recommendations --force --run-slot post_close
 python -m app.jobs warm-market-cache --max-deep 500 --workers 4 --lookback-days 620
 python -m app.jobs mootdx-l1-check --symbols 600519,000001,301308,002607 --timeout-seconds 3
 python -m app.jobs monitor-recommendations --force
+python -m app.jobs monitor-planned-exits --force   # post-close: profit-lock / calendar-gap planned exits
 ```
 
 Production timer units:
 
 - `quant-signal-recommend.timer`: weekdays 09:00, 09:32, 14:55 and 15:02 China time. The job skips non-trading days via the A-share trading calendar and records `run_slot` in each recommendation snapshot.
 - `quant-signal-monitor.timer`: every 5 minutes from 09:00 to 15:55 on weekdays; the job only acts inside A-share trading windows.
+- `quant-signal-planned-exits.timer`: weekdays 15:05 China time (after `post_close`); scans recent recommendations for profit-lock and pre-calendar-gap planned exits using completed daily bars.
 - `quant-signal-cache-warm.timer`: weekdays 08:35 and 15:45 China time; it refreshes the local daily K-line cache before the morning scan and after the close.
 
 Run slots:
@@ -206,7 +208,7 @@ See `DATA_SOURCES.md` for the current external data-source comparison and migrat
 - `ANNOUNCEMENT_LOOKBACK_DAYS`: CNINFO announcement lookback window for event scoring.
 - `MARKET_DATA_TIMEOUT_SECONDS`: AKShare A-share daily-history request timeout. The default is `8` seconds; lower it for broad research sweeps so one slow upstream request does not stall the run.
 
-The dashboard's recommendation-performance panel uses saved recommendation history and evaluates from the next trading bar's open. Early after deployment, this sample may be empty or too small; treat it as live validation rather than a promised future win rate.
+The dashboard's recommendation-performance panel uses saved recommendation history and evaluates from the next trading bar's open. Each recommendation also carries a `strategy_exit` (profit-lock + pre-calendar-gap + hold-days fallback) that reuses the research exit pipeline, so its single-trade outcome is comparable to the backtest target's exit semantics (the portfolio capital-model layer — slot-daily / exposure / correlation — is out of scope for per-trade tracking). Early after deployment, this sample may be empty or too small; treat it as live validation rather than a promised future win rate.
 
 ## Tests
 
@@ -673,7 +675,7 @@ After adding the slot-exit capital model and reducing the active slot budget to 
 | `slot-daily` | same 3-slot slice + pre-exit + exclude `entry_gap_lt_neg1`, `proxy20_avg_gte_15`, `proxy60_avg_lt_0` + 30d correlation cap 0.35 + 7% prior-high trailing stop | 3 | 2.3x | 20 | 85.00% | 198.41% | -5.53% | 201.66% | no |
 | `slot-daily` | same 20-trade strict slice + 18% prior-high next-open profit-lock exit | 3 | 2.08x | 20 | 85.00% | 199.09% | -5.00% | 201.99% | yes |
 
-This is now a strict `slot-daily` research pass, not a live performance promise. The pass depends on a narrow 20-trade slice, 2.08x exposure, realistic financing/cost/slippage assumptions, a 7% prior-high trailing stop, proxy-market risk exclusions, and an 18% prior-high next-open profit-lock exit. The stricter `slot-daily` model still marks open trades daily and uses daily lows for drawdown checks. Production defaults use the same signal tags, favorable/neutral market regime, 5-day cooldown, 3 returned recommendations, and live profit-lock alerting so forward validation can accumulate against this profile.
+This is now a strict `slot-daily` research pass, not a live performance promise. The pass depends on a narrow 20-trade slice, 2.08x exposure, realistic financing/cost/slippage assumptions, a 7% prior-high trailing stop, proxy-market risk exclusions, and an 18% prior-high next-open profit-lock exit. The stricter `slot-daily` model still marks open trades daily and uses daily lows for drawdown checks. Production defaults use the same signal tags, favorable/neutral market regime, 5-day cooldown, 3 returned recommendations, live profit-lock alerting (intraday plus post-close planned-exit alerts for profit-lock and pre-calendar-gap exits), and strategy-exit performance tracking, so forward validation can accumulate against this profile.
 
 A follow-up local search over 18,288 variants of the same core slice, adding common confirmation tags, risk-exclusion tags, 7%-10% prior-high protection, 2.0x-2.5x exposure, and 30-day correlation caps, still found no strict `slot-daily` row that passes all three targets. The best new boundary row used 7% prior-high protection and 2.3x exposure: it kept 85.19% trade win rate and 201.66% latest-one-year return, but strict max drawdown was still -6.46%. After adding proxy-market tags, excluding short-term proxy overheating (`proxy20_avg_gte_15`) and medium-term proxy weakness (`proxy60_avg_lt_0`) improved the strict drawdown boundary to -5.53% while preserving 85.00% win rate and 201.66% latest-one-year return. It is still not a 5% pass, but it is the closest strict result so far. Active-slot scans showed the same tradeoff: 3 slots are the best balance; 2 slots raise one-year return above 200% at lower exposure but drawdown remains worse than -7%, while 4 slots reduce return density. The next useful work is therefore new alpha or risk information, especially official announcements, industry/index regime features, and partial de-risking rules, not another fixed stop tweak.
 

@@ -74,6 +74,7 @@
 - 增加组合风控：按市场环境调总仓位，按相关行业/单票去重，避免多个信号同时暴露在同一风险因子。
 - 研究回测支持组合约束：单票冷却期、最大活跃持仓数、组合近似最大回撤。
 - 退出规则研究：固定止盈和追踪止损已接入研究回测；两年强信号样本里，8/12/15% 固定止盈都会截断收益，不作为生产默认。10 日持仓 + 6% 追踪止损在 2.0x 现实成本下最佳 70%/5% 切片最近一年仅 31.41%，不如 5 日 + 5% 硬止损。
+- 退出 alert 接入生产（回应「下一步实盘提醒执行」）：盘后 `monitor_planned_exits` 落地 profit-lock exit（前高≥18% → T+1 开盘退出，`exit_price_type=next_open`）与长假前退出（gap≥7 → 假前最后一交易日收盘退出，`exit_price_type=close`）两类执行性 alert，严格对齐回测 `_apply_partial_profit_lock` / `_truncate_trade_before_calendar_gap` 口径；与盘中 `monitor_recommendations`（止损/支撑/盘中跌幅）双轨分工。`performance.py` 同步加 `strategy_exit` 字段，复用同一退出管线（`_realized_trade_from_future` → profit-lock → 长假），单笔跟踪口径与回测标尺可比（组合资本模型 slot-daily/暴露/相关性不在单笔跟踪范围）。prior-high trailing 经复核被 profit-lock 取代（-6.46% vs -5.00%），不接入生产。
 - 增加严格目标看板：70% 单笔胜率、5% 最大不利波动/组合回撤、200% 一年组合收益作为研究目标，不作为未验证承诺。
 - 加登录保护或放到 Nginx Basic Auth 后面，并启用 CSP 等安全响应头。
 - 增加交易日志：计划买入价、实际成交、仓位、复盘备注。
