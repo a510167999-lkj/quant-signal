@@ -16,6 +16,16 @@ from app.signal_tags import build_market_breadth_tags, build_price_action_tags, 
 from app.signals import evaluate_signal
 
 
+def _round2(value: Any) -> Any:
+    """None 安全的两位小数四舍五入；None 透传。"""
+    return round(value, 2) if value is not None else None
+
+
+def _pct(rows: List[Dict[str, Any]], key: str) -> float:
+    """rows 中 key 为真的占比（%），两位小数。调用方保证 rows 非空。"""
+    return round(sum(1 for row in rows if row[key]) / len(rows) * 100, 2)
+
+
 def _historical_market_context(proxy_frames: List[pd.DataFrame], signal_date: str) -> Dict[str, Any]:
     scores = []
     weak_count = 0
@@ -195,12 +205,12 @@ def _price_action_context(frame: pd.DataFrame, index: int, symbol: Any) -> Dict[
             recent_large_up_count += 1
 
     context = {
-        "gap_pct": round(gap_pct, 2) if gap_pct is not None else None,
-        "intraday_return_pct": round(intraday_return_pct, 2) if intraday_return_pct is not None else None,
-        "range_pct": round(range_pct, 2) if range_pct is not None else None,
-        "close_position_pct": round(close_position_pct, 2) if close_position_pct is not None else None,
-        "upper_shadow_pct": round(upper_shadow_pct, 2) if upper_shadow_pct is not None else None,
-        "lower_shadow_pct": round(lower_shadow_pct, 2) if lower_shadow_pct is not None else None,
+        "gap_pct": _round2(gap_pct),
+        "intraday_return_pct": _round2(intraday_return_pct),
+        "range_pct": _round2(range_pct),
+        "close_position_pct": _round2(close_position_pct),
+        "upper_shadow_pct": _round2(upper_shadow_pct),
+        "lower_shadow_pct": _round2(lower_shadow_pct),
         "signal_change_pct": round(signal_change_pct, 2),
         "limit_threshold_pct": limit_threshold,
         "recent_limit_up_count_20d": recent_limit_up_count,
@@ -255,26 +265,11 @@ def _historical_market_breadth(
         returns = [row["return_20d_pct"] for row in rows]
         context = {
             "sample_count": sample_count,
-            "above_ma20_pct": round(
-                sum(1 for row in rows if row["above_ma20"]) / sample_count * 100,
-                2,
-            ),
-            "above_ma60_pct": round(
-                sum(1 for row in rows if row["above_ma60"]) / sample_count * 100,
-                2,
-            ),
-            "return_20d_positive_pct": round(
-                sum(1 for row in rows if row["return_20d_positive"]) / sample_count * 100,
-                2,
-            ),
-            "advancing_pct": round(
-                sum(1 for row in rows if row["advancing"]) / sample_count * 100,
-                2,
-            ),
-            "liquid_300m_pct": round(
-                sum(1 for row in rows if row["liquid_300m"]) / sample_count * 100,
-                2,
-            ),
+            "above_ma20_pct": _pct(rows, "above_ma20"),
+            "above_ma60_pct": _pct(rows, "above_ma60"),
+            "return_20d_positive_pct": _pct(rows, "return_20d_positive"),
+            "advancing_pct": _pct(rows, "advancing"),
+            "liquid_300m_pct": _pct(rows, "liquid_300m"),
             "median_return_20d_pct": round(float(pd.Series(returns).median()), 2),
         }
         context["tags"] = build_market_breadth_tags(context)
