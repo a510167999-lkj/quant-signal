@@ -542,6 +542,7 @@ def test_generate_daily_recommendations_default_strict_filter_blocks_weak_signal
         cors_origins=[],
         latest_recommendations_path=str(tmp_path / "recommendations_latest.json"),
         recommendation_history_path=str(tmp_path / "recommendations_history.jsonl"),
+        recommendation_audit_path=str(tmp_path / "recommendations_audit.jsonl"),
         alerts_path=str(tmp_path / "alerts.jsonl"),
         universe_cache_path=str(tmp_path / "universe.json"),
         recommendation_lock_path=str(tmp_path / "recommendations.lock"),
