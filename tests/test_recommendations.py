@@ -6,7 +6,11 @@ import pandas as pd
 import pytest
 
 from app.config import Settings
-from app.recommendations import RecommendationService, _selection_rejection_reason
+from app.recommendations import (
+    RecommendationService,
+    _selection_funnel_explanation,
+    _selection_rejection_reason,
+)
 from app.storage import append_jsonl, read_jsonl
 from tests.test_signals import sample_frame
 
@@ -220,6 +224,18 @@ def test_selection_rejection_reason_uses_first_decisive_gate(overrides, reason):
     }
     compact.update(overrides)
     assert _selection_rejection_reason(compact, {"BUY", "WATCH"}, 2.0) == reason
+
+
+def test_selection_funnel_explanation_names_top_zero_result_reasons():
+    explanation = _selection_funnel_explanation(
+        {
+            "considered": 5,
+            "returned": 0,
+            "rejection_reasons": {"strict_signal_failed": 3, "score_below_floor": 2},
+        }
+    )
+
+    assert explanation == "本次分析 5 只，最终 0 只；主要原因：严格信号未通过 3 只、评分不足 2 只。"
 
 
 def test_skipped_run_still_writes_empty_funnel_and_audit(tmp_path, monkeypatch):

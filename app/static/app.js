@@ -279,7 +279,10 @@ function renderRecommendations(payload) {
 
   clear(els.recommendationsList);
   if (!items.length) {
-    const empty = node("div", "recommendation-item empty-row", summary.skipped ? "非交易日已跳过。" : "暂无达到阈值的推荐。");
+    const emptyMessage = summary.skipped
+      ? "非交易日已跳过。"
+      : summary.selection_funnel?.explanation || "暂无达到阈值的推荐。";
+    const empty = node("div", "recommendation-item empty-row", emptyMessage);
     els.recommendationsList.appendChild(empty);
     return;
   }

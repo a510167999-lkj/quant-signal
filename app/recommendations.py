@@ -808,6 +808,39 @@ def _selection_rejection_reason(
     return None
 
 
+def _selection_funnel_explanation(funnel: Dict[str, Any]) -> str:
+    considered = int(funnel.get("considered") or 0)
+    returned = int(funnel.get("returned") or 0)
+    labels = {
+        "cooldown": "冷却期跳过",
+        "analysis_error": "分析失败",
+        "market_action": "操作类型不符合",
+        "score_below_floor": "评分不足",
+        "strict_signal_failed": "严格信号未通过",
+        "strategy_quality_failed": "历史质量未通过",
+        "announcement_blocked": "公告风险阻断",
+        "news_blocked": "新闻风险阻断",
+        "fund_flow_blocked": "资金流风险阻断",
+        "result_limit": "超过推荐数量上限",
+        "run_failed": "推荐任务失败",
+    }
+    reasons = sorted(
+        (funnel.get("rejection_reasons") or {}).items(),
+        key=lambda item: (-int(item[1]), str(item[0])),
+    )[:3]
+    if not reasons:
+        return "本次分析 %d 只，最终返回 %d 只。" % (considered, returned)
+    reason_text = "、".join(
+        "%s %d 只" % (labels.get(str(reason), str(reason)), int(count))
+        for reason, count in reasons
+    )
+    return "本次分析 %d 只，最终 %d 只；主要原因：%s。" % (
+        considered,
+        returned,
+        reason_text,
+    )
+
+
 class RecommendationService:
     def __init__(self, settings: Settings, data_provider, disclaimer: str) -> None:
         self.settings = settings
@@ -856,7 +889,7 @@ class RecommendationService:
     @staticmethod
     def _empty_selection_funnel(reason: Optional[str] = None) -> Dict[str, Any]:
         reasons = {reason: 1} if reason else {}
-        return {
+        funnel = {
             "snapshot": 0,
             "prefiltered": 0,
             "considered": 0,
@@ -868,6 +901,8 @@ class RecommendationService:
             "rejection_reasons": reasons,
             "rejection_examples": [],
         }
+        funnel["explanation"] = _selection_funnel_explanation(funnel)
+        return funnel
 
     def _append_recommendation_audit(
         self,
@@ -1284,6 +1319,7 @@ class RecommendationService:
             "rejection_reasons": dict(sorted(rejection_counts.items())),
             "rejection_examples": rejections[:20],
         }
+        selection_funnel["explanation"] = _selection_funnel_explanation(selection_funnel)
         hot_industry_payload = _hot_industry_windows(
             industry_payload=industry_payload,
             candidates=candidates,
