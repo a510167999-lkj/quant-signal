@@ -50,6 +50,16 @@ class Settings:
     announcement_cache_path: str = "data/announcement_context.json"
     margin_eligibility_cache_path: str = "data/margin_eligibility.json"
     akshare_status_path: str = "data/akshare_status.json"
+    trade_calendar_cache_path: str = "data/trade_calendar.json"
+    production_recommendation_max_age_hours: int = 36
+    production_running_max_minutes: int = 90
+    production_calendar_max_age_hours: int = 48
+    production_market_cache_max_age_hours: int = 36
+    production_industry_max_age_hours: int = 72
+    production_provider_failure_window_hours: int = 24
+    production_health_state_path: str = "data/production_health_state.json"
+    production_health_reminder_hours: int = 6
+    production_health_alerts_enabled: bool = True
     scan_max_deep: int = 500
     intraday_scan_max_deep: int = 120
     scan_result_limit: int = 3
@@ -146,6 +156,16 @@ def get_settings() -> Settings:
             "MARGIN_ELIGIBILITY_CACHE_PATH", "data/margin_eligibility.json"
         ),
         akshare_status_path=os.getenv("AKSHARE_STATUS_PATH", "data/akshare_status.json"),
+        trade_calendar_cache_path=os.getenv("TRADE_CALENDAR_CACHE_PATH", "data/trade_calendar.json"),
+        production_recommendation_max_age_hours=int_setting("PRODUCTION_RECOMMENDATION_MAX_AGE_HOURS", 36, 1, 168),
+        production_running_max_minutes=int_setting("PRODUCTION_RUNNING_MAX_MINUTES", 90, 5, 720),
+        production_calendar_max_age_hours=int_setting("PRODUCTION_CALENDAR_MAX_AGE_HOURS", 48, 1, 720),
+        production_market_cache_max_age_hours=int_setting("PRODUCTION_MARKET_CACHE_MAX_AGE_HOURS", 36, 1, 168),
+        production_industry_max_age_hours=int_setting("PRODUCTION_INDUSTRY_MAX_AGE_HOURS", 72, 1, 720),
+        production_provider_failure_window_hours=int_setting("PRODUCTION_PROVIDER_FAILURE_WINDOW_HOURS", 24, 1, 168),
+        production_health_state_path=os.getenv("PRODUCTION_HEALTH_STATE_PATH", "data/production_health_state.json"),
+        production_health_reminder_hours=int_setting("PRODUCTION_HEALTH_REMINDER_HOURS", 6, 1, 168),
+        production_health_alerts_enabled=os.getenv("PRODUCTION_HEALTH_ALERTS_ENABLED", "1").strip() != "0",
         scan_max_deep=int_setting("SCAN_MAX_DEEP", 500, 20, 3000),
         intraday_scan_max_deep=int_setting("INTRADAY_SCAN_MAX_DEEP", 120, 20, 1000),
         scan_result_limit=int_setting("SCAN_RESULT_LIMIT", 3, 3, 100),
