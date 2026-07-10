@@ -39,6 +39,7 @@ def test_health_systemd_units_have_expected_contract():
     service = (DEPLOY / "quant-signal-health.service").read_text(encoding="utf-8")
     timer = (DEPLOY / "quant-signal-health.timer").read_text(encoding="utf-8")
     assert "Type=oneshot" in service
+    assert "SuccessExitStatus=1" in service
     assert "ExecStart=/home/ubuntu/quant-signal/deploy/check-production-health.sh" in service
     assert "OnUnitActiveSec=5min" in timer
     assert "Unit=quant-signal-health.service" in timer

@@ -59,6 +59,15 @@ def test_stale_recommendation_is_unhealthy(tmp_path):
     assert find(result, "recommendations")["status"] == "unhealthy"
 
 
+def test_failed_recommendation_is_unhealthy_and_provider_failure_is_degraded(tmp_path):
+    cfg = settings(tmp_path)
+    write_healthy_artifacts(cfg)
+    write_json(cfg.akshare_status_path, {"updated_at": NOW.isoformat(), "endpoints": {"stock_zh_a_hist": {"status": "failed", "updated_at": NOW.isoformat()}}, "events": []})
+    assert find(build_production_status(cfg, NOW), "provider")["status"] == "degraded"
+    write_json(cfg.latest_recommendations_path, {"generated_at": NOW.isoformat(), "trade_date": "2026-07-10", "items": [], "errors": [{"message": "upstream"}], "summary": {"failed": True}})
+    assert find(build_production_status(cfg, NOW), "recommendations")["status"] == "unhealthy"
+
+
 def test_too_many_or_incomplete_recommendations_are_unhealthy(tmp_path):
     cfg = settings(tmp_path)
     write_healthy_artifacts(cfg)

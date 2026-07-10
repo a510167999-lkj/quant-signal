@@ -51,6 +51,8 @@ def _recommendations(settings: Settings, now: datetime, trade_dates: set[str]) -
             return _check("recommendations", "unhealthy", "最新推荐缺少生成时间。")
         age = _age_hours(generated, now)
         summary = payload.get("summary") or {}
+        if summary.get("failed"):
+            return _check("recommendations", "unhealthy", "最近一次推荐任务执行失败。", error_count=len(payload.get("errors") or []))
         if summary.get("running") and age * 60 > settings.production_running_max_minutes:
             return _check("recommendations", "unhealthy", "推荐任务长时间停留在 running。", age_hours=round(age, 2))
         if now.date().isoformat() in trade_dates and age > settings.production_recommendation_max_age_hours:
@@ -113,7 +115,7 @@ def _provider(settings: Settings, now: datetime) -> dict[str, Any]:
         if not failures:
             return _check("provider", "healthy", "近期无关键 provider 失败。")
         fallback = settings.market_data_provider == "tushare" and settings.tushare_fallback_to_akshare
-        return _check("provider", "degraded" if fallback else "unhealthy", "provider 近期存在失败。", failure_count=len(failures), fallback_enabled=fallback)
+        return _check("provider", "degraded", "provider 近期存在局部失败，当前依靠缓存或降级路径。", failure_count=len(failures), fallback_enabled=fallback)
     except Exception as exc:
         return _check("provider", "degraded", f"provider 状态不可读：{type(exc).__name__}。")
 
