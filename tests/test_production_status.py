@@ -48,7 +48,10 @@ def find(result, name):
 def test_fresh_empty_recommendation_is_healthy(tmp_path):
     cfg = settings(tmp_path)
     write_healthy_artifacts(cfg)
-    assert build_production_status(cfg, NOW)["status"] == "healthy"
+    result = build_production_status(cfg, NOW)
+    assert result["status"] == "healthy"
+    assert result["core_status"] == "healthy"
+    assert result["enhancement_status"] == "healthy"
 
 
 def test_stale_recommendation_is_unhealthy(tmp_path):
@@ -63,7 +66,11 @@ def test_failed_recommendation_is_unhealthy_and_provider_failure_is_degraded(tmp
     cfg = settings(tmp_path)
     write_healthy_artifacts(cfg)
     write_json(cfg.akshare_status_path, {"updated_at": NOW.isoformat(), "endpoints": {"stock_zh_a_hist": {"status": "failed", "updated_at": NOW.isoformat()}}, "events": []})
-    assert find(build_production_status(cfg, NOW), "provider")["status"] == "degraded"
+    degraded = build_production_status(cfg, NOW)
+    assert find(degraded, "provider")["status"] == "degraded"
+    assert degraded["core_status"] == "healthy"
+    assert degraded["enhancement_status"] == "degraded"
+    assert find(degraded, "provider")["domain"] == "enhancement"
     write_json(cfg.latest_recommendations_path, {"generated_at": NOW.isoformat(), "trade_date": "2026-07-10", "items": [], "errors": [{"message": "upstream"}], "summary": {"failed": True}})
     assert find(build_production_status(cfg, NOW), "recommendations")["status"] == "unhealthy"
 
@@ -106,10 +113,12 @@ def test_alert_transition_dedup_and_recovery(tmp_path):
     def sender(url, payload):
         sent.append(payload)
 
-    bad = {"status": "unhealthy", "observed_at": NOW.isoformat(), "checks": [{"name": "calendar", "status": "unhealthy", "message": "stale"}]}
-    good = {"status": "healthy", "observed_at": NOW.isoformat(), "checks": []}
+    bad = {"status": "unhealthy", "core_status": "unhealthy", "enhancement_status": "healthy", "observed_at": NOW.isoformat(), "checks": [{"name": "calendar", "status": "unhealthy", "message": "stale"}]}
+    good = {"status": "healthy", "core_status": "healthy", "enhancement_status": "healthy", "observed_at": NOW.isoformat(), "checks": []}
     assert process_health_alert(cfg, bad, NOW, sender)["notified"] is True
     assert process_health_alert(cfg, bad, NOW + timedelta(minutes=5), sender)["notified"] is False
     assert process_health_alert(cfg, bad, NOW + timedelta(hours=7), sender)["notified"] is True
     assert process_health_alert(cfg, good, NOW + timedelta(hours=8), sender)["notified"] is True
     assert [item["status"] for item in sent] == ["unhealthy", "unhealthy", "healthy"]
+    assert sent[0]["core_status"] == "unhealthy"
+    assert sent[0]["enhancement_status"] == "healthy"

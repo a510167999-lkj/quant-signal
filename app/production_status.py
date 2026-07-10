@@ -20,8 +20,16 @@ def _now() -> datetime:
     return datetime.now(ZoneInfo("Asia/Shanghai"))
 
 
-def _check(name: str, status: str, message: str, **evidence: Any) -> dict[str, Any]:
-    return {"name": name, "status": status, "message": message, "evidence": evidence}
+def _check(
+    name: str, status: str, message: str, domain: str = "core", **evidence: Any
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "status": status,
+        "domain": domain,
+        "message": message,
+        "evidence": evidence,
+    }
 
 
 def _load(path: str) -> dict[str, Any]:
@@ -88,14 +96,21 @@ def _lock(settings: Settings, now: datetime) -> dict[str, Any]:
         return _check("recommendation_lock", "unhealthy", f"任务锁无效：{type(exc).__name__}。")
 
 
-def _json_freshness(name: str, path: str, now: datetime, max_hours: int, stale_status: str) -> dict[str, Any]:
+def _json_freshness(
+    name: str,
+    path: str,
+    now: datetime,
+    max_hours: int,
+    stale_status: str,
+    domain: str = "core",
+) -> dict[str, Any]:
     try:
         payload = _load(path)
         age = _age_hours(payload.get("updated_at"), now)
         status = stale_status if age > max_hours else "healthy"
-        return _check(name, status, "数据已过期。" if status != "healthy" else "数据新鲜。", age_hours=round(age, 2))
+        return _check(name, status, "数据已过期。" if status != "healthy" else "数据新鲜。", domain=domain, age_hours=round(age, 2))
     except Exception as exc:
-        return _check(name, stale_status, f"数据不可读：{type(exc).__name__}。")
+        return _check(name, stale_status, f"数据不可读：{type(exc).__name__}。", domain=domain)
 
 
 def _market_cache(settings: Settings, now: datetime) -> dict[str, Any]:
@@ -113,11 +128,11 @@ def _provider(settings: Settings, now: datetime) -> dict[str, Any]:
         payload = _load(settings.akshare_status_path)
         failures = [v for v in (payload.get("endpoints") or {}).values() if v.get("status") == "failed" and _age_hours(v.get("updated_at"), now) <= settings.production_provider_failure_window_hours]
         if not failures:
-            return _check("provider", "healthy", "近期无关键 provider 失败。")
+            return _check("provider", "healthy", "近期无关键 provider 失败。", domain="enhancement")
         fallback = settings.market_data_provider == "tushare" and settings.tushare_fallback_to_akshare
-        return _check("provider", "degraded", "provider 近期存在局部失败，当前依靠缓存或降级路径。", failure_count=len(failures), fallback_enabled=fallback)
+        return _check("provider", "degraded", "provider 近期存在局部失败，当前依靠缓存或降级路径。", domain="enhancement", failure_count=len(failures), fallback_enabled=fallback)
     except Exception as exc:
-        return _check("provider", "degraded", f"provider 状态不可读：{type(exc).__name__}。")
+        return _check("provider", "degraded", f"provider 状态不可读：{type(exc).__name__}。", domain="enhancement")
 
 
 def build_production_status(settings: Settings, now: datetime | None = None) -> dict[str, Any]:
@@ -132,16 +147,40 @@ def build_production_status(settings: Settings, now: datetime | None = None) -> 
         _lock(settings, observed),
         _json_freshness("trade_calendar", settings.trade_calendar_cache_path, observed, settings.production_calendar_max_age_hours, "unhealthy"),
         _market_cache(settings, observed),
-        _json_freshness("industry_cache", settings.industry_cache_path, observed, settings.production_industry_max_age_hours, "degraded"),
+        _json_freshness("industry_cache", settings.industry_cache_path, observed, settings.production_industry_max_age_hours, "degraded", domain="enhancement"),
         _provider(settings, observed),
     ]
-    status = max((item["status"] for item in checks), key=RANK.__getitem__)
-    return {"status": status, "observed_at": observed.isoformat(), "checks": checks}
+    core_status = max(
+        (item["status"] for item in checks if item["domain"] == "core"),
+        key=RANK.__getitem__,
+        default="healthy",
+    )
+    enhancement_status = max(
+        (item["status"] for item in checks if item["domain"] == "enhancement"),
+        key=RANK.__getitem__,
+        default="healthy",
+    )
+    status = max((core_status, enhancement_status), key=RANK.__getitem__)
+    return {
+        "status": status,
+        "core_status": core_status,
+        "enhancement_status": enhancement_status,
+        "observed_at": observed.isoformat(),
+        "checks": checks,
+    }
 
 
 def _fingerprint(status: dict[str, Any]) -> str:
     problems = [(item.get("name"), item.get("status"), item.get("message")) for item in status.get("checks", []) if item.get("status") != "healthy"]
-    encoded = json.dumps(problems, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    encoded = json.dumps(
+        {
+            "core_status": status.get("core_status"),
+            "enhancement_status": status.get("enhancement_status"),
+            "problems": problems,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
@@ -167,7 +206,7 @@ def process_health_alert(settings: Settings, status: dict[str, Any], now: dateti
     notify = bool(settings.production_health_alerts_enabled and settings.alert_webhook_url and (changed or reminder))
     if notify:
         problems = [{"name": item.get("name"), "status": item.get("status"), "message": item.get("message")} for item in status.get("checks", []) if item.get("status") != "healthy"]
-        (sender or _post_webhook)(settings.alert_webhook_url, {"event_type": "production_health", "status": status.get("status"), "observed_at": status.get("observed_at"), "problems": problems})
-    state = {"status": status.get("status"), "fingerprint": fingerprint, "updated_at": observed.isoformat(), "last_notified_at": observed.isoformat() if notify else previous.get("last_notified_at")}
+        (sender or _post_webhook)(settings.alert_webhook_url, {"event_type": "production_health", "status": status.get("status"), "core_status": status.get("core_status"), "enhancement_status": status.get("enhancement_status"), "observed_at": status.get("observed_at"), "problems": problems})
+    state = {"status": status.get("status"), "core_status": status.get("core_status"), "enhancement_status": status.get("enhancement_status"), "fingerprint": fingerprint, "updated_at": observed.isoformat(), "last_notified_at": observed.isoformat() if notify else previous.get("last_notified_at")}
     write_json(str(path), state)
     return {"notified": notify, "reason": "changed" if changed else "reminder" if reminder else "suppressed"}
