@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from app.config import Settings
-from app.production_status import build_production_status
+from app.production_status import build_production_status, process_health_alert
 from app.storage import write_json
 
 
@@ -79,3 +79,25 @@ def test_stale_lock_is_unhealthy_and_stale_industry_is_degraded(tmp_path):
     write_healthy_artifacts(cfg)
     write_json(cfg.industry_cache_path, {"updated_at": (NOW - timedelta(hours=100)).isoformat()})
     assert find(build_production_status(cfg, NOW), "industry_cache")["status"] == "degraded"
+
+
+def test_cli_exit_codes(monkeypatch, capsys):
+    import app.jobs as jobs
+
+    for status, expected in (("healthy", 0), ("degraded", 1), ("unhealthy", 2)):
+        monkeypatch.setattr(jobs, "build_production_status", lambda settings, value=status: {"status": value, "checks": []})
+        assert jobs.main(["production-check", "--no-alert"]) == expected
+        assert f'"status": "{status}"' in capsys.readouterr().out
+
+
+def test_alert_transition_dedup_and_recovery(tmp_path):
+    cfg = replace(settings(tmp_path), alert_webhook_url="https://example.invalid", production_health_state_path=str(tmp_path / "health-state.json"))
+    sent = []
+    sender = lambda url, payload: sent.append(payload)
+    bad = {"status": "unhealthy", "observed_at": NOW.isoformat(), "checks": [{"name": "calendar", "status": "unhealthy", "message": "stale"}]}
+    good = {"status": "healthy", "observed_at": NOW.isoformat(), "checks": []}
+    assert process_health_alert(cfg, bad, NOW, sender)["notified"] is True
+    assert process_health_alert(cfg, bad, NOW + timedelta(minutes=5), sender)["notified"] is False
+    assert process_health_alert(cfg, bad, NOW + timedelta(hours=7), sender)["notified"] is True
+    assert process_health_alert(cfg, good, NOW + timedelta(hours=8), sender)["notified"] is True
+    assert [item["status"] for item in sent] == ["unhealthy", "unhealthy", "healthy"]

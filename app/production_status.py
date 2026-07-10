@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.config import Settings
+from app.storage import write_json
 
 
 RANK = {"healthy": 0, "degraded": 1, "unhealthy": 2}
@@ -131,3 +135,37 @@ def build_production_status(settings: Settings, now: datetime | None = None) -> 
     ]
     status = max((item["status"] for item in checks), key=RANK.__getitem__)
     return {"status": status, "observed_at": observed.isoformat(), "checks": checks}
+
+
+def _fingerprint(status: dict[str, Any]) -> str:
+    problems = [(item.get("name"), item.get("status"), item.get("message")) for item in status.get("checks", []) if item.get("status") != "healthy"]
+    encoded = json.dumps(problems, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _post_webhook(url: str, payload: dict[str, Any]) -> None:
+    request = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        urllib.request.urlopen(request, timeout=10).read()
+    except (urllib.error.URLError, TimeoutError):
+        return
+
+
+def process_health_alert(settings: Settings, status: dict[str, Any], now: datetime | None = None, sender=None) -> dict[str, Any]:
+    observed = now or _now()
+    path = Path(settings.production_health_state_path)
+    try:
+        previous = _load(str(path)) if path.exists() else {}
+    except Exception:
+        previous = {}
+    fingerprint = _fingerprint(status)
+    changed = previous.get("status") != status.get("status") or previous.get("fingerprint") != fingerprint
+    last_notified = previous.get("last_notified_at")
+    reminder = bool(last_notified and status.get("status") != "healthy" and _age_hours(last_notified, observed) >= settings.production_health_reminder_hours)
+    notify = bool(settings.production_health_alerts_enabled and settings.alert_webhook_url and (changed or reminder))
+    if notify:
+        problems = [{"name": item.get("name"), "status": item.get("status"), "message": item.get("message")} for item in status.get("checks", []) if item.get("status") != "healthy"]
+        (sender or _post_webhook)(settings.alert_webhook_url, {"event_type": "production_health", "status": status.get("status"), "observed_at": status.get("observed_at"), "problems": problems})
+    state = {"status": status.get("status"), "fingerprint": fingerprint, "updated_at": observed.isoformat(), "last_notified_at": observed.isoformat() if notify else previous.get("last_notified_at")}
+    write_json(str(path), state)
+    return {"notified": notify, "reason": "changed" if changed else "reminder" if reminder else "suppressed"}

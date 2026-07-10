@@ -15,6 +15,7 @@ from app.holdings import build_holdings_snapshot, load_holdings, save_holdings
 from app.logging_setup import configure_logging
 from app.market_data import MarketDataError, build_market_data_provider
 from app.performance import evaluate_recommendation_performance
+from app.production_status import build_production_status
 from app.recommendations import RUN_SLOT_AUTO, RUN_SLOT_CONTEXTS, RecommendationService
 from app.schemas import AnalyzeRequest, AnalyzeResponse, HoldingsUpdate, WatchlistUpdate
 from app.storage import read_json
@@ -178,6 +179,10 @@ def create_app() -> FastAPI:
             SETTINGS.akshare_status_path,
             {"updated_at": None, "endpoints": {}, "events": []},
         )
+
+    @app.get("/api/production/status", dependencies=[Depends(require_basic_auth)])
+    def production_status():
+        return build_production_status(SETTINGS)
 
     @app.post("/api/recommendations/run", dependencies=[Depends(require_basic_auth)])
     def run_recommendations(

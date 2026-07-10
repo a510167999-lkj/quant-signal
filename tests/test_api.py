@@ -71,6 +71,18 @@ def test_akshare_status_endpoint_reads_status_file(monkeypatch, tmp_path):
     assert response.json()["endpoints"]["stock_zh_a_hist"]["status"] == "recovered"
 
 
+def test_production_status_endpoint_is_authenticated_and_read_only(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "build_production_status",
+        lambda settings: {"status": "healthy", "observed_at": "now", "checks": []},
+    )
+    client = TestClient(main.create_app())
+    response = client.get("/api/production/status")
+    assert response.status_code == 200
+    assert response.json()["status"] == "healthy"
+
+
 def test_holdings_endpoint_tracks_default_positions(monkeypatch, tmp_path):
     def fake_history(symbol, market, lookback_days=360, adjust="qfq"):
         return sample_frame("up"), "test-provider"

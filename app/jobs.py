@@ -9,6 +9,7 @@ from app.industry_history import IndustryHistoryProvider
 from app.logging_setup import configure_logging
 from app.main import DATA_PROVIDER, DISCLAIMER
 from app.margin_eligibility import MarginEligibilityProvider
+from app.production_status import build_production_status, process_health_alert
 from app.recommendations import RUN_SLOT_AUTO, RUN_SLOT_CONTEXTS, RecommendationService
 from app.research_backtest import run_candidate_research_backtest, run_historical_universe_research_backtest
 from app.research_sweep import sweep_qualified_trades
@@ -273,7 +274,7 @@ def _compact_hold_sweep_result(hold_days: int, payload, sweep_payload, output_li
     }
 
 
-def main() -> int:
+def main(argv=None) -> int:
     configure_logging()
     parser = argparse.ArgumentParser(description="Quant signal scheduled jobs")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -303,6 +304,9 @@ def main() -> int:
 
     planned_exits = subparsers.add_parser("monitor-planned-exits")
     planned_exits.add_argument("--force", action="store_true")
+
+    production_check = subparsers.add_parser("production-check")
+    production_check.add_argument("--no-alert", action="store_true")
 
     research = subparsers.add_parser("research-backtest")
     research.add_argument("--start-date", default="2024-07-05")
@@ -566,7 +570,7 @@ def main() -> int:
     sweep_file.add_argument("--output-limit", type=int, default=12)
     sweep_file.add_argument("--compact", action="store_true")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     settings = get_settings()
     service = RecommendationService(settings, DATA_PROVIDER, DISCLAIMER)
 
@@ -619,6 +623,13 @@ def main() -> int:
         payload = service.monitor_planned_exits(force=args.force)
         _print_json(payload)
         return 0
+
+    if args.command == "production-check":
+        payload = build_production_status(settings)
+        if not args.no_alert:
+            payload["alert"] = process_health_alert(settings, payload)
+        _print_json(payload)
+        return {"healthy": 0, "degraded": 1, "unhealthy": 2}.get(payload.get("status"), 2)
 
     if args.command == "research-backtest":
         payload = run_candidate_research_backtest(
