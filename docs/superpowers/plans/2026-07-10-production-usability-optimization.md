@@ -169,7 +169,7 @@ Commit: `feat: classify production health domains`
 
 - [ ] **Step 1: Complete local gate**
 
-Run full pytest and Ruff. Run deterministic failure/no-action/action-block/recovery tests. Run real read-only samples for `600519`, `000001`, `510300`, `159915` and compare the latest 20 raw days with the existing trusted cache; require dates/OHLC within tick tolerance, volume <=0.1% difference and amount <=0.5% difference.
+Run full pytest and Ruff. Run deterministic failure/no-action/action-block/recovery tests. Run real read-only samples for `600519`, `000001`, `510300`, `159915`; use XDXR to find each symbol's latest material corporate-action boundary and compare up to 20 days after that boundary with the existing trusted cache. Require dates/OHLC within tick tolerance, volume <=0.1% difference and amount <=0.5% difference. Separately prove that a cache ending before a material action is blocked.
 
 - [ ] **Step 2: Document operator-visible behavior**
 
