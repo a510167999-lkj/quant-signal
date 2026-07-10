@@ -86,6 +86,26 @@ Production timer units:
 - `quant-signal-monitor.timer`: every 5 minutes from 09:00 to 15:55 on weekdays; the job only acts inside A-share trading windows.
 - `quant-signal-planned-exits.timer`: weekdays 15:05 China time (after `post_close`); scans recent recommendations for profit-lock and pre-calendar-gap planned exits using completed daily bars.
 - `quant-signal-cache-warm.timer`: weekdays 08:35 and 15:45 China time; it refreshes the local daily K-line cache before the morning scan and after the close.
+- `quant-signal-health.timer`: every 5 minutes; checks systemd scheduling plus recommendation, lock, calendar, cache, industry and provider health.
+
+Production health check:
+
+```bash
+python -m app.jobs production-check --no-alert
+deploy/check-production-health.sh
+```
+
+The application command returns `0` for healthy, `1` for degraded, and `2` for unhealthy. An empty recommendation list is valid; stale output, a stale scan lock, more than three recommendations, incomplete operation advice, expired critical data, or repeated provider failure are reported explicitly. Without `--no-alert`, state changes and periodic unresolved reminders reuse `ALERT_WEBHOOK_URL`; unchanged failures are suppressed and recovery is notified once.
+
+Always complete the local gate before installing or changing VPS units:
+
+```bash
+pytest -q
+ruff check .
+pytest tests/test_production_status.py tests/test_production_health_script.py -q
+```
+
+On the VPS, audit first with read-only `systemctl is-enabled`, `systemctl is-active`, `systemctl is-failed`, and `production-check --no-alert`. Install only `quant-signal-health.service` and `quant-signal-health.timer` after the audit matches the local assumptions.
 
 Run slots:
 

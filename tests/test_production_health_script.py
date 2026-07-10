@@ -4,6 +4,7 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).parents[1] / "deploy" / "check-production-health.sh"
+DEPLOY = SCRIPT.parent
 
 
 def run_checker(tmp_path, disabled=False, app_exit=0):
@@ -32,3 +33,12 @@ def test_checker_fails_for_disabled_timer_or_application(tmp_path):
     assert disabled.returncode == 2
     assert "quant-signal-monitor.timer" in disabled.stdout
     assert run_checker(tmp_path / "app", app_exit=1).returncode == 1
+
+
+def test_health_systemd_units_have_expected_contract():
+    service = (DEPLOY / "quant-signal-health.service").read_text(encoding="utf-8")
+    timer = (DEPLOY / "quant-signal-health.timer").read_text(encoding="utf-8")
+    assert "Type=oneshot" in service
+    assert "ExecStart=/home/ubuntu/quant-signal/deploy/check-production-health.sh" in service
+    assert "OnUnitActiveSec=5min" in timer
+    assert "Unit=quant-signal-health.service" in timer
