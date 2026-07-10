@@ -44,6 +44,7 @@ class Settings:
     holdings_path: str = "data/holdings.json"
     latest_recommendations_path: str = "data/recommendations_latest.json"
     recommendation_history_path: str = "data/recommendations_history.jsonl"
+    recommendation_audit_path: str = "data/recommendations_audit.jsonl"
     recommendation_lock_path: str = "data/recommendations.lock"
     alerts_path: str = "data/alerts.jsonl"
     universe_cache_path: str = "data/a_share_universe.json"
@@ -152,6 +153,9 @@ def get_settings() -> Settings:
         ),
         recommendation_history_path=os.getenv(
             "RECOMMENDATION_HISTORY_PATH", "data/recommendations_history.jsonl"
+        ),
+        recommendation_audit_path=os.getenv(
+            "RECOMMENDATION_AUDIT_PATH", "data/recommendations_audit.jsonl"
         ),
         alerts_path=os.getenv("ALERTS_PATH", "data/alerts.jsonl"),
         recommendation_lock_path=os.getenv("RECOMMENDATION_LOCK_PATH", "data/recommendations.lock"),

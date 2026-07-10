@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import uuid
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -793,6 +794,20 @@ def _compact_analysis(
     return compact
 
 
+def _selection_rejection_reason(
+    compact: Dict[str, Any], allowed_actions: set[str], min_score: float
+) -> Optional[str]:
+    if compact.get("action") not in allowed_actions:
+        return "market_action"
+    if _num(compact.get("score")) < min_score:
+        return "score_below_floor"
+    if not (compact.get("strict_signal") or {}).get("passed"):
+        return "strict_signal_failed"
+    if not (compact.get("strategy_quality") or {}).get("passed"):
+        return "strategy_quality_failed"
+    return None
+
+
 class RecommendationService:
     def __init__(self, settings: Settings, data_provider, disclaimer: str) -> None:
         self.settings = settings
@@ -835,6 +850,52 @@ class RecommendationService:
                 "errors": [],
                 "summary": {},
                 "disclaimer": self.disclaimer,
+            },
+        )
+
+    @staticmethod
+    def _empty_selection_funnel(reason: Optional[str] = None) -> Dict[str, Any]:
+        reasons = {reason: 1} if reason else {}
+        return {
+            "snapshot": 0,
+            "prefiltered": 0,
+            "considered": 0,
+            "analysis_succeeded": 0,
+            "analysis_failed": 0,
+            "qualified_before_limit": 0,
+            "returned": 0,
+            "industry_fallback_used": False,
+            "rejection_reasons": reasons,
+            "rejection_examples": [],
+        }
+
+    def _append_recommendation_audit(
+        self,
+        payload: Dict[str, Any],
+        rejections: Optional[List[Dict[str, Any]]] = None,
+        failed: bool = False,
+    ) -> None:
+        summary = payload.get("summary") or {}
+        append_jsonl(
+            self.settings.recommendation_audit_path,
+            {
+                "generated_at": payload.get("generated_at"),
+                "trade_date": payload.get("trade_date"),
+                "run_slot": payload.get("run_slot"),
+                "failed": bool(failed or summary.get("failed")),
+                "skipped": bool(summary.get("skipped")),
+                "selection_funnel": summary.get("selection_funnel")
+                or self._empty_selection_funnel(),
+                "rejections": rejections or [],
+                "selected": [
+                    {
+                        "symbol": item.get("symbol"),
+                        "name": item.get("name"),
+                        "action": item.get("action"),
+                        "score": item.get("score"),
+                    }
+                    for item in (payload.get("items") or [])
+                ],
             },
         )
 
@@ -998,10 +1059,16 @@ class RecommendationService:
                 "run_slot_label": slot_context["label"],
                 "items": [],
                 "errors": [{"message": str(exc)}],
-                "summary": {"running": False, "failed": True, "run_slot": slot_context},
+                "summary": {
+                    "running": False,
+                    "failed": True,
+                    "run_slot": slot_context,
+                    "selection_funnel": self._empty_selection_funnel("run_failed"),
+                },
                 "disclaimer": self.disclaimer,
             }
             write_json(self.settings.latest_recommendations_path, payload)
+            self._append_recommendation_audit(payload, failed=True)
             return payload
         finally:
             self._release_recommendation_lock(token)
@@ -1023,10 +1090,16 @@ class RecommendationService:
                 "run_slot_label": slot_context["label"],
                 "items": [],
                 "errors": [],
-                "summary": {"skipped": True, "reason": "not_trade_day", "run_slot": slot_context},
+                "summary": {
+                    "skipped": True,
+                    "reason": "not_trade_day",
+                    "run_slot": slot_context,
+                    "selection_funnel": self._empty_selection_funnel(),
+                },
                 "disclaimer": self.disclaimer,
             }
             write_json(self.settings.latest_recommendations_path, payload)
+            self._append_recommendation_audit(payload)
             return payload
 
         max_deep = _slot_max_deep(self.settings, slot_context, max_deep)
@@ -1087,10 +1160,28 @@ class RecommendationService:
         analysis_rows: List[Dict[str, Any]] = []
         errors: List[Dict[str, Any]] = []
         cooldown_skipped_count = 0
+        rejections: List[Dict[str, Any]] = []
+        rejected_symbols = set()
+
+        def reject(candidate: Dict[str, Any], reason: str, detail: Optional[str] = None) -> None:
+            symbol = str(candidate.get("symbol") or "")
+            if symbol in rejected_symbols:
+                return
+            rejected_symbols.add(symbol)
+            item = {
+                "symbol": symbol,
+                "name": candidate.get("name"),
+                "reason": reason,
+            }
+            if detail:
+                item["detail"] = str(detail)[:240]
+            rejections.append(item)
+
         for candidate in candidates:
             try:
                 if str(candidate.get("symbol")) in cooldown_symbols:
                     cooldown_skipped_count += 1
+                    reject(candidate, "cooldown")
                     continue
                 result = build_analysis(
                     AnalyzeRequest(
@@ -1106,6 +1197,7 @@ class RecommendationService:
                 result = model_to_dict(result)
                 analysis_rows.append({"candidate": candidate, "result": result})
             except Exception as exc:
+                reject(candidate, "analysis_error", type(exc).__name__)
                 errors.append(
                     {
                         "symbol": candidate.get("symbol"),
@@ -1137,12 +1229,10 @@ class RecommendationService:
                 )
                 allowed_actions = {"BUY", "WATCH"} if market_context.get("allow_watch", True) else {"BUY"}
                 min_score = _num(market_context.get("min_signal_score"), 2)
-                if (
-                    compact["action"] in allowed_actions
-                    and compact["score"] >= min_score
-                    and compact["strict_signal"]["passed"]
-                    and compact["strategy_quality"]["passed"]
-                ):
+                rejection_reason = _selection_rejection_reason(compact, allowed_actions, min_score)
+                if rejection_reason:
+                    reject(candidate, rejection_reason)
+                else:
                     news_context = self.news.evaluate(candidate["symbol"], use_cache_on_error=True)
                     announcement_context = self.announcements.evaluate(candidate["symbol"], use_cache_on_error=True)
                     fund_flow_context = self.fund_flow.evaluate(candidate["symbol"], use_cache_on_error=True)
@@ -1159,13 +1249,16 @@ class RecommendationService:
                         market_breadth_context=market_breadth,
                         price_action_context=price_action,
                     )
-                    if (
-                        compact["news_context"].get("allow_recommendation", True)
-                        and compact["announcement_context"].get("allow_recommendation", True)
-                        and compact["fund_flow_context"].get("allow_recommendation", True)
-                    ):
+                    if not compact["announcement_context"].get("allow_recommendation", True):
+                        reject(candidate, "announcement_blocked")
+                    elif not compact["news_context"].get("allow_recommendation", True):
+                        reject(candidate, "news_blocked")
+                    elif not compact["fund_flow_context"].get("allow_recommendation", True):
+                        reject(candidate, "fund_flow_blocked")
+                    else:
                         items.append(compact)
             except Exception as exc:
+                reject(candidate, "analysis_error", type(exc).__name__)
                 errors.append(
                     {
                         "symbol": candidate.get("symbol"),
@@ -1176,6 +1269,21 @@ class RecommendationService:
 
         items.sort(key=lambda item: item.get("rank_score", 0), reverse=True)
         selected = items[:result_limit]
+        for item in items[result_limit:]:
+            reject(item, "result_limit")
+        rejection_counts = Counter(item["reason"] for item in rejections)
+        selection_funnel = {
+            "snapshot": len(snapshot),
+            "prefiltered": len(candidates),
+            "considered": len(candidates),
+            "analysis_succeeded": len(analysis_rows),
+            "analysis_failed": rejection_counts.get("analysis_error", 0),
+            "qualified_before_limit": len(items),
+            "returned": len(selected),
+            "industry_fallback_used": not bool(industry_map),
+            "rejection_reasons": dict(sorted(rejection_counts.items())),
+            "rejection_examples": rejections[:20],
+        }
         hot_industry_payload = _hot_industry_windows(
             industry_payload=industry_payload,
             candidates=candidates,
@@ -1235,11 +1343,13 @@ class RecommendationService:
                 },
                 "cooldown_skipped_count": cooldown_skipped_count,
                 "industry_count": len(industry_payload.get("industries", [])),
+                "selection_funnel": selection_funnel,
             },
             "disclaimer": self.disclaimer,
         }
         write_json(self.settings.latest_recommendations_path, payload)
         append_jsonl(self.settings.recommendation_history_path, payload)
+        self._append_recommendation_audit(payload, rejections=rejections)
         return payload
 
     def monitor_recommendations(self, force: bool = False) -> Dict[str, Any]:
