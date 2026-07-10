@@ -143,12 +143,33 @@ def _trim_frame(frame: pd.DataFrame, start_date: str, end_date: str) -> pd.DataF
 
 
 class AkshareDataProvider:
-    def __init__(self, cache_ttl_seconds: int = 1800, disk_cache_path: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        cache_ttl_seconds: int = 1800,
+        disk_cache_path: Optional[str] = None,
+        enable_mootdx_daily_fallback: bool = False,
+        mootdx_daily=None,
+        mootdx_servers: str = "",
+        mootdx_timeout_seconds: float = 3.0,
+        mootdx_daily_max_pages: int = 3,
+        mootdx_daily_max_elapsed_seconds: float = 12.0,
+    ) -> None:
         self.cache_ttl_seconds = cache_ttl_seconds
         self.disk_cache_path = disk_cache_path or os.getenv("MARKET_DATA_CACHE_PATH", "")
         self._cache: Dict[Tuple[str, str, int, str], CachedFrame] = {}
         self._memory_lock = RLock()
         self._disk_lock = RLock()
+        self.enable_mootdx_daily_fallback = bool(enable_mootdx_daily_fallback)
+        self.mootdx_daily = mootdx_daily
+        if self.enable_mootdx_daily_fallback and self.mootdx_daily is None:
+            from app.mootdx_daily import MootdxDailyProvider
+
+            self.mootdx_daily = MootdxDailyProvider(
+                servers=mootdx_servers,
+                timeout_seconds=mootdx_timeout_seconds,
+                max_pages=mootdx_daily_max_pages,
+                max_elapsed_seconds=mootdx_daily_max_elapsed_seconds,
+            )
 
     def history(
         self,
@@ -180,26 +201,98 @@ class AkshareDataProvider:
             self._set_memory_cache(key, cached_frame, source, now)
             return cached_frame.copy(), source
 
+        stale_frame = self._read_disk_cache(
+            normalized_symbol,
+            market,
+            adjust_key,
+            start_date,
+            end_date,
+            require_fresh=False,
+        )
         try:
             frame, source = self._fetch(normalized_symbol, market, lookback_days, adjust)
-        except MarketDataError:
-            stale_frame = self._read_disk_cache(
-                normalized_symbol,
-                market,
-                adjust_key,
-                start_date,
-                end_date,
-                require_fresh=False,
-            )
+        except Exception as primary_error:
+            fallback_error = None
+            if self.enable_mootdx_daily_fallback and self.mootdx_daily is not None:
+                try:
+                    frame, source = self._mootdx_fallback(
+                        normalized_symbol,
+                        market,
+                        adjust_key,
+                        start_date,
+                        end_date,
+                        stale_frame,
+                    )
+                except MarketDataError as exc:
+                    fallback_error = exc
+                else:
+                    self._write_disk_cache(normalized_symbol, market, adjust_key, frame, source)
+                    self._set_memory_cache(key, frame, source, now)
+                    return frame.copy(), source
             if stale_frame is not None:
                 source = "SQLite daily cache stale fallback"
                 self._set_memory_cache(key, stale_frame, source, now)
                 return stale_frame.copy(), source
+            if fallback_error is not None:
+                raise fallback_error from primary_error
             raise
 
         self._write_disk_cache(normalized_symbol, market, adjust_key, frame, source)
         self._set_memory_cache(key, frame, source, now)
         return frame, source
+
+    def _mootdx_fallback(
+        self,
+        symbol: str,
+        market: str,
+        adjust: str,
+        start_date: str,
+        end_date: str,
+        cached_frame: Optional[pd.DataFrame],
+    ) -> Tuple[pd.DataFrame, str]:
+        start_iso = "%s-%s-%s" % (start_date[:4], start_date[4:6], start_date[6:8])
+        end_iso = "%s-%s-%s" % (end_date[:4], end_date[4:6], end_date[6:8])
+        if adjust == "hfq":
+            raise MarketDataError("MOOTDX hfq fallback is intentionally unsupported")
+        if adjust == "":
+            frame = self.mootdx_daily.history(symbol, start_iso, end_iso)
+            return _trim_frame(_normalize_frame(frame, symbol, market), start_date, end_date), "MOOTDX raw daily fallback"
+        if cached_frame is None or cached_frame.empty:
+            raise MarketDataError("MOOTDX qfq fallback requires trusted qfq cache")
+
+        latest_cached = str(cached_frame["date"].max())[:10]
+        actions = self.mootdx_daily.corporate_actions(symbol, latest_cached)
+        def nonzero(value) -> bool:
+            try:
+                return not pd.isna(value) and float(value) != 0
+            except (TypeError, ValueError):
+                return False
+
+        material = [
+            item
+            for item in actions
+            if int(item.get("category") or 0) in {1, 11}
+            or any(nonzero(item.get(key)) for key in ("fenhong", "peigu", "songzhuangu", "suogu"))
+        ]
+        if material:
+            raise MarketDataError("MOOTDX qfq merge blocked by corporate action after trusted cache")
+
+        raw = self.mootdx_daily.history(symbol, latest_cached, end_iso)
+        required = {"date", "open", "high", "low", "close", "volume"}
+        if raw is None or raw.empty or not required.issubset(raw.columns):
+            raise MarketDataError("MOOTDX incremental rows are missing required fields")
+        normalized = raw.copy()
+        normalized["date"] = pd.to_datetime(normalized["date"]).dt.strftime("%Y-%m-%d")
+        newer = normalized[normalized["date"] > latest_cached]
+        if newer.empty:
+            raise MarketDataError("MOOTDX returned no bars newer than trusted qfq cache")
+        previous_close = float(cached_frame.iloc[-1]["close"])
+        first_close = float(newer.iloc[0]["close"])
+        if previous_close <= 0 or abs(first_close / previous_close - 1) > 0.25:
+            raise MarketDataError("MOOTDX qfq merge failed price continuity validation")
+        combined = pd.concat([cached_frame, newer], ignore_index=True)
+        combined = _normalize_frame(combined, symbol, market)
+        return _trim_frame(combined, start_date, end_date), "MOOTDX incremental qfq fallback"
 
     def _set_memory_cache(
         self,
@@ -496,10 +589,23 @@ def build_market_data_provider(
     disk_cache_path: str,
     tushare_fallback_to_akshare: bool = True,
     tushare_token: str = "",
+    enable_mootdx_daily_fallback: bool = False,
+    mootdx_servers: str = "",
+    mootdx_timeout_seconds: float = 3.0,
+    mootdx_daily_max_pages: int = 3,
+    mootdx_daily_max_elapsed_seconds: float = 12.0,
 ):
     normalized = (provider_name or "akshare").strip().lower()
     if normalized == "akshare":
-        return AkshareDataProvider(cache_ttl_seconds=cache_ttl_seconds, disk_cache_path=disk_cache_path)
+        return AkshareDataProvider(
+            cache_ttl_seconds=cache_ttl_seconds,
+            disk_cache_path=disk_cache_path,
+            enable_mootdx_daily_fallback=enable_mootdx_daily_fallback,
+            mootdx_servers=mootdx_servers,
+            mootdx_timeout_seconds=mootdx_timeout_seconds,
+            mootdx_daily_max_pages=mootdx_daily_max_pages,
+            mootdx_daily_max_elapsed_seconds=mootdx_daily_max_elapsed_seconds,
+        )
     if normalized == "tushare":
         return TushareDataProvider(
             cache_ttl_seconds=cache_ttl_seconds,

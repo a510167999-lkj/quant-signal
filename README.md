@@ -154,6 +154,22 @@ Optional MOOTDX L1 quote layer:
 - The L1 layer reads current price, previous close, open, high, low, amount, bid1/ask1, spread and server time. It adds tags such as `l1_open_gap_gt_5`, `l1_near_limit_up`, and `l1_spread_lte_0_2`.
 - Treat MOOTDX as a fast supplemental quote source. It is not the source of truth for historical backtests, statutory disclosure, exchange eligibility, or final trade confirmation.
 
+Optional MOOTDX emergency daily fallback:
+
+- Set `ENABLE_MOOTDX_DAILY_FALLBACK=1` only after validating the configured TDX servers from the VPS.
+- Unadjusted requests can use validated MOOTDX daily bars after both AKShare paths fail.
+- `qfq` fallback requires an existing trusted SQLite qfq history. MOOTDX may append only dates after that cache when XDXR reports no intervening dividend, rights issue, stock split, consolidation, or ETF share adjustment.
+- A material XDXR event, unavailable XDXR data, missing trusted cache, invalid OHLC, or an excessive price discontinuity blocks the merge. The provider then uses a still-acceptable stale cache or fails explicitly.
+- `hfq` never falls back to MOOTDX. Raw prices are never stored under a qfq/hfq cache key.
+- MOOTDX daily paging always uses integer frequency `9`; each page is limited to 800 bars and every configured server must pass a real non-empty bars request.
+
+Recommendation selection audit:
+
+- Every recommendation run includes `summary.selection_funnel`, including valid zero-result, skipped, and failed runs.
+- The funnel reports snapshot, prefiltered, analyzed, qualified, returned, and first-decision rejection counts.
+- A sanitized full audit is appended to `RECOMMENDATION_AUDIT_PATH`; it contains symbols, bounded error details, rejection reasons, and selected action/score only. It does not store credentials, holdings, or news article bodies.
+- Production health exposes `core_status` for recommendation/calendar/cache/lock availability and `enhancement_status` for industry/provider overlays, while preserving the existing overall status and CLI exit codes.
+
 The A-share trading calendar is cached at `TRADE_CALENDAR_CACHE_PATH`. If AKShare's calendar endpoint is temporarily unavailable, the scheduler uses the latest cache; without a cache it skips the run instead of guessing from weekdays.
 
 Preferred source hierarchy for future hardening:

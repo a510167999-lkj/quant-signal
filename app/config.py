@@ -35,12 +35,16 @@ class Settings:
     enable_mootdx_l1_context: bool = False
     mootdx_servers: str = ""
     mootdx_timeout_seconds: float = 3.0
+    enable_mootdx_daily_fallback: bool = False
+    mootdx_daily_max_pages: int = 3
+    mootdx_daily_max_elapsed_seconds: float = 12.0
     basic_auth_user: str = ""
     basic_auth_password: str = ""
     watchlist_path: str = "data/watchlist.json"
     holdings_path: str = "data/holdings.json"
     latest_recommendations_path: str = "data/recommendations_latest.json"
     recommendation_history_path: str = "data/recommendations_history.jsonl"
+    recommendation_audit_path: str = "data/recommendations_audit.jsonl"
     recommendation_lock_path: str = "data/recommendations.lock"
     alerts_path: str = "data/alerts.jsonl"
     universe_cache_path: str = "data/a_share_universe.json"
@@ -135,6 +139,11 @@ def get_settings() -> Settings:
         enable_mootdx_l1_context=os.getenv("ENABLE_MOOTDX_L1_CONTEXT", "0").strip() == "1",
         mootdx_servers=os.getenv("MOOTDX_SERVERS", ""),
         mootdx_timeout_seconds=float_setting("MOOTDX_TIMEOUT_SECONDS", 3.0, 0.5, 30.0),
+        enable_mootdx_daily_fallback=os.getenv("ENABLE_MOOTDX_DAILY_FALLBACK", "0").strip() == "1",
+        mootdx_daily_max_pages=int_setting("MOOTDX_DAILY_MAX_PAGES", 3, 1, 10),
+        mootdx_daily_max_elapsed_seconds=float_setting(
+            "MOOTDX_DAILY_MAX_ELAPSED_SECONDS", 12.0, 1.0, 60.0
+        ),
         basic_auth_user=os.getenv("BASIC_AUTH_USER", ""),
         basic_auth_password=os.getenv("BASIC_AUTH_PASSWORD", ""),
         watchlist_path=os.getenv("WATCHLIST_PATH", "data/watchlist.json"),
@@ -144,6 +153,9 @@ def get_settings() -> Settings:
         ),
         recommendation_history_path=os.getenv(
             "RECOMMENDATION_HISTORY_PATH", "data/recommendations_history.jsonl"
+        ),
+        recommendation_audit_path=os.getenv(
+            "RECOMMENDATION_AUDIT_PATH", "data/recommendations_audit.jsonl"
         ),
         alerts_path=os.getenv("ALERTS_PATH", "data/alerts.jsonl"),
         recommendation_lock_path=os.getenv("RECOMMENDATION_LOCK_PATH", "data/recommendations.lock"),

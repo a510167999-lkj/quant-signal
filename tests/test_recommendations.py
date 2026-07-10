@@ -6,8 +6,12 @@ import pandas as pd
 import pytest
 
 from app.config import Settings
-from app.recommendations import RecommendationService
-from app.storage import append_jsonl
+from app.recommendations import (
+    RecommendationService,
+    _selection_funnel_explanation,
+    _selection_rejection_reason,
+)
+from app.storage import append_jsonl, read_jsonl
 from tests.test_signals import sample_frame
 
 
@@ -183,6 +187,7 @@ def make_settings(tmp_path):
         watchlist_path=str(tmp_path / "watchlist.json"),
         latest_recommendations_path=str(tmp_path / "recommendations_latest.json"),
         recommendation_history_path=str(tmp_path / "recommendations_history.jsonl"),
+        recommendation_audit_path=str(tmp_path / "recommendations_audit.jsonl"),
         alerts_path=str(tmp_path / "alerts.jsonl"),
         universe_cache_path=str(tmp_path / "universe.json"),
         recommendation_lock_path=str(tmp_path / "recommendations.lock"),
@@ -199,6 +204,67 @@ def make_settings(tmp_path):
         monitor_recent_days=10,
         monitor_intraday_drop_pct=4,
     )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"action": "SELL"}, "market_action"),
+        ({"score": 1.0}, "score_below_floor"),
+        ({"strict_signal": {"passed": False}}, "strict_signal_failed"),
+        ({"strategy_quality": {"passed": False}}, "strategy_quality_failed"),
+    ],
+)
+def test_selection_rejection_reason_uses_first_decisive_gate(overrides, reason):
+    compact = {
+        "action": "BUY",
+        "score": 5.0,
+        "strict_signal": {"passed": True},
+        "strategy_quality": {"passed": True},
+    }
+    compact.update(overrides)
+    assert _selection_rejection_reason(compact, {"BUY", "WATCH"}, 2.0) == reason
+
+
+def test_selection_funnel_explanation_names_top_zero_result_reasons():
+    explanation = _selection_funnel_explanation(
+        {
+            "considered": 5,
+            "returned": 0,
+            "rejection_reasons": {"strict_signal_failed": 3, "score_below_floor": 2},
+        }
+    )
+
+    assert explanation == "本次分析 5 只，最终 0 只；主要原因：严格信号未通过 3 只、评分不足 2 只。"
+
+
+def test_skipped_run_still_writes_empty_funnel_and_audit(tmp_path, monkeypatch):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    monkeypatch.setattr("app.recommendations.is_trade_day", lambda value: False)
+
+    result = service.generate_daily_recommendations(force=False)
+
+    assert result["summary"]["selection_funnel"]["considered"] == 0
+    audit = read_jsonl(service.settings.recommendation_audit_path, limit=10)[-1]
+    assert audit["selection_funnel"]["returned"] == 0
+
+
+def test_failed_run_still_writes_failure_funnel_and_audit(tmp_path):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    service.industry = FakeIndustry()
+    service.industry_history = FakeIndustryHistory()
+    service.margin_eligibility = FakeMarginEligibility()
+
+    class BrokenUniverse:
+        def snapshot(self, use_cache_on_error=True):
+            raise RuntimeError("snapshot failed")
+
+    service.universe = BrokenUniverse()
+    result = service.generate_daily_recommendations(force=True)
+
+    assert result["summary"]["failed"] is True
+    assert result["summary"]["selection_funnel"]["rejection_reasons"] == {"run_failed": 1}
+    assert read_jsonl(service.settings.recommendation_audit_path, limit=10)[-1]["failed"] is True
 
 
 def test_generate_daily_recommendations_from_a_share_universe(tmp_path):
@@ -258,6 +324,14 @@ def test_generate_daily_recommendations_from_a_share_universe(tmp_path):
     assert "breadth_ma20_gte_60" in result["summary"]["market_breadth_tags"]
     assert result["summary"]["relative_strength_proxy"]["proxy_return_60d_avg_pct"] is not None
     assert result["summary"]["margin_eligibility"]["enabled"] is False
+    funnel = result["summary"]["selection_funnel"]
+    assert funnel["considered"] == 1
+    assert funnel["returned"] == 1
+    assert funnel["rejection_reasons"] == {}
+    audit = read_jsonl(service.settings.recommendation_audit_path, limit=10)[-1]
+    assert audit["selection_funnel"]["returned"] == 1
+    assert audit["selected"][0]["symbol"] == "600519"
+    assert "news_context" not in audit["selected"][0]
     assert result["summary"]["market_context"]["level"] in {"favorable", "neutral", "cautious", "defensive"}
 
 
@@ -468,6 +542,7 @@ def test_generate_daily_recommendations_default_strict_filter_blocks_weak_signal
         cors_origins=[],
         latest_recommendations_path=str(tmp_path / "recommendations_latest.json"),
         recommendation_history_path=str(tmp_path / "recommendations_history.jsonl"),
+        recommendation_audit_path=str(tmp_path / "recommendations_audit.jsonl"),
         alerts_path=str(tmp_path / "alerts.jsonl"),
         universe_cache_path=str(tmp_path / "universe.json"),
         recommendation_lock_path=str(tmp_path / "recommendations.lock"),

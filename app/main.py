@@ -30,6 +30,11 @@ DATA_PROVIDER = build_market_data_provider(
     disk_cache_path=SETTINGS.market_data_cache_path,
     tushare_fallback_to_akshare=SETTINGS.tushare_fallback_to_akshare,
     tushare_token=SETTINGS.tushare_token,
+    enable_mootdx_daily_fallback=SETTINGS.enable_mootdx_daily_fallback,
+    mootdx_servers=SETTINGS.mootdx_servers,
+    mootdx_timeout_seconds=SETTINGS.mootdx_timeout_seconds,
+    mootdx_daily_max_pages=SETTINGS.mootdx_daily_max_pages,
+    mootdx_daily_max_elapsed_seconds=SETTINGS.mootdx_daily_max_elapsed_seconds,
 )
 RECOMMENDATIONS = RecommendationService(SETTINGS, DATA_PROVIDER, DISCLAIMER)
 SECURITY = HTTPBasic(auto_error=False)
