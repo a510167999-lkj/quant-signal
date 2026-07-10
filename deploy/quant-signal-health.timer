@@ -1,0 +1,11 @@
+[Unit]
+Description=Run quant signal production health check every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=quant-signal-health.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

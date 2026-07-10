@@ -1,0 +1,10 @@
+[Unit]
+Description=Quant signal production health check
+After=quant-signal.service
+
+[Service]
+Type=oneshot
+SuccessExitStatus=1
+User=ubuntu
+WorkingDirectory=/home/ubuntu/quant-signal
+ExecStart=/home/ubuntu/quant-signal/deploy/check-production-health.sh
