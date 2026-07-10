@@ -115,6 +115,19 @@ def test_history_rejects_invalid_ohlc_and_negative_volume():
         provider.history("600519", "2026-01-01", "2026-12-31")
 
 
+def test_history_prefers_existing_volume_when_mootdx_returns_vol_and_volume():
+    raw = page(datetime(2026, 1, 1), 100)
+    raw["volume"] = raw["vol"]
+    provider = MootdxDailyProvider(
+        servers="good:1", client_factory=factory_from([FakeClient([raw])])
+    )
+
+    frame = provider.history("600519", "2026-01-01", "2026-12-31")
+
+    assert frame.columns.tolist().count("volume") == 1
+    assert frame["volume"].iloc[0] == 1000
+
+
 def test_corporate_actions_returns_only_events_after_date():
     client = FakeClient([page(datetime(2026, 1, 1), 100)])
     provider = MootdxDailyProvider(

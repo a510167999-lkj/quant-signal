@@ -86,7 +86,11 @@ class MootdxDailyProvider:
     def _normalize(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
         if raw is None or raw.empty:
             raise MarketDataError("MOOTDX returned no daily bars for %s" % symbol)
-        frame = raw.rename(columns={"datetime": "date", "vol": "volume"}).copy()
+        frame = raw.copy()
+        if "date" not in frame.columns and "datetime" in frame.columns:
+            frame = frame.rename(columns={"datetime": "date"})
+        if "volume" not in frame.columns and "vol" in frame.columns:
+            frame = frame.rename(columns={"vol": "volume"})
         required = ["date", "open", "high", "low", "close", "volume"]
         missing = [name for name in required if name not in frame.columns]
         if missing:
