@@ -93,7 +93,10 @@ def test_cli_exit_codes(monkeypatch, capsys):
 def test_alert_transition_dedup_and_recovery(tmp_path):
     cfg = replace(settings(tmp_path), alert_webhook_url="https://example.invalid", production_health_state_path=str(tmp_path / "health-state.json"))
     sent = []
-    sender = lambda url, payload: sent.append(payload)
+
+    def sender(url, payload):
+        sent.append(payload)
+
     bad = {"status": "unhealthy", "observed_at": NOW.isoformat(), "checks": [{"name": "calendar", "status": "unhealthy", "message": "stale"}]}
     good = {"status": "healthy", "observed_at": NOW.isoformat(), "checks": []}
     assert process_health_alert(cfg, bad, NOW, sender)["notified"] is True
