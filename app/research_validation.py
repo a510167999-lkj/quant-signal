@@ -13,12 +13,16 @@ import inspect
 import json
 import math
 import os
-import fcntl
 import tempfile
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 from app.research_sweep import sweep_qualified_trades
 from app.research_pit import verify_research_evidence_bundle
@@ -966,6 +970,26 @@ def _read_ledger(path: Path) -> List[Dict[str, Any]]:
 def _ledger_lock(ledger_path: Path, exclusive: bool):
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = ledger_path.with_name(ledger_path.name + ".lock")
+    if os.name == "nt":
+        with lock_path.open("a+b") as lock_handle:
+            lock_handle.seek(0, os.SEEK_END)
+            if lock_handle.tell() == 0:
+                lock_handle.write(b"\0")
+                lock_handle.flush()
+            lock_handle.seek(0)
+            # Windows CRT has no true shared lock, so serialize readers and writers.
+            msvcrt.locking(
+                lock_handle.fileno(),
+                msvcrt.LK_LOCK,
+                1,
+            )
+            try:
+                yield
+            finally:
+                lock_handle.seek(0)
+                msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
     with lock_path.open("a+", encoding="utf-8") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         try:
