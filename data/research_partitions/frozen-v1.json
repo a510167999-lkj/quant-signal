@@ -1,0 +1,20 @@
+{
+  "schema_version": "research-temporal-partitions/v1",
+  "policy_version": "contamination-aware-forward-oos/v1",
+  "roles": [
+    {"name": "development", "start_date": "2016-01-01", "end_date": "2023-12-31", "sealed": false, "permitted_operations": ["collect", "publish", "train", "validate", "backtest"]},
+    {"name": "contaminated_diagnostic", "start_date": "2024-01-01", "end_date": "2026-07-03", "sealed": false, "permitted_operations": ["collect", "publish", "diagnose"]},
+    {"name": "embargo", "start_date": "2026-07-04", "end_date": "2026-07-12", "sealed": true, "permitted_operations": []},
+    {"name": "final_oos", "start_date": "2026-07-13", "end_date": null, "sealed": true, "permitted_operations": []}
+  ],
+  "contamination_evidence": {
+    "strategy_results": [
+      {"path": "data/research_cache/qualified_hold5_stop5.json", "sha256": "9d6b00f33cdfbb0719eb60f5d7130dbafb1d282d6d2ffee861831db021d76ac5", "maximum_observed_date": "2026-07-03"},
+      {"path": "data/research_cache/qualified_hold5_stop5_ohlc.json", "sha256": "320f58b480da8ccdaff501ff26c94b55614c2b05c5776c49aebdcd3749871bf3", "maximum_observed_date": "2026-07-03"}
+    ],
+    "real_pit_windows": [
+      {"start_date": "2024-01-02", "end_date": "2024-01-05", "coverage_audit_sha256": "bcf2ad4a82ca798e18d89370c4b10d2f6c45cba4eb508257438b1f9a1911e9e6", "artifact_root_sha256": "46fc70113a3243937ac8a0ebac50bebb4609537e1390945e7c87b492c18e473f"}
+    ]
+  },
+  "contract_sha256": "cf70083e66f8706bf21e48b655c5b4342886e230c6a88dcfff04698d12b2e227"
+}
