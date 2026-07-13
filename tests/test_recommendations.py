@@ -1,17 +1,22 @@
+import hashlib
+import json
 from dataclasses import replace
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
 
 from app.config import Settings
+from app.current_pool import POLICY_ID
 from app.recommendations import (
     RecommendationService,
     _selection_funnel_explanation,
     _selection_rejection_reason,
 )
-from app.storage import append_jsonl, read_jsonl
+from app.recommendation_profile import DEFAULT_PROFILE, profile_to_dict
+from app.storage import append_jsonl, read_jsonl, write_json
 from tests.test_signals import sample_frame
 
 
@@ -124,6 +129,10 @@ class FakeAnnouncement:
             "positive_count": 0,
             "announcements": [],
             "errors": [],
+            "source": "jiaoch:anns_d",
+            "source_profile": "jiaoch_first",
+            "fallback_used": False,
+            "fallback_reason_code": None,
         }
         self.calls = []
 
@@ -182,6 +191,11 @@ class FakeL1Quotes:
 
 
 def make_settings(tmp_path):
+    current_pool_audit_path = tmp_path / "current-pool-audit.json"
+    _write_current_pool_audit(
+        current_pool_audit_path,
+        ["000001", "000002", "000003", *[str(600519 + index) for index in range(12)]],
+    )
     return Settings(
         cors_origins=[],
         watchlist_path=str(tmp_path / "watchlist.json"),
@@ -191,6 +205,7 @@ def make_settings(tmp_path):
         alerts_path=str(tmp_path / "alerts.jsonl"),
         universe_cache_path=str(tmp_path / "universe.json"),
         recommendation_lock_path=str(tmp_path / "recommendations.lock"),
+        current_pool_audit_path=str(current_pool_audit_path),
         scan_max_deep=3,
         scan_result_limit=2,
         scan_min_amount=1,
@@ -204,6 +219,55 @@ def make_settings(tmp_path):
         monitor_recent_days=10,
         monitor_intraday_drop_pct=4,
     )
+
+
+def _write_current_pool_audit(path, symbols, *, source_as_of=None):
+    source_as_of = source_as_of or datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    universe_items = []
+    statuses = []
+    for symbol in symbols:
+        exchange = "SSE" if symbol.startswith("6") else "SZSE"
+        suffix = "SH" if exchange == "SSE" else "SZ"
+        market = "创业板" if symbol.startswith(("300", "301")) else "主板"
+        universe_items.append(
+            {
+                "ts_code": f"{symbol}.{suffix}",
+                "name": f"测试{symbol}",
+                "market": market,
+                "exchange": exchange,
+                "list_status": "L",
+                "risk_flags": {"is_st": False, "is_suspended": False},
+            }
+        )
+        statuses.append(
+            {
+                "symbol": symbol,
+                "eligible": True,
+                "bar_count": 120,
+                "fetch_status": "success",
+                "signal_ready": True,
+                "signal_allowed_today": True,
+            }
+        )
+    payload = {
+        "schema": "current-pool-coverage-audit",
+        "schema_version": "current-pool-coverage-audit/v1",
+        "policy_id": POLICY_ID,
+        "development_only": True,
+        "evidence_scope": "development_only",
+        "source_as_of": source_as_of,
+        "source_ids": {"universe": "jiaoch", "history_summary": "jiaoch", "risk_snapshot": "jiaoch"},
+        "input_descriptor_sha256": {"universe": "1" * 64, "history_summary": "2" * 64, "risk_snapshot": "3" * 64},
+        "risk_snapshot_complete": True,
+        "risk_gate_passed": True,
+        "production_recommendation_eligible": False,
+        "min_signal_bars": 90,
+        "universe_items": universe_items,
+        "item_history_status": statuses,
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    payload["canonical_sha256"] = hashlib.sha256(canonical.encode()).hexdigest()
+    write_json(str(path), payload)
 
 
 @pytest.mark.parametrize(
@@ -249,6 +313,73 @@ def test_skipped_run_still_writes_empty_funnel_and_audit(tmp_path, monkeypatch):
     assert audit["selection_funnel"]["returned"] == 0
 
 
+def test_generation_can_target_the_next_trade_date(tmp_path, monkeypatch):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    service.industry = FakeIndustry()
+    service.industry_history = FakeIndustryHistory()
+    service.news = FakeNews()
+    service.announcements = FakeAnnouncement()
+    service.fund_flow = FakeFundFlow()
+    service.margin_eligibility = FakeMarginEligibility()
+    service.universe = FakeUniverse(
+        [
+            {
+                "symbol": "600519",
+                "market": "a",
+                "name": "测试股票",
+                "latest": 100,
+                "amount": 100000000,
+                "change_pct": 7.0,
+                "volume": 10000,
+            }
+        ]
+    )
+    monkeypatch.setattr("app.recommendations.is_trade_day", lambda value: True)
+
+    result = service.generate_daily_recommendations(
+        force=True,
+        target_trade_date="2026-07-13",
+    )
+
+    assert result["trade_date"] == result["signal_date"]
+    assert result["target_trade_date"] == "2026-07-13"
+    assert result["summary"]["target_trade_date"] == "2026-07-13"
+    assert result["summary"]["recommendation_status"] == "blocked_current_pool_gate"
+
+
+def test_post_close_generation_defaults_to_next_trade_date(tmp_path, monkeypatch):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    service.industry = FakeIndustry()
+    service.industry_history = FakeIndustryHistory()
+    service.news = FakeNews()
+    service.announcements = FakeAnnouncement()
+    service.fund_flow = FakeFundFlow()
+    service.margin_eligibility = FakeMarginEligibility()
+    service.universe = FakeUniverse(
+        [
+            {
+                "symbol": "600519",
+                "market": "a",
+                "name": "测试股票",
+                "latest": 100,
+                "amount": 100000000,
+                "change_pct": 7.0,
+                "volume": 10000,
+            }
+        ]
+    )
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    next_day = today + timedelta(days=1)
+    monkeypatch.setattr("app.recommendations.next_trade_date", lambda value: next_day)
+    monkeypatch.setattr("app.recommendations.is_trade_day", lambda value: value == next_day)
+
+    result = service.generate_daily_recommendations(force=True, run_slot="post_close")
+
+    assert result["trade_date"] == result["signal_date"]
+    assert result["target_trade_date"] == next_day.isoformat()
+    assert result["target_trade_date_semantics"] == "next_trading_session"
+
+
 def test_failed_run_still_writes_failure_funnel_and_audit(tmp_path):
     service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
     service.industry = FakeIndustry()
@@ -265,6 +396,334 @@ def test_failed_run_still_writes_failure_funnel_and_audit(tmp_path):
     assert result["summary"]["failed"] is True
     assert result["summary"]["selection_funnel"]["rejection_reasons"] == {"run_failed": 1}
     assert read_jsonl(service.settings.recommendation_audit_path, limit=10)[-1]["failed"] is True
+
+
+def test_generation_blocks_missing_current_pool_audit_before_reading_live_snapshot(tmp_path):
+    settings = replace(
+        make_settings(tmp_path),
+        current_pool_audit_path=str(tmp_path / "missing-current-pool.json"),
+    )
+    service = RecommendationService(settings, FakeProvider(), "risk")
+
+    class SnapshotMustNotBeRead:
+        def snapshot(self, use_cache_on_error=True):
+            raise AssertionError("current-pool gate must run before the live snapshot")
+
+    service.universe = SnapshotMustNotBeRead()
+
+    result = service.generate_daily_recommendations(force=True)
+
+    assert result["items"] == []
+    assert result["recommendation_status"] == "blocked_current_pool_gate"
+    assert result["current_pool_gate"]["passed"] is False
+    assert result["auto_order"] is False
+    assert result["summary"]["selection_funnel"]["considered"] == 0
+    assert "股票池审计门禁" in result["summary"]["selection_funnel"]["explanation"]
+
+
+@pytest.mark.parametrize("audit_state", ["missing", "tampered", "development_only"])
+def test_latest_revalidates_current_pool_and_never_replays_old_advice(tmp_path, audit_state):
+    settings = make_settings(tmp_path)
+    write_json(
+        settings.latest_recommendations_path,
+        {
+            "generated_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
+            "items": [{"symbol": "600519", "auto_order": False}],
+            "recommendation_status": "live_proven",
+            "live_proof": True,
+            "auto_order": False,
+            "summary": {},
+        },
+    )
+    audit_path = Path(settings.current_pool_audit_path)
+    if audit_state == "missing":
+        audit_path.unlink()
+    elif audit_state == "tampered":
+        payload = json.loads(audit_path.read_text(encoding="utf-8"))
+        payload["source_as_of"] = "2000-01-01"
+        write_json(str(audit_path), payload)
+
+    result = RecommendationService(settings, FakeProvider(), "risk").latest()
+
+    assert result["items"] == []
+    assert result["recommendation_status"] == "blocked_current_pool_gate"
+    assert result["live_proof"] is False
+    assert result["auto_order"] is False
+    if audit_state == "development_only":
+        assert result["current_pool_gate"]["passed"] is True
+        assert result["current_pool_gate"]["production_recommendation_eligible"] is False
+    else:
+        assert result["current_pool_gate"]["passed"] is False
+
+
+@pytest.mark.parametrize(
+    ("status", "running"),
+    [("running", True), ("generation_failed", False), ("not_run_not_trade_day", False)],
+)
+def test_latest_preserves_execution_state_while_publication_gate_clears_items(
+    tmp_path, status, running
+):
+    settings = make_settings(tmp_path)
+    audit_sha = json.loads(Path(settings.current_pool_audit_path).read_text(encoding="utf-8"))[
+        "canonical_sha256"
+    ]
+    write_json(
+        settings.latest_recommendations_path,
+        {
+            "generated_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
+            "items": [{"symbol": "600519", "auto_order": False}],
+            "recommendation_status": status,
+            "live_proof": status == "live_proven",
+            "auto_order": False,
+            "current_pool_audit_sha256": audit_sha,
+            "summary": {"running": running},
+        },
+    )
+
+    result = RecommendationService(settings, FakeProvider(), "risk").latest()
+
+    assert result["items"] == []
+    assert result["recommendation_status"] == status
+    assert result["summary"]["running"] is running
+    assert result["publication_gate"]["status"] == "blocked"
+    assert result["publication_gate"]["reason"] == "current_pool_not_production_eligible"
+
+
+def test_latest_revalidates_pre_open_snapshot_for_current_time_after_open(
+    tmp_path, monkeypatch
+):
+    settings = replace(
+        make_settings(tmp_path),
+        trade_calendar_cache_path=str(tmp_path / "calendar.json"),
+    )
+    write_json(
+        settings.trade_calendar_cache_path,
+        {"dates": ["2026-07-10", "2026-07-13"]},
+    )
+    _write_current_pool_audit(
+        Path(settings.current_pool_audit_path),
+        ["600519"],
+        source_as_of="2026-07-10",
+    )
+    audit_sha = json.loads(
+        Path(settings.current_pool_audit_path).read_text(encoding="utf-8")
+    )["canonical_sha256"]
+    write_json(
+        settings.latest_recommendations_path,
+        {
+            "generated_at": "2026-07-13T09:00:00+08:00",
+            "trade_date": "2026-07-13",
+            "target_trade_date": "2026-07-13",
+            "run_slot": "pre_open",
+            "items": [],
+            "recommendation_status": "running",
+            "current_pool_audit_sha256": audit_sha,
+            "summary": {"running": True},
+        },
+    )
+    monkeypatch.setattr(
+        "app.recommendations.now_cn",
+        lambda: datetime(2026, 7, 13, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    result = RecommendationService(settings, FakeProvider(), "risk").latest()
+
+    assert result["current_pool_gate"]["passed"] is False
+    assert "trade data date" in result["current_pool_gate"]["reasons"][0]
+    assert result["publication_gate"]["reason"] == "current_pool_gate_failed"
+    assert result["recommendation_status"] == "running"
+    assert result["summary"]["running"] is True
+
+
+@pytest.mark.parametrize(
+    ("stored_hash", "item_symbol", "expected_reason"),
+    [
+        (None, "600519", "current_pool_audit_binding_missing"),
+        ("0" * 64, "600519", "current_pool_audit_binding_mismatch"),
+        ("current", "601999", "current_pool_symbol_outside_audit"),
+    ],
+)
+def test_latest_fails_closed_when_snapshot_is_not_bound_to_current_pool(
+    tmp_path, stored_hash, item_symbol, expected_reason
+):
+    settings = make_settings(tmp_path)
+    audit_sha = json.loads(Path(settings.current_pool_audit_path).read_text(encoding="utf-8"))[
+        "canonical_sha256"
+    ]
+    if stored_hash == "current":
+        stored_hash = audit_sha
+    write_json(
+        settings.latest_recommendations_path,
+        {
+            "generated_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
+            "items": [{"symbol": item_symbol, "auto_order": False}],
+            "recommendation_status": "live_proven",
+            "live_proof": True,
+            "auto_order": False,
+            "current_pool_audit_sha256": stored_hash,
+            "summary": {},
+        },
+    )
+
+    result = RecommendationService(settings, FakeProvider(), "risk").latest()
+
+    assert result["items"] == []
+    assert result["recommendation_status"] == "blocked_current_pool_gate"
+    assert result["publication_gate"] == {
+        "status": "blocked",
+        "reason": expected_reason,
+    }
+
+
+def test_live_snapshot_can_only_shrink_audited_current_pool(tmp_path):
+    settings = make_settings(tmp_path)
+    _write_current_pool_audit(Path(settings.current_pool_audit_path), ["600519"])
+
+    class TrackingProvider(FakeProvider):
+        def __init__(self):
+            self.a_share_symbols = []
+
+        def history(self, symbol, market, lookback_days=360, adjust="qfq"):
+            if market == "a":
+                self.a_share_symbols.append(symbol)
+            return super().history(symbol, market, lookback_days, adjust)
+
+    provider = TrackingProvider()
+    service = RecommendationService(settings, provider, "risk")
+    service.industry = FakeIndustry()
+    service.industry_history = FakeIndustryHistory()
+    service.news = FakeNews()
+    service.announcements = FakeAnnouncement()
+    service.fund_flow = FakeFundFlow()
+    service.margin_eligibility = FakeMarginEligibility()
+    service.universe = FakeUniverse(
+        [
+            {"symbol": "600519", "market": "a", "name": "审计内", "latest": 100, "amount": 100000000, "change_pct": 7.0, "volume": 10000},
+            {"symbol": "600520", "market": "a", "name": "实时扩池", "latest": 100, "amount": 100000000, "change_pct": 7.0, "volume": 10000},
+        ]
+    )
+
+    result = service.generate_daily_recommendations(force=True)
+
+    assert result["current_pool_gate"]["passed"] is True
+    audit_sha = json.loads(Path(settings.current_pool_audit_path).read_text(encoding="utf-8"))["canonical_sha256"]
+    assert result["current_pool_audit_sha256"] == audit_sha
+    assert result["summary"]["snapshot_count"] == 1
+    assert provider.a_share_symbols == ["600519"]
+    assert result["items"] == []
+    assert result["recommendation_status"] == "blocked_current_pool_gate"
+    assert {item["symbol"] for item in service._last_development_candidates} <= {"600519"}
+    assert len(service._last_development_candidates) <= 3
+    assert result["auto_order"] is False
+    assert all(item["auto_order"] is False for item in result["items"])
+
+
+def test_generate_revalidates_current_pool_hash_at_commit(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    service.industry = FakeIndustry()
+    service.industry_history = FakeIndustryHistory()
+    service.news = FakeNews()
+    service.announcements = FakeAnnouncement()
+    service.fund_flow = FakeFundFlow()
+    service.margin_eligibility = FakeMarginEligibility()
+    service.universe = FakeUniverse(
+        [{"symbol": "600519", "market": "a", "name": "甲", "latest": 100, "amount": 100000000, "change_pct": 7.0, "volume": 10000}]
+    )
+    first = service._current_pool_gate(datetime.now(ZoneInfo("Asia/Shanghai")))
+    second = {**first, "canonical_sha256": "f" * 64}
+    gates = iter([first, second])
+    monkeypatch.setattr(service, "_current_pool_gate", lambda *args, **kwargs: next(gates))
+
+    result = service.generate_daily_recommendations(force=True)
+
+    assert result["items"] == []
+    assert result["recommendation_status"] == "blocked_current_pool_gate"
+    assert result["current_pool_audit_sha256"] == "f" * 64
+    assert "current_pool_audit_changed" in result["publication_gate"]["reason"]
+
+
+def test_current_pool_freshness_is_run_slot_aware_by_trade_date(tmp_path):
+    settings = replace(
+        make_settings(tmp_path),
+        trade_calendar_cache_path=str(tmp_path / "calendar.json"),
+    )
+    write_json(
+        settings.trade_calendar_cache_path,
+        {"dates": ["2026-07-10", "2026-07-13"]},
+    )
+    _write_current_pool_audit(
+        Path(settings.current_pool_audit_path), ["600519"], source_as_of="2026-07-10"
+    )
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    pre_open = datetime(2026, 7, 13, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    open_confirm = datetime(2026, 7, 13, 9, 32, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    assert service._current_pool_gate(pre_open, "pre_open")["passed"] is True
+    opened = service._current_pool_gate(open_confirm, "open_confirm")
+    assert opened["passed"] is False
+    assert "trade data date" in opened["reasons"][0]
+
+
+def test_recommendation_data_as_of_includes_current_pool_source_date(
+    tmp_path, monkeypatch
+):
+    fixed = datetime(2026, 7, 13, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    settings = replace(
+        make_settings(tmp_path),
+        trade_calendar_cache_path=str(tmp_path / "calendar.json"),
+    )
+    write_json(
+        settings.trade_calendar_cache_path,
+        {"dates": ["2026-07-10", "2026-07-13"]},
+    )
+    _write_current_pool_audit(
+        Path(settings.current_pool_audit_path),
+        ["600519"],
+        source_as_of="2026-07-10",
+    )
+
+    class CurrentDataProvider(FakeProvider):
+        def history(self, symbol, market, lookback_days=360, adjust="qfq"):
+            frame = sample_frame("up")
+            frame["date"] = pd.bdate_range(
+                end="2026-07-13", periods=len(frame)
+            ).strftime("%Y-%m-%d")
+            return frame, "current-data-provider"
+
+    service = RecommendationService(settings, CurrentDataProvider(), "risk")
+    service.industry = FakeIndustry()
+    service.industry_history = FakeIndustryHistory()
+    service.news = FakeNews()
+    service.announcements = FakeAnnouncement()
+    service.fund_flow = FakeFundFlow()
+    service.margin_eligibility = FakeMarginEligibility()
+    service.l1_quotes = FakeL1Quotes()
+    service.universe = FakeUniverse(
+        [
+            {
+                "symbol": "600519",
+                "market": "a",
+                "name": "甲",
+                "latest": 100,
+                "amount": 100000000,
+                "change_pct": 2.0,
+                "volume": 10000,
+            }
+        ]
+    )
+    monkeypatch.setattr("app.recommendations.now_cn", lambda: fixed)
+    monkeypatch.setattr("app.recommendations.is_trade_day", lambda _value: True)
+
+    result = service.generate_daily_recommendations(
+        force=True,
+        run_slot="pre_open",
+    )
+
+    assert result["summary"]["development_selected_count"] == 1
+    assert result["current_pool_gate"]["source_as_of"] == "2026-07-10"
+    assert result["data_as_of"] == "2026-07-10"
+    assert result["summary"]["data_as_of"] == "2026-07-10"
 
 
 def test_generate_daily_recommendations_from_a_share_universe(tmp_path):
@@ -299,40 +758,293 @@ def test_generate_daily_recommendations_from_a_share_universe(tmp_path):
     assert result["summary"]["hot_industries"][0]["candidate_count"] == 1
     assert set(result["summary"]["hot_industries_by_window"]) == {"1d", "3d", "5d", "10d"}
     assert result["summary"]["hot_industries_by_window"]["3d"][0]["return_pct"] == 3.03
-    assert result["items"]
-    assert result["items"][0]["symbol"] == "600519"
-    assert result["items"][0]["market"] == "a"
+    assert result["items"] == []
+    development_items = service._last_development_candidates
+    assert development_items
+    assert development_items[0]["symbol"] == "600519"
+    assert development_items[0]["market"] == "a"
+    assert development_items[0]["market_data_source"] == "fake-provider"
     # 操作建议完整性：每条推荐必须给出 action + levels(止损/止盈) + 入场区间 + 短线/长线计划
-    assert result["items"][0]["action"] in {"BUY", "WATCH", "HOLD", "REDUCE", "SELL"}
-    assert {"stop_loss", "take_profit"} <= set(result["items"][0]["levels"])
-    assert result["items"][0]["entry_zone"]
-    assert result["items"][0]["trade_plans"]
-    assert result["items"][0]["industry"]["industry"] == "测试行业"
-    assert result["items"][0]["news_context"]["level"] == "neutral"
-    assert result["items"][0]["announcement_context"]["level"] == "neutral"
-    assert result["items"][0]["fund_flow_context"]["level"] == "neutral"
-    assert result["items"][0]["signal_tags"]
-    assert result["items"][0]["market_breadth"]["sample_count"] == 1
-    assert "breadth_ma20_gte_60" in result["items"][0]["signal_tags"]
-    assert result["items"][0]["relative_strength"]["relative_strength_60d_pct"] is not None
-    assert any(tag.startswith("rs60_") for tag in result["items"][0]["signal_tags"])
-    assert result["items"][0]["price_action"]["gap_pct"] is not None
-    assert any(tag.startswith("price_") for tag in result["items"][0]["signal_tags"])
-    assert result["items"][0]["strict_signal"]["passed"] is True
-    assert result["items"][0]["strategy_quality"]["passed"] is True
+    assert development_items[0]["action"] in {"BUY", "WATCH", "HOLD", "REDUCE", "SELL"}
+    assert {"stop_loss", "take_profit"} <= set(development_items[0]["levels"])
+    assert development_items[0]["entry_zone"]
+    assert development_items[0]["trade_plans"]
+    assert development_items[0]["industry"]["industry"] == "测试行业"
+    assert development_items[0]["news_context"]["level"] == "neutral"
+    assert development_items[0]["announcement_context"]["level"] == "neutral"
+    assert development_items[0]["announcement_context"]["source"] == "jiaoch:anns_d"
+    assert development_items[0]["announcement_context"]["fallback_used"] is False
+    assert development_items[0]["fund_flow_context"]["level"] == "neutral"
+    assert development_items[0]["signal_tags"]
+    assert development_items[0]["market_breadth"]["sample_count"] == 1
+    assert "breadth_ma20_gte_60" in development_items[0]["signal_tags"]
+    assert development_items[0]["relative_strength"]["relative_strength_60d_pct"] is not None
+    assert any(tag.startswith("rs60_") for tag in development_items[0]["signal_tags"])
+    assert development_items[0]["price_action"]["gap_pct"] is not None
+    assert any(tag.startswith("price_") for tag in development_items[0]["signal_tags"])
+    assert development_items[0]["strict_signal"]["passed"] is True
+    assert development_items[0]["strategy_quality"]["passed"] is True
     assert result["summary"]["market_breadth"]["sample_count"] == 1
     assert "breadth_ma20_gte_60" in result["summary"]["market_breadth_tags"]
     assert result["summary"]["relative_strength_proxy"]["proxy_return_60d_avg_pct"] is not None
     assert result["summary"]["margin_eligibility"]["enabled"] is False
     funnel = result["summary"]["selection_funnel"]
     assert funnel["considered"] == 1
-    assert funnel["returned"] == 1
+    assert funnel["returned"] == 0
+    assert funnel["development_selected"] == 1
     assert funnel["rejection_reasons"] == {}
     audit = read_jsonl(service.settings.recommendation_audit_path, limit=10)[-1]
-    assert audit["selection_funnel"]["returned"] == 1
-    assert audit["selected"][0]["symbol"] == "600519"
-    assert "news_context" not in audit["selected"][0]
+    assert audit["selection_funnel"]["returned"] == 0
+    assert audit["selection_funnel"]["development_selected"] == 1
+    assert audit["selected"] == []
     assert result["summary"]["market_context"]["level"] in {"favorable", "neutral", "cautious", "defensive"}
+
+
+def _profile_evidence_payload():
+    profile = profile_to_dict(DEFAULT_PROFILE)
+    payload = {
+        "profile_id": profile["profile_id"],
+        "version": profile["version"],
+        "profile_hash": profile["profile_hash"],
+        "status": "qualified",
+        "blocking_gates": [],
+        "gates": {
+            "annualized_return": True,
+            "max_drawdown": True,
+            "observed_win_rate": True,
+            "wilson_lower": True,
+            "payoff_ratio": True,
+            "profit_factor": True,
+            "calmar": True,
+            "minimum_sample": True,
+            "signal_days_120": True,
+            "all_rolling_12m": True,
+            "pit_contract": True,
+            "temporal_contract": True,
+            "cost_slippage": True,
+            "artifact_execution": True,
+            "strategy_signal_replay": True,
+            "outcome_replay": True,
+            "double_cost": True,
+            "regime": True,
+        },
+        "metrics": {
+            "annualized_return_pct": 52.0,
+            "max_drawdown_pct": 12.0,
+            "win_rate_pct": 56.0,
+            "win_rate_wilson_lower_pct": 52.1,
+            "payoff_ratio": 1.45,
+            "profit_factor": 1.6,
+            "calmar": 2.0,
+            "signal_days": 132,
+            "rolling_12m": [
+                {
+                    "annualized_return_pct": 50.2,
+                    "max_drawdown_pct": 13.0,
+                    "payoff_ratio": 1.4,
+                    "profit_factor": 1.5,
+                    "calmar": 1.8,
+                }
+            ],
+        },
+        "evidence": {
+            "pit_contract": True,
+            "temporal_contract": True,
+            "final_oos": False,
+            "cost_slippage": True,
+            "artifact_execution": True,
+            "strategy_signal_replay": True,
+            "outcome_replay": True,
+        },
+    }
+    payload["receipt_sha256"] = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return payload
+
+
+def _live_profile_evidence_payload():
+    payload = _profile_evidence_payload()
+    payload.pop("receipt_sha256")
+    payload.update({"status": "live_proven", "live_proof": True})
+    payload["evidence"].update(
+        {
+            "final_oos": True,
+            "shadow": True,
+            "live_monitoring": True,
+        }
+    )
+    payload["receipt_sha256"] = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return payload
+
+
+def test_incomplete_profile_receipt_blocks_even_when_point_metrics_pass(tmp_path):
+    evidence_path = tmp_path / "profile-evidence.json"
+    payload = _profile_evidence_payload()
+    payload["status"] = "incomplete"
+    payload["blocking_gates"] = ["double_cost", "regime"]
+    write_json(str(evidence_path), payload)
+    settings = replace(
+        make_settings(tmp_path),
+        recommendation_profile_id="primary_50_return_15_drawdown",
+        recommendation_profile_evidence_path=str(evidence_path),
+    )
+    service = RecommendationService(settings, FakeProvider(), "risk")
+
+    gate = service._profile_gate()
+
+    assert gate["development_ready"] is False
+    assert "receipt_incomplete" in gate["reasons"]
+    assert "double_cost" in gate["reasons"]
+
+
+def test_profile_enabled_generation_fails_closed_without_audited_evidence(tmp_path, monkeypatch):
+    evidence_path = tmp_path / "profile-evidence.json"
+    settings = replace(
+        make_settings(tmp_path),
+        recommendation_profile_id="primary_50_return_15_drawdown",
+        recommendation_profile_evidence_path=str(evidence_path),
+    )
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    service.industry = FakeIndustry()
+    service.industry_history = FakeIndustryHistory()
+    service.news = FakeNews()
+    service.announcements = FakeAnnouncement()
+    service.fund_flow = FakeFundFlow()
+    service.margin_eligibility = FakeMarginEligibility()
+    service.universe = FakeUniverse(
+        [
+            {
+                "symbol": "600519",
+                "market": "a",
+                "name": "测试股票",
+                "latest": 100,
+                "amount": 100000000,
+                "change_pct": 7.0,
+                "volume": 10000,
+            }
+        ]
+    )
+    monkeypatch.setattr("app.recommendations.is_trade_day", lambda value: True)
+    monkeypatch.setattr(
+        "app.recommendations.build_production_status",
+        lambda settings: {"status": "healthy", "checks": []},
+    )
+
+    result = service.generate_daily_recommendations(force=True)
+
+    assert result["items"] == []
+    assert result["recommendation_status"] == "blocked_profile_gate"
+    assert result["current_pool_gate"]["passed"] is True
+    assert result["profile_gate"]["development_ready"] is False
+    assert "profile_evidence_missing" in result["profile_gate"]["reasons"]
+    assert result["auto_order"] is False
+
+
+def test_profile_enabled_generation_caps_advice_and_records_profile_evidence(tmp_path, monkeypatch):
+    evidence_path = tmp_path / "profile-evidence.json"
+    write_json(str(evidence_path), _profile_evidence_payload())
+    settings = replace(
+        make_settings(tmp_path),
+        recommendation_profile_id="primary_50_return_15_drawdown",
+        recommendation_profile_evidence_path=str(evidence_path),
+        scan_max_deep=6,
+        scan_result_limit=6,
+    )
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    service.industry = FakeIndustry()
+    service.industry_history = FakeIndustryHistory()
+    service.news = FakeNews()
+    service.announcements = FakeAnnouncement()
+    service.fund_flow = FakeFundFlow()
+    service.margin_eligibility = FakeMarginEligibility()
+    service.universe = FakeUniverse(
+        [
+            {
+                "symbol": "%06d" % (600519 + index),
+                "market": "a",
+                "name": "测试股票%d" % index,
+                "latest": 100,
+                "amount": 100000000,
+                "change_pct": 7.0,
+                "volume": 10000,
+            }
+            for index in range(5)
+        ]
+    )
+    monkeypatch.setattr("app.recommendations.is_trade_day", lambda value: True)
+    monkeypatch.setattr(
+        "app.recommendations.build_production_status",
+        lambda settings: {"status": "healthy", "checks": []},
+    )
+
+    result = service.generate_daily_recommendations(force=True)
+
+    assert len(result["items"]) <= 3
+    assert result["profile_gate"]["development_ready"] is True
+    assert result["profile_gate"]["live_proof"] is False
+    assert result["evidence_scope"] == "development_only"
+    assert result["summary"]["strategy_profile"]["profile_id"] == "primary_50_return_15_drawdown"
+    assert all(item["market"] == "a" for item in result["items"])
+    assert all(item["auto_order"] is False for item in result["items"])
+
+
+def test_live_profile_cannot_publish_when_current_pool_is_development_only(tmp_path, monkeypatch):
+    evidence_path = tmp_path / "profile-evidence.json"
+    write_json(str(evidence_path), _live_profile_evidence_payload())
+    settings = replace(
+        make_settings(tmp_path),
+        recommendation_profile_id="primary_50_return_15_drawdown",
+        recommendation_profile_evidence_path=str(evidence_path),
+        scan_max_deep=6,
+        scan_result_limit=6,
+    )
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    service.industry = FakeIndustry()
+    service.industry_history = FakeIndustryHistory()
+    service.news = FakeNews()
+    service.announcements = FakeAnnouncement()
+    service.fund_flow = FakeFundFlow()
+    service.margin_eligibility = FakeMarginEligibility()
+    service.universe = FakeUniverse(
+        [
+            {
+                "symbol": "%06d" % (600519 + index),
+                "market": "a",
+                "name": "测试股票%d" % index,
+                "latest": 100,
+                "amount": 100000000,
+                "change_pct": 7.0,
+                "volume": 10000,
+            }
+            for index in range(5)
+        ]
+    )
+    monkeypatch.setattr("app.recommendations.is_trade_day", lambda value: True)
+    monkeypatch.setattr(
+        "app.recommendations.build_production_status",
+        lambda settings: {"status": "healthy", "checks": []},
+    )
+
+    result = service.generate_daily_recommendations(force=True)
+
+    assert result["profile_gate"]["development_ready"] is True
+    assert result["profile_gate"]["live_proof"] is True
+    assert result["recommendation_status"] == "blocked_current_pool_gate"
+    assert result["evidence_scope"] == "development_only"
+    assert result["live_proof"] is False
+    assert result["summary"]["recommendation_status"] == "blocked_current_pool_gate"
+    assert result["summary"]["evidence_scope"] == "development_only"
+    assert result["summary"]["live_proof"] is False
+    assert result["items"] == []
+    assert len(service._last_development_candidates) <= 3
+    assert result["auto_order"] is False
+    assert result["summary"]["auto_order"] is False
+    assert all(item["auto_order"] is False for item in result["items"])
 
 
 def test_pre_open_run_slot_skips_l1_context(tmp_path):
@@ -442,10 +1154,11 @@ def test_generate_daily_recommendations_can_require_breadth_and_relative_strengt
 
     result = service.generate_daily_recommendations(force=True)
 
-    assert result["items"]
-    tags = set(result["items"][0]["signal_tags"])
+    assert result["items"] == []
+    assert service._last_development_candidates
+    tags = set(service._last_development_candidates[0]["signal_tags"])
     assert {"breadth_ma20_gte_60", "rs60_nonnegative"}.issubset(tags)
-    assert result["items"][0]["strict_signal"]["passed"] is True
+    assert service._last_development_candidates[0]["strict_signal"]["passed"] is True
 
 
 def test_generate_daily_recommendations_can_require_margin_financing_tag(tmp_path):
@@ -494,8 +1207,9 @@ def test_generate_daily_recommendations_can_require_margin_financing_tag(tmp_pat
 
     result = service.generate_daily_recommendations(force=True)
 
-    assert result["items"]
-    item = result["items"][0]
+    assert result["items"] == []
+    assert service._last_development_candidates
+    item = service._last_development_candidates[0]
     assert "margin_financing_eligible" in item["signal_tags"]
     assert "margin_financing_underlying" in item["signal_tags"]
     assert item["margin_eligibility"]["exchange"] == "SSE"
@@ -532,26 +1246,23 @@ def test_generate_daily_recommendations_can_require_price_action_tags(tmp_path):
 
     result = service.generate_daily_recommendations(force=True)
 
-    assert result["items"]
-    assert result["items"][0]["price_action"]["gap_pct"] >= 2
-    assert "price_gap_up_2_to_5" in result["items"][0]["signal_tags"]
+    assert result["items"] == []
+    assert service._last_development_candidates
+    assert service._last_development_candidates[0]["price_action"]["gap_pct"] >= 2
+    assert "price_gap_up_2_to_5" in service._last_development_candidates[0]["signal_tags"]
 
 
 def test_generate_daily_recommendations_default_strict_filter_blocks_weak_signal(tmp_path):
-    settings = Settings(
-        cors_origins=[],
-        latest_recommendations_path=str(tmp_path / "recommendations_latest.json"),
-        recommendation_history_path=str(tmp_path / "recommendations_history.jsonl"),
-        recommendation_audit_path=str(tmp_path / "recommendations_audit.jsonl"),
-        alerts_path=str(tmp_path / "alerts.jsonl"),
-        universe_cache_path=str(tmp_path / "universe.json"),
-        recommendation_lock_path=str(tmp_path / "recommendations.lock"),
+    settings = replace(
+        make_settings(tmp_path),
         scan_max_deep=1,
         scan_result_limit=1,
-        scan_min_amount=1,
-        scan_min_price=1,
-        scan_max_price=500,
-        enable_margin_eligibility_context=False,
+        recommendation_required_signal_tags=[
+            "breadth_advancing_gte_50",
+            "breakout_20d",
+            "price_gap_up_2_to_5",
+        ],
+        recommendation_allowed_market_levels=["favorable", "neutral"],
     )
     service = RecommendationService(settings, FakeProvider(), "risk")
     service.industry = FakeIndustry()
@@ -898,6 +1609,42 @@ def test_recommendation_run_returns_current_status_when_already_running(tmp_path
     assert result["summary"]["reason"] == "already_running"
 
 
+def test_begin_validates_target_before_lock_and_releases_lock_if_mark_fails(tmp_path, monkeypatch):
+    settings = make_settings(tmp_path)
+    service = RecommendationService(settings, FakeProvider(), "risk")
+
+    with pytest.raises(ValueError, match="earlier"):
+        service.begin_recommendation_run(target_trade_date="2000-01-01")
+    assert not Path(settings.recommendation_lock_path).exists()
+
+    monkeypatch.setattr(
+        service,
+        "mark_recommendations_started",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("mark failed")),
+    )
+    with pytest.raises(RuntimeError, match="mark failed"):
+        service.begin_recommendation_run()
+    assert not Path(settings.recommendation_lock_path).exists()
+
+
+def test_running_snapshot_does_not_republish_previous_recommendations(tmp_path):
+    settings = make_settings(tmp_path)
+    write_json(
+        settings.latest_recommendations_path,
+        {
+            "generated_at": "2026-07-10T09:00:00+08:00",
+            "trade_date": "2026-07-10",
+            "items": [{"symbol": "600519", "market": "a"}],
+            "summary": {},
+        },
+    )
+    service = RecommendationService(settings, FakeProvider(), "risk")
+
+    started = service.mark_recommendations_started(max_deep=20)
+
+    assert started["items"] == []
+
+
 def _write_profit_lock_history(settings, last_close, rec_date):
     append_jsonl(
         settings.recommendation_history_path,
@@ -1210,10 +1957,13 @@ def test_generate_produces_three_recommendations_with_full_action_advice(tmp_pat
 
     result = service.generate_daily_recommendations(force=True)
 
-    assert len(result["items"]) == 3
-    returned_symbols = {item["symbol"] for item in result["items"]}
+    assert result["items"] == []
+    assert result["recommendation_status"] == "blocked_current_pool_gate"
+    development_items = service._last_development_candidates
+    assert len(development_items) == 3
+    returned_symbols = {item["symbol"] for item in development_items}
     assert returned_symbols == {"000001", "000002", "000003"}
-    for item in result["items"]:
+    for item in development_items:
         assert item["action"] in {"BUY", "WATCH", "HOLD", "REDUCE", "SELL"}
         assert {"stop_loss", "take_profit"} <= set(item["levels"])
         assert item["entry_zone"]

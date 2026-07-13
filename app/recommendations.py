@@ -5,7 +5,7 @@ import json
 import os
 import uuid
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +14,7 @@ from app.analysis import build_analysis
 from app.announcement_context import AnnouncementContextProvider
 from app.compat import model_to_dict
 from app.config import Settings
+from app.current_pool_gate import CurrentPoolGateError, load_current_pool_audit
 from app.execution import assess_entry_executability
 from app.fund_flow import FundFlowContextProvider
 from app.industry_history import IndustryHistoryProvider
@@ -23,6 +24,14 @@ from app.margin_eligibility import MarginEligibilityProvider
 from app.market_regime import evaluate_market_regime
 from app.mootdx_l1 import MootdxL1QuoteProvider
 from app.news_context import NewsContextProvider
+from app.production_status import build_production_status
+from app.recommendation_evidence import verify_profile_evidence_receipt
+from app.recommendation_gate import evaluate_recommendation_gate
+from app.recommendation_profile import (
+    DEFAULT_PROFILE,
+    RecommendationProfile,
+    profile_to_dict,
+)
 from app.schemas import AnalyzeRequest
 from app.signal_tags import (
     build_announcement_tags,
@@ -84,6 +93,8 @@ HOT_INDUSTRY_WINDOWS = (
     {"key": "5d", "label": "5日", "days": 5},
     {"key": "10d", "label": "10日", "days": 10},
 )
+RECOMMENDATION_STATUS_DEVELOPMENT = "research_development_candidate"
+EVIDENCE_SCOPE_DEVELOPMENT_ONLY = "development_only"
 
 
 def _recommendation_key(item: Dict[str, Any]) -> str:
@@ -104,6 +115,42 @@ def _resolve_run_slot(run_slot: str, moment: datetime) -> Dict[str, Any]:
     else:
         slot = "post_close"
     return {"slot": slot, **RUN_SLOT_CONTEXTS[slot]}
+
+
+def _resolve_target_trade_date(moment: datetime, requested: Optional[str] = None) -> date:
+    """Resolve and validate the session the recommendation is intended for.
+
+    ``next`` is useful for a post-close/holiday run: the signal is generated
+    from the latest available completed session but is explicitly labelled for
+    the next A-share trading session.  The live recommendation path never
+    silently labels a non-trading calendar date as an entry session.
+    """
+    if requested is None or not str(requested).strip():
+        return moment.date()
+    raw = str(requested).strip()
+    if raw.lower() == "next":
+        target = next_trade_date(moment.date())
+        if target is None:
+            raise ValueError("no next A-share trading date is available")
+    else:
+        try:
+            target = date.fromisoformat(raw)
+        except ValueError as exc:
+            raise ValueError("target_trade_date must be YYYY-MM-DD or next") from exc
+    if target < moment.date():
+        raise ValueError("target_trade_date cannot be earlier than the generation date")
+    if not is_trade_day(target):
+        raise ValueError("target_trade_date is not an A-share trading day")
+    return target
+
+
+def _effective_target_trade_date_request(
+    requested: Optional[str], slot_context: Dict[str, Any]
+) -> Optional[str]:
+    """Post-close scans are next-session candidates unless explicitly overridden."""
+    if requested is None and slot_context.get("slot") == "post_close":
+        return "next"
+    return requested
 
 
 def _slot_max_deep(settings: Settings, run_slot: Dict[str, Any], max_deep: int = None) -> int:
@@ -599,6 +646,7 @@ def _strict_signal_status(
     market_context: Dict[str, Any],
     settings: Settings,
     extra_signal_tags: List[str] = None,
+    profile: Optional[RecommendationProfile] = None,
 ) -> Dict[str, Any]:
     tags = sorted(
         set(
@@ -616,13 +664,18 @@ def _strict_signal_status(
         passed = False
         reasons.append("signal_score_below_min")
 
-    allowed_market_levels = set(settings.recommendation_allowed_market_levels or [])
+    allowed_market_levels = set(
+        (profile.allowed_market_levels if profile else settings.recommendation_allowed_market_levels) or []
+    )
     if allowed_market_levels and market_context.get("level") not in allowed_market_levels:
         passed = False
         reasons.append("market_level_not_allowed")
 
-    required_tags = set(settings.recommendation_required_signal_tags or [])
-    if required_tags and settings.recommendation_require_all_signal_tags:
+    required_tags = set(
+        (profile.required_signal_tags if profile else settings.recommendation_required_signal_tags) or []
+    )
+    require_all_tags = profile is not None or settings.recommendation_require_all_signal_tags
+    if required_tags and require_all_tags:
         missing = sorted(required_tags - tag_set)
         if missing:
             passed = False
@@ -642,7 +695,7 @@ def _strict_signal_status(
         "tags": tags,
         "min_signal_score": min_score,
         "required_tags": sorted(required_tags),
-        "require_all_tags": bool(settings.recommendation_require_all_signal_tags),
+        "require_all_tags": bool(require_all_tags),
         "excluded_tags": sorted(excluded_tags),
         "allowed_market_levels": sorted(allowed_market_levels),
         "reasons": reasons,
@@ -665,6 +718,7 @@ def _compact_analysis(
     relative_strength_context: Dict[str, Any] = None,
     market_breadth_context: Dict[str, Any] = None,
     price_action_context: Dict[str, Any] = None,
+    profile: Optional[RecommendationProfile] = None,
 ) -> Dict[str, Any]:
     quality = _strategy_quality(result.get("backtest") or {}, settings)
     industry = _industry_context(candidate, industry_map)
@@ -685,6 +739,7 @@ def _compact_analysis(
             + _l1_context_tags(candidate.get("l1_quote") or {})
             + build_announcement_tags(announcement_context)
         ),
+        profile=profile,
     )
     news_context = news_context or {}
     fund_flow_context = fund_flow_context or {}
@@ -700,6 +755,7 @@ def _compact_analysis(
         "market": result["market"],
         "name": result.get("name") or candidate.get("name"),
         "as_of": result["as_of"],
+        "market_data_source": result.get("source") or "unknown",
         "action": result["action"],
         "action_label": result["action_label"],
         "score": result["score"],
@@ -708,6 +764,17 @@ def _compact_analysis(
         "levels": result["levels"],
         "entry_zone": result["entry_zone"],
         "trade_plans": result.get("trade_plans", {}),
+        "operation_advice": {
+            "action": str(result.get("action") or "WATCH").lower(),
+            "entry_zone": result.get("entry_zone") or {},
+            "stop_loss": (result.get("levels") or {}).get("stop_loss"),
+            "take_profit": (result.get("levels") or {}).get("take_profit"),
+            "holding_period": ((result.get("trade_plans") or {}).get("short_term") or {}).get(
+                "horizon"
+            ),
+            "invalidation": (risks or [None])[0],
+        },
+        "auto_order": False,
         "reasons": result["reasons"],
         "risks": risks[:5],
         "indicators": result["indicators"],
@@ -762,6 +829,10 @@ def _compact_analysis(
             "event_counts": announcement_context.get("event_counts", {}),
             "announcements": announcement_context.get("announcements", []),
             "errors": announcement_context.get("errors", []),
+            "source": announcement_context.get("source", "unknown"),
+            "source_profile": announcement_context.get("source_profile", "unknown"),
+            "fallback_used": bool(announcement_context.get("fallback_used", False)),
+            "fallback_reason_code": announcement_context.get("fallback_reason_code"),
         },
         "fund_flow_context": {
             "level": fund_flow_context.get("level", "neutral"),
@@ -823,6 +894,7 @@ def _selection_funnel_explanation(funnel: Dict[str, Any]) -> str:
         "fund_flow_blocked": "资金流风险阻断",
         "result_limit": "超过推荐数量上限",
         "run_failed": "推荐任务失败",
+        "current_pool_gate_failed": "股票池审计门禁未通过",
     }
     reasons = sorted(
         (funnel.get("rejection_reasons") or {}).items(),
@@ -846,6 +918,14 @@ class RecommendationService:
         self.settings = settings
         self.data_provider = data_provider
         self.disclaimer = disclaimer
+        self._last_development_candidates: List[Dict[str, Any]] = []
+        self.profile: Optional[RecommendationProfile] = None
+        self.profile_error: Optional[str] = None
+        if settings.recommendation_profile_id:
+            if settings.recommendation_profile_id != DEFAULT_PROFILE.profile_id:
+                self.profile_error = "unknown_recommendation_profile"
+            else:
+                self.profile = DEFAULT_PROFILE
         self.universe = AShareUniverseProvider(settings.universe_cache_path)
         self.industry = IndustryStrengthProvider(settings.industry_cache_path, settings.industry_top_n)
         self.industry_history = IndustryHistoryProvider(settings.industry_history_cache_dir)
@@ -873,18 +953,274 @@ class RecommendationService:
             enabled=settings.enable_mootdx_l1_context,
         )
 
+    def _profile_gate(self) -> Dict[str, Any]:
+        if not self.settings.recommendation_profile_id:
+            return {
+                "enabled": False,
+                "profile_id": None,
+                "development_ready": True,
+                "live_proof": False,
+                "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+                "reasons": [],
+                "auto_order": False,
+            }
+        if self.profile is None:
+            return {
+                "enabled": True,
+                "profile_id": self.settings.recommendation_profile_id,
+                "development_ready": False,
+                "live_proof": False,
+                "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+                "reasons": [self.profile_error or "recommendation_profile_invalid"],
+                "auto_order": False,
+            }
+        payload = read_json(self.settings.recommendation_profile_evidence_path, None)
+        reasons: List[str] = []
+        receipt_check: Dict[str, Any] = {"ok": False, "errors": []}
+        if not isinstance(payload, dict):
+            reasons.append("profile_evidence_missing")
+            payload = {}
+        metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+        evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+        expected_profile = profile_to_dict(self.profile)
+        for key in ("profile_id", "version", "profile_hash"):
+            if payload.get(key) != expected_profile.get(key):
+                reasons.append("profile_binding_%s" % ("missing" if key not in payload else "mismatch"))
+        receipt_status = payload.get("status")
+        if receipt_status not in {"qualified", "live_proven"}:
+            reasons.append("receipt_incomplete" if receipt_status else "receipt_status_missing")
+            reasons.extend(str(item) for item in (payload.get("blocking_gates") or []))
+        elif receipt_status == "live_proven" and payload.get("live_proof") is not True:
+            reasons.append("receipt_live_proof_mismatch")
+        if payload.get("receipt_sha256"):
+            receipt_check = verify_profile_evidence_receipt(payload)
+            reasons.extend("receipt_%s" % item for item in receipt_check.get("errors") or [])
+        elif payload:
+            reasons.append("receipt_hash_missing")
+        if receipt_status in {"qualified", "live_proven"}:
+            development_gate_names = {
+                "annualized_return",
+                "max_drawdown",
+                "observed_win_rate",
+                "wilson_lower",
+                "payoff_ratio",
+                "profit_factor",
+                "calmar",
+                "minimum_sample",
+                "signal_days_120",
+                "all_rolling_12m",
+                "pit_contract",
+                "temporal_contract",
+                "cost_slippage",
+                "artifact_execution",
+                "strategy_signal_replay",
+                "outcome_replay",
+                "double_cost",
+                "regime",
+            }
+            receipt_gates = payload.get("gates")
+            if not isinstance(receipt_gates, dict):
+                reasons.append("receipt_gates_missing")
+            else:
+                reasons.extend(
+                    "receipt_gate_%s" % name
+                    for name in sorted(development_gate_names)
+                    if receipt_gates.get(name) is not True
+                )
+        try:
+            production = build_production_status(self.settings)
+        except Exception as exc:
+            production = {"status": "unhealthy", "checks": [], "error": type(exc).__name__}
+        support_names = {
+            "trade_calendar",
+            "market_cache",
+            "industry_cache",
+            "provider",
+            "current_pool",
+            "recommendation_profile",
+        }
+        support_checks = [
+            check for check in production.get("checks", []) if check.get("name") in support_names
+        ]
+        health_reasons = [
+            "%s_%s" % (check.get("name"), check.get("status"))
+            for check in support_checks
+            if check.get("status") != "healthy"
+        ]
+        support_health_ok = all(check.get("status") == "healthy" for check in support_checks)
+        production_health_ok = support_health_ok if support_checks else production.get("status") == "healthy"
+        gate = evaluate_recommendation_gate(
+            self.profile,
+            metrics,
+            evidence,
+            {"ok": production_health_ok, "reasons": health_reasons},
+        )
+        gate["enabled"] = True
+        gate["strategy_profile"] = profile_to_dict(self.profile)
+        gate["evidence_receipt_id"] = payload.get("evidence_receipt_id")
+        gate["receipt_status"] = receipt_status or "missing"
+        gate["receipt_verified"] = bool(payload and receipt_check.get("ok"))
+        gate["production_health"] = {
+            "status": production.get("status", "unhealthy"),
+            "reasons": health_reasons,
+        }
+        gate["reasons"] = list(dict.fromkeys(reasons + list(gate.get("reasons") or [])))
+        gate["development_ready"] = not gate["reasons"]
+        if not gate["development_ready"]:
+            gate["live_proof"] = False
+            gate["evidence_scope"] = EVIDENCE_SCOPE_DEVELOPMENT_ONLY
+        return gate
+
+    def _expected_current_pool_dates(
+        self, moment: datetime, run_slot: Optional[str]
+    ) -> Optional[set[str]]:
+        calendar = read_json(self.settings.trade_calendar_cache_path, {})
+        dates = sorted(
+            {
+                str(value)[:10]
+                for value in (calendar.get("dates") or [])
+                if str(value)[:10] <= moment.date().isoformat()
+            }
+        )
+        if not dates:
+            return None
+        today = moment.date().isoformat()
+        slot = run_slot or _resolve_run_slot(RUN_SLOT_AUTO, moment)["slot"]
+        if slot == "pre_open" and today in dates:
+            previous = [value for value in dates if value < today]
+            return {today, previous[-1]} if previous else {today}
+        if today in dates:
+            return {today}
+        return {dates[-1]}
+
+    def _current_pool_gate(
+        self, moment: datetime, run_slot: Optional[str] = None
+    ) -> Dict[str, Any]:
+        try:
+            audit = load_current_pool_audit(
+                self.settings.current_pool_audit_path,
+                now=moment,
+                max_age_hours=self.settings.production_current_pool_max_age_hours,
+                expected_source_dates=self._expected_current_pool_dates(moment, run_slot),
+            )
+        except CurrentPoolGateError as exc:
+            return {
+                "passed": False,
+                "allowed_symbols": set(),
+                "reasons": [str(exc)],
+                "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+                "production_recommendation_eligible": False,
+                "auto_order": False,
+            }
+        return {
+            "passed": True,
+            "allowed_symbols": audit["allowed_symbols"],
+            "canonical_sha256": audit["canonical_sha256"],
+            "source_as_of": audit["source_as_of"],
+            "age_hours": round(float(audit["age_hours"]), 2),
+            "reasons": [],
+            "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+            "production_recommendation_eligible": False,
+            "auto_order": False,
+        }
+
     def latest(self) -> Dict[str, Any]:
-        return read_json(
+        payload = read_json(
             self.settings.latest_recommendations_path,
             {
                 "generated_at": None,
                 "trade_date": None,
+                "signal_date": None,
+                "target_trade_date": None,
                 "items": [],
                 "errors": [],
+                "recommendation_status": "no_snapshot",
+                "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+                "live_proof": False,
+                "auto_order": False,
+                "profile_gate": {
+                    "enabled": bool(self.settings.recommendation_profile_id),
+                    "development_ready": False if self.settings.recommendation_profile_id else True,
+                    "live_proof": False,
+                    "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+                    "reasons": ["no_snapshot"],
+                    "auto_order": False,
+                },
                 "summary": {},
                 "disclaimer": self.disclaimer,
             },
         )
+        # Publication freshness follows the phase at read time. A pre-open
+        # snapshot must not keep yesterday's risk audit authorized after open.
+        current_pool_gate = self._current_pool_gate(now_cn())
+        gate_public = {
+            key: value for key, value in current_pool_gate.items() if key != "allowed_symbols"
+        }
+        stored_hash = payload.get("current_pool_audit_sha256")
+        current_hash = current_pool_gate.get("canonical_sha256")
+        item_symbols = {
+            str(item.get("symbol") or "").strip().upper().split(".", 1)[0]
+            for item in (payload.get("items") or [])
+            if isinstance(item, dict)
+        }
+        if not current_pool_gate.get("passed"):
+            reason = "current_pool_gate_failed"
+        elif not stored_hash:
+            reason = "current_pool_audit_binding_missing"
+        elif stored_hash != current_hash:
+            reason = "current_pool_audit_binding_mismatch"
+        elif not item_symbols.issubset(current_pool_gate.get("allowed_symbols") or set()):
+            reason = "current_pool_symbol_outside_audit"
+        elif not current_pool_gate.get("production_recommendation_eligible"):
+            reason = "current_pool_not_production_eligible"
+        else:
+            reason = None
+        if reason is None:
+            payload["current_pool_gate"] = gate_public
+            payload["publication_gate"] = {"status": "allowed", "reason": None}
+            return payload
+
+        execution_statuses = {"running", "generation_failed", "not_run_not_trade_day"}
+        original_status = str(payload.get("recommendation_status") or "")
+        preserve_execution_status = original_status in execution_statuses
+        summary = dict(payload.get("summary") or {})
+        summary.update(
+            {
+                "recommendation_status": original_status
+                if preserve_execution_status
+                else "blocked_current_pool_gate",
+                "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+                "live_proof": False,
+                "auto_order": False,
+                "current_pool_gate": gate_public,
+                "publication_gate": {"status": "blocked", "reason": reason},
+                "selection_funnel": self._empty_selection_funnel(reason),
+            }
+        )
+        errors = list(payload.get("errors") or [])
+        errors.append(
+            {
+                "stage": "current_pool_gate",
+                "reasons": gate_public.get("reasons") or [reason],
+            }
+        )
+        payload.update(
+            {
+                "items": [],
+                "errors": errors[:50],
+                "recommendation_status": original_status
+                if preserve_execution_status
+                else "blocked_current_pool_gate",
+                "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+                "live_proof": False,
+                "auto_order": False,
+                "current_pool_gate": gate_public,
+                "publication_gate": {"status": "blocked", "reason": reason},
+                "summary": summary,
+                "disclaimer": self.disclaimer,
+            }
+        )
+        return payload
 
     @staticmethod
     def _empty_selection_funnel(reason: Optional[str] = None) -> Dict[str, Any]:
@@ -916,9 +1252,15 @@ class RecommendationService:
             {
                 "generated_at": payload.get("generated_at"),
                 "trade_date": payload.get("trade_date"),
+                "signal_date": payload.get("signal_date") or payload.get("trade_date"),
+                "target_trade_date": payload.get("target_trade_date"),
                 "run_slot": payload.get("run_slot"),
                 "failed": bool(failed or summary.get("failed")),
                 "skipped": bool(summary.get("skipped")),
+                "recommendation_status": payload.get("recommendation_status"),
+                "evidence_scope": payload.get("evidence_scope"),
+                "live_proof": bool(payload.get("live_proof", False)),
+                "auto_order": bool(payload.get("auto_order", False)),
                 "selection_funnel": summary.get("selection_funnel")
                 or self._empty_selection_funnel(),
                 "rejections": rejections or [],
@@ -1012,31 +1354,95 @@ class RecommendationService:
         self,
         max_deep: int = None,
         run_slot: str = RUN_SLOT_AUTO,
+        target_trade_date: Optional[str] = None,
     ) -> tuple[Dict[str, Any], Optional[str]]:
+        validation_moment = now_cn()
+        validation_slot = _resolve_run_slot(run_slot, validation_moment)
+        validation_target = _effective_target_trade_date_request(
+            target_trade_date, validation_slot
+        )
+        _resolve_target_trade_date(validation_moment, validation_target)
         token = self._acquire_recommendation_lock()
         if not token:
             return self._already_running_payload(max_deep=max_deep, run_slot=run_slot), None
-        return self.mark_recommendations_started(max_deep=max_deep, run_slot=run_slot), token
+        try:
+            return self.mark_recommendations_started(
+                max_deep=max_deep,
+                run_slot=run_slot,
+                target_trade_date=target_trade_date,
+            ), token
+        except Exception:
+            self._release_recommendation_lock(token)
+            raise
 
     def mark_recommendations_started(
         self,
         max_deep: int = None,
         run_slot: str = RUN_SLOT_AUTO,
+        target_trade_date: Optional[str] = None,
     ) -> Dict[str, Any]:
-        slot_context = _resolve_run_slot(run_slot, now_cn())
+        started = now_cn()
+        self._last_development_candidates = []
+        slot_context = _resolve_run_slot(run_slot, started)
+        effective_target = _effective_target_trade_date_request(target_trade_date, slot_context)
+        resolved_target = _resolve_target_trade_date(started, effective_target)
+        target_text = resolved_target.isoformat()
         current = self.latest()
+        current_pool_gate = self._current_pool_gate(started, slot_context["slot"])
+        current_pool_public = {
+            key: value
+            for key, value in current_pool_gate.items()
+            if key != "allowed_symbols"
+        }
+        publication_reason = (
+            "current_pool_not_production_eligible"
+            if current_pool_gate.get("passed")
+            else "current_pool_gate_failed"
+        )
         payload = {
-            "generated_at": now_cn().isoformat(),
-            "trade_date": now_cn().date().isoformat(),
+            "generated_at": started.isoformat(),
+            "trade_date": started.date().isoformat(),
+            "signal_date": started.date().isoformat(),
+            "target_trade_date": target_text,
             "run_slot": slot_context["slot"],
             "run_slot_label": slot_context["label"],
-            "items": current.get("items", []),
+            # A running snapshot is not a recommendation snapshot. Do not
+            # expose the previous run while the new evidence/data pass is in
+            # flight; the UI must remain fail-closed until this run finishes.
+            "items": [],
             "errors": [],
+            "recommendation_status": "running",
+            "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+            "live_proof": False,
+            "auto_order": False,
+            "current_pool_audit_sha256": current_pool_gate.get("canonical_sha256"),
+            "current_pool_gate": current_pool_public,
+            "publication_gate": {"status": "blocked", "reason": publication_reason},
+            "strategy_profile": profile_to_dict(self.profile) if self.profile else None,
+            "profile_gate": {
+                "enabled": bool(self.settings.recommendation_profile_id),
+                "development_ready": False if self.settings.recommendation_profile_id else True,
+                "live_proof": False,
+                "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+                "reasons": ["running"],
+                "auto_order": False,
+            },
             "summary": {
                 "running": True,
                 "max_deep": _slot_max_deep(self.settings, slot_context, max_deep),
                 "run_slot": slot_context,
+                "target_trade_date": target_text,
+                "signal_date": started.date().isoformat(),
+                "target_trade_date_semantics": "next_trading_session"
+                if str(effective_target or "").strip().lower() == "next"
+                else "explicit_or_run_date",
+                "recommendation_status": "running",
+                "current_pool_audit_sha256": current_pool_gate.get("canonical_sha256"),
+                "current_pool_gate": current_pool_public,
+                "publication_gate": {"status": "blocked", "reason": publication_reason},
+                "strategy_profile": profile_to_dict(self.profile) if self.profile else None,
                 "previous_generated_at": current.get("generated_at"),
+                "previous_item_count": len(current.get("items") or []),
             },
             "disclaimer": self.disclaimer,
         }
@@ -1078,26 +1484,75 @@ class RecommendationService:
         result_limit: int = None,
         lock_token: Optional[str] = None,
         run_slot: str = RUN_SLOT_AUTO,
+        target_trade_date: Optional[str] = None,
     ) -> Dict[str, Any]:
         token = lock_token or self._acquire_recommendation_lock()
         if not token:
             return self._already_running_payload(max_deep=max_deep, run_slot=run_slot)
         try:
-            return self._generate_daily_recommendations_unlocked(force, max_deep, result_limit, run_slot)
+            return self._generate_daily_recommendations_unlocked(
+                force,
+                max_deep,
+                result_limit,
+                run_slot,
+                target_trade_date,
+            )
         except Exception as exc:
             moment = now_cn()
             slot_context = _resolve_run_slot(run_slot, moment)
+            effective_target = _effective_target_trade_date_request(target_trade_date, slot_context)
+            try:
+                target_text = _resolve_target_trade_date(moment, effective_target).isoformat()
+            except Exception:
+                target_text = moment.date().isoformat()
+            current_pool_gate = self._current_pool_gate(moment, slot_context["slot"])
+            current_pool_public = {
+                key: value
+                for key, value in current_pool_gate.items()
+                if key != "allowed_symbols"
+            }
             payload = {
                 "generated_at": moment.isoformat(),
                 "trade_date": moment.date().isoformat(),
+                "signal_date": moment.date().isoformat(),
+                "target_trade_date": target_text,
                 "run_slot": slot_context["slot"],
                 "run_slot_label": slot_context["label"],
                 "items": [],
                 "errors": [{"message": str(exc)}],
+                "recommendation_status": "generation_failed",
+                "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+                "live_proof": False,
+                "auto_order": False,
+                "current_pool_audit_sha256": current_pool_gate.get("canonical_sha256"),
+                "current_pool_gate": current_pool_public,
+                "publication_gate": {
+                    "status": "blocked",
+                    "reason": "generation_failed",
+                },
+                "strategy_profile": profile_to_dict(self.profile) if self.profile else None,
+                "profile_gate": {
+                    "enabled": bool(self.settings.recommendation_profile_id),
+                    "development_ready": False if self.settings.recommendation_profile_id else True,
+                    "live_proof": False,
+                    "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+                    "reasons": ["generation_failed"],
+                    "auto_order": False,
+                },
                 "summary": {
                     "running": False,
                     "failed": True,
                     "run_slot": slot_context,
+                    "signal_date": moment.date().isoformat(),
+                    "target_trade_date": target_text,
+                    "recommendation_status": "generation_failed",
+                    "current_pool_audit_sha256": current_pool_gate.get("canonical_sha256"),
+                    "current_pool_gate": current_pool_public,
+                    "publication_gate": {
+                        "status": "blocked",
+                        "reason": "generation_failed",
+                    },
+                    "strategy_profile": profile_to_dict(self.profile) if self.profile else None,
                     "selection_funnel": self._empty_selection_funnel("run_failed"),
                 },
                 "disclaimer": self.disclaimer,
@@ -1114,21 +1569,153 @@ class RecommendationService:
         max_deep: int = None,
         result_limit: int = None,
         run_slot: str = RUN_SLOT_AUTO,
+        target_trade_date: Optional[str] = None,
     ) -> Dict[str, Any]:
         started = now_cn()
         slot_context = _resolve_run_slot(run_slot, started)
-        if not force and not is_trade_day(started.date()):
+        effective_target = _effective_target_trade_date_request(target_trade_date, slot_context)
+        resolved_target = _resolve_target_trade_date(started, effective_target)
+        target_text = resolved_target.isoformat()
+        target_semantics = (
+            "next_trading_session"
+            if str(effective_target or "").strip().lower() == "next"
+            else "explicit_or_run_date"
+        )
+        current_pool_gate = self._current_pool_gate(started, slot_context["slot"])
+        current_pool_gate_public = {
+            key: value
+            for key, value in current_pool_gate.items()
+            if key != "allowed_symbols"
+        }
+        if not current_pool_gate.get("passed"):
+            blocked_funnel = self._empty_selection_funnel("current_pool_gate_failed")
             payload = {
                 "generated_at": started.isoformat(),
                 "trade_date": started.date().isoformat(),
+                "signal_date": started.date().isoformat(),
+                "target_trade_date": target_text,
+                "target_trade_date_semantics": target_semantics,
+                "data_as_of": None,
+                "run_slot": slot_context["slot"],
+                "run_slot_label": slot_context["label"],
+                "items": [],
+                "errors": [
+                    {
+                        "stage": "current_pool_gate",
+                        "reasons": current_pool_gate_public.get("reasons", []),
+                    }
+                ],
+                "recommendation_status": "blocked_current_pool_gate",
+                "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+                "live_proof": False,
+                "auto_order": False,
+                "current_pool_audit_sha256": current_pool_gate.get("canonical_sha256"),
+                "publication_gate": {
+                    "status": "blocked",
+                    "reason": "current_pool_gate_failed",
+                },
+                "current_pool_gate": current_pool_gate_public,
+                "strategy_profile": profile_to_dict(self.profile) if self.profile else None,
+                "summary": {
+                    "running": False,
+                    "signal_date": started.date().isoformat(),
+                    "target_trade_date": target_text,
+                    "target_trade_date_semantics": target_semantics,
+                    "data_as_of": None,
+                    "recommendation_status": "blocked_current_pool_gate",
+                    "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+                    "live_proof": False,
+                    "auto_order": False,
+                    "current_pool_audit_sha256": current_pool_gate.get("canonical_sha256"),
+                    "publication_gate": {
+                        "status": "blocked",
+                        "reason": "current_pool_gate_failed",
+                    },
+                    "run_slot": slot_context,
+                    "current_pool_gate": current_pool_gate_public,
+                    "strategy_profile": profile_to_dict(self.profile) if self.profile else None,
+                    "selection_funnel": blocked_funnel,
+                },
+                "disclaimer": self.disclaimer,
+            }
+            write_json(self.settings.latest_recommendations_path, payload)
+            self._append_recommendation_audit(payload)
+            return payload
+        profile_gate = self._profile_gate()
+        strategy_profile = profile_gate.get("strategy_profile")
+        if self.profile and not profile_gate.get("development_ready"):
+            blocked_funnel = self._empty_selection_funnel("profile_gate_failed")
+            payload = {
+                "generated_at": started.isoformat(),
+                "trade_date": started.date().isoformat(),
+                "signal_date": started.date().isoformat(),
+                "target_trade_date": target_text,
+                "target_trade_date_semantics": target_semantics,
+                "data_as_of": None,
+                "run_slot": slot_context["slot"],
+                "run_slot_label": slot_context["label"],
+                "items": [],
+                "errors": [{"stage": "profile_gate", "reasons": profile_gate.get("reasons", [])}],
+                "recommendation_status": "blocked_profile_gate",
+                "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+                "live_proof": False,
+                "auto_order": False,
+                "current_pool_audit_sha256": current_pool_gate.get("canonical_sha256"),
+                "publication_gate": {"status": "blocked", "reason": "profile_gate_failed"},
+                "current_pool_gate": current_pool_gate_public,
+                "profile_gate": profile_gate,
+                "strategy_profile": strategy_profile,
+                "summary": {
+                    "running": False,
+                    "signal_date": started.date().isoformat(),
+                    "target_trade_date": target_text,
+                    "target_trade_date_semantics": target_semantics,
+                    "data_as_of": None,
+                    "recommendation_status": "blocked_profile_gate",
+                    "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+                    "live_proof": False,
+                    "auto_order": False,
+                    "current_pool_audit_sha256": current_pool_gate.get("canonical_sha256"),
+                    "publication_gate": {"status": "blocked", "reason": "profile_gate_failed"},
+                    "run_slot": slot_context,
+                    "current_pool_gate": current_pool_gate_public,
+                    "profile_gate": profile_gate,
+                    "strategy_profile": strategy_profile,
+                    "selection_funnel": blocked_funnel,
+                },
+                "disclaimer": self.disclaimer,
+            }
+            write_json(self.settings.latest_recommendations_path, payload)
+            self._append_recommendation_audit(payload)
+            return payload
+        if not force and not is_trade_day(resolved_target):
+            payload = {
+                "generated_at": started.isoformat(),
+                "trade_date": started.date().isoformat(),
+                "signal_date": started.date().isoformat(),
+                "target_trade_date": target_text,
                 "run_slot": slot_context["slot"],
                 "run_slot_label": slot_context["label"],
                 "items": [],
                 "errors": [],
+                "recommendation_status": "not_run_not_trade_day",
+                "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+                "live_proof": False,
+                "auto_order": False,
+                "current_pool_audit_sha256": current_pool_gate.get("canonical_sha256"),
+                "current_pool_gate": current_pool_gate_public,
+                "publication_gate": {"status": "blocked", "reason": "not_trade_day"},
                 "summary": {
                     "skipped": True,
                     "reason": "not_trade_day",
                     "run_slot": slot_context,
+                    "signal_date": started.date().isoformat(),
+                    "target_trade_date": target_text,
+                    "target_trade_date_semantics": target_semantics,
+                    "recommendation_status": "not_run_not_trade_day",
+                    "current_pool_audit_sha256": current_pool_gate.get("canonical_sha256"),
+                    "current_pool_gate": current_pool_gate_public,
+                    "publication_gate": {"status": "blocked", "reason": "not_trade_day"},
                     "selection_funnel": self._empty_selection_funnel(),
                 },
                 "disclaimer": self.disclaimer,
@@ -1138,11 +1725,25 @@ class RecommendationService:
             return payload
 
         max_deep = _slot_max_deep(self.settings, slot_context, max_deep)
-        result_limit = result_limit or self.settings.scan_result_limit
+        # The user-facing contract is at most three A-share operation suggestions,
+        # regardless of an operator accidentally setting a larger scan limit.
+        result_limit = min(result_limit or self.settings.scan_result_limit, 3)
+        if self.profile:
+            result_limit = min(result_limit, self.profile.max_recommendations)
         market_context = evaluate_market_regime(self.data_provider, self.disclaimer)
         industry_payload = self.industry.build_map(use_cache_on_error=True)
         industry_map = industry_payload.get("symbol_map", {})
-        snapshot = self.universe.snapshot(use_cache_on_error=True)
+        raw_snapshot = self.universe.snapshot(use_cache_on_error=True)
+        allowed_symbols = current_pool_gate["allowed_symbols"]
+        snapshot = [
+            item
+            for item in raw_snapshot
+            if str(item.get("symbol") or item.get("ts_code") or "")
+            .strip()
+            .upper()
+            .split(".", 1)[0]
+            in allowed_symbols
+        ]
         margin_payload = {"summary": {"enabled": False}, "symbol_map": {}, "errors": []}
         try:
             margin_payload = self.margin_eligibility.build_map(use_cache_on_error=True)
@@ -1261,6 +1862,7 @@ class RecommendationService:
                     relative_strength_context=relative_strength,
                     market_breadth_context=market_breadth,
                     price_action_context=price_action,
+                    profile=self.profile,
                 )
                 allowed_actions = {"BUY", "WATCH"} if market_context.get("allow_watch", True) else {"BUY"}
                 min_score = _num(market_context.get("min_signal_score"), 2)
@@ -1283,6 +1885,7 @@ class RecommendationService:
                         relative_strength_context=relative_strength,
                         market_breadth_context=market_breadth,
                         price_action_context=price_action,
+                        profile=self.profile,
                     )
                     if not compact["announcement_context"].get("allow_recommendation", True):
                         reject(candidate, "announcement_blocked")
@@ -1304,9 +1907,75 @@ class RecommendationService:
 
         items.sort(key=lambda item: item.get("rank_score", 0), reverse=True)
         selected = items[:result_limit]
+        self._last_development_candidates = list(selected)
         for item in items[result_limit:]:
             reject(item, "result_limit")
         rejection_counts = Counter(item["reason"] for item in rejections)
+        source_dates = [
+            str(item.get("as_of"))
+            for item in selected
+            if item.get("as_of")
+        ]
+        source_dates.extend(
+            str(proxy.get("as_of"))
+            for proxy in (market_context.get("proxies") or [])
+            if proxy.get("as_of")
+        )
+        if current_pool_gate.get("source_as_of"):
+            source_dates.append(str(current_pool_gate["source_as_of"]))
+        committed_pool_gate = self._current_pool_gate(now_cn(), slot_context["slot"])
+        committed_pool_public = {
+            key: value
+            for key, value in committed_pool_gate.items()
+            if key != "allowed_symbols"
+        }
+        initial_pool_hash = current_pool_gate.get("canonical_sha256")
+        committed_pool_hash = committed_pool_gate.get("canonical_sha256")
+        selected_symbols = {str(item.get("symbol") or "") for item in selected}
+        pool_changed = (
+            not committed_pool_gate.get("passed")
+            or initial_pool_hash != committed_pool_hash
+        )
+        selected_outside_pool = not selected_symbols.issubset(
+            committed_pool_gate.get("allowed_symbols") or set()
+        )
+        current_pool_gate = committed_pool_gate
+        current_pool_gate_public = committed_pool_public
+        if committed_pool_gate.get("source_as_of"):
+            source_dates.append(str(committed_pool_gate["source_as_of"]))
+        # Publication freshness is bounded by every required market and pool
+        # source used during selection and commit revalidation.
+        source_as_of = min(source_dates) if source_dates else None
+        profile_live_proof = bool(profile_gate.get("live_proof", False))
+        current_pool_production_eligible = bool(
+            current_pool_gate.get("production_recommendation_eligible", False)
+        )
+        final_live_proof = profile_live_proof and current_pool_production_eligible
+        if pool_changed:
+            final_status = "blocked_current_pool_gate"
+            publication_reason = "current_pool_audit_changed"
+        elif selected_outside_pool:
+            final_status = "blocked_current_pool_gate"
+            publication_reason = "current_pool_symbol_outside_audit"
+        elif not current_pool_production_eligible:
+            final_status = "blocked_current_pool_gate"
+            publication_reason = "current_pool_not_production_eligible"
+        elif not profile_live_proof:
+            final_status = "blocked_profile_gate"
+            publication_reason = "profile_not_live_proven"
+        else:
+            final_status = "live_proven"
+            publication_reason = None
+        public_selected = selected if final_live_proof else []
+        final_evidence_scope = "live_proof" if final_live_proof else EVIDENCE_SCOPE_DEVELOPMENT_ONLY
+        current_pool_gate_public["publication_allowed"] = final_live_proof
+        if publication_reason:
+            errors.append(
+                {
+                    "stage": "publication_gate",
+                    "reasons": [publication_reason],
+                }
+            )
         selection_funnel = {
             "snapshot": len(snapshot),
             "prefiltered": len(candidates),
@@ -1314,7 +1983,8 @@ class RecommendationService:
             "analysis_succeeded": len(analysis_rows),
             "analysis_failed": rejection_counts.get("analysis_error", 0),
             "qualified_before_limit": len(items),
-            "returned": len(selected),
+            "returned": len(public_selected),
+            "development_selected": len(selected),
             "industry_fallback_used": not bool(industry_map),
             "rejection_reasons": dict(sorted(rejection_counts.items())),
             "rejection_examples": rejections[:20],
@@ -1332,12 +2002,44 @@ class RecommendationService:
         payload = {
             "generated_at": now_cn().isoformat(),
             "trade_date": started.date().isoformat(),
+            "signal_date": started.date().isoformat(),
+            "target_trade_date": target_text,
+            "target_trade_date_semantics": target_semantics,
+            "data_as_of": source_as_of,
             "run_slot": slot_context["slot"],
             "run_slot_label": slot_context["label"],
-            "items": selected,
+            "items": public_selected,
             "errors": errors[:50],
+            "recommendation_status": final_status,
+            "evidence_scope": final_evidence_scope,
+            "live_proof": final_live_proof,
+            "auto_order": False,
+            "current_pool_audit_sha256": committed_pool_hash,
+            "publication_gate": {
+                "status": "allowed" if final_live_proof else "blocked",
+                "reason": publication_reason,
+            },
+            "profile_gate": profile_gate,
+            "current_pool_gate": current_pool_gate_public,
+            "strategy_profile": strategy_profile,
             "summary": {
                 "running": False,
+                "signal_date": started.date().isoformat(),
+                "target_trade_date": target_text,
+                "target_trade_date_semantics": target_semantics,
+                "data_as_of": source_as_of,
+                "recommendation_status": final_status,
+                "evidence_scope": final_evidence_scope,
+                "live_proof": final_live_proof,
+                "auto_order": False,
+                "current_pool_audit_sha256": committed_pool_hash,
+                "publication_gate": {
+                    "status": "allowed" if final_live_proof else "blocked",
+                    "reason": publication_reason,
+                },
+                "profile_gate": profile_gate,
+                "current_pool_gate": current_pool_gate_public,
+                "strategy_profile": strategy_profile,
                 "run_slot": slot_context,
                 "snapshot_count": len(snapshot),
                 "candidate_count": len(candidates),
@@ -1348,7 +2050,8 @@ class RecommendationService:
                 "hot_industries_by_window": hot_industries_by_window,
                 "hot_industry_errors": hot_industry_payload.get("errors", [])[:10],
                 "qualified_count": len(items),
-                "returned_count": len(selected),
+                "returned_count": len(public_selected),
+                "development_selected_count": len(selected),
                 "max_deep": max_deep,
                 "result_limit": result_limit,
                 "market_context": market_context,

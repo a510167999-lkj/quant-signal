@@ -1,4 +1,5 @@
 import json
+from datetime import date, timedelta
 
 import app.research_sweep as research_sweep
 from app.jobs import (
@@ -14,10 +15,42 @@ from app.research_sweep import (
     _apply_prior_high_trailing_stop,
     _holding_calendar_gap_tags,
     _latest_window_portfolio_stats,
+    _trade_metrics,
     _trade_sweep_tags,
     _truncate_trade_before_calendar_gap,
     sweep_qualified_trades,
 )
+
+
+def test_trade_metrics_exposes_full_rolling_12m_and_window_calmar():
+    trades = []
+    start = date(2024, 1, 5)
+    for index in range(20):
+        signal_date = start + timedelta(days=index * 30)
+        trades.append(
+            {
+                "symbol": "%06d" % (600000 + index),
+                "signal_date": signal_date.isoformat(),
+                "entry_date": signal_date.isoformat(),
+                "exit_date": (signal_date + timedelta(days=5)).isoformat(),
+                "return_pct": 5.0 if index % 4 else -3.0,
+                "max_adverse_pct": -1.0,
+            }
+        )
+
+    metrics = _trade_metrics(trades, hold_days=5)
+
+    windows = metrics["rolling_1y_windows"]
+    assert len(windows) >= 2
+    latest = windows[-1]
+    assert metrics["rolling_1y_latest_return_pct"] == latest["return_pct"]
+    assert metrics["rolling_1y_latest_max_drawdown_pct"] == latest["max_drawdown_pct"]
+    assert "payoff_ratio" in latest
+    assert "profit_factor" in latest
+    assert "calmar" in latest
+    if latest["max_drawdown_pct"]:
+        expected_calmar = latest["return_pct"] / abs(latest["max_drawdown_pct"])
+        assert metrics["calmar_latest_12m"] == round(expected_calmar, 2)
 
 
 def test_sweep_qualified_trades_ranks_target_passing_filters():
@@ -37,7 +70,12 @@ def test_sweep_qualified_trades_ranks_target_passing_filters():
             "prior_avg_return_pct": 1.5,
             "prior_avg_adverse_pct": 3.8,
             "market_level": "favorable",
-            "signal_tags": ["score_gte_5", "balanced_rsi", "volume_confirmed", "breadth_ma20_gte_60"],
+            "signal_tags": [
+                "score_gte_5",
+                "balanced_rsi",
+                "volume_confirmed",
+                "breadth_ma20_gte_60",
+            ],
         },
         {
             "symbol": "600002",
@@ -54,7 +92,12 @@ def test_sweep_qualified_trades_ranks_target_passing_filters():
             "prior_avg_return_pct": 0.5,
             "prior_avg_adverse_pct": 5.0,
             "market_level": "favorable",
-            "signal_tags": ["score_gte_5", "balanced_rsi", "volume_confirmed", "breadth_ma20_gte_60"],
+            "signal_tags": [
+                "score_gte_5",
+                "balanced_rsi",
+                "volume_confirmed",
+                "breadth_ma20_gte_60",
+            ],
         },
         {
             "symbol": "600003",
@@ -104,6 +147,7 @@ def test_sweep_qualified_trades_ranks_target_passing_filters():
     assert best["target_win_drawdown_pass"] is True
     assert best["target_one_year_return_pass"] is False
     assert best["target_all_pass"] is False
+    assert best["target_rolling_12m_stability_pass"] is False
     assert best["trade_win_rate_pct"] == 100.0
     assert best["selected_trade_count"] == 2
     assert best["required_signal_tags"] or best["market_levels"]
@@ -147,6 +191,182 @@ def test_sweep_qualified_trades_uses_configurable_one_year_target():
     assert best["target_one_year_return_pass"] is True
     assert best["target_all_pass"] is True
     assert best["target_gap_1y_return_pct"] <= 0
+
+
+def test_sweep_qualified_trades_defaults_to_current_50pct_return_target():
+    result = sweep_qualified_trades(
+        [
+            {
+                "symbol": "600001",
+                "signal_date": "2025-01-02",
+                "exit_date": "2025-01-12",
+                "return_pct": 20,
+                "max_adverse_pct": -1,
+                "rank_score": 10,
+                "market_level": "favorable",
+                "signal_tags": ["score_gte_5", "balanced_rsi"],
+            },
+            {
+                "symbol": "600002",
+                "signal_date": "2025-02-03",
+                "exit_date": "2025-02-13",
+                "return_pct": 20,
+                "max_adverse_pct": -1,
+                "rank_score": 9,
+                "market_level": "favorable",
+                "signal_tags": ["score_gte_5", "balanced_rsi"],
+            },
+        ],
+        hold_days=10,
+        top_n=1,
+        min_trades=2,
+        max_filter_size=1,
+    )
+
+    assert result["target_one_year_return_pct"] == 50.0
+
+
+def test_sweep_qualified_trades_fixed_spec_never_selects_a_better_market_subset():
+    trades = []
+    for index in range(20):
+        trades.append(
+            {
+                "symbol": f"{600100 + index:06d}",
+                "signal_date": f"2025-01-{index + 1:02d}",
+                "exit_date": f"2025-02-{index + 1:02d}",
+                "return_pct": 4 if index % 2 == 0 else -4,
+                "max_adverse_pct": -1 if index % 2 == 0 else -5,
+                "rank_score": 20 - index,
+                "market_level": "favorable" if index % 2 == 0 else "defensive",
+                "signal_tags": ["score_gte_5"],
+            }
+        )
+
+    result = sweep_qualified_trades(
+        trades,
+        hold_days=5,
+        top_n=10,
+        min_trades=1,
+        max_filter_size=0,
+        required_signal_tags=[],
+        excluded_signal_tags=[],
+        market_levels=[],
+        fixed_spec=True,
+    )
+
+    assert result["spec_count"] == 1
+    assert result["top"][0]["required_signal_tags"] == []
+    assert result["top"][0]["market_levels"] == []
+    assert result["top"][0]["selected_trade_count"] == 20
+    assert result["top"][0]["trade_win_count"] == 10
+    assert result["top"][0]["trade_nonwin_count"] == 10
+    assert result["top"][0]["trade_win_rate_pct"] == 50.0
+
+
+def test_slot_daily_rolling_trade_count_counts_trades_not_position_days():
+    trades = [
+        {
+            "symbol": "600001",
+            "signal_date": "2025-01-01",
+            "entry_date": "2025-01-02",
+            "exit_date": "2025-01-04",
+            "return_pct": 3,
+            "max_adverse_pct": -1,
+            "mark_to_market_path": [
+                {"date": "2025-01-02", "close_return_pct": 1, "low_return_pct": -1},
+                {"date": "2025-01-03", "close_return_pct": 2, "low_return_pct": 0},
+                {"date": "2025-01-04", "close_return_pct": 3, "low_return_pct": 1},
+            ],
+        },
+        {
+            "symbol": "600002",
+            "signal_date": "2025-01-02",
+            "entry_date": "2025-01-03",
+            "exit_date": "2025-01-05",
+            "return_pct": 4,
+            "max_adverse_pct": -1,
+            "mark_to_market_path": [
+                {"date": "2025-01-03", "close_return_pct": 1, "low_return_pct": -1},
+                {"date": "2025-01-04", "close_return_pct": 2, "low_return_pct": 0},
+                {"date": "2025-01-05", "close_return_pct": 4, "low_return_pct": 1},
+            ],
+        },
+    ]
+
+    metrics = _trade_metrics(
+        trades,
+        hold_days=3,
+        max_active_positions=2,
+        capital_model="slot-daily",
+    )
+
+    assert metrics["rolling_1y_latest_trade_count"] == 2
+    assert metrics["rolling_1y_latest_active_position_days"] == 6
+
+
+def test_trade_metrics_reports_payoff_profit_factor_and_calmar():
+    trades = [
+        {
+            "symbol": "600001",
+            "signal_date": "2024-01-02",
+            "entry_date": "2024-01-03",
+            "exit_date": "2024-01-04",
+            "return_pct": 10.0,
+            "max_adverse_pct": -1.0,
+        },
+        {
+            "symbol": "600002",
+            "signal_date": "2025-01-03",
+            "entry_date": "2025-01-06",
+            "exit_date": "2025-01-07",
+            "return_pct": -5.0,
+            "max_adverse_pct": -5.0,
+        },
+    ]
+
+    metrics = _trade_metrics(trades, hold_days=1, capital_model="signal-day")
+
+    assert metrics["trade_payoff_ratio"] == 2.0
+    assert metrics["trade_profit_factor"] == 2.0
+    assert metrics["portfolio_calmar_latest_1y"] == round(
+        metrics["rolling_1y_latest_return_pct"]
+        / abs(metrics["portfolio_max_drawdown_pct"]),
+        2,
+    )
+
+
+def test_sweep_target_requires_profit_factor_and_calmar_quality():
+    trades = []
+    for index in range(10):
+        trades.append(
+            {
+                "symbol": f"{601000 + index:06d}",
+                "signal_date": f"2024-{index + 1:02d}-02",
+                "entry_date": f"2024-{index + 1:02d}-03",
+                "exit_date": f"2024-{index + 1:02d}-04",
+                "return_pct": 1.0 if index < 9 else -8.0,
+                "max_adverse_pct": -1.0 if index < 9 else -8.0,
+                "rank_score": 10 - index,
+                "market_level": "favorable",
+                "signal_tags": ["score_gte_5"],
+            }
+        )
+
+    result = sweep_qualified_trades(
+        trades,
+        hold_days=1,
+        top_n=1,
+        min_trades=10,
+        max_filter_size=0,
+        target_one_year_return_pct=-100.0,
+        fixed_spec=True,
+    )
+
+    best = result["top"][0]
+    assert best["target_win_drawdown_pass"] is True
+    assert best["trade_profit_factor"] < 1.3
+    assert best["target_quality_pass"] is False
+    assert best["target_all_pass"] is False
 
 
 def test_sweep_qualified_trades_can_scan_exposure_multiplier():
@@ -406,7 +626,10 @@ def test_sweep_qualified_trades_applies_financing_and_execution_costs():
     )
 
     assert net["top"][0]["annual_financing_rate_pct"] == 10.0
-    assert net["top"][0]["portfolio_compounded_return_pct"] < gross["top"][0]["portfolio_compounded_return_pct"]
+    assert (
+        net["top"][0]["portfolio_compounded_return_pct"]
+        < gross["top"][0]["portfolio_compounded_return_pct"]
+    )
 
 
 def test_sweep_qualified_trades_supports_slot_exit_capital_model():
@@ -458,9 +681,10 @@ def test_sweep_qualified_trades_supports_slot_exit_capital_model():
 
     assert slot_exit["capital_model"] == "slot-exit"
     assert slot_exit["top"][0]["capital_model"] == "slot-exit"
-    assert slot_exit["top"][0]["portfolio_compounded_return_pct"] > signal_day["top"][0][
-        "portfolio_compounded_return_pct"
-    ]
+    assert (
+        slot_exit["top"][0]["portfolio_compounded_return_pct"]
+        > signal_day["top"][0]["portfolio_compounded_return_pct"]
+    )
     assert slot_exit["top"][0]["target_all_pass"] is True
 
 
@@ -516,7 +740,7 @@ def test_sweep_qualified_trades_supports_slot_daily_drawdown_model():
     assert best["capital_model"] == "slot-daily"
     assert best["portfolio_compounded_return_pct"] == 20.0
     assert best["portfolio_max_drawdown_pct"] == -10.0
-    assert best["target_win_drawdown_pass"] is False
+    assert best["target_win_drawdown_pass"] is True
 
 
 def test_holding_calendar_gap_tags_classify_long_holiday_paths():
@@ -537,7 +761,11 @@ def test_holding_calendar_gap_tags_classify_long_holiday_paths():
         }
     )
 
-    assert {"holding_calendar_gap_gte_5", "holding_calendar_gap_gte_7", "holding_calendar_gap_gte_10"} <= long_gap_tags
+    assert {
+        "holding_calendar_gap_gte_5",
+        "holding_calendar_gap_gte_7",
+        "holding_calendar_gap_gte_10",
+    } <= long_gap_tags
     assert "holding_calendar_gap_lte_6" not in long_gap_tags
     assert {"holding_calendar_gap_lte_4", "holding_calendar_gap_lte_6"} <= short_gap_tags
     assert "holding_calendar_gap_gte_5" not in short_gap_tags
@@ -629,8 +857,20 @@ def test_prior_high_trailing_stop_uses_only_completed_prior_highs():
         "return_pct": -5,
         "max_adverse_pct": -6,
         "mark_to_market_path": [
-            {"date": "2025-01-03", "open_return_pct": 0, "high_return_pct": 6, "close_return_pct": 4, "low_return_pct": 0},
-            {"date": "2025-01-06", "open_return_pct": 5, "high_return_pct": 8, "close_return_pct": -5, "low_return_pct": -6},
+            {
+                "date": "2025-01-03",
+                "open_return_pct": 0,
+                "high_return_pct": 6,
+                "close_return_pct": 4,
+                "low_return_pct": 0,
+            },
+            {
+                "date": "2025-01-06",
+                "open_return_pct": 5,
+                "high_return_pct": 8,
+                "close_return_pct": -5,
+                "low_return_pct": -6,
+            },
         ],
     }
 
@@ -652,8 +892,20 @@ def test_prior_high_trailing_stop_exits_at_open_when_gap_crosses_stop():
         "return_pct": -5,
         "max_adverse_pct": -6,
         "mark_to_market_path": [
-            {"date": "2025-01-03", "open_return_pct": 0, "high_return_pct": 10, "close_return_pct": 8, "low_return_pct": 0},
-            {"date": "2025-01-06", "open_return_pct": 2, "high_return_pct": 6, "close_return_pct": -5, "low_return_pct": -6},
+            {
+                "date": "2025-01-03",
+                "open_return_pct": 0,
+                "high_return_pct": 10,
+                "close_return_pct": 8,
+                "low_return_pct": 0,
+            },
+            {
+                "date": "2025-01-06",
+                "open_return_pct": 2,
+                "high_return_pct": 6,
+                "close_return_pct": -5,
+                "low_return_pct": -6,
+            },
         ],
     }
 
@@ -793,9 +1045,27 @@ def test_sweep_qualified_trades_reports_partial_profit_parameters():
             "market_level": "favorable",
             "signal_tags": ["score_gte_5"],
             "mark_to_market_path": [
-                {"date": "2025-01-03", "open_return_pct": 0, "high_return_pct": 10, "low_return_pct": -1, "close_return_pct": 8},
-                {"date": "2025-01-06", "open_return_pct": 6, "high_return_pct": 8, "low_return_pct": 4, "close_return_pct": 5},
-                {"date": "2025-01-07", "open_return_pct": 3, "high_return_pct": 4, "low_return_pct": -2, "close_return_pct": 0},
+                {
+                    "date": "2025-01-03",
+                    "open_return_pct": 0,
+                    "high_return_pct": 10,
+                    "low_return_pct": -1,
+                    "close_return_pct": 8,
+                },
+                {
+                    "date": "2025-01-06",
+                    "open_return_pct": 6,
+                    "high_return_pct": 8,
+                    "low_return_pct": 4,
+                    "close_return_pct": 5,
+                },
+                {
+                    "date": "2025-01-07",
+                    "open_return_pct": 3,
+                    "high_return_pct": 4,
+                    "low_return_pct": -2,
+                    "close_return_pct": 0,
+                },
             ],
         },
         {
@@ -809,8 +1079,20 @@ def test_sweep_qualified_trades_reports_partial_profit_parameters():
             "market_level": "favorable",
             "signal_tags": ["score_gte_5"],
             "mark_to_market_path": [
-                {"date": "2025-01-09", "open_return_pct": 0, "high_return_pct": 9, "low_return_pct": -1, "close_return_pct": 6},
-                {"date": "2025-01-10", "open_return_pct": 4, "high_return_pct": 5, "low_return_pct": 1, "close_return_pct": 2},
+                {
+                    "date": "2025-01-09",
+                    "open_return_pct": 0,
+                    "high_return_pct": 9,
+                    "low_return_pct": -1,
+                    "close_return_pct": 6,
+                },
+                {
+                    "date": "2025-01-10",
+                    "open_return_pct": 4,
+                    "high_return_pct": 5,
+                    "low_return_pct": 1,
+                    "close_return_pct": 2,
+                },
             ],
         },
     ]
@@ -1179,5 +1461,7 @@ def test_compact_hold_sweep_result_keeps_hold_day_and_best_rows():
 
     assert result["hold_days"] == 5
     assert result["source_summary"]["selected_trade_count"] == 54
-    assert result["diagnostics"]["best_target_win_drawdown"]["rolling_1y_latest_return_pct"] == 96.82
+    assert (
+        result["diagnostics"]["best_target_win_drawdown"]["rolling_1y_latest_return_pct"] == 96.82
+    )
     assert result["top"][0]["label"] == "best"

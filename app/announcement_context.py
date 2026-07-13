@@ -1,11 +1,16 @@
 import contextlib
 import io
+import json
+import threading
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from app.akshare_client import akshare_call
+from app.research_pit_collector import UrllibTushareTransport
+from app.research_pit_sources import TushareSource, resolve_tushare_source
+from app.research_pit_store import PITReceiptError, _parse_native_envelope
 from app.storage import read_json, write_json
 
 
@@ -49,6 +54,18 @@ POSITIVE_KEYWORDS = {
     "权益分派": 1,
     "股权激励": 2,
 }
+
+
+ANNS_D_FIELDS = ("ann_date", "ts_code", "name", "title", "url", "rec_time")
+MAX_ANNS_D_BODY_BYTES = 8 * 1024 * 1024
+
+
+class AnnouncementSourceError(RuntimeError):
+    """Stable, non-secret failure code for announcement source selection."""
+
+    def __init__(self, code: str) -> None:
+        self.code = str(code)
+        super().__init__(self.code)
 
 HARD_BLOCKER_KEYWORDS = {
     "立案",
@@ -173,12 +190,111 @@ def _announcement_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
         return {}
     return {
         "title": title[:140],
-        "published_at": _parse_time(_first_existing(row, ["公告时间", "时间", "日期"], "")),
+        "published_at": _parse_time(
+            _first_existing(row, ["rec_time", "公告时间", "时间", "日期", "ann_date"], "")
+        ),
         "url": _clean_url(_first_existing(row, ["公告链接", "链接", "url"], "")),
         "score": _keyword_score(title),
         "hard_blocker": _has_hard_blocker(title),
         "categories": classify_announcement_title(title),
     }
+
+
+def _announcement_ts_code(symbol: str) -> str:
+    cleaned = str(symbol or "").strip().upper()
+    if cleaned.endswith((".SH", ".SZ", ".BJ")):
+        return cleaned
+    cleaned = cleaned.replace("SH", "").replace("SZ", "").replace("BJ", "")
+    if not (len(cleaned) == 6 and cleaned.isdigit()):
+        raise AnnouncementSourceError("invalid_symbol")
+    if cleaned.startswith(("6", "5", "9")):
+        suffix = "SH"
+    elif cleaned.startswith(("4", "8")):
+        suffix = "BJ"
+    else:
+        suffix = "SZ"
+    return f"{cleaned}.{suffix}"
+
+
+def fetch_jiaoch_announcements(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    *,
+    source: Optional[TushareSource] = None,
+    transport: Any = None,
+) -> List[Dict[str, Any]]:
+    """Fetch ``anns_d`` from the pinned Jiaoch Tushare-compatible source."""
+
+    try:
+        selected = source or resolve_tushare_source(
+            "jiaoch", api_url=None, allow_insecure_http=False
+        )
+    except ValueError as exc:
+        code = "credential_missing" if "JIAOCH_TOKEN" in str(exc) else "source_config_invalid"
+        raise AnnouncementSourceError(code) from None
+    if (
+        selected.name != "jiaoch"
+        or selected.api_url.rstrip("/") != "https://jiaoch.site"
+        or selected.request_protocol != "tushare-path-per-interface/v1"
+    ):
+        raise AnnouncementSourceError("source_config_invalid")
+    token = str(selected.token or "")
+    if not token:
+        raise AnnouncementSourceError("credential_missing")
+    request_payload = {
+        "api_name": "anns_d",
+        "token": token,
+        "params": {
+            "ts_code": _announcement_ts_code(symbol),
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+        },
+        "fields": ",".join(ANNS_D_FIELDS),
+    }
+    request_body = json.dumps(
+        request_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    client = transport or UrllibTushareTransport(proxy_url=selected.proxy_url)
+    try:
+        response = client.post(
+            url=f"{selected.api_url.rstrip('/')}/anns_d",
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "identity",
+                "Content-Type": "application/json; charset=utf-8",
+                "User-Agent": "quant-announcement-context/1",
+            },
+            body=request_body,
+            timeout_s=8.0,
+            max_body_bytes=MAX_ANNS_D_BODY_BYTES,
+        )
+    except Exception:
+        raise AnnouncementSourceError("transport_error") from None
+    if not getattr(response, "body_complete", False):
+        raise AnnouncementSourceError("incomplete_response")
+    if not 200 <= int(getattr(response, "status", 0)) < 300:
+        raise AnnouncementSourceError("http_error")
+    raw_body = getattr(response, "body", b"")
+    if not isinstance(raw_body, bytes) or token.encode("utf-8") in raw_body:
+        raise AnnouncementSourceError("credential_echo")
+    try:
+        fields, items, _code, _message = _parse_native_envelope(raw_body)
+    except PITReceiptError as exc:
+        message = str(exc)
+        code = "permission_denied" if "native response code 40203" in message else "api_error"
+        raise AnnouncementSourceError(code) from None
+    if tuple(fields) != ANNS_D_FIELDS:
+        raise AnnouncementSourceError("schema_mismatch")
+    announcements = []
+    for item in items:
+        normalized = _announcement_from_row(dict(zip(fields, item)))
+        if normalized:
+            announcements.append(normalized)
+    return announcements
 
 
 def fetch_cninfo_announcements(symbol: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
@@ -270,6 +386,9 @@ class AnnouncementContextProvider:
         self.cache_path = cache_path
         self.lookback_days = lookback_days
         self.enabled = enabled
+        self._jiaoch_disabled_reason: Optional[str] = None
+        self._jiaoch_capability_confirmed = False
+        self._source_lock = threading.Lock()
 
     def evaluate(self, symbol: str, use_cache_on_error: bool = True) -> Dict[str, Any]:
         if not self.enabled:
@@ -304,15 +423,66 @@ class AnnouncementContextProvider:
     def _fetch(self, symbol: str) -> Dict[str, Any]:
         end = _now().date()
         start = end - timedelta(days=self.lookback_days)
-        return build_announcement_context(
+        wire_start = start.strftime("%Y%m%d")
+        wire_end = end.strftime("%Y%m%d")
+
+        def attempt_jiaoch() -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+            with self._source_lock:
+                if self._jiaoch_disabled_reason is not None:
+                    return None, self._jiaoch_disabled_reason
+                if not self._jiaoch_capability_confirmed:
+                    try:
+                        rows = fetch_jiaoch_announcements(
+                            str(symbol), wire_start, wire_end
+                        )
+                    except AnnouncementSourceError as exc:
+                        if exc.code in {
+                            "credential_missing",
+                            "permission_denied",
+                            "source_config_invalid",
+                        }:
+                            self._jiaoch_disabled_reason = exc.code
+                        return None, exc.code
+                    self._jiaoch_capability_confirmed = True
+                    return rows, None
+            try:
+                return fetch_jiaoch_announcements(str(symbol), wire_start, wire_end), None
+            except AnnouncementSourceError as exc:
+                return None, exc.code
+
+        announcements, disabled_reason = attempt_jiaoch()
+        if announcements is not None:
+            payload = build_announcement_context(
+                announcements,
+                as_of_date=end.isoformat(),
+                lookback_days=self.lookback_days,
+            )
+            payload.update(
+                {
+                    "source": "jiaoch:anns_d",
+                    "source_profile": "jiaoch_first",
+                    "fallback_used": False,
+                    "fallback_reason_code": None,
+                }
+            )
+            return payload
+
+        payload = build_announcement_context(
             fetch_cninfo_announcements(
-                str(symbol),
-                start.strftime("%Y%m%d"),
-                end.strftime("%Y%m%d"),
+                str(symbol), wire_start, wire_end
             ),
             as_of_date=end.isoformat(),
             lookback_days=self.lookback_days,
         )
+        payload.update(
+            {
+                "source": "cninfo_official_via_akshare",
+                "source_profile": "jiaoch_first",
+                "fallback_used": True,
+                "fallback_reason_code": disabled_reason or "jiaoch_unavailable",
+            }
+        )
+        return payload
 
     def _neutral(self, reason: str) -> Dict[str, Any]:
         return {
@@ -327,4 +497,8 @@ class AnnouncementContextProvider:
             "event_counts": {},
             "announcements": [],
             "errors": [reason],
+            "source": "none",
+            "source_profile": "jiaoch_first",
+            "fallback_used": False,
+            "fallback_reason_code": reason,
         }

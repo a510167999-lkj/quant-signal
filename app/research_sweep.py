@@ -256,6 +256,39 @@ def _latest_window_portfolio_stats(
     }
 
 
+def _rolling_12m_window_stats(
+    equity_points: List[Dict[str, Any]],
+    days: int = 365,
+) -> List[Dict[str, Any]]:
+    """Return every completed rolling window, not only the latest one."""
+    if not equity_points:
+        return []
+    windows = []
+    for end_index, end in enumerate(equity_points):
+        end_date = _date_value(end["signal_date"])
+        start_cutoff = end_date - timedelta(days=days)
+        start_index = 0
+        for candidate_index in range(end_index, -1, -1):
+            if _date_value(equity_points[candidate_index]["signal_date"]) < start_cutoff:
+                start_index = candidate_index + 1
+                break
+        start_equity = equity_points[start_index - 1]["equity"] if start_index > 0 else 1.0
+        segment = equity_points[start_index : end_index + 1]
+        if not segment or not start_equity:
+            continue
+        windows.append(
+            {
+                "start_date": segment[0]["signal_date"],
+                "end_date": end["signal_date"],
+                "signal_days": len(segment),
+                "trade_count": sum(int(point.get("count") or 0) for point in segment),
+                "return_pct": round((end["equity"] / start_equity - 1) * 100, 2),
+                "max_drawdown_pct": _max_drawdown_pct_from_points(segment, start_equity=start_equity),
+            }
+        )
+    return windows
+
+
 def _trade_metrics(
     selected: List[Dict[str, Any]],
     hold_days: int,
@@ -285,6 +318,8 @@ def _trade_metrics(
     returns = [item["return_pct"] for item in selected]
     adverse = [item for item in selected if item.get("max_adverse_pct") is not None]
     wins = [item for item in selected if item.get("return_pct", 0) > 0]
+    winning_returns = [value for value in returns if value > 0]
+    losing_returns = [value for value in returns if value < 0]
     if capital_model == "slot-daily":
         equity_points = _equity_points_from_slot_daily_returns(
             selected,
@@ -314,6 +349,93 @@ def _trade_metrics(
             slippage_bps=slippage_bps,
         )
     latest_1y = _latest_window_portfolio_stats(equity_points, days=365)
+    rolling_1y_windows = _rolling_12m_window_stats(equity_points, days=365)
+
+    def window_quality(window: Dict[str, Any]) -> Dict[str, Any]:
+        start_date = _date_value(window["start_date"])
+        end_date = _date_value(window["end_date"])
+        window_trades = [
+            item
+            for item in selected
+            if start_date <= _date_value(item.get("signal_date")) <= end_date
+        ]
+        returns = [float(item.get("return_pct") or 0.0) for item in window_trades]
+        wins = [value for value in returns if value > 0]
+        losses = [value for value in returns if value < 0]
+        average_win = sum(wins) / len(wins) if wins else None
+        average_loss = abs(sum(losses) / len(losses)) if losses else None
+        payoff_ratio = average_win / average_loss if average_win is not None and average_loss else None
+        gross_loss = abs(sum(losses))
+        profit_factor = sum(wins) / gross_loss if gross_loss else None
+        drawdown = window.get("max_drawdown_pct")
+        calmar = (
+            float(window.get("return_pct")) / abs(float(drawdown))
+            if window.get("return_pct") is not None and drawdown not in {None, 0}
+            else None
+        )
+        return {
+            "selected_trade_count": len(window_trades),
+            "win_count": len(wins),
+            "nonwin_count": len(window_trades) - len(wins),
+            "win_rate_pct": round(len(wins) / len(window_trades) * 100, 2)
+            if window_trades
+            else None,
+            "payoff_ratio": round(payoff_ratio, 2) if payoff_ratio is not None else None,
+            "profit_factor": round(profit_factor, 2) if profit_factor is not None else None,
+            "calmar": round(calmar, 2) if calmar is not None else None,
+        }
+
+    rolling_1y_windows = [
+        {**window, **window_quality(window)} for window in rolling_1y_windows
+    ]
+    rolling_full_window = bool(
+        equity_points
+        and (
+            _date_value(equity_points[-1]["signal_date"])
+            - _date_value(equity_points[0]["signal_date"])
+        ).days
+        >= 365
+    )
+    rolling_position_days = latest_1y.get("trade_count")
+    rolling_trade_count = None
+    if latest_1y.get("start_date") and latest_1y.get("end_date"):
+        rolling_start = _date_value(latest_1y["start_date"])
+        rolling_end = _date_value(latest_1y["end_date"])
+        rolling_trade_count = sum(
+            1
+            for item in selected
+            if _date_value(item.get("entry_date") or item.get("signal_date")) <= rolling_end
+            and _date_value(item.get("exit_date") or item.get("signal_date")) >= rolling_start
+        )
+    average_win = (
+        sum(winning_returns) / len(winning_returns) if winning_returns else None
+    )
+    average_loss = (
+        abs(sum(losing_returns) / len(losing_returns)) if losing_returns else None
+    )
+    payoff_ratio = (
+        average_win / average_loss if average_win is not None and average_loss else None
+    )
+    gross_profit = sum(winning_returns)
+    gross_loss = abs(sum(losing_returns))
+    profit_factor = gross_profit / gross_loss if gross_loss else None
+    max_drawdown = (
+        _max_drawdown_pct_from_points(equity_points) if equity_points else None
+    )
+    latest_return = latest_1y.get("return_pct")
+    calmar = (
+        float(latest_return) / abs(float(max_drawdown))
+        if latest_return is not None and max_drawdown not in {None, 0}
+        else None
+    )
+    latest_rolling = rolling_1y_windows[-1] if rolling_1y_windows else {}
+    latest_rolling_drawdown = latest_rolling.get("max_drawdown_pct")
+    calmar_latest_12m = (
+        float(latest_rolling.get("return_pct")) / abs(float(latest_rolling_drawdown))
+        if latest_rolling.get("return_pct") is not None
+        and latest_rolling_drawdown not in {None, 0}
+        else None
+    )
 
     return {
         "selected_trade_count": len(selected),
@@ -323,9 +445,17 @@ def _trade_metrics(
         "roundtrip_cost_bps": round(float(roundtrip_cost_bps), 2),
         "slippage_bps": round(float(slippage_bps), 2),
         "capital_model": capital_model,
+        "trade_win_count": len(wins),
+        "trade_nonwin_count": len(selected) - len(wins),
         "trade_win_rate_pct": round(len(wins) / len(selected) * 100, 2) if selected else None,
+        "trade_payoff_ratio": round(payoff_ratio, 2) if payoff_ratio is not None else None,
+        "trade_profit_factor": round(profit_factor, 2)
+        if profit_factor is not None
+        else None,
         "trade_avg_return_pct": round(sum(returns) / len(returns), 2) if returns else None,
-        "trade_median_return_pct": round(float(pd.Series(returns).median()), 2) if returns else None,
+        "trade_median_return_pct": round(float(pd.Series(returns).median()), 2)
+        if returns
+        else None,
         "trade_avg_max_adverse_pct": round(
             sum(item["max_adverse_pct"] for item in adverse) / len(adverse),
             2,
@@ -335,9 +465,19 @@ def _trade_metrics(
         "portfolio_compounded_return_pct": round((equity_points[-1]["equity"] - 1) * 100, 2)
         if equity_points
         else None,
-        "portfolio_max_drawdown_pct": _max_drawdown_pct_from_points(equity_points) if equity_points else None,
-        "rolling_1y_latest_return_pct": latest_1y.get("return_pct"),
-        "rolling_1y_latest_trade_count": latest_1y.get("trade_count"),
+        "portfolio_max_drawdown_pct": max_drawdown,
+        "portfolio_calmar_latest_1y": round(calmar, 2) if calmar is not None else None,
+        "portfolio_calmar_latest_1y_method": "latest_365d_return_over_full_history_drawdown_legacy",
+        "calmar_latest_12m": round(calmar_latest_12m, 2)
+        if calmar_latest_12m is not None
+        else None,
+        "calmar_latest_12m_method": "latest_365d_return_over_latest_365d_drawdown",
+        "rolling_1y_latest_return_pct": latest_return,
+        "rolling_1y_latest_max_drawdown_pct": latest_rolling_drawdown,
+        "rolling_1y_windows": rolling_1y_windows,
+        "rolling_1y_latest_full_window": rolling_full_window,
+        "rolling_1y_latest_trade_count": rolling_trade_count,
+        "rolling_1y_latest_active_position_days": rolling_position_days,
     }
 
 
@@ -549,8 +689,7 @@ def _replace_trade_mark_path(
     last_mark = path[-1]
     close_return = _num(last_mark.get("close_return_pct"))
     adverse_returns = [
-        _num(mark.get("low_return_pct"), _num(mark.get("close_return_pct")))
-        for mark in path
+        _num(mark.get("low_return_pct"), _num(mark.get("close_return_pct"))) for mark in path
     ]
     adjusted["exit_date"] = last_mark["date"]
     adjusted["return_pct"] = close_return
@@ -615,11 +754,17 @@ def _correlation_as_of(
         if cache_key in correlation_cache:
             return correlation_cache[cache_key]
     left_returns = [
-        item for item in _history_returns_for_symbol(left_symbol, cache_dir, history_lookback_days, returns_cache)
+        item
+        for item in _history_returns_for_symbol(
+            left_symbol, cache_dir, history_lookback_days, returns_cache
+        )
         if item[0] <= as_of
     ]
     right_returns = [
-        item for item in _history_returns_for_symbol(right_symbol, cache_dir, history_lookback_days, returns_cache)
+        item
+        for item in _history_returns_for_symbol(
+            right_symbol, cache_dir, history_lookback_days, returns_cache
+        )
         if item[0] <= as_of
     ]
     if not left_returns or not right_returns:
@@ -644,8 +789,7 @@ def _correlation_as_of(
             correlation_cache[cache_key] = None
         return None
     covariance = sum(
-        (left - left_mean) * (right - right_mean)
-        for left, right in zip(left_values, right_values)
+        (left - left_mean) * (right - right_mean) for left, right in zip(left_values, right_values)
     )
     result = covariance / ((left_var * right_var) ** 0.5)
     if cache_key is not None:
@@ -674,7 +818,9 @@ def _select_with_correlation_budget(
     skipped_for_correlation = 0
 
     for signal_date in sorted(by_signal_date):
-        trades = sorted(by_signal_date[signal_date], key=lambda item: item["rank_score"], reverse=True)
+        trades = sorted(
+            by_signal_date[signal_date], key=lambda item: item["rank_score"], reverse=True
+        )
         signal_day = _date_value(signal_date)
         active_positions = [
             item for item in active_positions if _date_value(item["exit_date"]) >= signal_day
@@ -775,9 +921,11 @@ def sweep_qualified_trades(
     max_active_positions: int = 0,
     min_trades: int = 20,
     max_filter_size: int = 3,
-    target_win_rate_pct: float = 70.0,
-    target_drawdown_pct: float = 5.0,
-    target_one_year_return_pct: float = 200.0,
+    target_win_rate_pct: float = 52.0,
+    target_drawdown_pct: float = 15.0,
+    target_one_year_return_pct: float = 50.0,
+    target_profit_factor: float = 1.3,
+    target_calmar: float = 1.5,
     exposure_multipliers: List[float] = None,
     annual_financing_rate_pct: float = 0.0,
     roundtrip_cost_bps: float = 0.0,
@@ -797,11 +945,14 @@ def sweep_qualified_trades(
     correlation_cache_dir: str = "data/research_cache",
     correlation_min_periods: int = 20,
     correlation_history_lookback_days: int = 620,
+    fixed_spec: bool = False,
 ) -> Dict[str, Any]:
     if capital_model not in {"signal-day", "slot-exit", "slot-daily"}:
         capital_model = "signal-day"
     exposure_multipliers = exposure_multipliers or [1.0]
-    exposure_multipliers = sorted({round(max(float(item), 0.0), 2) for item in exposure_multipliers if item})
+    exposure_multipliers = sorted(
+        {round(max(float(item), 0.0), 2) for item in exposure_multipliers if item}
+    )
     if 1.0 not in exposure_multipliers and not force_exposure_multipliers:
         exposure_multipliers.insert(0, 1.0)
     if not exposure_multipliers:
@@ -822,7 +973,9 @@ def sweep_qualified_trades(
     correlation_enabled = correlation_threshold is not None and float(correlation_threshold) > 0
     correlation_lookback_days = max(int(correlation_lookback_days or 0), 1)
     correlation_min_periods = max(int(correlation_min_periods or 0), 2)
-    correlation_history_lookback_days = max(int(correlation_history_lookback_days or 0), correlation_lookback_days)
+    correlation_history_lookback_days = max(
+        int(correlation_history_lookback_days or 0), correlation_lookback_days
+    )
     if pre_exit_calendar_gap_days:
         qualified_trades = [
             _truncate_trade_before_calendar_gap(trade, pre_exit_calendar_gap_days)
@@ -858,9 +1011,16 @@ def sweep_qualified_trades(
     fixed_excluded_tags = {
         str(tag).strip() for tag in (excluded_signal_tags or []) if str(tag).strip()
     }
-    if required_signal_tags is not None or market_levels is not None or fixed_excluded_tags:
+    if (
+        fixed_spec
+        or required_signal_tags is not None
+        or market_levels is not None
+        or fixed_excluded_tags
+    ):
         fixed_tags = {str(tag).strip() for tag in (required_signal_tags or []) if str(tag).strip()}
-        fixed_market_levels = {str(level).strip() for level in (market_levels or []) if str(level).strip()}
+        fixed_market_levels = {
+            str(level).strip() for level in (market_levels or []) if str(level).strip()
+        }
         specs = [
             {
                 "label": _filter_label(fixed_tags, fixed_market_levels, fixed_excluded_tags),
@@ -932,7 +1092,11 @@ def sweep_qualified_trades(
         base_metrics = None
         base_win_drawdown_pass = False
         for exposure_multiplier in exposure_multipliers:
-            if exposure_multiplier != 1.0 and not base_win_drawdown_pass and not force_exposure_multipliers:
+            if (
+                exposure_multiplier != 1.0
+                and not base_win_drawdown_pass
+                and not force_exposure_multipliers
+            ):
                 continue
             metrics = _trade_metrics(
                 selected,
@@ -947,13 +1111,37 @@ def sweep_qualified_trades(
             max_drawdown = abs(metrics.get("portfolio_max_drawdown_pct") or 0)
             win_rate = metrics.get("trade_win_rate_pct") or 0
             rolling_return = metrics.get("rolling_1y_latest_return_pct")
-            win_drawdown_pass = bool(win_rate >= target_win_rate_pct and max_drawdown <= target_drawdown_pct)
+            win_drawdown_pass = bool(
+                win_rate >= target_win_rate_pct and max_drawdown <= target_drawdown_pct
+            )
             if exposure_multiplier == 1.0:
                 base_metrics = metrics
                 base_win_drawdown_pass = win_drawdown_pass
             one_year_return_pass = bool(
                 rolling_return is not None and rolling_return >= target_one_year_return_pct
             )
+            profit_factor_pass = bool(
+                (
+                    metrics.get("trade_profit_factor") is not None
+                    and float(metrics["trade_profit_factor"]) >= target_profit_factor
+                )
+                or int(metrics.get("trade_nonwin_count") or 0) == 0
+            )
+            calmar_value = metrics.get("calmar_latest_12m")
+            if calmar_value is None:
+                calmar_value = metrics.get("portfolio_calmar_latest_1y")
+            calmar_pass = bool(
+                (
+                    calmar_value is not None
+                    and float(calmar_value) >= target_calmar
+                )
+                or (
+                    rolling_return is not None
+                    and float(rolling_return) > 0
+                    and float(metrics.get("portfolio_max_drawdown_pct") or 0) == 0
+                )
+            )
+            quality_pass = profit_factor_pass and calmar_pass
             rows.append(
                 {
                     **spec,
@@ -967,19 +1155,36 @@ def sweep_qualified_trades(
                     "partial_profit_fraction": partial_profit_fraction
                     if partial_profit_activation_pct
                     else None,
-                    "excluded_signal_tags": sorted(fixed_excluded_tags) if fixed_excluded_tags else None,
-                    "correlation_threshold": round(float(correlation_threshold), 4) if correlation_enabled else None,
-                    "correlation_lookback_days": correlation_lookback_days if correlation_enabled else None,
-                    "correlation_skip_count": correlation_skip_count if correlation_enabled else None,
+                    "excluded_signal_tags": sorted(fixed_excluded_tags)
+                    if fixed_excluded_tags
+                    else None,
+                    "correlation_threshold": round(float(correlation_threshold), 4)
+                    if correlation_enabled
+                    else None,
+                    "correlation_lookback_days": correlation_lookback_days
+                    if correlation_enabled
+                    else None,
+                    "correlation_skip_count": correlation_skip_count
+                    if correlation_enabled
+                    else None,
                     "target_win_drawdown_pass": win_drawdown_pass,
                     "target_one_year_return_pass": one_year_return_pass,
-                    "target_all_pass": bool(win_drawdown_pass and one_year_return_pass),
-                    "target_gap_1y_return_pct": round(target_one_year_return_pct - rolling_return, 2)
+                    "target_quality_pass": quality_pass,
+                    "target_all_pass": bool(
+                        win_drawdown_pass and one_year_return_pass and quality_pass
+                    ),
+                    "target_gap_1y_return_pct": round(
+                        target_one_year_return_pct - rolling_return, 2
+                    )
                     if rolling_return is not None
                     else None,
                 }
             )
-        if base_metrics is None and 1.0 not in exposure_multipliers and not force_exposure_multipliers:
+        if (
+            base_metrics is None
+            and 1.0 not in exposure_multipliers
+            and not force_exposure_multipliers
+        ):
             metrics = _trade_metrics(
                 selected,
                 hold_days,
@@ -993,10 +1198,34 @@ def sweep_qualified_trades(
             max_drawdown = abs(metrics.get("portfolio_max_drawdown_pct") or 0)
             win_rate = metrics.get("trade_win_rate_pct") or 0
             rolling_return = metrics.get("rolling_1y_latest_return_pct")
-            win_drawdown_pass = bool(win_rate >= target_win_rate_pct and max_drawdown <= target_drawdown_pct)
+            win_drawdown_pass = bool(
+                win_rate >= target_win_rate_pct and max_drawdown <= target_drawdown_pct
+            )
             one_year_return_pass = bool(
                 rolling_return is not None and rolling_return >= target_one_year_return_pct
             )
+            profit_factor_pass = bool(
+                (
+                    metrics.get("trade_profit_factor") is not None
+                    and float(metrics["trade_profit_factor"]) >= target_profit_factor
+                )
+                or int(metrics.get("trade_nonwin_count") or 0) == 0
+            )
+            calmar_value = metrics.get("calmar_latest_12m")
+            if calmar_value is None:
+                calmar_value = metrics.get("portfolio_calmar_latest_1y")
+            calmar_pass = bool(
+                (
+                    calmar_value is not None
+                    and float(calmar_value) >= target_calmar
+                )
+                or (
+                    rolling_return is not None
+                    and float(rolling_return) > 0
+                    and float(metrics.get("portfolio_max_drawdown_pct") or 0) == 0
+                )
+            )
+            quality_pass = profit_factor_pass and calmar_pass
             rows.append(
                 {
                     **spec,
@@ -1010,18 +1239,50 @@ def sweep_qualified_trades(
                     "partial_profit_fraction": partial_profit_fraction
                     if partial_profit_activation_pct
                     else None,
-                    "excluded_signal_tags": sorted(fixed_excluded_tags) if fixed_excluded_tags else None,
-                    "correlation_threshold": round(float(correlation_threshold), 4) if correlation_enabled else None,
-                    "correlation_lookback_days": correlation_lookback_days if correlation_enabled else None,
-                    "correlation_skip_count": correlation_skip_count if correlation_enabled else None,
+                    "excluded_signal_tags": sorted(fixed_excluded_tags)
+                    if fixed_excluded_tags
+                    else None,
+                    "correlation_threshold": round(float(correlation_threshold), 4)
+                    if correlation_enabled
+                    else None,
+                    "correlation_lookback_days": correlation_lookback_days
+                    if correlation_enabled
+                    else None,
+                    "correlation_skip_count": correlation_skip_count
+                    if correlation_enabled
+                    else None,
                     "target_win_drawdown_pass": win_drawdown_pass,
                     "target_one_year_return_pass": one_year_return_pass,
-                    "target_all_pass": bool(win_drawdown_pass and one_year_return_pass),
-                    "target_gap_1y_return_pct": round(target_one_year_return_pct - rolling_return, 2)
+                    "target_quality_pass": quality_pass,
+                    "target_all_pass": bool(
+                        win_drawdown_pass and one_year_return_pass and quality_pass
+                    ),
+                    "target_gap_1y_return_pct": round(
+                        target_one_year_return_pct - rolling_return, 2
+                    )
                     if rolling_return is not None
                     else None,
                 }
             )
+
+    for row in rows:
+        windows = row.get("rolling_1y_windows") or []
+        row["target_rolling_12m_stability_pass"] = bool(
+            windows
+            and all(
+                window.get("return_pct") is not None
+                and float(window["return_pct"]) >= target_one_year_return_pct
+                and window.get("max_drawdown_pct") is not None
+                and abs(float(window["max_drawdown_pct"])) <= target_drawdown_pct
+                and window.get("payoff_ratio") is not None
+                and float(window["payoff_ratio"]) >= target_profit_factor
+                and window.get("profit_factor") is not None
+                and float(window["profit_factor"]) >= target_profit_factor
+                and window.get("calmar") is not None
+                and float(window["calmar"]) >= target_calmar
+                for window in windows
+            )
+        )
 
     rows.sort(
         key=lambda item: (
@@ -1056,11 +1317,21 @@ def sweep_qualified_trades(
             "correlation_lookback_days",
             "correlation_skip_count",
             "selected_trade_count",
+            "trade_win_count",
+            "trade_nonwin_count",
             "trade_win_rate_pct",
+            "trade_payoff_ratio",
+            "trade_profit_factor",
             "portfolio_max_drawdown_pct",
+            "portfolio_calmar_latest_1y",
+            "calmar_latest_12m",
             "rolling_1y_latest_return_pct",
+            "rolling_1y_latest_max_drawdown_pct",
+            "rolling_1y_windows",
             "target_win_drawdown_pass",
             "target_one_year_return_pass",
+            "target_quality_pass",
+            "target_rolling_12m_stability_pass",
             "target_all_pass",
             "target_gap_1y_return_pct",
         ]
@@ -1068,6 +1339,9 @@ def sweep_qualified_trades(
 
     win_drawdown_rows = [row for row in rows if row.get("target_win_drawdown_pass")]
     all_pass_rows = [row for row in rows if row.get("target_all_pass")]
+    rolling_stability_rows = [
+        row for row in rows if row.get("target_rolling_12m_stability_pass")
+    ]
     best_by_win_rate = max(
         rows,
         key=lambda item: (
@@ -1094,9 +1368,12 @@ def sweep_qualified_trades(
         "returned_count": len(rows),
         "target_win_drawdown_pass_count": len(win_drawdown_rows),
         "target_all_pass_count": len(all_pass_rows),
+        "target_rolling_12m_stability_pass_count": len(rolling_stability_rows),
         "target_win_rate_pct": target_win_rate_pct,
         "target_drawdown_pct": target_drawdown_pct,
         "target_one_year_return_pct": target_one_year_return_pct,
+        "target_profit_factor": target_profit_factor,
+        "target_calmar": target_calmar,
         "min_trades": min_trades,
         "exposure_multipliers": exposure_multipliers,
         "annual_financing_rate_pct": round(float(annual_financing_rate_pct), 2),
@@ -1113,7 +1390,9 @@ def sweep_qualified_trades(
         if partial_profit_activation_pct
         else None,
         "excluded_signal_tags": sorted(fixed_excluded_tags) if fixed_excluded_tags else None,
-        "correlation_threshold": round(float(correlation_threshold), 4) if correlation_enabled else None,
+        "correlation_threshold": round(float(correlation_threshold), 4)
+        if correlation_enabled
+        else None,
         "correlation_lookback_days": correlation_lookback_days if correlation_enabled else None,
         "correlation_min_periods": correlation_min_periods if correlation_enabled else None,
         "diagnostics": {

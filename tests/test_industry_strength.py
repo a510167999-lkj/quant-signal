@@ -1,6 +1,7 @@
 import pandas as pd
 
 from app.industry_strength import IndustryStrengthProvider
+from app.storage import write_json
 
 
 def test_industry_strength_uses_akshare_board_code_for_constituents(tmp_path, monkeypatch):
@@ -37,3 +38,26 @@ def test_industry_strength_uses_akshare_board_code_for_constituents(tmp_path, mo
     assert result["industries"][0]["code"] == "BK0001"
     assert result["symbol_map"]["600001"]["industry"] == "测试行业"
     assert result["symbol_map"]["600001"]["industry_code"] == "BK0001"
+
+
+def test_invalid_research_cache_is_not_used_as_live_industry_fallback(tmp_path, monkeypatch):
+    cache_path = tmp_path / "industry_strength.json"
+    write_json(
+        str(cache_path),
+        {
+            "updated_at": "full_backtest_membership",
+            "source": "research_fixture",
+            "industries": [],
+            "symbol_map": {"600001": {"industry": "污染缓存"}},
+        },
+    )
+    provider = IndustryStrengthProvider(str(cache_path), top_n=1)
+
+    def fail_fetch():
+        raise RuntimeError("upstream unavailable")
+
+    monkeypatch.setattr(provider, "_fetch", fail_fetch)
+    result = provider.build_map(use_cache_on_error=True)
+
+    assert result["symbol_map"] == {}
+    assert "industry_cache_invalid" in result["errors"]

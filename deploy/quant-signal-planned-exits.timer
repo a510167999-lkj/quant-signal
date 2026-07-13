@@ -2,7 +2,7 @@
 Description=Post-close planned-exit scan (profit-lock / calendar-gap), weekdays 15:05
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 15:05:00
+OnCalendar=Mon..Fri *-*-* 15:05:00 Asia/Shanghai
 Persistent=true
 Unit=quant-signal-planned-exits.service
 

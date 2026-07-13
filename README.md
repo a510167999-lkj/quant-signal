@@ -13,10 +13,10 @@
 - 历史信号质量过滤：统计历史 `BUY/WATCH` 信号后 10 个交易日的胜率、平均收益和回撤
 - 回测按信号日后一交易日开盘入场，避免同 K 线成交偏差
 - 外部消息风险叠加：近期负面标题会降低排名，高风险消息会阻断推荐
-- 公告事件叠加：读取巨潮信息披露公告，立案、处罚、退市、风险警示等高风险公告直接阻断推荐；正向公告先展示和记录，暂不作为排名加分
+- 公告事件叠加：先读 Jiaoch/Tushare 兼容 `anns_d`，不可用时回退巨潮信息披露；立案、处罚、退市、风险警示等高风险公告直接阻断推荐，正向公告先展示和记录，暂不作为排名加分
 - 资金流确认层：近期主力净流入加分，持续主力流出降权或阻断推荐
 - 推荐后验证：跟踪已推荐标的 1/3/5/10 个交易日收益、10 日胜率和不利波动
-- 可执行性过滤：历史验证会剔除次日高开过大、低开破坏信号、疑似一字板、入场日振幅过大等难成交样本
+- 可执行性过滤：次日开盘入场只使用前收与开盘时已知字段，剔除高开过大、低开破坏信号和接近涨停的难成交样本；入场日完整振幅仅可作收盘后诊断，不能反向决定开盘是否买入
 - 交易日北京时间 09:00、09:32、14:55、15:02 自动生成开盘/收盘策略快照
 - 推荐扫描带跨进程锁；运行中再次触发会返回当前任务状态，不重复开扫
 - 独立持仓跟踪：默认持续追踪 `159567` 和 `520700`，展示 L1 现价、涨跌、支撑/止损/止盈距离和策略状态
@@ -80,13 +80,42 @@ python -m app.jobs monitor-recommendations --force
 python -m app.jobs monitor-planned-exits --force   # post-close: profit-lock / calendar-gap planned exits
 ```
 
+周末或收盘后准备下一交易日清单时，可显式使用
+`python -m app.jobs generate-recommendations --force --run-slot pre_open --target-trade-date next`。
+快照最多返回 3 只 A 股，并在网页中标注目标交易日、数据截至日、研究开发候选状态和“不自动下单”边界；50% 年化 / 15% 最大回撤是策略验收目标，不是单次推荐或实盘证明。
+生产推荐还绑定 `primary_50_return_15_drawdown` profile：它要求完整的成本/滑点后收益、回撤、胜率 Wilson 下界、盈亏比、Profit Factor、Calmar、滚动 12 个月、PIT/时间分区和健康证据。证据文件缺失或门槛未通过时，网页显示“今日不推荐”，不会用未经验证的候选填满 3 个名额。
+研究验证成功时会生成 content-addressed profile evidence receipt，并在实验 ledger 中绑定报告、源数据和 ledger anchor；receipt 缺少任一 hash、PIT 权威、双成本/环境证据或全滚动窗口时保持 `incomplete`，不会被推荐服务当成可用 profile。
+
+当前股票池审计采用“生成”和“激活”分离的两步流程。`research-current-pool-audit`
+仍只写入内容寻址的不可变审计文件；确认该文件后，再将它原子激活到运行时路径：
+
+```bash
+python -m app.jobs research-current-pool-audit \
+  --universe-path data/current_pool_inputs/universe.json \
+  --history-summary-path data/current_pool_inputs/history-summary.json \
+  --risk-path data/current_pool_inputs/risk.json \
+  --output-dir data/current_pool_audits
+
+python -m app.jobs research-current-pool-publish \
+  --audit-path data/current_pool_audits/<canonical_sha256>.json
+```
+
+`research-current-pool-publish` 默认发布到 `CURRENT_POOL_AUDIT_PATH`，并按
+`PRODUCTION_CURRENT_POOL_MAX_AGE_HOURS` 检查时效；一次性路径可用 `--target-path`
+覆盖，一次性时效可用 `--max-age-hours` 覆盖。命令先在目标目录内建立原字节临时快照，
+对该快照执行 schema、canonical hash、来源、风险完整性、结构化股票池和时效的严格校验，
+然后执行 `fsync` 和原子替换。它不重新序列化 JSON，因此目标字节和源文件完全一致；
+校验或替换失败时旧目标保持不变。重复发布或源路径已等于目标路径时安全幂等，输出
+`published=false`。该步骤只激活已验证的开发边界审计，不会把
+`production_recommendation_eligible=false` 提升为实盘证明。
+
 Production timer units:
 
-- `quant-signal-recommend.timer`: weekdays 09:00, 09:32, 14:55 and 15:02 China time. The job skips non-trading days via the A-share trading calendar and records `run_slot` in each recommendation snapshot.
+- `quant-signal-recommend.timer`: weekdays 09:00, 09:32, 14:55 and 15:02 China time (`Timezone=Asia/Shanghai`). The job skips non-trading days via the A-share trading calendar and records `run_slot` in each recommendation snapshot.
 - `quant-signal-monitor.timer`: every 5 minutes from 09:00 to 15:55 on weekdays; the job only acts inside A-share trading windows.
 - `quant-signal-planned-exits.timer`: weekdays 15:05 China time (after `post_close`); scans recent recommendations for profit-lock and pre-calendar-gap planned exits using completed daily bars.
 - `quant-signal-cache-warm.timer`: weekdays 08:35 and 15:45 China time; it refreshes the local daily K-line cache before the morning scan and after the close.
-- `quant-signal-health.timer`: every 5 minutes; checks systemd scheduling plus recommendation, lock, calendar, cache, industry and provider health.
+- `quant-signal-health.timer`: every 5 minutes; checks its own timer, recommendation/monitor/cache/planned-exit oneshot failure states, and recommendation, lock, calendar, cache, industry and provider health.
 
 Production health check:
 
@@ -95,7 +124,7 @@ python -m app.jobs production-check --no-alert
 deploy/check-production-health.sh
 ```
 
-The application command returns `0` for healthy, `1` for degraded, and `2` for unhealthy. An empty recommendation list is valid; stale output, a stale scan lock, more than three recommendations, incomplete operation advice, expired critical data, or repeated provider failure are reported explicitly. Without `--no-alert`, state changes and periodic unresolved reminders reuse `ALERT_WEBHOOK_URL`; unchanged failures are suppressed and recovery is notified once.
+The application command returns `0` for healthy, `1` for degraded, and `2` for unhealthy. An empty recommendation list is valid; stale output, a stale scan lock, more than three recommendations, incomplete operation advice, an incomplete/tampered profile receipt, an industry cache with a research-only source/schema, expired critical data, repeated provider failure, or an SQLite cache whose latest `daily_bars.date` falls behind the trade calendar are reported explicitly. Without `--no-alert`, state changes and periodic unresolved reminders reuse `ALERT_WEBHOOK_URL`; unchanged failures are suppressed and recovery is notified once.
 
 Always complete the local gate before installing or changing VPS units:
 
@@ -231,7 +260,9 @@ Important knobs:
 - `RECOMMENDATION_MIN_SIGNAL_SCORE`: production recommendation score floor. The current default is `2`; the market-regime layer still raises the effective floor outside favorable markets.
 
 See `DATA_SOURCES.md` for the current external data-source comparison and migration plan.
-- `RECOMMENDATION_REQUIRED_SIGNAL_TAGS`: comma-separated production signal tags that must be present. The current default is `breadth_advancing_gte_50,breakout_20d,price_gap_up_2_to_5`, matching the latest 3-slot research profile; stricter daily mark-to-market validation still exceeds the 5% drawdown target.
+- `RECOMMENDATION_PROFILE_ID`: canonical production advice profile. The default is `primary_50_return_15_drawdown`; an empty value is only useful for isolated unit-test fixtures.
+- `RECOMMENDATION_PROFILE_EVIDENCE_PATH`: JSON receipt containing `metrics`, `evidence`, and optional `evidence_receipt_id`. The default is `data/recommendation_profile_evidence.json`; missing or invalid content fails closed.
+- `RECOMMENDATION_REQUIRED_SIGNAL_TAGS`: comma-separated fallback signal tags. The canonical production profile binds `breadth_advancing_gte_50,breakout_20d` and cannot be weakened by this setting.
 - `RECOMMENDATION_ALLOWED_MARKET_LEVELS`: comma-separated market regimes allowed for production recommendations. The current default is `favorable,neutral`.
 - `RECOMMENDATION_SYMBOL_COOLDOWN_DAYS`: skip stocks recommended in the recent holding window. The default is `5`, matching the 5-trading-day hard-stop research profile.
 - `RECOMMENDATION_LOCK_PATH`: lock file used to prevent overlapping recommendation scans.
@@ -311,6 +342,216 @@ python -m app.jobs research-historical-universe \
 
 This mode still seeds symbols from the current A-share snapshot for practicality, so it can retain survivorship/current-liquidity bias. Its main improvement is that liquidity, price,涨跌幅, and candidate rank are reconstructed from each signal date's historical bar.
 
+The legacy JSON builder can still produce a content-hashed development universe from dated security
+master, exchange-calendar, daily-universe, and source-manifest files. It is intentionally accepted only
+through `--pit-universe-path`; changing its filename or suffix never upgrades it to an audited source:
+
+```bash
+python -m app.jobs research-build-pit-universe \
+  --security-master-path data/pit_inputs/stock_basic.json \
+  --trade-calendar-path data/pit_inputs/trade_cal.json \
+  --daily-universe-path data/pit_inputs/bak_basic_by_session.json \
+  --source-manifest-path data/pit_inputs/source_manifest.json \
+  --start-date 2016-01-01 \
+  --end-date 2025-12-31
+
+python -m app.jobs research-historical-universe \
+  --start-date 2016-01-01 \
+  --pit-universe-path data/research_artifacts/pit_universe/<universe_sha256>.json \
+  --max-universe-symbols 0 \
+  --max-deep 80 \
+  --top-n 10 \
+  --hold-days 10 \
+  --lookback-days 3200
+```
+
+Legacy artifact mode forbids live/current-snapshot fallback and current-liquidity pre-truncation. Candidate
+names, ST/name exclusions, and market breadth all use the same supplied signal-date membership. This
+is an integrity-preserving development input, not yet trusted PIT: the current builder does not prove
+that every daily source response was complete or that normalized rows were derived from the archived
+raw responses. It remains `final_oos_eligible=false` until those lineage checks, frozen raw execution
+bars, causal corporate-action handling, historical ST/suspension intervals, and the full producer
+bundle are implemented.
+
+Native Tushare responses can now be ingested one bounded request at a time into an append-only,
+resumable SQLite receipt store. This avoids a multi-gigabyte all-years JSON and preserves the exact
+pre-DataFrame response bytes:
+
+```bash
+python -m app.jobs research-pit-ingest-response \
+  --store-dir data/research_receipts/pit-universe \
+  --dataset bak_basic \
+  --partition-key 2024-01-02 \
+  --endpoint bak_basic \
+  --params-json '{"trade_date":"20240102"}' \
+  --raw-response-path data/raw_responses/bak_basic-20240102.json \
+  --http-status 200 \
+  --retrieved-at 2024-01-02T16:00:00+08:00 \
+  --row-cap 7000
+
+python -m app.jobs research-pit-audit-store \
+  --store-dir data/research_receipts/pit-universe \
+  --start-date 2024-01-02 \
+  --end-date 2024-01-31 \
+  --calendar-exchanges SSE,SZSE
+```
+
+For controlled collection, keep the token out of command-line arguments and files. The collector
+first freezes the two exchange calendars, then stages the exact eight L/D/P/G master requests into
+one immutable stock-master generation, atomically publishes its verified head, and only then derives
+daily requests from the common SSE/SZSE open sessions. It records every transport failure, retryable
+HTTP body, API error, invalid response, successful candidate, reuse, and immutable conflict before
+receipt promotion or generation staging:
+
+```bash
+export TUSHARE_TOKEN='<token-in-process-environment-only>'
+
+python -m app.jobs research-pit-fetch-tushare \
+  --store-dir data/research_receipts/pit-universe \
+  --start-date 2016-01-01 \
+  --end-date 2025-12-31 \
+  --api-url http://api.tushare.pro \
+  --allow-insecure-official-http \
+  --max-attempts 3 \
+  --timeout-seconds 30
+```
+
+The same audited historical PIT collection path can use the pinned Jiaoch
+Tushare-compatible source. Its credential is separate from the official provider token,
+and this profile fixes both HTTPS and the allowed host instead of accepting a URL override:
+
+```bash
+export JIAOCH_TOKEN='<token-in-process-environment-only>'
+
+python -m app.jobs research-pit-fetch-tushare \
+  --source-profile jiaoch \
+  --store-dir data/research_receipts/pit-universe \
+  --start-date 2016-01-01 \
+  --end-date 2025-12-31 \
+  --max-attempts 3 \
+  --timeout-seconds 30
+```
+
+For PIT collection this profile only changes the historical evidence source. It does not replace
+the daily recommendation market-data provider, alter strategy parameters, or qualify results as
+OOS evidence. Announcement context separately attempts Jiaoch `anns_d` first and falls back to the
+official CNINFO disclosure lookup on a stable, token-free failure code. The current credential's
+`anns_d` permission probe is denied, so that fallback is expected until the source grants access.
+The recommendation card exposes the actual market-data source, announcement source, and fallback
+state; it never labels AKShare/SQLite daily bars as Jiaoch.
+The compatible service uses a pinned `/{api_name}` POST path and may return the exact
+success message `"success"` with business code zero; other non-empty success messages remain
+fail-closed. A collection is not publishable until its stock-master identifiers and row-cap
+semantics also pass the existing coverage audit.
+
+The official REST documentation currently names the plain-HTTP endpoint, so this project refuses it
+unless `--allow-insecure-official-http` is explicit. HTTPS may be supplied through `--api-url` when a
+verified endpoint is available. The built-in clock gate fails closed unless the host reports network
+time synchronization with measured evidence; on macOS, merely enabling Network Time is insufficient
+without an SNTP offset within one second. The attestation is refreshed after a five-minute TTL. A
+successful report deep-verifies every calendar/daily receipt plus the active stock generation,
+including token-free request semantics, exact response entity bytes, all eight staged events, the
+generation manifest, normalized-row hash, exact attempt/event lineage hash, and atomic head.
+`--no-resume` forces a fresh generation and receipt refetch; a completed normal rerun can skip the
+network only after re-verifying the existing receipt and generation lineage.
+
+The controlled boundary also rejects narrowed or otherwise non-canonical wire parameters before
+network access, treats a short `Content-Length` entity as incomplete, and discards any response body
+that reflects the in-memory token before raw CAS publication. If a crash occurs after a matching
+receipt commits but before its promotion event commits, resume and artifact publication repair that
+event in the same local SQLite transaction without refetching the network.
+
+The eight `stock_basic` shards are not promoted into legacy receipt keys. They are bound to one
+generation ID; fresh partial generations resume, stale partial generations are abandoned without
+deleting evidence, and a head becomes visible only after all eight shards pass the one-hour batch,
+raw, normalization, request, and event checks. Coverage audit rejects stores that contain only the
+old stock receipts and no verified active generation.
+
+The store rejects non-2xx/API-error responses, malformed native fields, duplicate keys, cap hits,
+partition rewrites, missing calendar dates, missing daily receipts, and daily symbol sets that do not
+match the frozen listing/delisting lifecycles. It re-parses every raw shard and re-hashes the SQLite
+rows during audit. After a successful audit, publish the exact externally anchored coverage snapshot:
+
+```bash
+AUDIT_SHA=<coverage_audit_sha256-from-the-previous-command>
+
+python -m app.jobs research-pit-publish-universe \
+  --store-dir data/research_receipts/pit-universe \
+  --start-date 2024-01-02 \
+  --end-date 2024-01-31 \
+  --expected-coverage-audit-sha256 "$AUDIT_SHA" \
+  --output-dir data/research_artifacts/audited_pit_universe
+
+python -m app.jobs research-historical-universe \
+  --start-date 2024-01-02 \
+  --audited-pit-universe-path \
+    data/research_artifacts/audited_pit_universe/<bundle_sha256>/metadata.sqlite3 \
+  --expected-coverage-audit-sha256 "$AUDIT_SHA" \
+  --max-universe-symbols 0 \
+  --max-deep 80 \
+  --top-n 10 \
+  --hold-days 10 \
+  --lookback-days 3200
+```
+
+The audited bundle is a pruned, read-only receipt-store snapshot. It copies the selected calendar and
+daily receipts plus the exact active generation, its head, eight shards, referenced attempts/events,
+raw CAS objects, normalized generation rows, and a foreign-key-bound consumer master projection.
+Calendar rows outside the requested coverage and out-of-scope daily rows remain when needed to replay
+a selected raw response. The loader requires the audit hash supplied out of band, replays every raw
+and normalized proof, recomputes the generation lineage, and proves that the consumer master is an
+exact projection before applying the frozen SSE/SZSE and 主板/创业板/科创板 policy. Publication uses
+staging, fsync, semantic and physical hashes, and an atomic directory rename; verification remains
+self-contained after the source store is removed.
+
+This still remains `final_oos_eligible=false`: no live-token collection has yet proved the controlled
+transport against real multi-year source responses or a real delisting boundary, no independent
+exchange security master is bound, and frozen raw execution bars, corporate actions, historical
+pause/suspension and price-limit intervals, and qualified-trade lineage are still required.
+
+If the three frozen market-component JSON files and the legacy PIT JSON artifact are already present,
+the following command can assemble a content-addressed v2 evidence bundle after re-opening the
+audited SQLite artifact. Its output is deliberately `development_integrity_only`; it does not write
+or claim a strict `research_data_contract`, because the current component schema still reports
+unresolved lineage/semantic reasons:
+
+```bash
+python -m app.jobs research-build-evidence-bundle \
+  --pit-universe-path data/research_artifacts/pit_universe/<universe_sha256>.json \
+  --market-data-manifest-path data/research_artifacts/market/market-<sha256>.json \
+  --audited-pit-universe-path data/research_artifacts/audited_pit_universe/<bundle_sha256>/metadata.sqlite3 \
+  --expected-coverage-audit-sha256 "$AUDIT_SHA" \
+  --expected-artifact-root-sha256 "$ARTIFACT_ROOT_SHA" \
+  --expected-temporal-contract-sha256 "$TEMPORAL_CONTRACT_SHA" \
+  --expected-temporal-role development \
+  --output-dir data/research_artifacts
+```
+
+`research-validate-file` rejects this integrity-only bundle until qualified-trade lineage,
+producer-code binding, and all market semantics are independently verified.
+
+For an audited artifact-native historical run, the execution lineage can be materialized separately:
+
+```bash
+python -m app.jobs research-build-artifact-native-evidence \
+  --qualified-trades-path data/research_artifacts/qualified_trades/auto031.json \
+  --audited-pit-universe-path data/research_artifacts/audited_pit_universe/<bundle_sha256>/metadata.sqlite3 \
+  --expected-coverage-audit-sha256 "$AUDIT_SHA" \
+  --expected-artifact-root-sha256 "$ARTIFACT_ROOT_SHA" \
+  --expected-temporal-contract-sha256 "$TEMPORAL_CONTRACT_SHA" \
+  --expected-temporal-role development \
+  --output-dir data/research_artifacts/native_evidence
+```
+
+This re-queries the audited artifact for each trade's membership, causal signal frame, next-open
+entry/exit, raw price, and generation proof. Newly generated qualified trades also carry a
+`strategy_signal` snapshot; the command replays that snapshot against the exact
+`evaluate_signal` source hash. It also replays the first-fillable sell search, return, MAE/MFE,
+and mark-to-market path for trades that carry the complete outcome fields. Legacy qualified files
+without those claims remain explicitly blocked. Producer-code lineage and corporate-action
+receipts are still separate blockers, so this command never turns development evidence into a
+production recommendation receipt.
+
 Automated factor-combination sweeps can be run as a first pass before promoting any signal tag into production:
 
 ```bash
@@ -328,7 +569,7 @@ python -m app.jobs research-sweep \
   --output-limit 12
 ```
 
-The sweep ranks tag and market-regime combinations against three explicit targets: 70% single-trade win rate, 5% portfolio drawdown, and 200% latest rolling-one-year portfolio return. A row is only fully passing when `target_all_pass` is true.
+The sweep now uses a stricter development target: 50% net latest rolling-one-year return after configured costs/slippage, no more than 15% portfolio drawdown, and an observed win-rate floor of 52%. Promotion review must also inspect payoff ratio, Profit Factor (target at least 1.3), Calmar (at least 1.5), and rolling-window stability. A development pass is not live-readiness proof.
 
 Strict historical-universe sweeps combine the two steps: rebuild historical candidates, collect qualified trades, then sweep signal tags, candidate-rank tags, amount tags, and market regimes:
 
@@ -387,6 +628,39 @@ python -m app.jobs research-sweep-file \
   --correlation-min-periods 15 \
   --compact
 ```
+
+`research-sweep*` remains an exploratory interface. Promotion evidence must use the frozen-spec
+development-validation gate, which writes a locked and hash-verified
+`registered -> completed|failed|aborted` experiment ledger, purges outcomes crossing fold
+boundaries, applies an embargo, reports the Wilson 95% win-rate interval, and rejects any input file
+that already contains rows from the declared final OOS period:
+
+```bash
+python -m app.jobs research-validate-file \
+  --qualified-trades-path data/research_cache/qualified_point_in_time.json \
+  --experiment-id exp-YYYYMMDD-001 \
+  --hypothesis "A single frozen hypothesis" \
+  --expected-mechanism "Why the signal should persist" \
+  --falsification-criterion "Wilson lower bound is below 70%" \
+  --exit-criterion "Reject when any primary gate fails" \
+  --final-oos-start YYYY-MM-DD \
+  --required-signal-tags tag_a,tag_b \
+  --market-levels favorable,neutral
+```
+
+The command intentionally rejects legacy qualified-trade artifacts unless their summary carries a
+versioned point-in-time contract, an empty known-bias list, explicit final-validation eligibility,
+`entry_decision_cutoff=next_open`, and (for an audited development artifact) a
+`qualified_trade_lineage_sha256` that was recomputed from fresh artifact entry/exit proofs. Hash-looking
+strings are not evidence: the contract must point to a relative, content-addressed evidence bundle,
+and validation recursively rehashes the exact PIT universe, raw vendor universe inputs, frozen trading
+calendar, raw execution bars, corporate actions, causal signal bars, and market source manifest. For
+audited artifact-native trades it also re-queries the read-only artifact for membership, causal signal
+rows, next-open buy/sell fillability, raw prices, and generation proofs; editing the trade JSON and
+recomputing its outer hash cannot pass. Current normal and PIT historical-universe runs still declare
+`eligible_for_final_validation=false` until all of those real components exist for the requested
+period. Existing 2024-2026 artifacts have already been used for parameter exploration, so they remain
+development diagnostics rather than a new final OOS set.
 
 Holding-period comparisons can be run in one command:
 
@@ -494,7 +768,7 @@ python -m app.jobs research-backtest \
   --max-active-positions 10
 ```
 
-The research output includes `portfolio_max_drawdown_pct`. Recent experiments showed that active-position caps can reduce portfolio drawdown toward 5%, but they also reduce trade count and compounded return; new alpha factors are still required for the 70% / 200% target.
+The research output includes `portfolio_max_drawdown_pct`, `trade_payoff_ratio`, `trade_profit_factor`, and `portfolio_calmar_latest_1y`. Current acceptance aims for roughly 50% net rolling-one-year return with drawdown no worse than 15%; cached development experiments remain hypothesis-screening evidence only.
 
 Announcement-aware research can be enabled without leaking future events:
 
@@ -541,7 +815,7 @@ Latest two-year research snapshot, measured from next trading day's open and hel
 
 This older snapshot used today's Top 80 prefiltered names and is retained only as a benchmark. After adding daily historical prefilter reconstruction, the production gate was tightened to the stricter historical-universe slice below.
 
-The research summary also reports `rolling_1y`, a 365-day rolling portfolio window. For the strict signal gate above, the latest one-year window is 2025-06-06 to 2026-06-02 with 22 trades, 22.06% return, and -0.46% max drawdown. This is the clearest current gap against the 200% one-year return target.
+The research summary also reports `rolling_1y`, a 365-day rolling portfolio window. For the strict signal gate above, the latest one-year window is 2025-06-06 to 2026-06-02 with 22 trades, 22.06% return, and -0.46% max drawdown. Under the old 200% one-year return target, this was the clearest gap.
 
 Deep-scan breadth test:
 
@@ -635,7 +909,7 @@ After adding signal-day market breadth tags and precomputing per-trade sweep tag
 | `breadth_ma20_gte_60 + rs60_nonnegative + volume_confirmed`, favorable market | 74 | 71.62% | 6.13% | 37.08% | -0.68% | 33.73% | no |
 | `breadth_ma20_gte_60 + candidate_rank_lte_40 + rs20_nonnegative`, favorable market | 87 | 71.26% | 6.00% | 38.84% | -0.75% | 31.49% | no |
 | `breadth_ma20_gte_60 + candidate_change_3_to_6 + rs60_nonnegative`, favorable market | 44 | 75.00% | 7.05% | 27.88% | -1.34% | 27.39% | no |
-| Current production gate: `candidate_change_0_to_3 + moderate_20d_momentum + volume_confirmed`, favorable market | 101 | 70.30% | 4.52% | 30.10% | -1.72% | 27.37% | no |
+| Historical production-gate candidate: `candidate_change_0_to_3 + moderate_20d_momentum + volume_confirmed`, favorable market | 101 | 70.30% | 4.52% | 30.10% | -1.72% | 27.37% | no |
 
 Market breadth improved the best 70%/5% passing slice from 27.37% to 33.73% latest-one-year return. This is useful risk/quality filtration, but it does not close the return target gap; the next research direction needs return-expansion factors such as industry rotation breadth, limit-up continuation state, gap continuation, intraday volume percentile, and position sizing rather than only more precision filters.
 
@@ -683,7 +957,7 @@ Shorter holding-period plus corrected hard-stop accounting improved the realisti
 | 3-day hold + 5% hard stop: `moderate_20d_momentum + price_gap_down + price_intraday_loss`, favorable | 2.0x | 24 | 70.83% | 35.61% | -1.57% | 33.49% | no |
 | 10-day hold + 6% trailing stop: `breadth_ma20_gte_60 + controlled_volatility + rs60_market_leader`, favorable | 2.0x | 31 | 74.19% | 38.04% | -1.22% | 31.41% | no |
 
-The 5-day hard-stop slice is the current best realistic-cost improvement: it raises the latest-one-year result from 70.69% to 96.82% while keeping win rate and drawdown inside target. Adjacent 4/6/7/8-day scans did not beat it, and trailing stops were not helpful in this sample.
+The 5-day hard-stop slice was the best realistic-cost improvement in this historical scan: it raises the latest-one-year result from 70.69% to 96.82% while keeping win rate and drawdown inside that scan's target. Adjacent 4/6/7/8-day scans did not beat it, and trailing stops were not helpful in this sample.
 
 Capacity and breadth expansion did not improve that best slice:
 

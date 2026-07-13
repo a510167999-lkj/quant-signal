@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import json
 import hashlib
+import sqlite3
 import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from app.config import Settings
+from app.current_pool_gate import CurrentPoolGateError, load_current_pool_audit
+from app.industry_strength import IndustryStrengthProvider
+from app.recommendation_evidence import verify_profile_evidence_receipt
 from app.storage import write_json
 
 
@@ -48,7 +53,10 @@ def _parse(value: Any) -> datetime:
 
 
 def _age_hours(value: Any, now: datetime) -> float:
-    return max(0.0, (now - _parse(value)).total_seconds() / 3600)
+    age = (now - _parse(value)).total_seconds() / 3600
+    if age < -0.25:
+        raise ValueError("timestamp is in the future")
+    return max(0.0, age)
 
 
 def _recommendations(settings: Settings, now: datetime, trade_dates: set[str]) -> dict[str, Any]:
@@ -63,6 +71,56 @@ def _recommendations(settings: Settings, now: datetime, trade_dates: set[str]) -
             return _check("recommendations", "unhealthy", "最近一次推荐任务执行失败。", error_count=len(payload.get("errors") or []))
         if summary.get("running") and age * 60 > settings.production_running_max_minutes:
             return _check("recommendations", "unhealthy", "推荐任务长时间停留在 running。", age_hours=round(age, 2))
+        trade_date = str(payload.get("trade_date") or "")[:10]
+        target_trade_date = str(payload.get("target_trade_date") or "")[:10]
+        run_slot = str(payload.get("run_slot") or "")
+        if not target_trade_date:
+            return _check("recommendations", "unhealthy", "推荐缺少目标交易日。")
+        if run_slot not in {"pre_open", "open_confirm", "pre_close", "post_close"}:
+            return _check("recommendations", "unhealthy", "推荐缺少有效运行时段。", run_slot=run_slot)
+        if target_trade_date:
+            if target_trade_date not in trade_dates:
+                return _check("recommendations", "unhealthy", "推荐目标交易日不在交易日历中。", target_trade_date=target_trade_date)
+            if summary.get("target_trade_date") and str(summary.get("target_trade_date"))[:10] != target_trade_date:
+                return _check("recommendations", "unhealthy", "推荐摘要目标交易日与快照不一致。")
+            summary_slot = summary.get("run_slot")
+            if isinstance(summary_slot, dict):
+                summary_slot = summary_slot.get("slot")
+            if summary_slot and str(summary_slot) != run_slot:
+                return _check("recommendations", "unhealthy", "推荐摘要运行时段与快照不一致。")
+            target_semantics = str(
+                payload.get("target_trade_date_semantics")
+                or summary.get("target_trade_date_semantics")
+                or ""
+            )
+            if trade_date and target_trade_date != trade_date:
+                if target_semantics == "next_trading_session":
+                    expected_next = next(
+                        (
+                            value
+                            for value in sorted(trade_dates)
+                            if str(value)[:10] > trade_date
+                        ),
+                        None,
+                    )
+                    if target_trade_date != expected_next:
+                        return _check(
+                            "recommendations",
+                            "unhealthy",
+                            "推荐目标交易日不是信号日后的下一交易日。",
+                            run_slot=run_slot,
+                            target_trade_date=target_trade_date,
+                            expected_next_trade_date=expected_next,
+                        )
+                elif run_slot in {"pre_open", "open_confirm", "pre_close"}:
+                    return _check(
+                        "recommendations",
+                        "unhealthy",
+                        "盘中推荐目标交易日与信号交易日不一致。",
+                        run_slot=run_slot,
+                    )
+            if run_slot == "post_close" and trade_date and target_trade_date < trade_date:
+                return _check("recommendations", "unhealthy", "盘后推荐目标交易日早于信号交易日。", run_slot=run_slot)
         if now.date().isoformat() in trade_dates and age > settings.production_recommendation_max_age_hours:
             return _check("recommendations", "unhealthy", "交易日推荐快照已过期。", age_hours=round(age, 2))
         items = payload.get("items") or []
@@ -70,13 +128,66 @@ def _recommendations(settings: Settings, now: datetime, trade_dates: set[str]) -
             return _check("recommendations", "unhealthy", "推荐 items 结构无效。")
         if len(items) > 3:
             return _check("recommendations", "unhealthy", "推荐数量超过 3 只上限。", item_count=len(items))
+        if payload.get("recommendation_status") == "blocked_profile_gate":
+            return _check("recommendations", "unhealthy", "推荐被策略证据/生产健康门槛阻断。")
+        if payload.get("recommendation_status") == "blocked_current_pool_gate":
+            return _check("recommendations", "unhealthy", "推荐被股票池审计/生产资格门禁阻断。")
+        data_as_of = str(payload.get("data_as_of") or summary.get("data_as_of") or "")[:10]
+        if payload.get("recommendation_status") not in {"not_run_not_trade_day", "no_snapshot"} and not data_as_of:
+            return _check("recommendations", "unhealthy", "推荐缺少数据截至日期。")
+        generated_date = _parse(generated).date().isoformat()
+        if data_as_of and data_as_of > generated_date:
+            return _check(
+                "recommendations",
+                "unhealthy",
+                "推荐数据截至日期晚于生成时间。",
+                data_as_of=data_as_of,
+            )
+        if data_as_of and payload.get("recommendation_status") not in {
+            "not_run_not_trade_day",
+            "no_snapshot",
+        }:
+            expected_dates = _expected_current_pool_dates(now, trade_dates)
+            if run_slot != "pre_open" and now.date().isoformat() in trade_dates:
+                expected_dates = {now.date().isoformat()}
+            if expected_dates and data_as_of not in expected_dates:
+                return _check(
+                    "recommendations",
+                    "unhealthy",
+                    "推荐依赖的最旧数据日已过期。",
+                    data_as_of=data_as_of,
+                    expected_data_dates=sorted(expected_dates),
+                )
+        if items:
+            if not data_as_of:
+                return _check("recommendations", "unhealthy", "推荐缺少数据截至日期。")
+            try:
+                generated_date = _parse(generated).date().isoformat()
+            except Exception:
+                generated_date = ""
+            if generated_date and data_as_of > generated_date:
+                return _check("recommendations", "unhealthy", "推荐数据截至日期晚于生成时间。", data_as_of=data_as_of)
+            if summary.get("data_as_of") and str(summary.get("data_as_of"))[:10] != data_as_of:
+                return _check("recommendations", "unhealthy", "推荐摘要数据截至日期与快照不一致。")
         for item in items:
             zone, levels = item.get("entry_zone") or {}, item.get("levels") or {}
             plan = (item.get("trade_plans") or {}).get("short_term") or {}
+            advice = item.get("operation_advice") or {}
+            advice_zone = advice.get("entry_zone") or {}
             required = all(zone.get(key) is not None for key in ("low", "high")) and all(
                 levels.get(key) is not None for key in ("support", "resistance", "stop_loss", "take_profit")
             )
-            if not required or not item.get("risks") or not (plan.get("horizon") or plan.get("holding_period")):
+            operation_contract = (
+                item.get("market") == "a"
+                and item.get("auto_order") is False
+                and advice.get("action")
+                and all(advice_zone.get(key) is not None for key in ("low", "high"))
+                and advice.get("stop_loss") is not None
+                and advice.get("take_profit") is not None
+                and (advice.get("holding_period") or plan.get("horizon") or plan.get("holding_period"))
+                and advice.get("invalidation")
+            )
+            if not required or not operation_contract or not item.get("risks") or not (plan.get("horizon") or plan.get("holding_period")):
                 return _check("recommendations", "unhealthy", "推荐缺少完整操作建议。", symbol=item.get("symbol"))
         return _check("recommendations", "healthy", "推荐快照可读且结构完整。", item_count=len(items), age_hours=round(age, 2))
     except Exception as exc:
@@ -113,12 +224,47 @@ def _json_freshness(
         return _check(name, stale_status, f"数据不可读：{type(exc).__name__}。", domain=domain)
 
 
-def _market_cache(settings: Settings, now: datetime) -> dict[str, Any]:
+def _market_cache(
+    settings: Settings,
+    now: datetime,
+    trade_dates: set[str] | None = None,
+) -> dict[str, Any]:
     try:
-        modified = datetime.fromtimestamp(Path(settings.market_data_cache_path).stat().st_mtime, tz=now.tzinfo)
-        age = (now - modified).total_seconds() / 3600
-        status = "unhealthy" if age > settings.production_market_cache_max_age_hours else "healthy"
-        return _check("market_cache", status, "行情缓存已过期。" if status != "healthy" else "行情缓存新鲜。", age_hours=round(age, 2))
+        path = Path(settings.market_data_cache_path).resolve()
+        modified = datetime.fromtimestamp(path.stat().st_mtime, tz=now.tzinfo)
+        file_age = (now - modified).total_seconds() / 3600
+        uri = "file:%s?mode=ro" % quote(str(path), safe="/")
+        with sqlite3.connect(uri, uri=True) as connection:
+            max_bar_date, row_count = connection.execute(
+                "SELECT MAX(date), COUNT(*) FROM daily_bars"
+            ).fetchone()
+        max_bar_date = str(max_bar_date or "")[:10]
+        if not max_bar_date or int(row_count or 0) <= 0:
+            raise ValueError("daily_bars is empty")
+
+        expected = sorted(
+            value
+            for value in (trade_dates or set())
+            if str(value)[:10] <= now.date().isoformat()
+        )
+        lag_sessions = None
+        if expected:
+            if max_bar_date not in expected:
+                raise ValueError("latest daily bar is outside the trade calendar")
+            lag_sessions = len([value for value in expected if value > max_bar_date])
+        stale_by_file = file_age > settings.production_market_cache_max_age_hours
+        stale_by_session = lag_sessions is not None and lag_sessions > 1
+        status = "unhealthy" if stale_by_file or stale_by_session else "healthy"
+        message = "行情缓存已过期。" if status != "healthy" else "行情缓存新鲜。"
+        return _check(
+            "market_cache",
+            status,
+            message,
+            file_age_hours=round(file_age, 2),
+            max_bar_date=max_bar_date,
+            row_count=int(row_count),
+            trade_date_lag_sessions=lag_sessions,
+        )
     except Exception as exc:
         return _check("market_cache", "unhealthy", f"行情缓存不可读：{type(exc).__name__}。")
 
@@ -135,6 +281,151 @@ def _provider(settings: Settings, now: datetime) -> dict[str, Any]:
         return _check("provider", "degraded", f"provider 状态不可读：{type(exc).__name__}。", domain="enhancement")
 
 
+def _industry_cache(settings: Settings, now: datetime) -> dict[str, Any]:
+    try:
+        payload = _load(settings.industry_cache_path)
+        if not IndustryStrengthProvider._valid_live_cache(payload):
+            raise ValueError("industry cache source or schema is not live-compatible")
+        age = _age_hours(payload.get("updated_at"), now)
+        status = "degraded" if age > settings.production_industry_max_age_hours else "healthy"
+        return _check(
+            "industry_cache",
+            status,
+            "行业缓存已过期。" if status != "healthy" else "行业缓存新鲜。",
+            domain="enhancement",
+            age_hours=round(age, 2),
+            source=payload.get("source"),
+            industry_count=len(payload.get("industries") or []),
+            symbol_count=len(payload.get("symbol_map") or {}),
+        )
+    except Exception as exc:
+        return _check("industry_cache", "degraded", f"行业缓存不可用：{type(exc).__name__}。", domain="enhancement")
+
+
+def _expected_current_pool_dates(now: datetime, trade_dates: set[str]) -> set[str] | None:
+    dates = sorted(value for value in trade_dates if value <= now.date().isoformat())
+    if not dates:
+        return None
+    today = now.date().isoformat()
+    if today in dates and (now.hour, now.minute) < (9, 30):
+        previous = [value for value in dates if value < today]
+        return {today, previous[-1]} if previous else {today}
+    if today in dates:
+        return {today}
+    return {dates[-1]}
+
+
+def _current_pool(
+    settings: Settings, now: datetime, trade_dates: set[str]
+) -> dict[str, Any]:
+    try:
+        audit = load_current_pool_audit(
+            settings.current_pool_audit_path,
+            now=now,
+            max_age_hours=settings.production_current_pool_max_age_hours,
+            expected_source_dates=_expected_current_pool_dates(now, trade_dates),
+        )
+        return _check(
+            "current_pool",
+            "healthy",
+            "当前股票池审计门禁有效。",
+            canonical_sha256=audit["canonical_sha256"],
+            source_as_of=audit["source_as_of"],
+            age_hours=round(float(audit["age_hours"]), 2),
+            allowed_symbol_count=len(audit["allowed_symbols"]),
+            evidence_scope=audit["evidence_scope"],
+            production_recommendation_eligible=False,
+        )
+    except CurrentPoolGateError as exc:
+        return _check(
+            "current_pool",
+            "unhealthy",
+            f"当前股票池审计门禁无效：{str(exc)[:200]}。",
+        )
+
+
+def _recommendation_profile(settings: Settings) -> dict[str, Any]:
+    profile_id = str(getattr(settings, "recommendation_profile_id", "") or "").strip()
+    if not profile_id:
+        return _check("recommendation_profile", "healthy", "未启用强制策略 profile。")
+    path = str(getattr(settings, "recommendation_profile_evidence_path", "") or "")
+    try:
+        payload = _load(path)
+        metrics = payload.get("metrics")
+        evidence = payload.get("evidence")
+        if not isinstance(metrics, dict) or not isinstance(evidence, dict):
+            raise ValueError("metrics/evidence missing")
+        if payload.get("profile_id") != profile_id or payload.get("version") != "v1" or not payload.get("profile_hash"):
+            raise ValueError("profile binding missing or mismatched")
+        if payload.get("status") not in {"qualified", "live_proven"}:
+            raise ValueError("receipt incomplete: %s" % ",".join(payload.get("blocking_gates") or []))
+        if payload.get("status") == "live_proven" and payload.get("live_proof") is not True:
+            raise ValueError("live proof flag mismatch")
+        receipt_check = verify_profile_evidence_receipt(payload)
+        if not receipt_check.get("ok"):
+            raise ValueError("receipt invalid: %s" % ",".join(receipt_check.get("errors") or []))
+        required_gates = {
+            "annualized_return",
+            "max_drawdown",
+            "observed_win_rate",
+            "wilson_lower",
+            "payoff_ratio",
+            "profit_factor",
+            "calmar",
+            "minimum_sample",
+            "signal_days_120",
+            "all_rolling_12m",
+            "pit_contract",
+            "temporal_contract",
+            "cost_slippage",
+            "artifact_execution",
+            "strategy_signal_replay",
+            "outcome_replay",
+            "double_cost",
+            "regime",
+        }
+        gates = payload.get("gates")
+        if not isinstance(gates, dict):
+            raise ValueError("receipt gates missing")
+        missing_gates = sorted(name for name in required_gates if gates.get(name) is not True)
+        if missing_gates:
+            raise ValueError("receipt gates incomplete: %s" % ",".join(missing_gates))
+        required_evidence = (
+            "pit_contract",
+            "temporal_contract",
+            "cost_slippage",
+            "artifact_execution",
+            "strategy_signal_replay",
+            "outcome_replay",
+        )
+        missing = [key for key in required_evidence if evidence.get(key) is not True]
+        if missing:
+            raise ValueError("evidence missing: %s" % ",".join(missing))
+        return _check(
+            "recommendation_profile",
+            "healthy",
+            "推荐策略 profile 证据可读。",
+            profile_id=profile_id,
+            evidence_receipt_id=payload.get("evidence_receipt_id"),
+        )
+    except FileNotFoundError:
+        return _check("recommendation_profile", "unhealthy", "推荐策略 profile 证据文件缺少。", profile_id=profile_id)
+    except ValueError as exc:
+        return _check(
+            "recommendation_profile",
+            "unhealthy",
+            f"推荐策略 profile 证据未完成：{str(exc)[:200]}。",
+            profile_id=profile_id,
+        )
+    except Exception as exc:
+        return _check(
+            "recommendation_profile",
+            "unhealthy",
+            f"推荐策略 profile 证据无效：{type(exc).__name__}。",
+            profile_id=profile_id,
+        )
+
+
 def build_production_status(settings: Settings, now: datetime | None = None) -> dict[str, Any]:
     observed = now or _now()
     try:
@@ -146,9 +437,11 @@ def build_production_status(settings: Settings, now: datetime | None = None) -> 
         _recommendations(settings, observed, trade_dates),
         _lock(settings, observed),
         _json_freshness("trade_calendar", settings.trade_calendar_cache_path, observed, settings.production_calendar_max_age_hours, "unhealthy"),
-        _market_cache(settings, observed),
-        _json_freshness("industry_cache", settings.industry_cache_path, observed, settings.production_industry_max_age_hours, "degraded", domain="enhancement"),
+        _market_cache(settings, observed, trade_dates),
+        _industry_cache(settings, observed),
         _provider(settings, observed),
+        _current_pool(settings, observed, trade_dates),
+        _recommendation_profile(settings),
     ]
     core_status = max(
         (item["status"] for item in checks if item["domain"] == "core"),

@@ -3,6 +3,15 @@ const state = {
   watchlist: [],
   scanResults: new Map(),
 };
+const RECOMMENDATION_POLL_BASE_DELAY_MS = 15_000;
+const RECOMMENDATION_POLL_MAX_DELAY_MS = 120_000;
+const recommendationPolling = {
+  active: false,
+  consecutiveFailures: 0,
+  controller: null,
+  requestSequence: 0,
+  timer: null,
+};
 const HOT_INDUSTRY_WINDOWS = [
   { key: "1d", label: "当日" },
   { key: "3d", label: "3日" },
@@ -37,6 +46,7 @@ const els = {
   hotIndustryMeta: document.querySelector("#hotIndustryMeta"),
   hotIndustriesList: document.querySelector("#hotIndustriesList"),
   recommendationMeta: document.querySelector("#recommendationMeta"),
+  recommendationEvidence: document.querySelector("#recommendationEvidence"),
   recommendationsList: document.querySelector("#recommendationsList"),
   performanceMeta: document.querySelector("#performanceMeta"),
   performanceList: document.querySelector("#performanceList"),
@@ -118,6 +128,17 @@ function stack(...children) {
   return wrapper;
 }
 
+function safeApiErrorMessage(body, status) {
+  const candidate =
+    typeof body?.error?.message === "string"
+      ? body.error.message
+      : typeof body?.detail === "string"
+      ? body.detail
+      : "";
+  const message = candidate.trim().slice(0, 240);
+  return message || `HTTP ${status}`;
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     ...options,
@@ -129,10 +150,110 @@ async function api(path, options = {}) {
   const isJson = response.headers.get("content-type")?.includes("application/json");
   const body = isJson ? await response.json() : await response.text();
   if (!response.ok) {
-    const message = body?.error?.message || body?.detail || `HTTP ${response.status}`;
-    throw new Error(message);
+    const error = new Error(safeApiErrorMessage(body, response.status));
+    error.httpStatus = response.status;
+    throw error;
   }
   return body;
+}
+
+function clearRecommendationPollTimer() {
+  if (recommendationPolling.timer !== null) {
+    window.clearTimeout(recommendationPolling.timer);
+  }
+  recommendationPolling.timer = null;
+  window.__recommendationPollTimer = null;
+}
+
+function stopRecommendationPolling({ abort = true } = {}) {
+  clearRecommendationPollTimer();
+  recommendationPolling.active = false;
+  recommendationPolling.consecutiveFailures = 0;
+  recommendationPolling.requestSequence += 1;
+  if (abort && recommendationPolling.controller) {
+    recommendationPolling.controller.abort();
+  }
+  recommendationPolling.controller = null;
+}
+
+function recommendationRetryDelay(failureCount) {
+  const exponent = Math.max(0, Number(failureCount || 1) - 1);
+  const exponentialDelay = Math.min(
+    RECOMMENDATION_POLL_MAX_DELAY_MS,
+    RECOMMENDATION_POLL_BASE_DELAY_MS * 2 ** exponent,
+  );
+  const randomSource =
+    typeof window.__recommendationPollRandom === "function"
+      ? window.__recommendationPollRandom
+      : Math.random;
+  const randomValue = Math.max(0, Math.min(1, Number(randomSource())));
+  const jitteredDelay = Math.round(exponentialDelay * (0.8 + randomValue * 0.4));
+  return Math.min(RECOMMENDATION_POLL_MAX_DELAY_MS, jitteredDelay);
+}
+
+function isRetryableRecommendationError(error) {
+  const status = Number(error?.httpStatus);
+  if (!Number.isFinite(status)) return true;
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function scheduleRecommendationPoll(delay) {
+  if (!recommendationPolling.active) return;
+  clearRecommendationPollTimer();
+  recommendationPolling.timer = window.setTimeout(() => {
+    recommendationPolling.timer = null;
+    window.__recommendationPollTimer = null;
+    void loadRecommendations();
+  }, delay);
+  window.__recommendationPollTimer = recommendationPolling.timer;
+}
+
+async function requestRecommendationSnapshot(path, options = {}) {
+  recommendationPolling.active = true;
+  clearRecommendationPollTimer();
+  const requestSequence = recommendationPolling.requestSequence + 1;
+  recommendationPolling.requestSequence = requestSequence;
+  if (recommendationPolling.controller) {
+    recommendationPolling.controller.abort();
+  }
+  const controller = new AbortController();
+  recommendationPolling.controller = controller;
+
+  try {
+    const data = await api(path, { ...options, signal: controller.signal });
+    if (requestSequence !== recommendationPolling.requestSequence) return null;
+
+    recommendationPolling.consecutiveFailures = 0;
+    renderRecommendations(data);
+    if (data?.summary?.running) {
+      scheduleRecommendationPoll(RECOMMENDATION_POLL_BASE_DELAY_MS);
+    } else {
+      stopRecommendationPolling({ abort: false });
+    }
+    return data;
+  } catch (error) {
+    if (requestSequence !== recommendationPolling.requestSequence || controller.signal.aborted) {
+      return null;
+    }
+    if (!isRetryableRecommendationError(error)) {
+      const message = typeof error?.message === "string" ? error.message : "请求失败";
+      stopRecommendationPolling({ abort: false });
+      els.recommendationMeta.textContent = message;
+      return null;
+    }
+    recommendationPolling.consecutiveFailures += 1;
+    const delay = recommendationRetryDelay(recommendationPolling.consecutiveFailures);
+    els.recommendationMeta.textContent = `网络请求失败，${Math.ceil(delay / 1000)} 秒后自动重试`;
+    scheduleRecommendationPoll(delay);
+    return null;
+  } finally {
+    if (
+      requestSequence === recommendationPolling.requestSequence &&
+      recommendationPolling.controller === controller
+    ) {
+      recommendationPolling.controller = null;
+    }
+  }
 }
 
 function setBusy(isBusy) {
@@ -170,6 +291,9 @@ function compactReason(item) {
 
 function recommendationMetaLine(item) {
   const parts = [item.action_label, `评分 ${fmt(item.score, 2)}`];
+  if (item.market_data_source) {
+    parts.push(`行情 ${item.market_data_source}`);
+  }
   if (item.industry?.industry) {
     parts.push(`${item.industry.industry} #${item.industry.industry_rank}`);
   }
@@ -189,10 +313,38 @@ function recommendationMetaLine(item) {
   } else if (item.announcement_context?.announcement_count) {
     parts.push(`公告 ${item.announcement_context.announcement_count}条`);
   }
+  if (item.announcement_context?.source && item.announcement_context.source !== "unknown") {
+    const fallback = item.announcement_context?.fallback_used ? "（回退）" : "";
+    parts.push(`公告源 ${item.announcement_context.source}${fallback}`);
+  }
   if (item.fund_flow_context?.level && item.fund_flow_context.level !== "neutral") {
     parts.push(`资金 ${item.fund_flow_context.level}`);
   }
   return parts.filter(Boolean).join(" · ");
+}
+
+function recommendationAdviceLine(item) {
+  const advice = item.operation_advice || {};
+  const zone = advice.entry_zone || item.entry_zone || {};
+  const levels = item.levels || {};
+  const plan = (item.trade_plans || {}).short_term || {};
+  const parts = [];
+  if (zone.low !== null && zone.low !== undefined && zone.high !== null && zone.high !== undefined) {
+    parts.push(`入场 ${fmt(zone.low, 2)}-${fmt(zone.high, 2)}`);
+  }
+  if (levels.stop_loss !== null && levels.stop_loss !== undefined) {
+    parts.push(`止损 ${fmt(levels.stop_loss, 2)}`);
+  }
+  if (levels.take_profit !== null && levels.take_profit !== undefined) {
+    parts.push(`止盈 ${fmt(levels.take_profit, 2)}`);
+  }
+  if (advice.holding_period || plan.horizon || plan.holding_period) {
+    parts.push(`周期 ${advice.holding_period || plan.horizon || plan.holding_period}`);
+  }
+  if (advice.invalidation) {
+    parts.push(`失效 ${advice.invalidation}`);
+  }
+  return parts.length ? parts.join(" · ") : "操作参数待人工核验。";
 }
 
 function updateRecommendationSummary(payload) {
@@ -207,7 +359,7 @@ function updateRecommendationSummary(payload) {
   els.candidateValue.textContent = summary.candidate_count ?? "--";
   els.qualifiedValue.textContent = summary.returned_count ?? items.length ?? "--";
   els.lastRunValue.textContent = payload?.generated_at
-    ? `${payload.trade_date || ""} · ${summary.running ? "扫描中" : "已生成"}`
+    ? `${payload.target_trade_date || payload.trade_date || ""} · ${summary.running ? "扫描中" : "已生成"}`
     : "等待交易日扫描";
 }
 
@@ -266,20 +418,55 @@ function renderHotIndustries(payload) {
 }
 
 function renderRecommendations(payload) {
-  const items = payload?.items || [];
+  const rawItems = Array.isArray(payload?.items) ? payload.items : [];
   const summary = payload?.summary || {};
   const marketLabel = summary.market_context?.label ? ` · ${summary.market_context.label}` : "";
+  const targetDate = payload?.target_trade_date || payload?.trade_date || "--";
+  const dataAsOf = payload?.data_as_of ? ` · 数据截至 ${payload.data_as_of}` : "";
+  const generatedAt = payload?.generated_at ? payload.generated_at.replace("T", " ").slice(0, 16) : "--";
+  const slotLabel = payload?.run_slot_label || summary.run_slot?.label || "";
+  const profileGate = payload?.profile_gate || summary.profile_gate || {};
+  const currentPoolGate = payload?.current_pool_gate || summary.current_pool_gate || {};
+  const profileId = payload?.strategy_profile?.profile_id || summary.strategy_profile?.profile_id || "";
+  const blockedByProfileGate =
+    payload?.recommendation_status === "blocked_profile_gate" ||
+    (profileGate.enabled === true && profileGate.development_ready !== true);
+  const blockedByCurrentPoolGate =
+    payload?.recommendation_status === "blocked_current_pool_gate" ||
+    currentPoolGate.passed !== true ||
+    currentPoolGate.production_recommendation_eligible !== true;
+  const oversizedSnapshot = rawItems.length > 3;
+  // Never render stale/oversized items under a blocked or malformed snapshot.
+  const items = blockedByCurrentPoolGate || blockedByProfileGate || oversizedSnapshot ? [] : rawItems.slice(0, 3);
   updateRecommendationSummary(payload);
   renderHotIndustries(payload);
   els.recommendationMeta.textContent = summary.running
     ? `扫描进行中 · 深扫 ${summary.max_deep ?? "--"}`
     : payload?.generated_at
-    ? `${payload.trade_date || ""} · 候选 ${summary.candidate_count ?? "--"} · 入选 ${summary.returned_count ?? items.length}${marketLabel}`
+    ? `目标交易日 ${targetDate}${dataAsOf} · 生成 ${generatedAt}${slotLabel ? ` · ${slotLabel}` : ""} · 候选 ${summary.candidate_count ?? "--"} · 入选 ${summary.returned_count ?? items.length}${marketLabel}`
     : "暂无推荐结果";
+  if (els.recommendationEvidence) {
+    const developmentOnly =
+      payload?.evidence_scope === "development_only" ||
+      (payload?.evidence_scope !== "live_proven" && payload?.live_proof !== true);
+    els.recommendationEvidence.textContent = blockedByCurrentPoolGate
+      ? "今日不推荐 · 股票池审计门禁未通过或仅有研究证据 · 不自动下单"
+      : blockedByProfileGate
+      ? `今日不推荐 · 策略证据/生产健康门槛未通过${profileId ? ` · ${profileId}` : ""}${profileGate.receipt_status ? ` · 证据 ${profileGate.receipt_status}` : ""} · 不自动下单`
+      : developmentOnly
+      ? `研究开发候选${profileId ? ` · ${profileId}` : ""} · 数据/回测不等于实盘证明 · 不自动下单`
+      : "请人工核验数据新鲜度与实盘可用性";
+  }
 
   clear(els.recommendationsList);
   if (!items.length) {
-    const emptyMessage = summary.skipped
+    const emptyMessage = oversizedSnapshot
+      ? "今日不展示：推荐快照超过 3 只上限，需重新生成。"
+      : blockedByCurrentPoolGate
+      ? `今日不推荐：${(currentPoolGate.reasons || []).slice(0, 3).join("、") || "股票池审计门禁未通过"}。`
+      : blockedByProfileGate
+      ? `今日不推荐：${(profileGate.reasons || []).slice(0, 3).join("、") || "证据门槛未通过"}。`
+      : summary.skipped
       ? "非交易日已跳过。"
       : summary.selection_funnel?.explanation || "暂无达到阈值的推荐。";
     const empty = node("div", "recommendation-item empty-row", emptyMessage);
@@ -294,6 +481,7 @@ function renderRecommendations(payload) {
       stack(
         node("span", "recommendation-title", `${item.name || ""} ${item.symbol}`.trim()),
         node("span", "recommendation-reason", recommendationMetaLine(item)),
+        node("span", "recommendation-reason", recommendationAdviceLine(item)),
         node("span", "recommendation-reason", compactReason(item)),
       )
     );
@@ -445,12 +633,13 @@ async function refreshHoldings() {
 }
 
 async function loadRecommendations() {
-  const data = await api("/api/recommendations/latest");
-  renderRecommendations(data);
-  if (data?.summary?.running) {
-    window.clearTimeout(window.__recommendationPollTimer);
-    window.__recommendationPollTimer = window.setTimeout(loadRecommendations, 15000);
-  }
+  return requestRecommendationSnapshot("/api/recommendations/latest");
+}
+
+async function loadProductionStatus() {
+  const data = await api("/api/production/status");
+  const status = data?.status || "unknown";
+  setStatus(`服务在线 · 生产检查 ${status}`, status === "healthy");
 }
 
 async function loadAlerts() {
@@ -467,10 +656,10 @@ async function runRecommendations() {
   els.runRecommendationsButton.disabled = true;
   els.runRecommendationsButton.textContent = "扫描中";
   try {
-    const data = await api("/api/recommendations/run?force=true&background=true", { method: "POST", body: "{}" });
-    renderRecommendations(data);
-    window.clearTimeout(window.__recommendationPollTimer);
-    window.__recommendationPollTimer = window.setTimeout(loadRecommendations, 15000);
+    await requestRecommendationSnapshot("/api/recommendations/run?force=true&background=true", {
+      method: "POST",
+      body: "{}",
+    });
   } catch (error) {
     els.recommendationMeta.textContent = error.message;
   } finally {
@@ -757,7 +946,7 @@ renderResult = (result) => {
   try {
     const health = await api("/health");
     setStatus(health.auth === "enabled" ? "需认证" : "已连接", true);
-    await Promise.allSettled([loadRecommendations(), loadAlerts(), loadPerformance(), loadHoldings()]);
+    await Promise.allSettled([loadRecommendations(), loadProductionStatus(), loadAlerts(), loadPerformance(), loadHoldings()]);
     await loadWatchlist();
     analyze();
   } catch (error) {

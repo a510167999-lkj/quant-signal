@@ -43,3 +43,29 @@ def test_health_systemd_units_have_expected_contract():
     assert "ExecStart=/home/ubuntu/quant-signal/deploy/check-production-health.sh" in service
     assert "OnUnitActiveSec=5min" in timer
     assert "Unit=quant-signal-health.service" in timer
+
+
+def test_all_calendar_timers_pin_the_china_timezone():
+    for name in (
+        "quant-signal-recommend.timer",
+        "quant-signal-monitor.timer",
+        "quant-signal-planned-exits.timer",
+        "quant-signal-cache-warm.timer",
+    ):
+        timer = (DEPLOY / name).read_text(encoding="utf-8")
+        assert "Timezone=Asia/Shanghai" not in timer
+        calendar_lines = [line for line in timer.splitlines() if line.startswith("OnCalendar=")]
+        assert calendar_lines
+        assert all(line.endswith("Asia/Shanghai") for line in calendar_lines)
+
+
+def test_checker_covers_health_timer_and_oneshot_failure_states():
+    script = SCRIPT.read_text(encoding="utf-8")
+    for unit in (
+        "quant-signal-health.timer",
+        "quant-signal-recommend.service",
+        "quant-signal-monitor.service",
+        "quant-signal-planned-exits.service",
+        "quant-signal-cache-warm.service",
+    ):
+        assert unit in script

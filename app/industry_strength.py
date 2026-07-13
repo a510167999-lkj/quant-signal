@@ -58,9 +58,26 @@ class IndustryStrengthProvider:
         except Exception:
             if use_cache_on_error:
                 cached = read_json(self.cache_path, {})
-                if cached:
+                if self._valid_live_cache(cached):
                     return cached
-            return {"updated_at": None, "industries": [], "symbol_map": {}, "errors": ["industry_fetch_failed"]}
+            errors = ["industry_fetch_failed"]
+            cached = read_json(self.cache_path, {})
+            if cached and not self._valid_live_cache(cached):
+                errors.append("industry_cache_invalid")
+            return {"updated_at": None, "industries": [], "symbol_map": {}, "errors": errors}
+
+    @staticmethod
+    def _valid_live_cache(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("source") != SOURCE_NAME:
+            return False
+        updated_at = payload.get("updated_at")
+        try:
+            datetime.fromisoformat(str(updated_at))
+        except (TypeError, ValueError):
+            return False
+        return isinstance(payload.get("industries"), list) and isinstance(payload.get("symbol_map"), dict)
 
     def _fetch(self) -> Dict[str, Any]:
         ak = _load_akshare()

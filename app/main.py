@@ -195,6 +195,7 @@ def create_app() -> FastAPI:
         force: bool = Query(False),
         max_deep: Optional[int] = Query(None, ge=20, le=2000),
         run_slot: str = Query(RUN_SLOT_AUTO, pattern="^(auto|pre_open|open_confirm|pre_close|post_close)$"),
+        target_trade_date: Optional[str] = Query(None),
         background: bool = Query(True),
     ):
         if run_slot not in {RUN_SLOT_AUTO, *RUN_SLOT_CONTEXTS.keys()}:
@@ -203,6 +204,7 @@ def create_app() -> FastAPI:
             payload, lock_token = RECOMMENDATIONS.begin_recommendation_run(
                 max_deep=max_deep,
                 run_slot=run_slot,
+                target_trade_date=target_trade_date,
             )
             if lock_token:
                 background_tasks.add_task(
@@ -212,12 +214,14 @@ def create_app() -> FastAPI:
                     None,
                     lock_token,
                     run_slot,
+                    target_trade_date,
                 )
             return payload
         return RECOMMENDATIONS.generate_daily_recommendations(
             force=force,
             max_deep=max_deep,
             run_slot=run_slot,
+            target_trade_date=target_trade_date,
         )
 
     @app.get("/api/alerts/recent", dependencies=[Depends(require_basic_auth)])

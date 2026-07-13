@@ -2,10 +2,9 @@
 Description=Check recent recommendations every five minutes
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 09..15:00/5:00
+OnCalendar=Mon..Fri *-*-* 09..15:00/5:00 Asia/Shanghai
 Persistent=true
 Unit=quant-signal-monitor.service
 
 [Install]
 WantedBy=timers.target
-

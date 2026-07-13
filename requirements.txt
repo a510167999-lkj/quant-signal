@@ -7,5 +7,6 @@ pandas>=2.0
 numpy>=1.24
 requests>=2.31
 openpyxl>=3.1
+pypdf>=6,<7
 pytest>=8.0
 httpx>=0.25,<0.26

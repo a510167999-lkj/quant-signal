@@ -1,14 +1,27 @@
+import json
 from dataclasses import replace
+
+import pytest
 
 from app.config import Settings
 from app.research_backtest import (
+    _emit_progress,
     _realized_trade_from_future,
     _relative_strength_context,
     _select_with_portfolio_controls,
+    _run_historical_universe_research_backtest_resolved,
     run_candidate_research_backtest,
-    run_historical_universe_research_backtest,
+)
+from app.research_pit import (
+    PointInTimeUniverse,
+    build_pit_universe_payload,
+    write_pit_universe_artifact,
 )
 from app.storage import write_json
+from app.research_portfolio import (
+    _select_with_portfolio_controls_receipt,
+    verify_portfolio_selection_receipt,
+)
 from tests.test_signals import sample_frame
 
 
@@ -20,12 +33,82 @@ class FakeProvider:
         return frame, "fake-provider"
 
 
+def _run_legacy_unit_backtest(**kwargs):
+    path = kwargs["pit_universe_path"]
+    universe = PointInTimeUniverse.from_file(path)
+    items = universe.seed_items(kwargs["start_date"], universe.end_date)
+    return _run_historical_universe_research_backtest_resolved(
+        **kwargs,
+        _resolved_universe_items=items,
+        _resolved_pit_universe=universe,
+    )
+
+
+def _write_test_pit_universe(tmp_path, items, start_date="2025-06-01"):
+    frame = sample_frame("up", periods=180)
+    sessions = sorted({str(value) for value in frame["date"] if str(value) >= start_date})
+    master = []
+    daily_universe = []
+    for item in items:
+        symbol = str(item["symbol"])
+        exchange = "SSE" if symbol.startswith("6") else "SZSE"
+        ts_code = f"{symbol}.{'SH' if exchange == 'SSE' else 'SZ'}"
+        master.append(
+            {
+                "ts_code": ts_code,
+                "symbol": symbol,
+                "name": item["name"],
+                "exchange": exchange,
+                "list_status": "L",
+                "list_date": "20000101",
+                "delist_date": None,
+            }
+        )
+        daily_universe.extend(
+            {
+                "trade_date": session.replace("-", ""),
+                "ts_code": ts_code,
+                "name": item["name"],
+                "industry": "测试行业",
+            }
+            for session in sessions
+        )
+    payload = build_pit_universe_payload(
+        security_master=master,
+        trade_calendar=[
+            {"cal_date": session.replace("-", ""), "is_open": 1}
+            for session in sessions
+        ],
+        daily_universe=daily_universe,
+        source_manifest={
+            "provider": "synthetic-test-source",
+            "stock_basic_raw_sha256": "1" * 64,
+            "bak_basic_raw_sha256": "2" * 64,
+            "trade_cal_raw_sha256": "3" * 64,
+        },
+        start_date=start_date,
+        end_date=sessions[-1],
+    )
+    return write_pit_universe_artifact(str(tmp_path / "pit"), payload)["path"]
+
+
+def test_research_progress_is_machine_readable_stderr(capsys):
+    _emit_progress({"phase": "fetch_history", "processed": 50})
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {"phase": "fetch_history", "processed": 50}
+
+
 def test_research_backtest_stop_loss_caps_trade_return(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.research_backtest.evaluate_signal", lambda history: {
-        "action": "BUY",
-        "score": 5.0,
-        "confidence": 90,
-    })
+    monkeypatch.setattr(
+        "app.research_backtest.evaluate_signal",
+        lambda history: {
+            "action": "BUY",
+            "score": 5.0,
+            "confidence": 90,
+        },
+    )
     universe_path = tmp_path / "universe.json"
     write_json(
         str(universe_path),
@@ -80,11 +163,14 @@ def test_research_backtest_take_profit_exits_early(tmp_path, monkeypatch):
                 frame.loc[91:, "low"] = frame.loc[91:, "open"] * 0.99
             return frame, "fake-provider"
 
-    monkeypatch.setattr("app.research_backtest.evaluate_signal", lambda history: {
-        "action": "BUY",
-        "score": 5.0,
-        "confidence": 90,
-    })
+    monkeypatch.setattr(
+        "app.research_backtest.evaluate_signal",
+        lambda history: {
+            "action": "BUY",
+            "score": 5.0,
+            "confidence": 90,
+        },
+    )
     universe_path = tmp_path / "universe.json"
     write_json(
         str(universe_path),
@@ -154,11 +240,14 @@ def test_realized_trade_trailing_stop_uses_prior_high():
 
 
 def test_research_backtest_announcement_context_blocks_known_risk(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.research_backtest.evaluate_signal", lambda history: {
-        "action": "BUY",
-        "score": 5.0,
-        "confidence": 90,
-    })
+    monkeypatch.setattr(
+        "app.research_backtest.evaluate_signal",
+        lambda history: {
+            "action": "BUY",
+            "score": 5.0,
+            "confidence": 90,
+        },
+    )
     monkeypatch.setattr(
         "app.research_cache.fetch_cninfo_announcements",
         lambda symbol, start_date, end_date: [
@@ -218,11 +307,14 @@ def test_research_backtest_announcement_context_blocks_known_risk(tmp_path, monk
 
 
 def test_research_backtest_announcement_context_ignores_future_risk(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.research_backtest.evaluate_signal", lambda history: {
-        "action": "BUY",
-        "score": 5.0,
-        "confidence": 90,
-    })
+    monkeypatch.setattr(
+        "app.research_backtest.evaluate_signal",
+        lambda history: {
+            "action": "BUY",
+            "score": 5.0,
+            "confidence": 90,
+        },
+    )
     monkeypatch.setattr(
         "app.research_cache.fetch_cninfo_announcements",
         lambda symbol, start_date, end_date: [
@@ -278,15 +370,20 @@ def test_research_backtest_announcement_context_ignores_future_risk(tmp_path, mo
 
     assert result["summary"]["selected_trade_count"] > 0
     assert result["summary"]["announcement_blocked_count"] == 0
-    assert result["announcement_group_stats"]["by_event"]["no_announcement_event"]["trade_count"] > 0
+    assert (
+        result["announcement_group_stats"]["by_event"]["no_announcement_event"]["trade_count"] > 0
+    )
 
 
 def test_research_backtest_can_require_announcement_event(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.research_backtest.evaluate_signal", lambda history: {
-        "action": "BUY",
-        "score": 5.0,
-        "confidence": 90,
-    })
+    monkeypatch.setattr(
+        "app.research_backtest.evaluate_signal",
+        lambda history: {
+            "action": "BUY",
+            "score": 5.0,
+            "confidence": 90,
+        },
+    )
     monkeypatch.setattr(
         "app.research_cache.fetch_cninfo_announcements",
         lambda symbol, start_date, end_date: [
@@ -349,15 +446,18 @@ def test_research_backtest_can_require_announcement_event(tmp_path, monkeypatch)
 
 
 def test_research_backtest_can_require_signal_tag(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.research_backtest.evaluate_signal", lambda history: {
-        "action": "BUY",
-        "score": 5.0,
-        "confidence": 90,
-        "reasons": [],
-        "confirmations": [],
-        "risks": [],
-        "indicators": {},
-    })
+    monkeypatch.setattr(
+        "app.research_backtest.evaluate_signal",
+        lambda history: {
+            "action": "BUY",
+            "score": 5.0,
+            "confidence": 90,
+            "reasons": [],
+            "confirmations": [],
+            "risks": [],
+            "indicators": {},
+        },
+    )
     universe_path = tmp_path / "universe.json"
     write_json(
         str(universe_path),
@@ -403,15 +503,18 @@ def test_research_backtest_can_require_signal_tag(tmp_path, monkeypatch):
 
 
 def test_research_backtest_can_include_qualified_trades(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.research_backtest.evaluate_signal", lambda history: {
-        "action": "BUY",
-        "score": 5.0,
-        "confidence": 90,
-        "reasons": [],
-        "confirmations": [],
-        "risks": [],
-        "indicators": {},
-    })
+    monkeypatch.setattr(
+        "app.research_backtest.evaluate_signal",
+        lambda history: {
+            "action": "BUY",
+            "score": 5.0,
+            "confidence": 90,
+            "reasons": [],
+            "confirmations": [],
+            "risks": [],
+            "indicators": {},
+        },
+    )
     universe_path = tmp_path / "universe.json"
     write_json(
         str(universe_path),
@@ -460,15 +563,18 @@ def test_research_backtest_can_include_qualified_trades(tmp_path, monkeypatch):
 
 
 def test_research_backtest_can_attach_current_margin_tags(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.research_backtest.evaluate_signal", lambda history: {
-        "action": "BUY",
-        "score": 5.0,
-        "confidence": 90,
-        "reasons": [],
-        "confirmations": [],
-        "risks": [],
-        "indicators": {},
-    })
+    monkeypatch.setattr(
+        "app.research_backtest.evaluate_signal",
+        lambda history: {
+            "action": "BUY",
+            "score": 5.0,
+            "confidence": 90,
+            "reasons": [],
+            "confirmations": [],
+            "risks": [],
+            "indicators": {},
+        },
+    )
     monkeypatch.setattr(
         "app.research_backtest.MarginEligibilityProvider.build_map",
         lambda self, use_cache_on_error=True, as_of=None: {
@@ -561,43 +667,47 @@ def test_historical_universe_rebuilds_daily_prefilter_from_history(tmp_path, mon
             frame["amount"] = frame["close"] * frame["volume"]
             return frame, "fake-provider"
 
-    monkeypatch.setattr("app.research_backtest.evaluate_signal", lambda history: {
-        "action": "BUY",
-        "score": 5.0,
-        "confidence": 90,
-        "reasons": [],
-        "confirmations": [],
-        "risks": [],
+    monkeypatch.setattr(
+        "app.research_backtest.evaluate_signal",
+        lambda history: {
+            "action": "BUY",
+            "score": 5.0,
+            "confidence": 90,
+            "reasons": [],
+            "confirmations": [],
+            "risks": [],
             "indicators": {},
-        })
+        },
+    )
     monkeypatch.setattr(
         "app.research_backtest._historical_industry_rotation_contexts",
         lambda *args, **kwargs: IndustryMap(),
     )
+    monkeypatch.setattr("app.research_context.STOCK_MARKET_MIN_ELIGIBLE", 1)
+    universe_items = [
+        {
+            "symbol": "000001",
+            "market": "a",
+            "name": "低成交额",
+            "latest": 100,
+            "amount": 1000000000,
+            "change_pct": 2,
+        },
+        {
+            "symbol": "600001",
+            "market": "a",
+            "name": "高成交额",
+            "latest": 100,
+            "amount": 1,
+            "change_pct": 2,
+        },
+    ]
     universe_path = tmp_path / "universe.json"
     write_json(
         str(universe_path),
-        {
-            "items": [
-                {
-                    "symbol": "000001",
-                    "market": "a",
-                    "name": "低成交额",
-                    "latest": 100,
-                    "amount": 1000000000,
-                    "change_pct": 2,
-                },
-                {
-                    "symbol": "600001",
-                    "market": "a",
-                    "name": "高成交额",
-                    "latest": 100,
-                    "amount": 1,
-                    "change_pct": 2,
-                },
-            ]
-        },
+        {"items": universe_items},
     )
+    pit_universe_path = _write_test_pit_universe(tmp_path, universe_items)
     settings = replace(
         Settings(),
         universe_cache_path=str(universe_path),
@@ -607,7 +717,7 @@ def test_historical_universe_rebuilds_daily_prefilter_from_history(tmp_path, mon
         max_backtest_avg_adverse=100,
     )
 
-    result = run_historical_universe_research_backtest(
+    result = _run_legacy_unit_backtest(
         settings=settings,
         provider=HistoricalUniverseProvider(),
         start_date="2025-06-01",
@@ -615,18 +725,26 @@ def test_historical_universe_rebuilds_daily_prefilter_from_history(tmp_path, mon
         top_n=1,
         hold_days=10,
         lookback_days=620,
-        max_universe_symbols=2,
+        max_universe_symbols=0,
         cache_dir=str(tmp_path / "cache"),
         use_industry_rotation_context=True,
         include_qualified_trades=True,
+        pit_universe_path=pit_universe_path,
     )
 
-    assert result["summary"]["candidate_mode"] == "historical_daily_prefilter"
+    assert result["summary"]["candidate_mode"] == "dated_universe_artifact_prefilter"
+    contract = result["summary"]["research_data_contract"]
+    assert contract["entry_decision_cutoff"] == "next_open"
+    assert contract["point_in_time"] is False
+    assert contract["eligible_for_final_validation"] is False
+    assert contract["universe_artifact_integrity_verified"] is True
+    assert "current_snapshot_seed" not in contract["known_biases"]
     assert result["summary"]["selected_trade_count"] > 0
     assert result["summary"]["historical_candidate_days"] > 0
     assert {item["symbol"] for item in result["qualified_trades"]} == {"600001"}
     assert result["qualified_trades"][0]["candidate_rank"] == 1
     assert result["qualified_trades"][0]["candidate_rank_pct"] == 100.0
+    assert result["qualified_trades"][0]["entry_executability"]["intraday_range_pct"] is None
     assert "candidate_change_0_to_3" in result["qualified_trades"][0]["signal_tags"]
     assert "market_breadth" in result["qualified_trades"][0]
     assert any(tag.startswith("breadth_") for tag in result["qualified_trades"][0]["signal_tags"])
@@ -672,35 +790,36 @@ def test_historical_universe_can_attach_szse_margin_asof_tags(tmp_path, monkeypa
             "errors": [],
         }
 
-    monkeypatch.setattr("app.research_backtest.evaluate_signal", lambda history: {
-        "action": "BUY",
-        "score": 5.0,
-        "confidence": 90,
-        "reasons": [],
-        "confirmations": [],
-        "risks": [],
-        "indicators": {},
-    })
+    monkeypatch.setattr(
+        "app.research_backtest.evaluate_signal",
+        lambda history: {
+            "action": "BUY",
+            "score": 5.0,
+            "confidence": 90,
+            "reasons": [],
+            "confirmations": [],
+            "risks": [],
+            "indicators": {},
+        },
+    )
     monkeypatch.setattr(
         "app.research_backtest.MarginEligibilityProvider.build_szse_underlying_map",
         fake_margin_map,
     )
-    universe_path = tmp_path / "universe.json"
-    write_json(
-        str(universe_path),
+    monkeypatch.setattr("app.research_context.STOCK_MARKET_MIN_ELIGIBLE", 1)
+    universe_items = [
         {
-            "items": [
-                {
-                    "symbol": "000001",
-                    "market": "a",
-                    "name": "平安银行",
-                    "latest": 100,
-                    "amount": 1000000000,
-                    "change_pct": 2,
-                }
-            ]
-        },
-    )
+            "symbol": "000001",
+            "market": "a",
+            "name": "平安银行",
+            "latest": 100,
+            "amount": 1000000000,
+            "change_pct": 2,
+        }
+    ]
+    universe_path = tmp_path / "universe.json"
+    write_json(str(universe_path), {"items": universe_items})
+    pit_universe_path = _write_test_pit_universe(tmp_path, universe_items)
     settings = replace(
         Settings(),
         universe_cache_path=str(universe_path),
@@ -710,7 +829,7 @@ def test_historical_universe_can_attach_szse_margin_asof_tags(tmp_path, monkeypa
         max_backtest_avg_adverse=100,
     )
 
-    result = run_historical_universe_research_backtest(
+    result = _run_legacy_unit_backtest(
         settings=settings,
         provider=HistoricalProvider(),
         start_date="2025-06-01",
@@ -718,12 +837,13 @@ def test_historical_universe_can_attach_szse_margin_asof_tags(tmp_path, monkeypa
         top_n=1,
         hold_days=10,
         lookback_days=620,
-        max_universe_symbols=1,
+        max_universe_symbols=0,
         cache_dir=str(tmp_path / "cache"),
         use_margin_eligibility_context=True,
         require_signal_tags="margin_financing_eligible",
         require_all_signal_tags=True,
         include_qualified_trades=True,
+        pit_universe_path=pit_universe_path,
     )
 
     assert result["summary"]["margin_eligibility_context_enabled"] is True
@@ -766,15 +886,18 @@ def test_historical_universe_can_attach_dragon_tiger_tags(tmp_path, monkeypatch)
                 frame["amount"] = frame["close"] * frame["volume"]
             return frame, "fake-provider"
 
-    monkeypatch.setattr("app.research_backtest.evaluate_signal", lambda history: {
-        "action": "BUY",
-        "score": 5.0,
-        "confidence": 90,
-        "reasons": [],
-        "confirmations": [],
-        "risks": [],
-        "indicators": {},
-    })
+    monkeypatch.setattr(
+        "app.research_backtest.evaluate_signal",
+        lambda history: {
+            "action": "BUY",
+            "score": 5.0,
+            "confidence": 90,
+            "reasons": [],
+            "confirmations": [],
+            "risks": [],
+            "indicators": {},
+        },
+    )
     monkeypatch.setattr(
         "app.research_backtest.DragonTigerProvider.build_contexts",
         lambda self, start_date, end_date, use_cache_on_error=True: {
@@ -783,22 +906,20 @@ def test_historical_universe_can_attach_dragon_tiger_tags(tmp_path, monkeypatch)
             "errors": [],
         },
     )
-    universe_path = tmp_path / "universe.json"
-    write_json(
-        str(universe_path),
+    monkeypatch.setattr("app.research_context.STOCK_MARKET_MIN_ELIGIBLE", 1)
+    universe_items = [
         {
-            "items": [
-                {
-                    "symbol": "600519",
-                    "market": "a",
-                    "name": "测试股票",
-                    "latest": 100,
-                    "amount": 1000000000,
-                    "change_pct": 2,
-                }
-            ]
-        },
-    )
+            "symbol": "600519",
+            "market": "a",
+            "name": "测试股票",
+            "latest": 100,
+            "amount": 1000000000,
+            "change_pct": 2,
+        }
+    ]
+    universe_path = tmp_path / "universe.json"
+    write_json(str(universe_path), {"items": universe_items})
+    pit_universe_path = _write_test_pit_universe(tmp_path, universe_items)
     settings = replace(
         Settings(),
         universe_cache_path=str(universe_path),
@@ -808,7 +929,7 @@ def test_historical_universe_can_attach_dragon_tiger_tags(tmp_path, monkeypatch)
         max_backtest_avg_adverse=100,
     )
 
-    result = run_historical_universe_research_backtest(
+    result = _run_legacy_unit_backtest(
         settings=settings,
         provider=HistoricalProvider(),
         start_date="2025-06-01",
@@ -816,12 +937,13 @@ def test_historical_universe_can_attach_dragon_tiger_tags(tmp_path, monkeypatch)
         top_n=1,
         hold_days=10,
         lookback_days=620,
-        max_universe_symbols=1,
+        max_universe_symbols=0,
         cache_dir=str(tmp_path / "cache"),
         use_dragon_tiger_context=True,
         require_signal_tags="lhb_net_buy_positive",
         require_all_signal_tags=True,
         include_qualified_trades=True,
+        pit_universe_path=pit_universe_path,
     )
 
     assert result["summary"]["dragon_tiger_context_enabled"] is True
@@ -885,3 +1007,51 @@ def test_portfolio_controls_skip_overlapping_same_symbol():
     )
 
     assert [item["symbol"] for item in selected] == ["600519", "000001"]
+
+
+def test_portfolio_selection_receipt_replays_ordered_candidates_and_rejections():
+    candidates = {
+        "2026-01-02": [
+            {
+                "symbol": "600519",
+                "signal_date": "2026-01-02",
+                "entry_date": "2026-01-05",
+                "exit_date": "2026-01-16",
+                "rank_score": 10,
+            }
+        ],
+        "2026-01-05": [
+            {
+                "symbol": "600519",
+                "signal_date": "2026-01-05",
+                "entry_date": "2026-01-06",
+                "exit_date": "2026-01-19",
+                "rank_score": 20,
+            },
+            {
+                "symbol": "000001",
+                "signal_date": "2026-01-05",
+                "entry_date": "2026-01-06",
+                "exit_date": "2026-01-19",
+                "rank_score": 8,
+            },
+        ],
+    }
+
+    selected, receipt = _select_with_portfolio_controls_receipt(
+        candidates,
+        top_n=2,
+        symbol_cooldown_days=10,
+        max_active_positions=3,
+    )
+
+    assert [item["symbol"] for item in selected] == ["600519", "000001"]
+    assert receipt["candidate_count"] == 3
+    assert receipt["selected_count"] == 2
+    assert receipt["days"][1]["decisions"][0]["decision"] == "active_symbol"
+    verified = verify_portfolio_selection_receipt(candidates, receipt)
+    assert verified["verified"] is True
+    tampered = json.loads(json.dumps(receipt))
+    tampered["days"][1]["selected_trade_keys"] = []
+    with pytest.raises(ValueError, match="portfolio selection receipt"):
+        verify_portfolio_selection_receipt(candidates, tampered)

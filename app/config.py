@@ -46,6 +46,11 @@ class Settings:
     recommendation_history_path: str = "data/recommendations_history.jsonl"
     recommendation_audit_path: str = "data/recommendations_audit.jsonl"
     recommendation_lock_path: str = "data/recommendations.lock"
+    # Empty in direct unit-test fixtures; get_settings enables the canonical
+    # production profile unless explicitly overridden by the environment.
+    recommendation_profile_id: str = ""
+    recommendation_profile_evidence_path: str = "data/recommendation_profile_evidence.json"
+    current_pool_audit_path: str = "data/current_pool_audit.json"
     alerts_path: str = "data/alerts.jsonl"
     universe_cache_path: str = "data/a_share_universe.json"
     industry_cache_path: str = "data/industry_strength.json"
@@ -60,6 +65,7 @@ class Settings:
     production_calendar_max_age_hours: int = 48
     production_market_cache_max_age_hours: int = 36
     production_industry_max_age_hours: int = 72
+    production_current_pool_max_age_hours: int = 36
     production_provider_failure_window_hours: int = 24
     production_health_state_path: str = "data/production_health_state.json"
     production_health_reminder_hours: int = 6
@@ -159,6 +165,15 @@ def get_settings() -> Settings:
         ),
         alerts_path=os.getenv("ALERTS_PATH", "data/alerts.jsonl"),
         recommendation_lock_path=os.getenv("RECOMMENDATION_LOCK_PATH", "data/recommendations.lock"),
+        recommendation_profile_id=os.getenv(
+            "RECOMMENDATION_PROFILE_ID", "primary_50_return_15_drawdown"
+        ),
+        recommendation_profile_evidence_path=os.getenv(
+            "RECOMMENDATION_PROFILE_EVIDENCE_PATH", "data/recommendation_profile_evidence.json"
+        ),
+        current_pool_audit_path=os.getenv(
+            "CURRENT_POOL_AUDIT_PATH", "data/current_pool_audit.json"
+        ),
         universe_cache_path=os.getenv("UNIVERSE_CACHE_PATH", "data/a_share_universe.json"),
         industry_cache_path=os.getenv("INDUSTRY_CACHE_PATH", "data/industry_strength.json"),
         industry_history_cache_dir=os.getenv("INDUSTRY_HISTORY_CACHE_DIR", "data/industry_history"),
@@ -174,6 +189,9 @@ def get_settings() -> Settings:
         production_calendar_max_age_hours=int_setting("PRODUCTION_CALENDAR_MAX_AGE_HOURS", 48, 1, 720),
         production_market_cache_max_age_hours=int_setting("PRODUCTION_MARKET_CACHE_MAX_AGE_HOURS", 36, 1, 168),
         production_industry_max_age_hours=int_setting("PRODUCTION_INDUSTRY_MAX_AGE_HOURS", 72, 1, 720),
+        production_current_pool_max_age_hours=int_setting(
+            "PRODUCTION_CURRENT_POOL_MAX_AGE_HOURS", 36, 1, 720
+        ),
         production_provider_failure_window_hours=int_setting("PRODUCTION_PROVIDER_FAILURE_WINDOW_HOURS", 24, 1, 168),
         production_health_state_path=os.getenv("PRODUCTION_HEALTH_STATE_PATH", "data/production_health_state.json"),
         production_health_reminder_hours=int_setting("PRODUCTION_HEALTH_REMINDER_HOURS", 6, 1, 168),

@@ -34,7 +34,7 @@ def run_backtest(frame: pd.DataFrame) -> Dict[str, Any]:
         next_open = float(next_bar.get("open", next_bar["close"]))
         signal = evaluate_signal(enriched.iloc[: index + 1])
 
-        executable = assess_entry_executability(current, next_bar)
+        executable = assess_entry_executability(current, next_bar, decision_cutoff="next_open")
         if shares <= 0 and signal["action"] == "BUY" and executable["executable"]:
             shares = cash / next_open
             cash = 0.0
@@ -117,7 +117,11 @@ def evaluate_signal_outcomes(frame: pd.DataFrame, hold_days: int = 10) -> Dict[s
         if signal["action"] in {"BUY", "WATCH"} and signal["score"] >= 2:
             entry_index = index + 1
             exit_index = entry_index + hold_days
-            executable = assess_entry_executability(enriched.iloc[index], enriched.iloc[entry_index])
+            executable = assess_entry_executability(
+                enriched.iloc[index],
+                enriched.iloc[entry_index],
+                decision_cutoff="next_open",
+            )
             if not executable["executable"]:
                 skipped_unexecutable_count += 1
                 index += 1

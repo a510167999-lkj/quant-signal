@@ -4,6 +4,8 @@
 统计、按信号日选股 + 持仓去重/冷却/仓位数控制、单笔交易实现（止损/止盈/移动
 止损 + mark-to-market 路径）。与回测编排解耦，供 research_backtest 调用。
 """
+import hashlib
+import json
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
@@ -68,34 +70,75 @@ def _window_portfolio_stats(
     }
 
 
-def _select_with_portfolio_controls(
+def _selection_trade_key(trade: Dict[str, Any]) -> str:
+    values = [
+        str(trade.get("symbol") or ""),
+        str(trade.get("signal_date") or "")[:10],
+        str(trade.get("entry_date") or "")[:10],
+        str(trade.get("exit_date") or "")[:10],
+    ]
+    if not values[0] or not values[1] or not values[3]:
+        raise ValueError("portfolio selection trade key is incomplete")
+    return "|".join(values)
+
+
+def _selection_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _select_with_portfolio_controls_receipt(
     by_signal_date: Dict[str, List[Dict[str, Any]]],
     top_n: int,
     symbol_cooldown_days: int = 0,
     max_active_positions: int = 0,
-) -> List[Dict[str, Any]]:
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     selected: List[Dict[str, Any]] = []
     active_positions: List[Dict[str, Any]] = []
     last_exit_by_symbol: Dict[str, datetime] = {}
+    days: List[Dict[str, Any]] = []
+    all_candidate_keys: List[str] = []
 
     for signal_date in sorted(by_signal_date):
         trades = sorted(by_signal_date[signal_date], key=lambda item: item["rank_score"], reverse=True)
+        ordered_keys = [_selection_trade_key(trade) for trade in trades]
+        if len(ordered_keys) != len(set(ordered_keys)):
+            raise ValueError("portfolio selection candidates contain duplicate trade keys")
+        all_candidate_keys.extend(ordered_keys)
         signal_day = _date_value(signal_date)
         active_positions = [
             item for item in active_positions if _date_value(item["exit_date"]) >= signal_day
         ]
         day_count = 0
         active_symbols = {item["symbol"] for item in active_positions}
+        decisions: List[Dict[str, str]] = []
+        day_selected_keys: List[str] = []
 
-        for trade in trades:
+        for index, trade in enumerate(trades):
+            trade_key = ordered_keys[index]
             symbol = trade.get("symbol")
             if symbol in active_symbols:
+                decisions.append({"trade_key": trade_key, "decision": "active_symbol"})
                 continue
             previous_exit = last_exit_by_symbol.get(symbol)
             if previous_exit and symbol_cooldown_days > 0:
                 if (signal_day - previous_exit).days < symbol_cooldown_days:
+                    decisions.append({"trade_key": trade_key, "decision": "cooldown"})
                     continue
             if max_active_positions > 0 and len(active_positions) >= max_active_positions:
+                decisions.extend(
+                    {
+                        "trade_key": ordered_keys[remaining_index],
+                        "decision": "max_active_positions_break",
+                    }
+                    for remaining_index in range(index, len(trades))
+                )
                 break
 
             selected.append(trade)
@@ -103,9 +146,88 @@ def _select_with_portfolio_controls(
             active_symbols.add(symbol)
             last_exit_by_symbol[symbol] = _date_value(trade["exit_date"])
             day_count += 1
+            day_selected_keys.append(trade_key)
+            decisions.append({"trade_key": trade_key, "decision": "selected"})
             if day_count >= top_n:
+                decisions.extend(
+                    {
+                        "trade_key": ordered_keys[remaining_index],
+                        "decision": "top_n_break",
+                    }
+                    for remaining_index in range(index + 1, len(trades))
+                )
                 break
 
+        days.append(
+            {
+                "signal_date": str(signal_date)[:10],
+                "ordered_candidate_trade_keys": ordered_keys,
+                "ordered_candidate_root_sha256": _selection_sha256(ordered_keys),
+                "decisions": decisions,
+                "selected_trade_keys": day_selected_keys,
+            }
+        )
+
+    selected_keys = [_selection_trade_key(trade) for trade in selected]
+    payload = {
+        "schema_version": "portfolio_selection_receipt/v1",
+        "parameters": {
+            "top_n": int(top_n),
+            "symbol_cooldown_days": int(symbol_cooldown_days),
+            "max_active_positions": int(max_active_positions),
+        },
+        "candidate_count": len(all_candidate_keys),
+        "selected_count": len(selected_keys),
+        "candidate_trade_keys_sha256": _selection_sha256(all_candidate_keys),
+        "selected_trade_keys": selected_keys,
+        "selected_trade_keys_sha256": _selection_sha256(selected_keys),
+        "days": days,
+    }
+    payload["receipt_sha256"] = _selection_sha256(payload)
+    return selected, payload
+
+
+def verify_portfolio_selection_receipt(
+    by_signal_date: Dict[str, List[Dict[str, Any]]],
+    receipt: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not isinstance(receipt, dict) or receipt.get("schema_version") != (
+        "portfolio_selection_receipt/v1"
+    ):
+        raise ValueError("portfolio selection receipt is invalid")
+    parameters = receipt.get("parameters") or {}
+    try:
+        _selected, expected = _select_with_portfolio_controls_receipt(
+            by_signal_date,
+            top_n=int(parameters["top_n"]),
+            symbol_cooldown_days=int(parameters["symbol_cooldown_days"]),
+            max_active_positions=int(parameters["max_active_positions"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("portfolio selection receipt is invalid") from exc
+    if expected != receipt:
+        raise ValueError("portfolio selection receipt replay mismatch")
+    return {
+        "verified": True,
+        "receipt_sha256": expected["receipt_sha256"],
+        "candidate_count": expected["candidate_count"],
+        "selected_count": expected["selected_count"],
+        "selected_trade_keys_sha256": expected["selected_trade_keys_sha256"],
+    }
+
+
+def _select_with_portfolio_controls(
+    by_signal_date: Dict[str, List[Dict[str, Any]]],
+    top_n: int,
+    symbol_cooldown_days: int = 0,
+    max_active_positions: int = 0,
+) -> List[Dict[str, Any]]:
+    selected, _receipt = _select_with_portfolio_controls_receipt(
+        by_signal_date,
+        top_n,
+        symbol_cooldown_days=symbol_cooldown_days,
+        max_active_positions=max_active_positions,
+    )
     return selected
 
 
