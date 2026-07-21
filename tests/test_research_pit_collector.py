@@ -1079,6 +1079,149 @@ def test_macos_systemsetup_and_sntp_subprocesses_both_receive_scrubbed_env(monke
     assert all(not credential_keys & set(env) for _name, env in captured)
 
 
+def test_windows_w32tm_subprocess_receives_scrubbed_env_and_accepts_recent_sync(monkeypatch):
+    """Windows 上 _system_probe 应调用 w32tm /query /status,验证最近同步时间并报告 synchronized=True。"""
+    api = _api()
+    credential_keys = {"TUSHARE_TOKEN", "TUSHARE_API_KEY", "JIAOCH_TOKEN"}
+    for key in credential_keys:
+        monkeypatch.setenv(key, f"secret-{key}")
+    monkeypatch.setattr(api.shutil, "which", lambda name: None)
+    monkeypatch.setattr(api.platform, "system", lambda: "Windows")
+    # w32tm 输出"最近同步时间",需要被解析为 aware UTC,然后和 now_utc 对比。
+    # 固定 now,让同步时间落在 24 小时窗口内。
+    fixed_now = api.datetime(2026, 7, 21, 7, 30, tzinfo=api.timezone.utc)
+    monkeypatch.setattr(api.SystemTrustedClock, "now_utc", staticmethod(lambda: fixed_now))
+
+    captured_env: list[dict] = []
+
+    def run(command, **kwargs):
+        captured_env.append(kwargs["env"])
+        # 真实中文 Windows w32tm 输出(同步时间 = UTC 当天 15:06 ≈ 上海时间 23:06,
+        # 这里用 UTC 当天早些时候让"距今 < 24h"成立)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                "Leap 指示符: 0(无警告)\r\n"
+                "层次: 3 (次引用 - 与(S)NTP 同步)\r\n"
+                "精度: -23 (每刻度 119.209ns)\r\n"
+                "根延迟: 0.0313876s\r\n"
+                "根分散: 1.3653103s\r\n"
+                "引用 ID: 0xCB6B0658 (源 IP:  203.107.6.88)\r\n"
+                "上次成功同步时间: 2026/7/21 15:06:14\r\n"
+                "源: ntp.aliyun.com,0x9\r\n"
+                "轮询间隔: 11 (2048s)\r\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(api.subprocess, "run", run)
+    evidence = api.SystemTrustedClock._system_probe()
+    assert evidence["source"] == "w32tm"
+    assert evidence["synchronized"] is True
+    assert evidence["sync_source"] == "ntp.aliyun.com,0x9"
+    assert evidence["stratum"] == 3
+    # 任何 credential 都不能传给 w32tm 子进程
+    assert all(not credential_keys & set(env) for env in captured_env)
+
+
+def test_windows_w32tm_fails_closed_when_last_sync_too_old(monkeypatch):
+    """w32tm 报告同步时间超过 24 小时时必须 fail-closed。"""
+    api = _api()
+    monkeypatch.setattr(api.shutil, "which", lambda name: None)
+    monkeypatch.setattr(api.platform, "system", lambda: "Windows")
+    fixed_now = api.datetime(2026, 7, 21, 12, 0, tzinfo=api.timezone.utc)
+    monkeypatch.setattr(api.SystemTrustedClock, "now_utc", staticmethod(lambda: fixed_now))
+
+    def run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                "Leap 指示符: 0(无警告)\r\n"
+                "上次成功同步时间: 2026/7/19 09:00:00\r\n"  # 51 小时前
+                "源: ntp.aliyun.com,0x9\r\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(api.subprocess, "run", run)
+    evidence = api.SystemTrustedClock._system_probe()
+    assert evidence["source"] == "w32tm"
+    assert evidence["synchronized"] is False
+    assert "stale" in evidence.get("reason", "")
+
+
+def test_windows_w32tm_fails_closed_when_source_is_local_cmos(monkeypatch):
+    """w32tm 源是 Local CMOS Clock(硬件时钟,未同步)时必须 fail-closed。"""
+    api = _api()
+    monkeypatch.setattr(api.shutil, "which", lambda name: None)
+    monkeypatch.setattr(api.platform, "system", lambda: "Windows")
+    fixed_now = api.datetime(2026, 7, 21, 12, 0, tzinfo=api.timezone.utc)
+    monkeypatch.setattr(api.SystemTrustedClock, "now_utc", staticmethod(lambda: fixed_now))
+
+    def run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                "Leap 指示符: 0(无警告)\r\n"
+                "上次成功同步时间: 2026/7/21 11:55:00\r\n"  # 很近
+                "源: Local CMOS Clock\r\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(api.subprocess, "run", run)
+    evidence = api.SystemTrustedClock._system_probe()
+    assert evidence["source"] == "w32tm"
+    assert evidence["synchronized"] is False
+    assert "local_cmos" in evidence.get("reason", "")
+
+
+def test_windows_w32tm_fails_closed_when_command_fails(monkeypatch):
+    """w32tm 命令不可用或返回非零时必须 fail-closed(而不是 crash)。"""
+    api = _api()
+    monkeypatch.setattr(api.shutil, "which", lambda name: None)
+    monkeypatch.setattr(api.platform, "system", lambda: "Windows")
+
+    def run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="服务未启动")
+
+    monkeypatch.setattr(api.subprocess, "run", run)
+    evidence = api.SystemTrustedClock._system_probe()
+    assert evidence["source"] == "w32tm"
+    assert evidence["synchronized"] is False
+
+
+def test_windows_w32tm_parses_english_output_too(monkeypatch):
+    """英文 Windows 的 w32tm 输出也应被识别(中英双解析)。"""
+    api = _api()
+    monkeypatch.setattr(api.shutil, "which", lambda name: None)
+    monkeypatch.setattr(api.platform, "system", lambda: "Windows")
+    fixed_now = api.datetime(2026, 7, 21, 12, 0, tzinfo=api.timezone.utc)
+    monkeypatch.setattr(api.SystemTrustedClock, "now_utc", staticmethod(lambda: fixed_now))
+
+    def run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                "Leap Indicator: 0(no warning)\r\n"
+                "Stratum: 3 (secondary reference - synchronized)\r\n"
+                "Last Successful Sync Time: 7/21/2026 11:00:00 AM\r\n"
+                "Source: time.windows.com,0x8\r\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(api.subprocess, "run", run)
+    evidence = api.SystemTrustedClock._system_probe()
+    assert evidence["source"] == "w32tm"
+    assert evidence["synchronized"] is True
+    assert evidence["sync_source"] == "time.windows.com,0x8"
+
+
 def test_fetch_partition_sends_one_canonical_four_field_post_body():
     api = _api()
     response = api.HttpEntityResponse(status=200, headers={}, body=_success_body())

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import socket
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -93,8 +94,38 @@ class FakeIndustryHistory:
 
 
 @pytest.fixture(autouse=True)
-def fake_industry_history_provider(monkeypatch):
+def fake_industry_history_provider(monkeypatch, tmp_path):
+    network_attempts = []
+
+    def deny_network(*args, **kwargs):
+        network_attempts.append(args[1:] if len(args) > 1 else args)
+        raise AssertionError("recommendation unit tests must not use the network")
+
+    monkeypatch.setattr(socket, "getaddrinfo", deny_network)
+    monkeypatch.setattr(socket.socket, "connect", deny_network)
+    monkeypatch.setattr(socket.socket, "connect_ex", deny_network)
     monkeypatch.setattr("app.recommendations.IndustryHistoryProvider", lambda cache_dir: FakeIndustryHistory())
+    monkeypatch.setenv(
+        "TRADE_CALENDAR_CACHE_PATH", str(tmp_path / "global-trade-calendar.json")
+    )
+    monkeypatch.setattr("app.recommendations.is_trade_day", lambda _value: True)
+    monkeypatch.setattr(
+        "app.recommendations.next_trade_date", lambda value: value + timedelta(days=1)
+    )
+    monkeypatch.setattr(
+        "app.recommendations.next_calendar_gap", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "app.recommendations.is_a_share_trading_time", lambda _moment: True
+    )
+    monkeypatch.setattr(
+        "app.trading_calendar._load_trade_dates",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("recommendation tests must not load the global calendar")
+        ),
+    )
+    yield
+    assert network_attempts == []
 
 
 class FakeNews:
@@ -204,6 +235,7 @@ def make_settings(tmp_path):
         recommendation_audit_path=str(tmp_path / "recommendations_audit.jsonl"),
         alerts_path=str(tmp_path / "alerts.jsonl"),
         universe_cache_path=str(tmp_path / "universe.json"),
+        trade_calendar_cache_path=str(tmp_path / "trading_calendar.json"),
         recommendation_lock_path=str(tmp_path / "recommendations.lock"),
         current_pool_audit_path=str(current_pool_audit_path),
         scan_max_deep=3,
@@ -314,6 +346,10 @@ def test_skipped_run_still_writes_empty_funnel_and_audit(tmp_path, monkeypatch):
 
 
 def test_generation_can_target_the_next_trade_date(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "app.recommendations.now_cn",
+        lambda: datetime(2026, 7, 10, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
     service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
     service.industry = FakeIndustry()
     service.industry_history = FakeIndustryHistory()
@@ -1298,13 +1334,17 @@ def test_generate_daily_recommendations_default_strict_filter_blocks_weak_signal
     assert result["items"] == []
 
 
-def test_generate_daily_recommendations_skips_recent_symbol_in_cooldown(tmp_path):
+def test_generate_daily_recommendations_skips_recent_symbol_in_cooldown(
+    tmp_path,
+):
     settings = make_settings(tmp_path)
     settings = replace(settings, recommendation_symbol_cooldown_days=10)
     append_jsonl(
         settings.recommendation_history_path,
         {
-            "generated_at": "2026-07-04T09:00:00+08:00",
+            "generated_at": (
+                datetime.now(ZoneInfo("Asia/Shanghai")) - timedelta(days=1)
+            ).isoformat(),
             "items": [{"symbol": "600519", "market": "a"}],
         },
     )
@@ -1456,7 +1496,11 @@ def test_generate_daily_recommendations_blocks_high_fund_outflow(tmp_path):
     assert service.fund_flow.calls == ["600519"]
 
 
-def test_monitor_recommendations_alerts_when_stop_loss_breaks(tmp_path):
+def test_monitor_recommendations_alerts_when_stop_loss_breaks(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "app.recommendations.now_cn",
+        lambda: datetime(2026, 7, 10, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
     settings = make_settings(tmp_path)
     service = RecommendationService(settings, FakeProvider(), "risk")
     service.industry = FakeIndustry()
@@ -1499,7 +1543,13 @@ def test_monitor_recommendations_alerts_when_stop_loss_breaks(tmp_path):
     assert result["alerts"][0]["event_type"] == "stop_loss"
 
 
-def test_monitor_recommendations_alerts_when_take_profit_reached(tmp_path):
+def test_monitor_recommendations_alerts_when_take_profit_reached(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "app.recommendations.now_cn",
+        lambda: datetime(2026, 7, 10, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
     settings = make_settings(tmp_path)
     service = RecommendationService(settings, FakeProvider(), "risk")
     service.industry = FakeIndustry()
@@ -1542,7 +1592,11 @@ def test_monitor_recommendations_alerts_when_take_profit_reached(tmp_path):
     assert result["alerts"][0]["severity"] == "info"
 
 
-def test_monitor_recommendations_uses_l1_quotes_before_snapshot(tmp_path):
+def test_monitor_recommendations_uses_l1_quotes_before_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "app.recommendations.now_cn",
+        lambda: datetime(2026, 7, 10, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
     settings = make_settings(tmp_path)
     service = RecommendationService(settings, FakeProvider(), "risk")
     service.l1_quotes = FakeL1Quotes(

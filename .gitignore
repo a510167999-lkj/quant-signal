@@ -8,3 +8,10 @@ __pycache__/
 .worktrees/
 data/*
 !data/.gitkeep
+# Scratch/diagnostic work directories created by research tooling must never
+# be tracked. Keep them out of git even when an agent forgets to clean up.
+tmp/
+*.tmp/
+.secrets/
+.zcode/
+tmp_test_result.txt

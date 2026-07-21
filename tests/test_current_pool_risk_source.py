@@ -132,7 +132,7 @@ def test_resume_day_blocks_new_entry_at_morning_and_afternoon_boundaries(
         output_dir=tmp_path / "risk",
         fetch_partition=fetch,
     )
-    payload = json.loads(Path(result["path"]).read_text())
+    payload = json.loads(Path(result["path"]).read_text(encoding="utf-8"))
     assert payload["risk_snapshot_complete"] is True
     item = next(item for item in payload["items"] if item["ts_code"] == "300001.SZ")
     assert item["is_suspended"] is True
@@ -169,7 +169,7 @@ def test_fails_closed_on_unsafe_partition_data(tmp_path: Path, failure: str):
 
 def test_rejects_tampered_universe_and_wrong_collection_day_before_fetch(tmp_path: Path):
     universe = _universe(tmp_path)
-    tampered = json.loads(universe.read_text())
+    tampered = json.loads(universe.read_text(encoding="utf-8"))
     tampered["items"][0]["name"] = "tampered"
     candidate = tmp_path / "tampered.json"
     candidate.write_text(json.dumps(tampered))
@@ -238,7 +238,7 @@ def test_same_day_suspend_and_resume_conflict_blocks_entry(tmp_path: Path):
         return _envelope(fields, [])
 
     result = build_current_pool_risk_descriptor(as_of="2026-07-13", retrieved_at="2026-07-13T09:30:00+08:00", universe_path=universe, output_dir=tmp_path / "risk", fetch_partition=fetch)
-    item = next(item for item in json.loads(Path(result["path"]).read_text())["items"] if item["ts_code"] == "300001.SZ")
+    item = next(item for item in json.loads(Path(result["path"]).read_text(encoding="utf-8"))["items"] if item["ts_code"] == "300001.SZ")
     assert item["is_suspended"] is True
     assert item["suspension_reason"] == "conflict"
 
@@ -256,7 +256,7 @@ def test_risk_verifier_rejects_resigned_invalid_retrieved_at(
     tmp_path: Path, retrieved_at: str | None
 ) -> None:
     universe = _universe(tmp_path)
-    universe_payload = json.loads(universe.read_text())
+    universe_payload = json.loads(universe.read_text(encoding="utf-8"))
     result = build_current_pool_risk_descriptor(
         as_of="2026-07-13",
         retrieved_at="2026-07-13T09:30:00+08:00",
@@ -264,7 +264,7 @@ def test_risk_verifier_rejects_resigned_invalid_retrieved_at(
         output_dir=tmp_path / "risk",
         fetch_partition=lambda api, params, fields: _envelope(fields, []),
     )
-    candidate = json.loads(Path(result["path"]).read_text())
+    candidate = json.loads(Path(result["path"]).read_text(encoding="utf-8"))
     candidate["retrieved_at"] = retrieved_at
     candidate.pop("descriptor_sha256")
     candidate["descriptor_sha256"] = hashlib.sha256(
@@ -306,6 +306,34 @@ def test_transport_exception_never_exposes_token(monkeypatch, tmp_path: Path):
     assert caught.value.__cause__ is None
 
 
+def test_transport_exception_message_includes_exception_type_without_token(monkeypatch, tmp_path: Path):
+    """失败消息必须带异常类型名(便于诊断 Windows clock gate / TLS / 超时),但不带原始消息(防 token 泄露)。"""
+    universe = _universe(tmp_path)
+    token = "do-not-leak-token"
+
+    class Transport:
+        def __init__(self, **kwargs):
+            pass
+
+        def post(self, **kwargs):
+            raise TimeoutError(f"connect timed out leaked={token}")
+
+    monkeypatch.setattr(current_pool_risk_source, "resolve_tushare_source", lambda *a, **k: SimpleNamespace(token=token, proxy_url=None, api_url="https://jiaoch.site"))
+    monkeypatch.setattr(current_pool_risk_source, "UrllibTushareTransport", Transport)
+    with pytest.raises(CurrentPoolRiskSourceError) as caught:
+        fetch_jiaoch_current_pool_risk_descriptor(
+            as_of="2026-07-13",
+            universe_path=universe,
+            output_dir=tmp_path / "risk",
+            now_provider=lambda: datetime(2026, 7, 13, 9, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    message = str(caught.value)
+    assert "TimeoutError" in message, f"exception type missing from message: {message}"
+    assert token not in message, f"token leaked into message: {message}"
+    assert "network failed" not in message
+    assert caught.value.__cause__ is None
+
+
 def test_existing_content_address_conflict_is_rejected(tmp_path: Path, monkeypatch):
     universe = _universe(tmp_path)
     output = tmp_path / "risk"
@@ -315,11 +343,32 @@ def test_existing_content_address_conflict_is_rejected(tmp_path: Path, monkeypat
         build_current_pool_risk_descriptor(as_of="2026-07-13", retrieved_at="2026-07-13T09:30:00+08:00", universe_path=universe, output_dir=output, fetch_partition=lambda api, params, fields: _envelope(fields, []))
 
 
+def test_risk_publisher_uses_cross_platform_directory_fsync(tmp_path: Path, monkeypatch):
+    universe = _universe(tmp_path)
+    output = tmp_path / "risk"
+    calls = []
+    monkeypatch.setattr(
+        current_pool_risk_source,
+        "fsync_directory",
+        lambda directory: calls.append(Path(directory)),
+    )
+
+    build_current_pool_risk_descriptor(
+        as_of="2026-07-13",
+        retrieved_at="2026-07-13T09:30:00+08:00",
+        universe_path=universe,
+        output_dir=output,
+        fetch_partition=lambda api, params, fields: _envelope(fields, []),
+    )
+
+    assert calls == [output]
+
+
 def test_risk_verifier_rejects_topology_and_item_semantic_mutations(tmp_path: Path):
     universe = _universe(tmp_path)
-    universe_payload = json.loads(universe.read_text())
+    universe_payload = json.loads(universe.read_text(encoding="utf-8"))
     result = build_current_pool_risk_descriptor(as_of="2026-07-13", retrieved_at="2026-07-13T09:30:00+08:00", universe_path=universe, output_dir=tmp_path / "risk", fetch_partition=lambda api, params, fields: _envelope(fields, []))
-    original = json.loads(Path(result["path"]).read_text())
+    original = json.loads(Path(result["path"]).read_text(encoding="utf-8"))
     mutations = [
         lambda value: value["partition_receipts"][0]["params"].update(trade_date="20260712"),
         lambda value: value["partition_receipts"][2]["params"].update(start_date="19910101"),
@@ -356,7 +405,7 @@ def test_duplicate_stock_st_symbol_is_rejected(tmp_path: Path, different_type: b
 
 def test_active_star_st_name_alone_marks_st_and_verifies(tmp_path: Path):
     universe = _universe(tmp_path)
-    universe_payload = json.loads(universe.read_text())
+    universe_payload = json.loads(universe.read_text(encoding="utf-8"))
 
     def fetch(api_name, params, fields):
         if api_name == "namechange" and params["start_date"] == "20260101":
@@ -364,7 +413,7 @@ def test_active_star_st_name_alone_marks_st_and_verifies(tmp_path: Path):
         return _envelope(fields, [])
 
     result = build_current_pool_risk_descriptor(as_of="2026-07-13", retrieved_at="2026-07-13T09:30:00+08:00", universe_path=universe, output_dir=tmp_path / "risk", fetch_partition=fetch)
-    payload = json.loads(Path(result["path"]).read_text())
+    payload = json.loads(Path(result["path"]).read_text(encoding="utf-8"))
     item = next(item for item in payload["items"] if item["ts_code"] == "600000.SH")
     assert item["is_st"] is True
     assert item["st_type"] is None
@@ -382,7 +431,7 @@ def test_nonprefix_st_text_does_not_mark_risk(tmp_path: Path, name: str):
         return _envelope(fields, [])
 
     result = build_current_pool_risk_descriptor(as_of="2026-07-13", retrieved_at="2026-07-13T09:30:00+08:00", universe_path=universe, output_dir=tmp_path / "risk", fetch_partition=fetch)
-    item = next(item for item in json.loads(Path(result["path"]).read_text())["items"] if item["ts_code"] == "600000.SH")
+    item = next(item for item in json.loads(Path(result["path"]).read_text(encoding="utf-8"))["items"] if item["ts_code"] == "600000.SH")
     assert item["is_st"] is False
     assert item["st_type"] is None
 
@@ -426,7 +475,9 @@ def test_jiaoch_adapter_uses_fixed_https_paths_and_rejects_secret(monkeypatch, t
         "https://jiaoch.site/suspend_d",
         "https://jiaoch.site/namechange",
     }
-    assert token not in Path(next((tmp_path / "risk").glob("*.json"))).read_text()
+    assert token not in Path(next((tmp_path / "risk").glob("*.json"))).read_text(
+        encoding="utf-8"
+    )
 
     mode["secret"] = True
     with pytest.raises(CurrentPoolRiskSourceError, match="risk source collection failed"):

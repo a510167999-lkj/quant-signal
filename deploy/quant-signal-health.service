@@ -6,5 +6,7 @@ After=quant-signal.service
 Type=oneshot
 SuccessExitStatus=1
 User=ubuntu
+Group=ubuntu
 WorkingDirectory=/home/ubuntu/quant-signal
+EnvironmentFile=/home/ubuntu/quant-signal/.env
 ExecStart=/home/ubuntu/quant-signal/deploy/check-production-health.sh

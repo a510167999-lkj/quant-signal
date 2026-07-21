@@ -9,14 +9,24 @@ latency is synthetic.
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
+from pathlib import Path
 import sqlite3
 import statistics
+import subprocess
+import sys
 import threading
 import time
 import tracemalloc
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.research_partitions import load_temporal_partition_contract
 from app.research_pit_collector import ControlledTushareCollector, HttpEntityResponse
@@ -159,12 +169,19 @@ class Measurement:
     workers: int
     elapsed_s: float
     max_active: int
-    peak_bytes: int
+    peak_bytes: Optional[int]
     calls: list
     report: dict
     audit: dict
     store: PITReceiptStore
     rss_delta_bytes: Optional[int] = None
+    round_index: Optional[int] = None
+    position: Optional[int] = None
+    pid: int = 0
+    logical_cpu_count: int = 0
+    affinity: Optional[tuple[int, ...]] = None
+    elapsed_ns: int = 0
+    timed_phase: str = "collector.collect_only"
 
 
 def _collector(store, transport, workers):
@@ -197,6 +214,23 @@ def _rss_bytes():
         return None
 
 
+def _cpu_metadata():
+    logical_cpu_count = os.cpu_count() or 1
+    try:
+        import psutil
+
+        affinity = tuple(psutil.Process().cpu_affinity())
+    except (ImportError, OSError):
+        affinity = None
+    return logical_cpu_count, affinity
+
+
+def _fresh_e_root(label):
+    root = Path("tmp") / f"throughput-{label}-{uuid.uuid4().hex}"
+    root.mkdir(parents=True, exist_ok=False)
+    return root
+
+
 def _measure(
     root,
     workers,
@@ -206,30 +240,51 @@ def _measure(
     end_date="2024-01-03",
     delay_s=NETWORK_DELAY_S,
     stock_count=None,
+    capture_python_heap=True,
+    round_index=None,
+    position=None,
 ):
-    store = PITReceiptStore(str(root / f"store-{label}-{workers}"))
+    store_path = root / f"store-{label}-{workers}"
+    assert not store_path.exists(), f"benchmark store root must be fresh: {store_path}"
+    assert not tracemalloc.is_tracing(), "benchmark environment has active tracemalloc"
+    assert not multiprocessing.active_children(), "benchmark environment has active child processes"
+    assert not [
+        thread for thread in threading.enumerate()
+        if thread.name.startswith("ThreadPoolExecutor")
+    ], "benchmark environment has active executor threads"
+    logical_cpu_count, affinity = _cpu_metadata()
+    store = PITReceiptStore(str(store_path))
     transport = LatencyControlledTransport(delay_s, stock_count)
     collector = _collector(store, transport, workers)
     before_threads = {thread.ident for thread in threading.enumerate()}
     rss_before = _rss_bytes()
-    tracemalloc.start()
-    started = time.monotonic()
-    report = collector.collect(start_date=start_date, end_date=end_date, workers=workers)
-    elapsed = time.monotonic() - started
-    _, peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
+    peak = None
+    if capture_python_heap:
+        tracemalloc.start()
+    try:
+        started_ns = time.perf_counter_ns()
+        report = collector.collect(start_date=start_date, end_date=end_date, workers=workers)
+        elapsed_ns = time.perf_counter_ns() - started_ns
+        elapsed = elapsed_ns / 1_000_000_000
+        if capture_python_heap:
+            _, peak = tracemalloc.get_traced_memory()
+    finally:
+        if capture_python_heap:
+            tracemalloc.stop()
     leaked = [
         thread
         for thread in threading.enumerate()
         if thread.ident not in before_threads and thread.name.startswith("ThreadPoolExecutor")
     ]
     assert leaked == []
+    assert not multiprocessing.active_children(), "collector left active child processes"
     rss_after = _rss_bytes()
     audit = store.audit_coverage(start_date=start_date, end_date=end_date)
     rss_delta = None if rss_before is None or rss_after is None else max(0, rss_after - rss_before)
     return Measurement(
         workers, elapsed, transport.max_active, peak, transport.calls,
-        report, audit, store, rss_delta,
+        report, audit, store, rss_delta, round_index, position, os.getpid(),
+        logical_cpu_count, affinity, elapsed_ns, "collector.collect_only",
     )
 
 
@@ -307,16 +362,180 @@ def _assert_terminal_event_lineage(store, expected_attempts):
             assert row["market_semantics_sha256"] == row["request_semantics_sha256"]
 
 
-def test_full_collector_parallel_throughput_and_business_equivalence(tmp_path):
-    samples = {
-        workers: [
-            _measure(
-                tmp_path, workers, label=f"throughput-{workers}-{sample}",
-                end_date="2024-01-05",
+def _throughput_sample_schedule():
+    return (
+        (1, 2, 8, 4),
+        (2, 4, 1, 8),
+        (4, 8, 2, 1),
+        (8, 1, 4, 2),
+    )
+
+
+def _paired_measurements(samples, left_workers, right_workers):
+    left = {item.round_index: item for item in samples[left_workers]}
+    right = {item.round_index: item for item in samples[right_workers]}
+    assert None not in left and None not in right
+    assert set(left) == set(right)
+    assert len(left) == len(samples[left_workers])
+    assert len(right) == len(samples[right_workers])
+    return [(left[index], right[index]) for index in sorted(left)]
+
+
+def _subprocess_diagnostic(result):
+    payload = result.stderr or result.stdout or b""
+    return bytes(payload).decode("utf-8", errors="replace")
+
+
+def _json_stdout(result):
+    assert isinstance(result.stdout, (bytes, bytearray)), _subprocess_diagnostic(result)
+    return json.loads(bytes(result.stdout).decode("utf-8", errors="strict"))
+
+
+def test_throughput_child_protocol_uses_binary_capture_and_strict_json_utf8():
+    result = subprocess.CompletedProcess(
+        args=["synthetic-child"],
+        returncode=0,
+        stdout=b'{"workers":4,"elapsed_s":1.25}',
+        stderr=b"\xd6",
+    )
+
+    assert _json_stdout(result) == {"workers": 4, "elapsed_s": 1.25}
+    assert "\ufffd" in _subprocess_diagnostic(result)
+
+    with pytest.raises(UnicodeDecodeError):
+        _json_stdout(
+            subprocess.CompletedProcess(
+                args=["synthetic-child"], returncode=0, stdout=b"\xd6", stderr=b""
             )
-            for sample in range(3)
-        ]
-        for workers in (1, 2, 4, 8)
+        )
+
+
+def test_throughput_child_commands_force_utf8_before_protocol_output(monkeypatch, tmp_path):
+    captured = []
+
+    def intercepted_run(args, **kwargs):
+        captured.append((args, kwargs))
+        raise RuntimeError("intercepted child launch")
+
+    monkeypatch.setattr(subprocess, "run", intercepted_run)
+
+    with pytest.raises(RuntimeError, match="intercepted child launch"):
+        _measure_isolated(
+            tmp_path,
+            2,
+            label="isolated",
+            end_date="2024-01-05",
+            round_index=0,
+            position=0,
+        )
+    with pytest.raises(RuntimeError, match="intercepted child launch"):
+        _measure_pair_isolated(tmp_path, 0, {1: 0, 4: 1})
+
+    assert len(captured) == 2
+    for args, kwargs in captured:
+        assert args[0] == sys.executable
+        assert args[1:3] == ["-X", "utf8"]
+        assert kwargs == {"capture_output": True, "check": False}
+
+
+def _measure_isolated(root, workers, *, label, end_date, round_index, position):
+    assert not multiprocessing.active_children(), "benchmark parent has active child processes"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-X",
+            "utf8",
+            str(Path(__file__).resolve()),
+            "--throughput-worker",
+            str(root.resolve()),
+            str(workers),
+            label,
+            end_date,
+            str(round_index),
+            str(position),
+        ],
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, _subprocess_diagnostic(result)
+    payload = _json_stdout(result)
+    assert not multiprocessing.active_children(), "benchmark child process did not exit"
+    return _measurement_from_payload(root, payload, label)
+
+
+def _measurement_from_payload(root, payload, label):
+    workers = payload["workers"]
+    store_path = root / f"store-{label}-{workers}"
+    assert store_path.is_dir()
+    return Measurement(
+        payload["workers"], payload["elapsed_s"], payload["max_active"],
+        payload["peak_bytes"], [tuple(call) for call in payload["calls"]], payload["report"],
+        payload["audit"], PITReceiptStore(str(store_path)), payload["rss_delta_bytes"],
+        payload["round_index"], payload["position"], payload["pid"],
+        payload["logical_cpu_count"], tuple(payload["affinity"]) if payload["affinity"] else None,
+        payload["elapsed_ns"], payload["timed_phase"],
+    )
+
+
+def _measure_pair_isolated(root, round_index, positions):
+    assert not multiprocessing.active_children(), "benchmark parent has active child processes"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-X",
+            "utf8",
+            str(Path(__file__).resolve()),
+            "--throughput-pair",
+            str(root.resolve()),
+            str(round_index),
+            str(positions[1]),
+            str(positions[4]),
+        ],
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, _subprocess_diagnostic(result)
+    payloads = _json_stdout(result)
+    assert len(payloads) == 2
+    assert not multiprocessing.active_children(), "benchmark pair child did not exit"
+    return sorted(
+        (_measurement_from_payload(root, payload, payload["label"]) for payload in payloads),
+        key=lambda measurement: measurement.workers,
+    )
+
+
+def test_full_collector_parallel_throughput_and_business_equivalence():
+    tmp_path = _fresh_e_root("full")
+    workers_set = (1, 2, 4, 8)
+    samples = {workers: [] for workers in workers_set}
+    for round_index, round_workers in enumerate(_throughput_sample_schedule()):
+        positions = {workers: position for position, workers in enumerate(round_workers)}
+        pair = _measure_pair_isolated(tmp_path, round_index, positions)
+        samples[1].append(pair[0])
+        samples[4].append(pair[1])
+        for position, workers in enumerate(round_workers):
+            if workers in {1, 4}:
+                continue
+            samples[workers].append(
+                _measure_isolated(
+                    tmp_path,
+                    workers,
+                    label=f"throughput-r{round_index}-p{position}-w{workers}",
+                    end_date="2024-01-05",
+                    round_index=round_index,
+                    position=position,
+                )
+            )
+    heap_samples = {
+        workers: _measure(
+            tmp_path,
+            workers,
+            label=f"heap-{workers}",
+            end_date="2024-01-05",
+            delay_s=0,
+            capture_python_heap=True,
+        )
+        for workers in workers_set
     }
     measurements = [measurement for group in samples.values() for measurement in group]
     baseline = samples[1][0]
@@ -332,11 +551,16 @@ def test_full_collector_parallel_throughput_and_business_equivalence(tmp_path):
     }
 
     for measured in measurements:
+        assert measured.pid > 0
+        assert measured.pid != os.getpid()
+        assert measured.logical_cpu_count >= 1
+        assert measured.affinity is None or measured.affinity
+        assert measured.elapsed_ns > 0
+        assert measured.timed_phase == "collector.collect_only"
         assert len(measured.calls) == expected_calls
         assert len(set(measured.calls)) == expected_calls
         assert sorted(measured.calls) == sorted(baseline.calls)
         assert measured.max_active <= measured.workers
-        assert measured.peak_bytes < 32 * 1024 * 1024
         # The top-level report counts controlled receipts plus stock shards;
         # market-generation attempts are represented by their generation refs.
         assert measured.report["attempt_count"] == 2 + 8 + len(SESSIONS)
@@ -389,28 +613,28 @@ def test_full_collector_parallel_throughput_and_business_equivalence(tmp_path):
     assert min(item.max_active for item in samples[2]) >= 2
     assert min(item.max_active for item in samples[4]) >= 4
     assert min(item.max_active for item in samples[8]) >= 6
+    assert all(
+        sample.peak_bytes is not None and sample.peak_bytes < 32 * 1024 * 1024
+        for sample in heap_samples.values()
+    )
     serial_median = statistics.median(item.elapsed_s for item in samples[1])
-    parallel_median = statistics.median(item.elapsed_s for item in samples[4])
     assert len(samples[1]) == len(samples[4])
-    paired_speedups = [
-        serial.elapsed_s / parallel.elapsed_s
-        for serial, parallel in zip(samples[1], samples[4])
-    ]
-    assert serial_median / parallel_median >= 2.2
+    paired = _paired_measurements(samples, 1, 4)
+    paired_speedups = [serial.elapsed_s / parallel.elapsed_s for serial, parallel in paired]
+    paired_speedup_median = statistics.median(paired_speedups)
+    assert paired_speedup_median >= 2.2
     assert min(paired_speedups) >= 1.8
 
     print("\nworkers  median_s  speedup  worst_pair  max_active  peak_mib")
-    for workers in (1, 2, 4, 8):
+    for workers in workers_set:
         group = samples[workers]
         median_s = statistics.median(item.elapsed_s for item in group)
         assert len(samples[1]) == len(group)
-        worst = min(
-            serial.elapsed_s / parallel.elapsed_s
-            for serial, parallel in zip(samples[1], group)
-        )
+        paired_group = _paired_measurements(samples, 1, workers)
+        worst = min(serial.elapsed_s / parallel.elapsed_s for serial, parallel in paired_group)
         print(f"{workers:>7}  {median_s:>8.3f}  {serial_median / median_s:>7.2f}x  "
               f"{worst:>10.2f}x  {max(item.max_active for item in group):>10}  "
-              f"{max(item.peak_bytes for item in group) / 1024 / 1024:>8.2f}")
+              f"{heap_samples[workers].peak_bytes / 1024 / 1024:>8.2f}")
 
 
 class _ResumeForbiddenTransport:
@@ -418,7 +642,8 @@ class _ResumeForbiddenTransport:
         raise AssertionError("resume of a complete collection must use zero network calls")
 
 
-def test_full_collector_python_heap_scaling_smoke(tmp_path):
+def test_full_collector_python_heap_scaling_smoke():
+    tmp_path = _fresh_e_root("heap")
     # tracemalloc observes Python allocations only. RSS is optional diagnostic
     # output when psutil happens to be installed; it is deliberately not a gate.
     small = _measure(
@@ -466,3 +691,124 @@ def test_full_collector_python_heap_scaling_smoke(tmp_path):
         f"{large.peak_bytes / 1024 / 1024:.2f}, "
         f"rss_delta_mib={None if large.rss_delta_bytes is None else round(large.rss_delta_bytes / 1024 / 1024, 2)}"
     )
+
+
+def test_throughput_measurement_excludes_python_heap_tracing(monkeypatch):
+    def unexpected_tracemalloc_call(*_args, **_kwargs):
+        raise AssertionError("throughput timing must not enable Python heap tracing")
+
+    monkeypatch.setattr(tracemalloc, "start", unexpected_tracemalloc_call)
+    monkeypatch.setattr(tracemalloc, "stop", unexpected_tracemalloc_call)
+    monkeypatch.setattr(tracemalloc, "get_traced_memory", unexpected_tracemalloc_call)
+    tmp_path = _fresh_e_root("no-heap-tracing")
+    measured = _measure(
+        tmp_path,
+        1,
+        label="no-heap-tracing",
+        end_date="2024-01-02",
+        delay_s=0,
+        capture_python_heap=False,
+    )
+    assert measured.peak_bytes is None
+
+
+def test_throughput_measurement_rejects_preexisting_tracemalloc(monkeypatch):
+    monkeypatch.setattr(tracemalloc, "is_tracing", lambda: True)
+    tmp_path = _fresh_e_root("preexisting-tracemalloc")
+    with pytest.raises(AssertionError, match="active tracemalloc"):
+        _measure(tmp_path, 1, label="preexisting-tracemalloc", capture_python_heap=False)
+
+
+def test_throughput_measurement_rejects_preexisting_child_process(monkeypatch):
+    monkeypatch.setattr(multiprocessing, "active_children", lambda: [object()])
+    tmp_path = _fresh_e_root("preexisting-child")
+    with pytest.raises(AssertionError, match="active child processes"):
+        _measure(tmp_path, 1, label="preexisting-child", capture_python_heap=False)
+
+
+def test_throughput_measurement_requires_fresh_store_root():
+    tmp_path = _fresh_e_root("existing")
+    (tmp_path / "store-existing-1").mkdir()
+    with pytest.raises(AssertionError, match="store root must be fresh"):
+        _measure(tmp_path, 1, label="existing", capture_python_heap=False)
+
+
+def test_throughput_sample_schedule_is_latin_balanced():
+    rounds = _throughput_sample_schedule()
+    workers = (1, 2, 4, 8)
+    assert len(rounds) == len(workers)
+    assert all(tuple(sorted(round_)) == workers for round_ in rounds)
+    for worker in workers:
+        assert sorted(round_.index(worker) for round_ in rounds) == list(range(len(workers)))
+
+
+def test_throughput_sample_schedule_balances_directed_carryover():
+    rounds = _throughput_sample_schedule()
+    transitions = [
+        (round_[position], round_[position + 1])
+        for round_ in rounds
+        for position in range(len(round_) - 1)
+    ]
+    assert len(transitions) == 12
+    assert len(set(transitions)) == len(transitions)
+
+
+def _measurement_payload(measurement, label):
+    return {
+        "label": label,
+        "workers": measurement.workers,
+        "elapsed_s": measurement.elapsed_s,
+        "max_active": measurement.max_active,
+        "peak_bytes": measurement.peak_bytes,
+        "calls": measurement.calls,
+        "report": measurement.report,
+        "audit": measurement.audit,
+        "rss_delta_bytes": measurement.rss_delta_bytes,
+        "round_index": measurement.round_index,
+        "position": measurement.position,
+        "pid": measurement.pid,
+        "logical_cpu_count": measurement.logical_cpu_count,
+        "affinity": measurement.affinity,
+        "elapsed_ns": measurement.elapsed_ns,
+        "timed_phase": measurement.timed_phase,
+    }
+
+
+def _throughput_worker_main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "--throughput-pair":
+        root = Path(sys.argv[2])
+        round_index = int(sys.argv[3])
+        positions = {1: int(sys.argv[4]), 4: int(sys.argv[5])}
+        payloads = []
+        order = tuple(sorted((1, 4), key=lambda workers: positions[workers]))
+        for workers in order:
+            label = f"throughput-r{round_index}-p{positions[workers]}-w{workers}"
+            measurement = _measure(
+                root,
+                workers,
+                label=label,
+                end_date="2024-01-05",
+                capture_python_heap=False,
+                round_index=round_index,
+                position=positions[workers],
+            )
+            payloads.append(_measurement_payload(measurement, label))
+        print(json.dumps(payloads, ensure_ascii=False, separators=(",", ":")))
+        return
+    if len(sys.argv) != 8 or sys.argv[1] != "--throughput-worker":
+        return
+    measurement = _measure(
+        Path(sys.argv[2]),
+        int(sys.argv[3]),
+        label=sys.argv[4],
+        end_date=sys.argv[5],
+        capture_python_heap=False,
+        round_index=int(sys.argv[6]),
+        position=int(sys.argv[7]),
+    )
+    print(json.dumps(_measurement_payload(measurement, sys.argv[4]),
+                     ensure_ascii=False, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    _throughput_worker_main()

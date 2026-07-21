@@ -533,7 +533,11 @@ def test_verified_contract_rejects_trade_outside_declared_range(tmp_path):
 def test_development_gates_never_claim_completion_without_final_and_stress():
     start = date(2022, 1, 1)
     trades = [
-        _trade(start + timedelta(days=offset), 2.0, symbol=f"{603000 + offset:06d}")
+        _trade(
+            start + timedelta(days=offset),
+            2.0 if offset % 20 < 11 else -1.0,
+            symbol=f"{603000 + offset:06d}",
+        )
         for offset in range(600)
     ]
 
@@ -611,6 +615,78 @@ def test_development_gates_use_realistic_return_drawdown_and_quality_targets():
     assert qualification["calmar_pass"] is True
     assert qualification["observed_win_rate_pct"] >= 52.0
     assert qualification["target_profile"] == "primary_50_return_15_drawdown"
+
+
+def test_development_profile_name_and_values_follow_frozen_50_15_target():
+    start = date(2022, 1, 1)
+    report = run_frozen_strategy_validation(
+        [
+            _trade(start + timedelta(days=offset), 2.0, symbol=f"{605000 + offset:06d}")
+            for offset in range(220)
+        ],
+        strategy={
+            "hold_days": 3,
+            "top_n": 3,
+            "target_one_year_return_pct": 50.0,
+            "target_drawdown_pct": 15.0,
+            "target_win_rate_pct": 52.0,
+            "target_win_rate_max_pct": 60.0,
+        },
+        validation={
+            "train_days": 60,
+            "validation_days": 30,
+            "step_days": 30,
+            "embargo_days": 5,
+            "final_oos_start": "2026-07-13",
+            "minimum_oos_trades": 200,
+        },
+    )
+
+    qualification = report["qualification"]
+    assert qualification["target_profile"] == "primary_50_return_15_drawdown"
+    assert qualification["target_profile_values"] == {
+        "one_year_return_pct": 50.0,
+        "max_drawdown_pct": 15.0,
+        "win_rate_min_pct": 52.0,
+        "win_rate_max_pct": 60.0,
+        "profit_factor": 1.3,
+        "calmar": 1.5,
+    }
+
+
+def test_development_profile_rejects_win_rate_above_frozen_ceiling():
+    start = date(2022, 1, 1)
+    report = run_frozen_strategy_validation(
+        [
+            _trade(start + timedelta(days=offset), 2.0, symbol=f"606000{offset:02d}")
+            for offset in range(220)
+        ],
+        strategy={
+            "hold_days": 3,
+            "top_n": 3,
+            "target_one_year_return_pct": 50.0,
+            "target_drawdown_pct": 15.0,
+            "target_win_rate_pct": 52.0,
+            "target_win_rate_max_pct": 60.0,
+            "target_profit_factor": 1.3,
+            "target_calmar": 1.5,
+        },
+        validation={
+            "train_days": 60,
+            "validation_days": 30,
+            "step_days": 30,
+            "embargo_days": 5,
+            "final_oos_start": "2026-07-13",
+            "minimum_oos_trades": 200,
+        },
+    )
+
+    qualification = report["qualification"]
+    assert qualification["target_profile_values"]["one_year_return_pct"] == 50.0
+    assert qualification["target_profile_values"]["win_rate_min_pct"] == 52.0
+    assert qualification["target_profile_values"]["win_rate_max_pct"] == 60.0
+    assert qualification["observed_win_rate_ceiling_pass"] is False
+    assert qualification["profile_primary_gates_pass"] is False
 
 
 def test_experiment_event_ledger_proves_registration_precedes_result(tmp_path):
@@ -1166,7 +1242,11 @@ def test_validation_read_failures_are_registered_then_failed(tmp_path, monkeypat
     ledger = tmp_path / "read-failure-ledger.jsonl"
     if isinstance(error, PermissionError):
         source.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(Path, "read_bytes", lambda self: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(
+        jobs,
+        "_read_bounded_regular_file_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(error),
+    )
     with pytest.raises(type(error)):
         jobs.main(
             [

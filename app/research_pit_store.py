@@ -19,12 +19,24 @@ import shutil
 import sqlite3
 import stat
 import tempfile
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 from urllib.parse import quote, urlsplit
 
+from app.durable_io import fsync_directory, fsync_file
 from app.research_pit_contracts import STOCK_BASIC_FIELDS
 from app.research_membership import (
     MEMBERSHIP_POLICY_VERSION,
@@ -1293,14 +1305,19 @@ class PITReceiptStore:
         self.raw_root.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(str(self.database_path), timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=FULL")
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=30000")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA busy_timeout=30000")
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -1948,11 +1965,7 @@ class PITReceiptStore:
 
     @staticmethod
     def _fsync_directory(path: Path) -> None:
-        descriptor = os.open(str(path), os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        fsync_directory(path)
 
     def _publish_raw(
         self, dataset: str, raw_bytes: bytes, digest: str, *, suffix: str = ".json"
@@ -9845,8 +9858,7 @@ class PITReceiptStore:
                 finally:
                     destination.close()
 
-            with database_path.open("rb") as database_handle:
-                os.fsync(database_handle.fileno())
+            fsync_file(database_path)
             sqlite_sha256 = _file_sha256(database_path)
             sqlite_bytes = database_path.stat().st_size
             manifest_payload = {
@@ -11385,7 +11397,7 @@ class AuditedPointInTimeUniverse:
                 """
                 SELECT substr(daily.ts_code, 1, 6) AS symbol,
                        daily.ts_code, daily.exchange, 'a' AS market,
-                       daily.name, daily.industry
+                       daily.name, daily.industry, daily.list_date
                 FROM daily_universe AS daily
                 WHERE daily.trade_date = ?
                   AND substr(daily.ts_code, 1, 6) = ?
@@ -11426,7 +11438,7 @@ class AuditedPointInTimeUniverse:
                 """
                 SELECT substr(daily.ts_code, 1, 6) AS symbol,
                        daily.ts_code, daily.exchange, 'a' AS market,
-                       daily.name, daily.industry
+                       daily.name, daily.industry, daily.list_date
                 FROM daily_universe AS daily
                 WHERE daily.trade_date = ?
                   AND daily.list_date IS NOT NULL

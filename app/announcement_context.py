@@ -200,6 +200,29 @@ def _announcement_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _classify_transport_error(exc: Exception) -> str:
+    """把底层网络异常映射到稳定的失败 code,避免暴露原始消息(可能含 token)。
+
+    顺序很重要:SSL 必须在 URLError 之前判定(SSL 异常常常被 URLError 包裹)。
+    """
+    import socket
+    import ssl
+    from urllib.error import URLError
+
+    if isinstance(exc, socket.timeout):
+        return "transport_timeout"
+    if isinstance(exc, ssl.SSLError):
+        return "transport_tls"
+    if isinstance(exc, URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, socket.timeout):
+            return "transport_timeout"
+        if isinstance(reason, ssl.SSLError):
+            return "transport_tls"
+        return "transport_connection"
+    return "transport_error"
+
+
 def _announcement_ts_code(symbol: str) -> str:
     cleaned = str(symbol or "").strip().upper()
     if cleaned.endswith((".SH", ".SZ", ".BJ")):
@@ -272,8 +295,11 @@ def fetch_jiaoch_announcements(
             timeout_s=8.0,
             max_body_bytes=MAX_ANNS_D_BODY_BYTES,
         )
-    except Exception:
-        raise AnnouncementSourceError("transport_error") from None
+    except Exception as exc:
+        # 保留稳定 fallback code "transport_error" 的契约不变,但细分常见类型
+        # 让运维能不开 DEBUG 日志就分辨 clock gate / DNS / TCP / TLS / 真超时。
+        # token 永不进入消息(异常 message 可能含 token,故只分类、不转发原文)。
+        raise AnnouncementSourceError(_classify_transport_error(exc)) from None
     if not getattr(response, "body_complete", False):
         raise AnnouncementSourceError("incomplete_response")
     if not 200 <= int(getattr(response, "status", 0)) < 300:

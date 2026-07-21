@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
+from app.durable_io import fsync_directory
 from app.research_pit_contracts import (
     CURRENT_POOL_EXCLUDED_IDENTITY_ALLOWLIST,
     CURRENT_POOL_MARKET_EVIDENCE_VALUES,
@@ -422,11 +423,7 @@ def _write_content_addressed(output_dir: str | Path, payload: dict[str, Any]) ->
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, destination)
-            directory_descriptor = os.open(directory, os.O_RDONLY)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
+            fsync_directory(directory)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)

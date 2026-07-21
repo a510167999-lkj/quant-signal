@@ -13,16 +13,25 @@ import inspect
 import json
 import os
 import tempfile
-from copy import deepcopy
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
+from app import artifact_outcome_evidence as artifact_outcome_evidence_module
 from app.artifact_outcome_evidence import (
+    OUTCOME_CLAIM_SCHEMA_VERSION,
+    OUTCOME_ROUNDING_MODE,
+    build_artifact_outcome_claim,
     replay_trade_outcome,
     verify_artifact_trade_outcome,
 )
 from app.indicators import add_indicators
 from app.research_market_data import causal_adjusted_bars
+from app.research_authority import (
+    audited_coverage_from_universe,
+    is_composite_universe,
+)
+from app.research_scope import verify_trade_market_scope
 from app.research_pit_store import AuditedPointInTimeUniverse
 from app.research_validation import (
     _canonical_json,
@@ -39,13 +48,15 @@ from app.strategy_signal_evidence import (
 )
 
 
-SCHEMA_VERSION = "research_artifact_native_evidence/v2"
+SCHEMA_VERSION = "research_artifact_native_evidence/v4"
+COMPOSITE_SCHEMA_VERSION = "research_artifact_native_evidence/v7"
 _REASONS = [
     "qualified_trade_lineage_not_bound",
     "strategy_signal_replay_not_bound",
     "strategy_entry_decision_not_bound",
     "producer_code_not_bound",
     "adjustment_factor_generation_not_bound",
+    "cross_segment_identity_continuity_not_bound",
     "outcome_replay_not_bound",
 ]
 _GENERATION_PROOF_FIELDS = (
@@ -153,28 +164,67 @@ def _source_identity(target: Any) -> Dict[str, str]:
     }
 
 
+def _module_source_identity(target: Any) -> Dict[str, str]:
+    try:
+        source = inspect.getsource(target).encode("utf-8")
+    except (OSError, TypeError) as exc:
+        raise ValueError("producer module source is unavailable") from exc
+    module = str(getattr(target, "__name__", ""))
+    if not module:
+        raise ValueError("producer module identity is incomplete")
+    return {
+        "module": module,
+        "source_sha256": _sha256_bytes(source),
+    }
+
+
 def _producer_code_binding(audited_universe: Any) -> Dict[str, Any]:
     # Imported at call time to avoid the research_pit -> validation -> native
     # module cycle while still binding the candidate-pool and portfolio paths
     # that produced the qualified trade set.
     from app.research_backtest import (
+        _artifact_causal_indicator_prefix,
+        _artifact_native_time_exit_trade,
         _research_payload_from_trades,
         _run_historical_universe_research_backtest_resolved,
     )
     from app.research_portfolio import _select_with_portfolio_controls
     from app.research_sweep import sweep_qualified_trades
     from app.research_validation import _fixed_sweep
-
-    manifest = getattr(audited_universe, "manifest", None)
-    artifact_producer_code_sha256 = (
-        manifest.get("producer_code_sha256") if isinstance(manifest, Mapping) else None
+    from app.research_composite_universe import (
+        CompositeAuditedUniverse,
+        rebase_segmented_causal_bars,
     )
+
+    if is_composite_universe(audited_universe):
+        segment_producers = [
+            {
+                "sequence": sequence,
+                "artifact_root_sha256": segment.artifact_root_sha256,
+                "producer_code_sha256": (segment.manifest or {}).get(
+                    "producer_code_sha256"
+                ),
+            }
+            for sequence, segment in enumerate(audited_universe.verified_segments, 1)
+        ]
+        artifact_producer_code_sha256 = None
+    else:
+        manifest = getattr(audited_universe, "manifest", None)
+        artifact_producer_code_sha256 = (
+            manifest.get("producer_code_sha256")
+            if isinstance(manifest, Mapping)
+            else None
+        )
+        segment_producers = None
     components = {
         "artifact_native_builder": _source_identity(build_artifact_native_evidence),
         "artifact_native_verifier": _source_identity(verify_artifact_native_evidence),
         "producer_binding_builder": _source_identity(_producer_code_binding),
         "adjustment_generation_verifier": _source_identity(
             _adjustment_factor_generation_binding
+        ),
+        "cross_segment_identity_verifier": _source_identity(
+            _cross_segment_identity_continuity_binding
         ),
         "strategy_entry_decision_verifier": _source_identity(
             _strategy_entry_decision_binding
@@ -190,6 +240,16 @@ def _producer_code_binding(audited_universe: Any) -> Dict[str, Any]:
         "signal_tags_builder": _source_identity(build_signal_tags),
         "outcome_replay": _source_identity(replay_trade_outcome),
         "outcome_replay_verifier": _source_identity(verify_artifact_trade_outcome),
+        "outcome_claim_builder": _source_identity(build_artifact_outcome_claim),
+        "outcome_contract_module": _module_source_identity(
+            artifact_outcome_evidence_module
+        ),
+        "artifact_outcome_producer": _source_identity(
+            _artifact_native_time_exit_trade
+        ),
+        "artifact_causal_indicator_prefix": _source_identity(
+            _artifact_causal_indicator_prefix
+        ),
         "causal_adjustment": _source_identity(causal_adjusted_bars),
         "audited_causal_signal_bars": _source_identity(
             AuditedPointInTimeUniverse.causal_signal_bars
@@ -205,12 +265,51 @@ def _producer_code_binding(audited_universe: Any) -> Dict[str, Any]:
         "frozen_fixed_sweep": _source_identity(_fixed_sweep),
         "fixed_sweep_engine": _source_identity(sweep_qualified_trades),
     }
-    identity = {
-        "schema_version": "artifact_native_producer_code_binding/v1",
-        "artifact_producer_code_sha256": artifact_producer_code_sha256,
-        "components": components,
-    }
-    bound = _valid_sha256(artifact_producer_code_sha256) and all(
+    if is_composite_universe(audited_universe):
+        components.update(
+            {
+                "composite_segment_router": _source_identity(
+                    CompositeAuditedUniverse.segment_for_date
+                ),
+                "composite_open_sessions": _source_identity(
+                    CompositeAuditedUniverse.open_sessions
+                ),
+                "composite_causal_signal_bars": _source_identity(
+                    CompositeAuditedUniverse.causal_signal_bars
+                ),
+                "composite_execution_evidence": _source_identity(
+                    CompositeAuditedUniverse.next_open_execution_evidence
+                ),
+                "composite_price_rebase": _source_identity(
+                    rebase_segmented_causal_bars
+                ),
+            }
+        )
+    identity = (
+        {
+            "schema_version": "artifact_native_producer_code_binding/v3",
+            "authority_kind": "ordered_composite",
+            "segment_producers": segment_producers,
+            "components": components,
+        }
+        if segment_producers is not None
+        else {
+            "schema_version": "artifact_native_producer_code_binding/v2",
+            "artifact_producer_code_sha256": artifact_producer_code_sha256,
+            "components": components,
+        }
+    )
+    producer_bound = (
+        bool(segment_producers)
+        and all(
+            _valid_sha256(row.get("artifact_root_sha256"))
+            and _valid_sha256(row.get("producer_code_sha256"))
+            for row in segment_producers
+        )
+        if segment_producers is not None
+        else _valid_sha256(artifact_producer_code_sha256)
+    )
+    bound = producer_bound and all(
         _valid_sha256(component.get("source_sha256"))
         for component in components.values()
     )
@@ -223,25 +322,41 @@ def _producer_code_binding(audited_universe: Any) -> Dict[str, Any]:
 
 
 def _generation_ref_map(audited_universe: Any) -> Dict[str, Dict[str, Any]]:
-    manifest = getattr(audited_universe, "manifest", None)
-    market_generations = (
-        manifest.get("market_generations") if isinstance(manifest, Mapping) else None
+    segments = (
+        audited_universe.verified_segments
+        if is_composite_universe(audited_universe)
+        else (audited_universe,)
     )
-    refs = market_generations.get("refs") if isinstance(market_generations, Mapping) else None
-    if not isinstance(refs, list) or not refs:
-        return {}
     result: Dict[str, Dict[str, Any]] = {}
-    for ref in refs:
-        if not isinstance(ref, Mapping) or any(
-            ref.get(field) is None for field in _GENERATION_PROOF_FIELDS
-        ):
+    for segment in segments:
+        manifest = getattr(segment, "manifest", None)
+        market_generations = (
+            manifest.get("market_generations")
+            if isinstance(manifest, Mapping)
+            else None
+        )
+        refs = (
+            market_generations.get("refs")
+            if isinstance(market_generations, Mapping)
+            else None
+        )
+        if not isinstance(refs, list) or not refs:
             return {}
-        projection = {field: ref[field] for field in _GENERATION_PROOF_FIELDS}
-        trade_date = str(projection["trade_date"])[:10]
-        projection["trade_date"] = trade_date
-        if trade_date in result:
-            raise ValueError("market generation refs contain duplicate trade dates")
-        result[trade_date] = projection
+        for ref in refs:
+            if not isinstance(ref, Mapping) or any(
+                ref.get(field) is None for field in _GENERATION_PROOF_FIELDS
+            ):
+                return {}
+            projection = {field: ref[field] for field in _GENERATION_PROOF_FIELDS}
+            trade_date = str(projection["trade_date"])[:10]
+            projection["trade_date"] = trade_date
+            if is_composite_universe(audited_universe):
+                owner = audited_universe.segment_for_date(trade_date)
+                if owner is not segment:
+                    raise ValueError("market generation ref is owned by another segment")
+            if trade_date in result:
+                raise ValueError("market generation refs contain duplicate trade dates")
+            result[trade_date] = projection
     return result
 
 
@@ -249,7 +364,7 @@ def _adjustment_factor_generation_binding(
     audited_universe: Any, trades: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
     refs = _generation_ref_map(audited_universe)
-    coverage = getattr(audited_universe, "manifest", {}).get("coverage") or {}
+    coverage = audited_coverage_from_universe(audited_universe)
     start_date = str(
         getattr(audited_universe, "start_date", None)
         or coverage.get("start_date")
@@ -333,6 +448,140 @@ def _adjustment_factor_generation_binding(
     }
 
 
+def _identity_row(item: Mapping[str, Any], *, session: str) -> Dict[str, Any]:
+    projection = {
+        "symbol": str(item.get("symbol") or "").strip(),
+        "ts_code": str(item.get("ts_code") or "").strip(),
+        "exchange": str(item.get("exchange") or "").strip(),
+        "list_date": str(item.get("list_date") or "").strip(),
+    }
+    if not all(projection.values()):
+        raise ValueError("cross-segment identity row is incomplete")
+    symbol = projection["symbol"]
+    ts_code = projection["ts_code"]
+    if len(symbol) != 6 or not symbol.isdigit() or ts_code[:6] != symbol:
+        raise ValueError("cross-segment identity symbol mismatch")
+    suffix_by_exchange = {"SSE": ".SH", "SZSE": ".SZ"}
+    expected_suffix = suffix_by_exchange.get(projection["exchange"])
+    if expected_suffix is None or not ts_code.endswith(expected_suffix):
+        raise ValueError("cross-segment identity exchange mismatch")
+    try:
+        listed = date.fromisoformat(projection["list_date"])
+    except ValueError as exc:
+        raise ValueError("cross-segment identity list_date is invalid") from exc
+    if listed.isoformat() != projection["list_date"] or listed.isoformat() > session:
+        raise ValueError("cross-segment identity list_date is invalid")
+    return projection
+
+
+def _boundary_session(segment: Any, *, first: bool) -> str:
+    sessions = segment.open_sessions(segment.start_date, segment.end_date)
+    if not isinstance(sessions, list) or not sessions:
+        raise ValueError("cross-segment boundary lacks an open session")
+    ordered = [str(value) for value in sessions]
+    if ordered != sorted(set(ordered)):
+        raise ValueError("cross-segment boundary sessions are invalid")
+    return ordered[0] if first else ordered[-1]
+
+
+def _identity_map(segment: Any, session: str) -> Dict[str, Dict[str, Any]]:
+    rows = segment.items_as_of(session)
+    if not isinstance(rows, list):
+        raise ValueError("cross-segment identity snapshot is invalid")
+    result: Dict[str, Dict[str, Any]] = {}
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            raise ValueError("cross-segment identity row is invalid")
+        identity = _identity_row(raw, session=session)
+        symbol = identity["symbol"]
+        if symbol in result:
+            raise ValueError("cross-segment identity snapshot has duplicates")
+        result[symbol] = {
+            "identity": identity,
+            "row_sha256": _sha256_value(dict(raw)),
+        }
+    return result
+
+
+def _cross_segment_identity_continuity_binding(
+    audited_universe: Any,
+) -> Dict[str, Any]:
+    if not is_composite_universe(audited_universe):
+        return {
+            "schema_version": "cross_segment_identity_continuity/v2",
+            "applicable": False,
+            "boundary_count": 0,
+            "shared_identity_count": 0,
+            "boundaries": [],
+            "bound": True,
+            "reasons": [],
+        }
+    segments = audited_universe.verified_segments
+    boundaries = []
+    shared_total = 0
+    for sequence, (previous, current) in enumerate(zip(segments, segments[1:]), 1):
+        previous_session = _boundary_session(previous, first=False)
+        current_session = _boundary_session(current, first=True)
+        previous_rows = _identity_map(previous, previous_session)
+        current_rows = _identity_map(current, current_session)
+        shared = []
+        for symbol in sorted(set(previous_rows) & set(current_rows)):
+            left = previous_rows[symbol]
+            right = current_rows[symbol]
+            if left["identity"] != right["identity"]:
+                raise ValueError(
+                    f"cross-segment identity conflict for {symbol}"
+                )
+            shared.append(
+                {
+                    "symbol": symbol,
+                    "identity": left["identity"],
+                    "previous_row_sha256": left["row_sha256"],
+                    "current_row_sha256": right["row_sha256"],
+                }
+            )
+        previous_only = sorted(set(previous_rows) - set(current_rows))
+        current_only = sorted(set(current_rows) - set(previous_rows))
+        shared_total += len(shared)
+        boundaries.append(
+            {
+                "sequence": sequence,
+                "previous_artifact_root_sha256": previous.artifact_root_sha256,
+                "current_artifact_root_sha256": current.artifact_root_sha256,
+                "previous_session": previous_session,
+                "current_session": current_session,
+                "previous_snapshot_sha256": _sha256_value(previous_rows),
+                "current_snapshot_sha256": _sha256_value(current_rows),
+                "previous_identity_count": len(previous_rows),
+                "current_identity_count": len(current_rows),
+                "shared_identity_count": len(shared),
+                "shared_identities_sha256": _sha256_value(shared),
+                "previous_only_count": len(previous_only),
+                "previous_only_sha256": _sha256_value(previous_only),
+                "current_only_count": len(current_only),
+                "current_only_sha256": _sha256_value(current_only),
+                "unexplained_transition_count": len(previous_only)
+                + len(current_only),
+            }
+        )
+    unexplained = sum(
+        row["unexplained_transition_count"] for row in boundaries
+    )
+    bound = bool(boundaries) and shared_total > 0 and unexplained == 0
+    return {
+        "schema_version": "cross_segment_identity_continuity/v2",
+        "applicable": True,
+        "boundary_count": len(boundaries),
+        "shared_identity_count": shared_total,
+        "unexplained_transition_count": unexplained,
+        "boundaries": boundaries,
+        "bound": bound,
+        "reasons": (
+            [] if bound else ["cross_segment_identity_continuity_not_bound"]
+        ),
+    }
+
+
 def _strategy_entry_decision_binding(
     trades: List[Dict[str, Any]], strategy_signal_replay: Mapping[str, Any]
 ) -> Dict[str, Any]:
@@ -398,6 +647,8 @@ def _proof_policy(outcome_replay: Mapping[str, Any]) -> Dict[str, Any]:
         ),
         "price_basis": "raw_unadjusted_execution",
         "return_price_basis": "causal_total_return_open_to_open",
+        "outcome_claim_schema_version": OUTCOME_CLAIM_SCHEMA_VERSION,
+        "outcome_rounding_mode": OUTCOME_ROUNDING_MODE,
         "intraday_exit_supported": False,
     }
 
@@ -409,6 +660,7 @@ def _eligibility(
     strategy_entry_decision_binding: Mapping[str, Any],
     producer_code_binding: Mapping[str, Any],
     adjustment_factor_generation_binding: Mapping[str, Any],
+    cross_segment_identity_continuity: Mapping[str, Any],
     outcome_replay: Mapping[str, Any],
 ) -> Dict[str, Any]:
     bindings = {
@@ -421,6 +673,9 @@ def _eligibility(
         "adjustment_factor_generation_bound": (
             adjustment_factor_generation_binding.get("bound") is True
         ),
+        "cross_segment_identity_continuity_bound": (
+            cross_segment_identity_continuity.get("bound") is True
+        ),
         "outcome_replay_bound": outcome_replay.get("bound") is True,
     }
     reason_by_binding = {
@@ -430,6 +685,9 @@ def _eligibility(
         "producer_code_bound": "producer_code_not_bound",
         "adjustment_factor_generation_bound": (
             "adjustment_factor_generation_not_bound"
+        ),
+        "cross_segment_identity_continuity_bound": (
+            "cross_segment_identity_continuity_not_bound"
         ),
         "outcome_replay_bound": "outcome_replay_not_bound",
     }
@@ -474,6 +732,9 @@ def build_artifact_native_evidence(
     adjustment_factor_generation_binding = _adjustment_factor_generation_binding(
         audited_universe, qualified_trades
     )
+    cross_segment_identity_continuity = (
+        _cross_segment_identity_continuity_binding(audited_universe)
+    )
     trade_keys_sha256 = _trade_keys_sha256(qualified_trades)
     authority = audited_authority_from_universe(audited_universe)
     eligibility = _eligibility(
@@ -482,14 +743,25 @@ def build_artifact_native_evidence(
         strategy_entry_decision_binding=strategy_entry_decision_binding,
         producer_code_binding=producer_code_binding,
         adjustment_factor_generation_binding=adjustment_factor_generation_binding,
+        cross_segment_identity_continuity=cross_segment_identity_continuity,
         outcome_replay=outcome_replay,
     )
+    market_scope = verify_trade_market_scope(qualified_trades)
     payload = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": (
+            COMPOSITE_SCHEMA_VERSION
+            if is_composite_universe(audited_universe)
+            else SCHEMA_VERSION
+        ),
         "artifact_role": "development_only",
-        "evidence_scope": "artifact_native_development_replay_v2",
-        "coverage": deepcopy(audited_universe.manifest["coverage"]),
+        "evidence_scope": (
+            "artifact_native_composite_development_replay_v7"
+            if is_composite_universe(audited_universe)
+            else "artifact_native_development_replay_v4"
+        ),
+        "coverage": audited_coverage_from_universe(audited_universe),
         "authority": authority,
+        "market_scope": market_scope,
         "qualified_trades": {
             **descriptor,
             "count": len(qualified_trades),
@@ -505,6 +777,7 @@ def build_artifact_native_evidence(
         "adjustment_factor_generation_binding": (
             adjustment_factor_generation_binding
         ),
+        "cross_segment_identity_continuity": cross_segment_identity_continuity,
         "eligibility": eligibility,
     }
     payload["evidence_sha256"] = _sha256_value(payload)
@@ -512,7 +785,7 @@ def build_artifact_native_evidence(
 
 
 def write_artifact_native_evidence(directory: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
-    if payload.get("schema_version") != SCHEMA_VERSION:
+    if payload.get("schema_version") not in {SCHEMA_VERSION, COMPOSITE_SCHEMA_VERSION}:
         raise ValueError("unsupported artifact-native evidence schema")
     semantic = dict(payload)
     claimed = semantic.pop("evidence_sha256", None)
@@ -551,7 +824,12 @@ def verify_artifact_native_evidence(
         payload = json.loads(evidence_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("artifact-native evidence is not valid JSON") from exc
-    if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:
+    expected_schema = (
+        COMPOSITE_SCHEMA_VERSION
+        if is_composite_universe(audited_universe)
+        else SCHEMA_VERSION
+    )
+    if not isinstance(payload, dict) or payload.get("schema_version") != expected_schema:
         raise ValueError("unsupported artifact-native evidence schema")
     semantic = dict(payload)
     claimed = semantic.pop("evidence_sha256", None)
@@ -559,11 +837,16 @@ def verify_artifact_native_evidence(
         raise ValueError("artifact-native evidence hash mismatch")
     if payload.get("authority") != audited_authority_from_universe(audited_universe):
         raise ValueError("artifact-native evidence authority mismatch")
-    if payload.get("coverage") != audited_universe.manifest.get("coverage"):
+    if payload.get("coverage") != audited_coverage_from_universe(audited_universe):
         raise ValueError("artifact-native evidence coverage mismatch")
     if (
         payload.get("artifact_role") != "development_only"
-        or payload.get("evidence_scope") != "artifact_native_development_replay_v2"
+        or payload.get("evidence_scope")
+            != (
+                "artifact_native_composite_development_replay_v7"
+                if is_composite_universe(audited_universe)
+                else "artifact_native_development_replay_v4"
+        )
     ):
         raise ValueError("artifact-native evidence scope is invalid")
     qualified_descriptor = payload.get("qualified_trades") or {}
@@ -574,6 +857,8 @@ def verify_artifact_native_evidence(
         if descriptor[key] != qualified_descriptor.get(key):
             raise ValueError("qualified trades file descriptor mismatch")
     trades = _load_trade_rows(qualified_path)
+    if payload.get("market_scope") != verify_trade_market_scope(trades):
+        raise ValueError("artifact-native evidence market scope mismatch")
     if len(trades) != qualified_descriptor.get("count"):
         raise ValueError("qualified trades file count mismatch")
     if qualified_trades_sha256(trades) != qualified_descriptor.get("qualified_trades_sha256"):
@@ -606,6 +891,13 @@ def verify_artifact_native_evidence(
         "adjustment_factor_generation_binding"
     ):
         raise ValueError("artifact-native adjustment factor generation binding mismatch")
+    fresh_cross_segment_identity_continuity = (
+        _cross_segment_identity_continuity_binding(audited_universe)
+    )
+    if fresh_cross_segment_identity_continuity != payload.get(
+        "cross_segment_identity_continuity"
+    ):
+        raise ValueError("artifact-native cross-segment identity binding mismatch")
     expected_proof_policy = _proof_policy(fresh_outcome_replay)
     if (payload.get("proof_policy") or {}).get(
         "blocked_sell_retry"
@@ -620,6 +912,9 @@ def verify_artifact_native_evidence(
         producer_code_binding=fresh_producer_code_binding,
         adjustment_factor_generation_binding=(
             fresh_adjustment_factor_generation_binding
+        ),
+        cross_segment_identity_continuity=(
+            fresh_cross_segment_identity_continuity
         ),
         outcome_replay=fresh_outcome_replay,
     )

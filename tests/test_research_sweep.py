@@ -1,5 +1,6 @@
 import json
 from datetime import date, timedelta
+from pathlib import Path
 
 import app.research_sweep as research_sweep
 from app.jobs import (
@@ -1214,7 +1215,7 @@ def test_sweep_qualified_trades_reuses_correlation_history_cache(monkeypatch):
     read_counts = {}
 
     def fake_read_json(path, default):
-        name = str(path).split("/")[-1]
+        name = Path(path).name
         read_counts[name] = read_counts.get(name, 0) + 1
         closes = histories.get(name)
         if not closes:

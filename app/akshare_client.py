@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import random
 import time
@@ -117,10 +118,25 @@ def akshare_call(
         if max_elapsed_seconds is not None
         else _float_env("AKSHARE_MAX_ELAPSED_SECONDS", 0.0, 0.0, 600.0)
     )
+    if not math.isfinite(max_elapsed) or max_elapsed < 0:
+        raise ValueError("max_elapsed_seconds must be finite and non-negative")
+    if not math.isfinite(started):
+        raise RuntimeError("monotonic clock returned a non-finite value")
+    deadline = started + max_elapsed if max_elapsed > 0 else None
+    if deadline is not None and not math.isfinite(deadline):
+        raise RuntimeError("monotonic deadline is not finite")
     last_error: Optional[BaseException] = None
+    attempts_executed = 0
+    last_observed = started
 
     with market_data_proxy_scope():
         for attempt in range(1, max_attempts + 1):
+            if attempt > 1 and deadline is not None:
+                now = time.monotonic()
+                if not math.isfinite(now) or now < last_observed or now >= deadline:
+                    break
+                last_observed = now
+            attempts_executed = attempt
             try:
                 result = operation()
                 if attempt > 1:
@@ -143,28 +159,37 @@ def akshare_call(
                 )
                 if attempt >= max_attempts:
                     break
-                if max_elapsed and (time.monotonic() - started) >= max_elapsed:
+                now = time.monotonic()
+                if not math.isfinite(now) or now < last_observed:
+                    break
+                last_observed = now
+                remaining = deadline - now if deadline is not None else None
+                if remaining is not None and remaining <= 0:
                     break
                 delay = base_delay * (2 ** (attempt - 1))
                 if jitter > 0:
                     delay += random.uniform(0, jitter)
-                if max_elapsed:
-                    remaining = max_elapsed - (time.monotonic() - started)
-                    if remaining <= 0:
-                        break
-                    delay = min(delay, remaining)
+                if remaining is not None and delay >= remaining:
+                    break
                 if delay > 0:
                     time.sleep(delay)
 
+    ended = time.monotonic()
+    if math.isfinite(ended) and ended >= last_observed:
+        last_observed = ended
+    elapsed_ms = int((last_observed - started) * 1000)
     _record_status(
         endpoint,
         "failed",
-        max_attempts,
-        int((time.monotonic() - started) * 1000),
+        attempts_executed,
+        elapsed_ms,
         last_error,
     )
     logger.error(
-        "akshare %s failed after %d attempts: %s", endpoint, max_attempts, last_error
+        "akshare %s failed after %d attempts: %s",
+        endpoint,
+        attempts_executed,
+        last_error,
     )
     if last_error is not None:
         raise last_error

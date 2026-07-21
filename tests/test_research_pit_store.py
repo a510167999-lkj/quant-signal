@@ -1226,6 +1226,33 @@ def test_external_coverage_connection_requires_a_preexisting_snapshot(tmp_path):
             )
 
 
+def test_store_connection_context_closes_handle_after_exit(tmp_path):
+    store = PITReceiptStore(str(tmp_path))
+
+    with store._connect() as connection:
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
+
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connection.execute("SELECT 1")
+
+
+def test_external_coverage_connection_remains_borrowed(tmp_path):
+    store = PITReceiptStore(str(tmp_path))
+    _ingest_complete_two_day_fixture(store)
+
+    with store._connect() as connection:
+        connection.execute("BEGIN")
+        audit = store.audit_coverage(
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+            _connection=connection,
+        )
+
+        assert audit["status"] == "passed"
+        assert connection.in_transaction is True
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
+
+
 def test_common_open_sessions_verifies_two_exchange_calendar_gate(tmp_path):
     store = PITReceiptStore(str(tmp_path))
     _ingest_complete_two_day_fixture(store)
@@ -2561,15 +2588,19 @@ def _fully_resign_temporal_binding(manifest_path, binding):
     logical = {key: value for key, value in manifest.items() if key not in non_logical}
     root = research_pit_store._sha256(logical)
     database_path = manifest_path.parent / manifest["sqlite"]["path"]
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            "INSERT OR REPLACE INTO artifact_metadata (key, value_json) VALUES (?, ?)",
-            ("temporal_binding", research_pit_store._canonical_json(binding)),
-        )
-        connection.execute(
-            "UPDATE artifact_metadata SET value_json = ? WHERE key = 'artifact_root_sha256'",
-            (research_pit_store._canonical_json(root),),
-        )
+    connection = sqlite3.connect(database_path)
+    try:
+        with connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO artifact_metadata (key, value_json) VALUES (?, ?)",
+                ("temporal_binding", research_pit_store._canonical_json(binding)),
+            )
+            connection.execute(
+                "UPDATE artifact_metadata SET value_json = ? WHERE key = 'artifact_root_sha256'",
+                (research_pit_store._canonical_json(root),),
+            )
+    finally:
+        connection.close()
     manifest["artifact_root_sha256"] = root
     manifest["sqlite"] = {
         **manifest["sqlite"],
@@ -2748,15 +2779,19 @@ def test_universe_artifact_rejects_tampered_manifest_and_metadata_via_rerun_audi
     # Mirror the forgery into artifact_metadata so manifest==metadata agrees
     # and artifact_root recomputes consistently. This mutates the DB file, so
     # the sqlite hash must be re-derived afterwards.
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            "UPDATE artifact_metadata SET value_json = ? WHERE key = 'market_generations'",
-            (research_pit_store._canonical_json(manifest["market_generations"]),),
-        )
-        connection.execute(
-            "UPDATE artifact_metadata SET value_json = ? WHERE key = 'artifact_root_sha256'",
-            (research_pit_store._canonical_json(forged_root),),
-        )
+    connection = sqlite3.connect(database_path)
+    try:
+        with connection:
+            connection.execute(
+                "UPDATE artifact_metadata SET value_json = ? WHERE key = 'market_generations'",
+                (research_pit_store._canonical_json(manifest["market_generations"]),),
+            )
+            connection.execute(
+                "UPDATE artifact_metadata SET value_json = ? WHERE key = 'artifact_root_sha256'",
+                (research_pit_store._canonical_json(forged_root),),
+            )
+    finally:
+        connection.close()
 
     # WHY: re-derive the sqlite hash/bytes after the metadata edit, then re-sign
     # so the loader is not stopped by the file-hash check and actually reaches

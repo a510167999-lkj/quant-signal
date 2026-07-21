@@ -1142,7 +1142,7 @@ def test_pit_backtest_fails_closed_when_any_seed_symbol_history_is_missing(
 
 def test_audited_backtest_closes_universe_when_history_fetch_fails(tmp_path, monkeypatch):
     class Universe:
-        start_date = "2024-01-02"
+        start_date = "2023-08-25"
         end_date = "2024-01-04"
         is_audited_store_artifact = True
 
@@ -1156,7 +1156,7 @@ def test_audited_backtest_closes_universe_when_history_fetch_fails(tmp_path, mon
             return []
 
         def open_sessions(self, start_date, end_date):
-            return []
+            return pd.bdate_range(start_date, end_date).strftime("%Y-%m-%d").tolist()
 
     universe = Universe()
     class FailingArtifactAdapter:

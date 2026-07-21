@@ -77,12 +77,17 @@ class _ReplayFakeAudited(_FakeAudited):
 
 class _OutcomeReplayFakeAudited(_FakeAudited):
     def causal_signal_bars(self, symbol, start_date, as_of_date):
-        return [
+        rows = [
             {"trade_date": "2020-01-01", "signal_open": 9.0, "signal_high": 9.5, "signal_low": 8.5, "signal_close": 9.0},
             {"trade_date": "2020-01-02", "signal_open": 10.0, "signal_high": 10.5, "signal_low": 9.5, "signal_close": 10.2},
             {"trade_date": "2020-01-03", "signal_open": 10.4, "signal_high": 10.8, "signal_low": 10.0, "signal_close": 10.6},
             {"trade_date": "2020-01-04", "signal_open": 11.0, "signal_high": 11.2, "signal_low": 10.7, "signal_close": 11.1},
         ]
+        for row in rows:
+            row["bar_adj_factor"] = 1.0
+            for field in ("open", "high", "low", "close"):
+                row[f"raw_{field}"] = row[f"signal_{field}"]
+        return rows
 
 
 class _StrictReplayAudited(_FakeAudited):
@@ -124,6 +129,23 @@ class _StrictReplayAudited(_FakeAudited):
                         else 1_000_000 + index * 1_000
                     ),
                     "generation_proof": proof,
+                }
+            )
+            bar = self._bars[-1]
+            raw_open = (
+                10.0
+                if trade_date == "2020-01-02"
+                else 11.0
+                if trade_date == "2020-01-04"
+                else bar["signal_open"]
+            )
+            bar.update(
+                {
+                    "bar_adj_factor": 1.0,
+                    "raw_open": raw_open,
+                    "raw_high": max(raw_open, bar["signal_high"]),
+                    "raw_low": min(raw_open, bar["signal_low"]),
+                    "raw_close": bar["signal_close"],
                 }
             )
         self.start_date = dates[0]
@@ -218,7 +240,7 @@ def test_artifact_native_evidence_keeps_incomplete_legacy_trade_ineligible(tmp_p
         artifact_root=str(tmp_path),
     )
 
-    assert payload["schema_version"] == "research_artifact_native_evidence/v2"
+    assert payload["schema_version"] == "research_artifact_native_evidence/v4"
     assert payload["eligibility"]["eligible_for_development_validation"] is False
     assert "strategy_signal_replay_not_bound" in payload["eligibility"]["reasons"]
     assert "corporate_action_receipt_bound" not in payload["eligibility"]
@@ -246,11 +268,19 @@ def test_artifact_native_evidence_derives_development_eligibility_from_all_bindi
     assert payload["producer_code_binding"]["bound"] is True
     assert {
         "historical_artifact_backtest",
+        "outcome_claim_builder",
+        "outcome_contract_module",
+        "artifact_outcome_producer",
+        "artifact_causal_indicator_prefix",
         "research_payload_builder",
         "portfolio_selector",
         "frozen_fixed_sweep",
         "fixed_sweep_engine",
     }.issubset(payload["producer_code_binding"]["components"])
+    assert (
+        payload["producer_code_binding"]["schema_version"]
+        == "artifact_native_producer_code_binding/v2"
+    )
     assert payload["adjustment_factor_generation_binding"]["bound"] is True
     assert payload["eligibility"] == {
         "execution_proof_complete": True,
@@ -259,6 +289,7 @@ def test_artifact_native_evidence_derives_development_eligibility_from_all_bindi
         "strategy_entry_decision_bound": True,
         "producer_code_bound": True,
         "adjustment_factor_generation_bound": True,
+        "cross_segment_identity_continuity_bound": True,
         "outcome_replay_bound": True,
         "eligible_for_development_validation": True,
         "eligible_for_final_validation": False,

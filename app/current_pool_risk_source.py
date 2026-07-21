@@ -12,6 +12,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.current_pool_source import verify_current_pool_universe_descriptor
+from app.durable_io import fsync_directory
 from app.research_pit_sources import resolve_tushare_source
 from app.research_pit_transport import UrllibTushareTransport
 
@@ -149,11 +150,7 @@ def _write(output_dir: str | Path, payload: dict[str, Any], universe_payload: Ma
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, destination)
-            dfd = os.open(directory, os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
+            fsync_directory(directory)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
@@ -383,5 +380,9 @@ def _fetch_jiaoch_current_pool_risk_descriptor(*, as_of: str, universe_path: str
 def fetch_jiaoch_current_pool_risk_descriptor(*, as_of: str, universe_path: str | Path, output_dir: str | Path, timeout_seconds: float = 30.0, now_provider: Callable[[], datetime] | None = None) -> dict[str, Any]:
     try:
         return _fetch_jiaoch_current_pool_risk_descriptor(as_of=as_of, universe_path=universe_path, output_dir=output_dir, timeout_seconds=timeout_seconds, now_provider=now_provider)
-    except Exception:
-        raise CurrentPoolRiskSourceError("current-pool risk source collection failed") from None
+    except Exception as exc:
+        # __cause__ 必须为 None:异常 message 可能包含 token,通过异常链泄露会破坏
+        # token 永不落盘的契约。只暴露异常类型名供运维诊断(clock gate / TLS / 超时等)。
+        raise CurrentPoolRiskSourceError(
+            f"current-pool risk source collection failed ({type(exc).__name__})"
+        ) from None

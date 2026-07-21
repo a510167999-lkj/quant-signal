@@ -12,6 +12,8 @@ import hashlib
 import hmac
 import json
 import math
+import os
+import stat
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -266,6 +268,12 @@ class CompositeAuditedUniverse:
         return copy.deepcopy(self._composite_authority)
 
     @property
+    def verified_segments(self) -> tuple[Any, ...]:
+        """Expose the already verified read-only segments in authority order."""
+
+        return self._segments
+
+    @property
     def start_date(self) -> str:
         return self._authorities[0]["coverage"]["start_date"]
 
@@ -442,10 +450,48 @@ class CompositeAuditedUniverse:
             raise first_error
 
 
+def _read_composite_descriptor_snapshot(path: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(str(path), flags)
+    except OSError as exc:
+        raise CompositeUniverseError("composite descriptor is unreadable") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size < 1:
+            raise CompositeUniverseError("composite descriptor is unreadable")
+        if before.st_size > 64 * 1024:
+            raise CompositeUniverseError("composite descriptor exceeds size limit")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            len(raw) != before.st_size
+            or after.st_dev != before.st_dev
+            or after.st_ino != before.st_ino
+            or after.st_size != before.st_size
+            or after.st_mtime_ns != before.st_mtime_ns
+        ):
+            raise CompositeUniverseError("composite descriptor changed while reading")
+        return raw
+    finally:
+        os.close(descriptor)
+
+
 def load_composite_universe_descriptor(
     descriptor_path: str,
     *,
     expected_composite_root_sha256: str,
+    expected_descriptor_file_sha256: str = None,
 ) -> CompositeAuditedUniverse:
     """Open all descriptor segments through their externally anchored loader."""
 
@@ -454,10 +500,22 @@ def load_composite_universe_descriptor(
     expected_root = _require_sha256(
         expected_composite_root_sha256, "expected composite root"
     )
+    expected_descriptor = (
+        _require_sha256(
+            expected_descriptor_file_sha256, "expected composite descriptor file"
+        )
+        if expected_descriptor_file_sha256 is not None
+        else None
+    )
     path = Path(str(descriptor_path)).expanduser().resolve()
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        raw = _read_composite_descriptor_snapshot(path)
+        if expected_descriptor is not None and not hmac.compare_digest(
+            hashlib.sha256(raw).hexdigest(), expected_descriptor
+        ):
+            raise CompositeUniverseError("composite descriptor external hash mismatch")
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CompositeUniverseError("composite descriptor is unreadable") from exc
     if not isinstance(payload, dict) or set(payload) != {
         "schema_version",

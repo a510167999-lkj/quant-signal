@@ -20,8 +20,10 @@ import pandas as pd
 import pytest
 
 import app.research_backtest as research_backtest_module
+from app.artifact_outcome_evidence import replay_trade_outcome
 from app.config import Settings
 from app.research_backtest import (
+    ArtifactNativeUnresolvedExit,
     _artifact_native_time_exit_trade,
     _research_payload_from_trades,
     _run_historical_universe_research_backtest_resolved,
@@ -143,8 +145,17 @@ def test_composite_resolver_loads_descriptor_and_seeds_full_requested_range(monk
     universe = Universe()
     seen = {}
 
-    def fake_loader(path, *, expected_composite_root_sha256):
-        seen.update(path=path, root=expected_composite_root_sha256)
+    def fake_loader(
+        path,
+        *,
+        expected_composite_root_sha256,
+        expected_descriptor_file_sha256=None,
+    ):
+        seen.update(
+            path=path,
+            root=expected_composite_root_sha256,
+            descriptor=expected_descriptor_file_sha256,
+        )
         return universe
 
     monkeypatch.setattr(
@@ -167,7 +178,12 @@ def test_composite_resolver_loads_descriptor_and_seeds_full_requested_range(monk
 
     assert items == [{"symbol": "600001", "name": "composite"}]
     assert resolved is universe
-    assert seen == {"path": "/frozen/composite.json", "root": "d" * 64}
+    assert seen["descriptor"] is None
+    assert seen == {
+        "path": "/frozen/composite.json",
+        "root": "d" * 64,
+        "descriptor": None,
+    }
     assert universe.seed_calls == [("2022-06-01", "2023-06-30")]
 
 
@@ -334,6 +350,9 @@ def _artifact_frame(periods=100):
     frame["change_pct"] = frame["close"].pct_change().fillna(0) * 100
     for field in ("open", "high", "low", "close"):
         frame[f"raw_{field}"] = frame[field]
+    frame["bar_adj_factor"] = 1.0
+    frame["as_of_adj_factor"] = 1.0
+    frame["adjustment_as_of_date"] = frame["date"].iloc[-1]
     frame["raw_pre_close"] = frame["raw_close"].shift(1).fillna(frame["raw_close"])
     frame["raw_volume_lots"] = frame["volume"] / 100
     frame["raw_amount_thousand_yuan"] = frame["amount"] / 1000
@@ -520,6 +539,7 @@ def test_artifact_entry_gap_uses_same_asof_adjusted_prices_across_corporate_acti
                     "raw_high": 101.0,
                     "raw_low": 99.0,
                     "raw_close": 100.0,
+                    "bar_adj_factor": 1.0,
                 },
                 {
                     # 2-for-1 corporate action: raw 50, but on the entry-date
@@ -534,6 +554,7 @@ def test_artifact_entry_gap_uses_same_asof_adjusted_prices_across_corporate_acti
                     "raw_high": 52.0,
                     "raw_low": 49.0,
                     "raw_close": 51.0,
+                    "bar_adj_factor": 2.0,
                 },
                 {
                     "date": "2025-01-06",
@@ -545,6 +566,7 @@ def test_artifact_entry_gap_uses_same_asof_adjusted_prices_across_corporate_acti
                     "raw_high": 55.0,
                     "raw_low": 55.0,
                     "raw_close": 55.0,
+                    "bar_adj_factor": 2.0,
                 },
             ]
             return pd.DataFrame(
@@ -568,6 +590,133 @@ def test_artifact_entry_gap_uses_same_asof_adjusted_prices_across_corporate_acti
     assert entry_evidence["gap_pct"] == pytest.approx(0.0)
     assert realized["entry_raw_price"] == pytest.approx(50.0)
     assert realized["return_pct"] == pytest.approx(10.0)
+
+
+def test_artifact_producer_matches_strict_replay_at_pct4_half_boundary():
+    """Producer and verifier must share one exact outcome arithmetic contract."""
+
+    sessions = [
+        "2025-01-02",
+        "2025-01-03",
+        "2025-01-06",
+        "2025-01-07",
+        "2025-01-08",
+    ]
+    analysis_end_factor = 1.9673950175832966
+    exit_factor = 1.3726677763186674
+    entry_factor = 0.8982917896085058
+    intermediate_factor = 0.9394327477178013
+    entry_raw = 49.83642340716134
+    factors = [
+        entry_factor,
+        entry_factor,
+        intermediate_factor,
+        exit_factor,
+        analysis_end_factor,
+    ]
+    raw_ohlc = [
+        (entry_raw, entry_raw, entry_raw, entry_raw),
+        (entry_raw, entry_raw, entry_raw, entry_raw),
+        (47.8, 50.0, 45.0, 47.70226166787021),
+        (32.28072976306658,) * 4,
+        (31.0,) * 4,
+    ]
+    rows = []
+    for trade_date, factor, values in zip(sessions, factors, raw_ohlc):
+        row = {
+            "date": trade_date,
+            "bar_adj_factor": factor,
+            "as_of_adj_factor": analysis_end_factor,
+            "adjustment_as_of_date": sessions[-1],
+        }
+        for field, raw_value in zip(("open", "high", "low", "close"), values):
+            row[field] = raw_value * factor / analysis_end_factor
+            row[f"raw_{field}"] = raw_value
+        rows.append(row)
+    analysis_frame = pd.DataFrame(rows)
+
+    class Adapter:
+        def signal_frame(self, symbol, start_date, as_of_date):
+            return analysis_frame[
+                (analysis_frame["date"] >= start_date)
+                & (analysis_frame["date"] <= as_of_date)
+            ].copy()
+
+        def next_open(self, symbol, trade_date, side="buy"):
+            raw_price = float(
+                analysis_frame.loc[
+                    analysis_frame["date"] == trade_date, "raw_open"
+                ].iloc[0]
+            )
+            return {
+                "fillable": True,
+                "reason": "raw_open",
+                "raw_price": raw_price,
+                "generation_proof": {"trade_date": trade_date, "side": side},
+            }
+
+    outcome = _artifact_native_time_exit_trade(
+        adapter=Adapter(),
+        verdict_cache={},
+        symbol="600001",
+        signal_date=sessions[0],
+        sessions=sessions,
+        session_positions={value: index for index, value in enumerate(sessions)},
+        artifact_start_date=sessions[0],
+        hold_days=2,
+        settings=Settings(),
+        analysis_frame=analysis_frame,
+        analysis_date_positions={
+            value: index for index, value in enumerate(sessions)
+        },
+    )
+    assert outcome is not None
+    realized, _entry_evidence = outcome
+
+    class Audited:
+        start_date = sessions[0]
+
+        def open_sessions(self, start_date, end_date):
+            return [
+                value for value in sessions if start_date <= value <= end_date
+            ]
+
+        def causal_signal_bars(self, symbol, start_date, as_of_date):
+            bars = []
+            for row in rows:
+                if not start_date <= row["date"] <= as_of_date:
+                    continue
+                bar = {
+                    "trade_date": row["date"],
+                    "bar_adj_factor": row["bar_adj_factor"],
+                    "as_of_adj_factor": exit_factor,
+                    "adjustment_as_of_date": sessions[3],
+                }
+                for field in ("open", "high", "low", "close"):
+                    bar[f"raw_{field}"] = row[f"raw_{field}"]
+                    bar[f"signal_{field}"] = (
+                        row[f"raw_{field}"]
+                        * row["bar_adj_factor"]
+                        / exit_factor
+                    )
+                bars.append(bar)
+            return bars
+
+        def next_open_execution_evidence(self, symbol, trade_date, side):
+            raw_price = float(
+                analysis_frame.loc[
+                    analysis_frame["date"] == trade_date, "raw_open"
+                ].iloc[0]
+            )
+            return {
+                "fillable": True,
+                "reason": "raw_open",
+                "raw_price": raw_price,
+                "generation_proof": {"trade_date": trade_date, "side": side},
+            }
+
+    trade = {"symbol": "600001", "signal_date": sessions[0], **realized}
+    replay_trade_outcome(Audited(), trade, compare_claim=True)
 
 
 def _universe_items(n):
@@ -715,6 +864,25 @@ def test_audited_artifact_path_makes_zero_provider_calls_and_uses_raw_open(
     assert result["summary"]["artifact_native_replay"] is True
     assert result["summary"]["market_data_source"] == "audited_artifact"
     assert result["summary"]["artifact_root_sha256"] == adapter.artifact_root_sha256
+    evaluation_window = result["summary"]["artifact_evaluation_window"]
+    assert evaluation_window == {
+        "schema_version": "artifact-evaluation-window/v1",
+        "requested_start_date": "2025-04-01",
+        "artifact_history_start_date": universe.start_date,
+        "analysis_end_date": universe.end_date,
+        "required_warmup_sessions": 90,
+        "warmup_cutoff_date": frame.iloc[90]["date"],
+        "effective_evaluation_start_date": frame.iloc[90]["date"],
+        "available_pre_evaluation_sessions": 90,
+        "expected_session_count": 10,
+    }
+    assert result["summary"]["stock_universe_benchmark_eligible"] is True
+    assert result["summary"]["stock_universe_benchmark_days"] == 10
+    assert result["summary"]["stock_universe_benchmark_expected_days"] == 10
+    assert (
+        result["summary"]["stock_universe_benchmark_start_date"]
+        == frame.iloc[90]["date"]
+    )
     contract = result["summary"]["research_data_contract"]
     assert contract["point_in_time"] is False
     assert contract["universe_point_in_time"] is False
@@ -730,6 +898,54 @@ def test_audited_artifact_path_makes_zero_provider_calls_and_uses_raw_open(
     )
     assert evidence["generation_proof"]["trade_date"] == trade["entry_date"]
     assert trade["price_basis"] == "raw_unadjusted_execution"
+
+
+def test_artifact_benchmark_missing_post_warmup_session_stays_fail_closed(
+    tmp_path, monkeypatch
+):
+    _force_signal(monkeypatch)
+    monkeypatch.setattr("app.research_context.STOCK_MARKET_MIN_ELIGIBLE", 1)
+    frame = _artifact_frame()
+    items = _universe_items(1)
+    universe = FakeAuditedPITUniverse(items, frame["date"].tolist())
+    adapter = FakeArtifactReplayAdapter(universe, frame)
+    monkeypatch.setattr(
+        "app.research_backtest.ArtifactNativeReplayAdapter", lambda value: adapter
+    )
+    expected_sessions = frame.iloc[90:]["date"].tolist()
+    missing_session = expected_sessions[4]
+    monkeypatch.setattr(
+        research_backtest_module,
+        "_historical_market_breadth",
+        lambda *_args, **_kwargs: {
+            session: {
+                "eligible_count": 1,
+                "coverage_pct": 100.0,
+                "equal_weight_daily_return_pct": 0.1,
+            }
+            for session in expected_sessions
+            if session != missing_session
+        },
+    )
+
+    result = _run_historical_universe_research_backtest_resolved(
+        settings=_stock_only_settings(tmp_path),
+        provider=NoHistoryProvider(),
+        start_date="2025-04-01",
+        max_deep=1,
+        top_n=1,
+        hold_days=1,
+        lookback_days=620,
+        include_qualified_trades=True,
+        _resolved_universe_items=items,
+        _resolved_pit_universe=universe,
+    )
+
+    summary = result["summary"]
+    assert summary["stock_universe_benchmark_eligible"] is False
+    assert summary["stock_universe_benchmark_expected_days"] == 10
+    assert summary["stock_universe_benchmark_days"] == 9
+    assert missing_session in summary["stock_universe_benchmark_reasons"][0]
 
 
 def test_artifact_signal_evaluation_reuses_preloaded_causal_prefix(
@@ -776,6 +992,52 @@ def test_artifact_signal_evaluation_reuses_preloaded_causal_prefix(
     ]
     assert evaluated_lengths
     assert set(evaluated_lengths) == {2}
+
+
+def test_artifact_unresolved_exit_is_audited_and_does_not_abort_universe(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "app.research_backtest.evaluate_signal",
+        lambda history: {"action": "BUY", "score": 5.0, "confidence": 90},
+    )
+    monkeypatch.setattr("app.research_context.STOCK_MARKET_MIN_ELIGIBLE", 1)
+
+    def unresolved(**kwargs):
+        raise ArtifactNativeUnresolvedExit(
+            kwargs["symbol"], kwargs["signal_date"], "2025-04-08"
+        )
+
+    monkeypatch.setattr(
+        "app.research_backtest._artifact_native_time_exit_trade", unresolved
+    )
+    frame = _artifact_frame()
+    items = _universe_items(1)
+    universe = FakeAuditedPITUniverse(items, frame["date"].tolist())
+    adapter = FakeArtifactReplayAdapter(universe, frame)
+    monkeypatch.setattr(
+        "app.research_backtest.ArtifactNativeReplayAdapter", lambda value: adapter
+    )
+
+    result = _run_historical_universe_research_backtest_resolved(
+        settings=_stock_only_settings(tmp_path),
+        provider=NoHistoryProvider(),
+        start_date="2025-04-01",
+        max_deep=1,
+        top_n=1,
+        hold_days=1,
+        lookback_days=620,
+        cache_dir=str(tmp_path / "must-not-be-read"),
+        include_qualified_trades=True,
+        _resolved_universe_items=items,
+        _resolved_pit_universe=universe,
+    )
+
+    assert result["qualified_trades"] == []
+    assert result["summary"]["artifact_unresolved_exit_count"] > 0
+    assert {
+        row["reason"] for row in result["summary"]["artifact_unresolved_exits"]
+    } == {"unfillable_through_coverage_end"}
 
 
 def test_artifact_signal_evaluation_rejects_missing_precomputed_indicator(
@@ -936,6 +1198,12 @@ def test_verified_composite_declares_pit_but_not_strict_or_live_eligibility(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr("app.research_context.STOCK_MARKET_MIN_ELIGIBLE", 1)
+    # This compact fixture verifies authority classification, not indicator
+    # warmup.  Production warmup behavior is covered by the dedicated
+    # artifact-evaluation-window tests below.
+    monkeypatch.setattr(
+        research_backtest_module, "STRATEGY_SIGNAL_WARMUP_SESSIONS", 0
+    )
     first, second = _annual_segments()
     first.bars = [
         _bar(
@@ -960,6 +1228,14 @@ def test_verified_composite_declares_pit_but_not_strict_or_live_eligibility(
     composite = CompositeAuditedUniverse(
         [first, second],
         permitted_boundary_gaps=[("2022-12-30", "2023-01-03")],
+    )
+    compact_sessions = ["2022-12-29", "2023-06-01"]
+    monkeypatch.setattr(
+        composite,
+        "open_sessions",
+        lambda start, end: [
+            session for session in compact_sessions if start <= session <= end
+        ],
     )
 
     result = _run_historical_universe_research_backtest_resolved(
@@ -1134,7 +1410,7 @@ def test_audited_artifact_blocked_sell_retries_next_market_open(tmp_path, monkey
     assert sell_calls[blocked_index + 1][1] > first_planned_exit
 
 
-def test_audited_artifact_tail_signal_uses_market_sessions_across_suspension(
+def test_audited_artifact_missing_held_session_fails_closed_across_suspension(
     tmp_path, monkeypatch
 ):
     _force_signal(monkeypatch)
@@ -1154,18 +1430,21 @@ def test_audited_artifact_tail_signal_uses_market_sessions_across_suspension(
         "app.research_backtest.ArtifactNativeReplayAdapter", lambda value: adapter
     )
 
-    _run_historical_universe_research_backtest_resolved(
-        settings=replace(_stock_only_settings(tmp_path), min_backtest_trades=0),
-        provider=NoHistoryProvider(),
-        start_date="2025-04-01",
-        max_deep=1,
-        top_n=1,
-        hold_days=5,
-        lookback_days=620,
-        include_qualified_trades=True,
-        _resolved_universe_items=items,
-        _resolved_pit_universe=universe,
-    )
+    with pytest.raises(
+        ValueError, match="artifact outcome frame is missing a held market session"
+    ):
+        _run_historical_universe_research_backtest_resolved(
+            settings=replace(_stock_only_settings(tmp_path), min_backtest_trades=0),
+            provider=NoHistoryProvider(),
+            start_date="2025-04-01",
+            max_deep=1,
+            top_n=1,
+            hold_days=5,
+            lookback_days=620,
+            include_qualified_trades=True,
+            _resolved_universe_items=items,
+            _resolved_pit_universe=universe,
+        )
 
     symbol = items[0]["symbol"]
     assert (symbol, sessions[91], "buy") in adapter.open_calls
@@ -1173,7 +1452,9 @@ def test_audited_artifact_tail_signal_uses_market_sessions_across_suspension(
     assert (symbol, sessions[99], "sell") in adapter.open_calls
 
 
-def test_audited_artifact_unresolved_sell_fails_closed(tmp_path, monkeypatch):
+def test_audited_artifact_unresolved_sell_fails_closed_per_trade(
+    tmp_path, monkeypatch
+):
     _force_signal(monkeypatch)
     monkeypatch.setattr("app.research_context.STOCK_MARKET_MIN_ELIGIBLE", 1)
     frame = _artifact_frame()
@@ -1188,19 +1469,25 @@ def test_audited_artifact_unresolved_sell_fails_closed(tmp_path, monkeypatch):
         "app.research_backtest.ArtifactNativeReplayAdapter", lambda value: adapter
     )
 
-    with pytest.raises(ValueError, match="exit remains unfillable"):
-        _run_historical_universe_research_backtest_resolved(
-            settings=replace(_stock_only_settings(tmp_path), min_backtest_trades=0),
-            provider=NoHistoryProvider(),
-            start_date="2025-04-01",
-            max_deep=1,
-            top_n=1,
-            hold_days=1,
-            lookback_days=620,
-            include_qualified_trades=True,
-            _resolved_universe_items=items,
-            _resolved_pit_universe=universe,
-        )
+    result = _run_historical_universe_research_backtest_resolved(
+        settings=replace(_stock_only_settings(tmp_path), min_backtest_trades=0),
+        provider=NoHistoryProvider(),
+        start_date="2025-04-01",
+        max_deep=1,
+        top_n=1,
+        hold_days=1,
+        lookback_days=620,
+        include_qualified_trades=True,
+        _resolved_universe_items=items,
+        _resolved_pit_universe=universe,
+    )
+
+    unresolved = result["summary"]["artifact_unresolved_exits"]
+    assert result["summary"]["artifact_unresolved_exit_count"] == len(unresolved)
+    assert unresolved
+    assert {row["reason"] for row in unresolved} == {
+        "unfillable_through_coverage_end"
+    }
 
 
 @pytest.mark.parametrize("field", ["stop_loss_pct", "take_profit_pct", "trailing_stop_pct"])
@@ -1521,6 +1808,89 @@ def _breadth(date, daily_return_pct, eligible=100, coverage=95.0):
     }
 
 
+def test_artifact_evaluation_window_uses_fixed_calendar_warmup():
+    sessions = [
+        date.strftime("%Y-%m-%d")
+        for date in pd.bdate_range("2025-01-02", periods=100)
+    ]
+    universe = FakeAuditedPITUniverse(_universe_items(1), sessions)
+
+    window, expected = research_backtest_module._artifact_evaluation_window(
+        universe,
+        requested_start_date=sessions[0],
+        analysis_end_date=sessions[-1],
+    )
+
+    assert window["schema_version"] == "artifact-evaluation-window/v1"
+    assert window["requested_start_date"] == sessions[0]
+    assert window["artifact_history_start_date"] == sessions[0]
+    assert window["warmup_cutoff_date"] == sessions[90]
+    assert window["effective_evaluation_start_date"] == sessions[90]
+    assert window["available_pre_evaluation_sessions"] == 90
+    assert window["expected_session_count"] == 10
+    assert expected == sessions[90:]
+
+
+def test_artifact_evaluation_window_preserves_pre_warmed_requested_start():
+    sessions = [
+        date.strftime("%Y-%m-%d")
+        for date in pd.bdate_range("2024-01-02", periods=130)
+    ]
+    universe = FakeAuditedPITUniverse(_universe_items(1), sessions)
+
+    window, expected = research_backtest_module._artifact_evaluation_window(
+        universe,
+        requested_start_date=sessions[100],
+        analysis_end_date=sessions[-1],
+    )
+
+    assert window["warmup_cutoff_date"] == sessions[90]
+    assert window["effective_evaluation_start_date"] == sessions[100]
+    assert window["available_pre_evaluation_sessions"] == 100
+    assert expected == sessions[100:]
+
+
+def test_artifact_evaluation_window_advances_closed_requested_date_by_calendar():
+    sessions = [
+        date.strftime("%Y-%m-%d")
+        for date in pd.bdate_range("2024-01-02", periods=130)
+    ]
+    universe = FakeAuditedPITUniverse(_universe_items(1), sessions)
+    gap_index = next(
+        index
+        for index in range(91, len(sessions))
+        if (pd.Timestamp(sessions[index]) - pd.Timestamp(sessions[index - 1])).days > 1
+    )
+    closed_date = (
+        pd.Timestamp(sessions[gap_index]) - pd.Timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+
+    window, expected = research_backtest_module._artifact_evaluation_window(
+        universe,
+        requested_start_date=closed_date,
+        analysis_end_date=sessions[-1],
+    )
+
+    assert closed_date not in sessions
+    assert window["effective_evaluation_start_date"] == sessions[gap_index]
+    assert expected[0] == sessions[gap_index]
+
+
+def test_artifact_evaluation_window_rejects_insufficient_history():
+    sessions = [
+        date.strftime("%Y-%m-%d")
+        for date in pd.bdate_range("2025-01-02", periods=90)
+    ]
+    universe = FakeAuditedPITUniverse(_universe_items(1), sessions)
+
+    with pytest.raises(ValueError, match="91 audited open sessions"):
+        research_backtest_module._artifact_evaluation_window(
+            universe,
+            requested_start_date=sessions[0],
+            analysis_end_date=sessions[-1],
+        )
+
+
 def test_stock_benchmark_compounds_daily_equal_weight_returns():
     breadth = {
         "2025-06-02": _breadth("2025-06-02", 1.0),
@@ -1535,8 +1905,38 @@ def test_stock_benchmark_compounds_daily_equal_weight_returns():
     assert result["stock_universe_benchmark_eligible"] is True
     assert result["stock_universe_equal_weight_daily_rebalanced_return_pct"] == expected
     assert result["stock_universe_benchmark_days"] == 3
+    assert result["stock_universe_benchmark_expected_days"] == 3
+    assert result["stock_universe_benchmark_start_date"] == "2025-06-01"
+    assert result["stock_universe_benchmark_end_date"] == "2025-06-30"
     assert result["stock_universe_benchmark_min_coverage_pct"] == 95.0
-    assert result["schema_version"]
+    assert result["schema_version"] == "stock-universe-equal-weight-benchmark/v2"
+
+
+def test_stock_benchmark_v2_has_same_shape_on_success_and_failure():
+    success = _stock_universe_equal_weight_benchmark(
+        {"2025-06-02": _breadth("2025-06-02", 1.0)},
+        "2025-06-02",
+        "2025-06-02",
+        expected_sessions=["2025-06-02"],
+    )
+    missing_session = _stock_universe_equal_weight_benchmark(
+        {},
+        "2025-06-02",
+        "2025-06-02",
+        expected_sessions=["2025-06-02"],
+    )
+    missing_end = _stock_universe_equal_weight_benchmark(
+        {"2025-06-02": _breadth("2025-06-02", 1.0)},
+        "2025-06-02",
+        None,
+        expected_sessions=["2025-06-02"],
+    )
+
+    assert set(success) == set(missing_session) == set(missing_end)
+    assert all(
+        result["schema_version"] == "stock-universe-equal-weight-benchmark/v2"
+        for result in (success, missing_session, missing_end)
+    )
 
 
 def test_stock_benchmark_reports_observed_minimum_coverage_separately():
@@ -1663,6 +2063,8 @@ def test_historical_summary_declares_stock_only_source_and_serializes_clean(tmp_
     assert summary["market_context_source"] == "point_in_time_stock_breadth"
     assert summary["market_context_etf_dependent"] is False
     assert "market_context_schema_version" in summary
+    assert summary["artifact_evaluation_window"] is None
+    assert summary["stock_universe_benchmark_start_date"] == "2025-04-01"
     assert "hs300etf_buy_hold_pct" not in summary
     assert "cybetf_buy_hold_pct" not in summary
 

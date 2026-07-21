@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import stat
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -613,7 +612,7 @@ def test_current_pool_audit_cli_writes_idempotent_content_addressed_json(
         "--history-summary-path",
         str(history_path),
         "--risk-path",
-        str(_write_risk(tmp_path, json.loads(universe_path.read_text()))),
+        str(_write_risk(tmp_path, json.loads(universe_path.read_text(encoding="utf-8")))),
         "--output-dir",
         str(output_dir),
     ]
@@ -705,7 +704,7 @@ def test_current_pool_audit_cli_requires_structured_universe_fields(
                 "--history-summary-path",
                 str(history_path),
                 "--risk-path",
-                str(_write_risk(tmp_path, json.loads(universe_path.read_text()))),
+                str(_write_risk(tmp_path, json.loads(universe_path.read_text(encoding="utf-8")))),
                 "--output-dir",
                 str(tmp_path / "audits"),
             ]
@@ -761,7 +760,7 @@ def test_current_pool_audit_cli_does_not_emit_input_credentials(
                 "--history-summary-path",
                 str(history_path),
                 "--risk-path",
-                str(_write_risk(tmp_path, json.loads(universe_path.read_text()))),
+                str(_write_risk(tmp_path, json.loads(universe_path.read_text(encoding="utf-8")))),
                 "--output-dir",
                 str(tmp_path / "audits"),
             ]
@@ -827,7 +826,7 @@ def test_current_pool_audit_cli_rejects_untrusted_or_mismatched_descriptors(
                 "--history-summary-path",
                 str(history_path),
                 "--risk-path",
-                str(_write_risk(tmp_path, json.loads(universe_path.read_text()))),
+                str(_write_risk(tmp_path, json.loads(universe_path.read_text(encoding="utf-8")))),
                 "--output-dir",
                 str(tmp_path / "audits"),
             ]
@@ -873,7 +872,7 @@ def test_current_pool_audit_cli_normalizes_aware_instants_to_shanghai_date(
                 "--history-summary-path",
                 str(history_path),
                 "--risk-path",
-                str(_write_risk(tmp_path, json.loads(universe_path.read_text()))),
+                str(_write_risk(tmp_path, json.loads(universe_path.read_text(encoding="utf-8")))),
                 "--output-dir",
                 str(tmp_path / "audits"),
             ]
@@ -941,7 +940,7 @@ def test_current_pool_audit_cli_rejects_shanghai_date_mismatch_naive_and_orphan(
                 "--history-summary-path",
                 str(history_path),
                 "--risk-path",
-                str(_write_risk(tmp_path, json.loads(universe_path.read_text()))),
+                str(_write_risk(tmp_path, json.loads(universe_path.read_text(encoding="utf-8")))),
                 "--output-dir",
                 str(tmp_path / "audits"),
             ]
@@ -987,13 +986,17 @@ def test_current_pool_audit_merges_verified_risk_and_preserves_original_name(
         ],
     )
     assert jobs.main(["research-current-pool-audit", "--universe-path", str(universe_path), "--history-summary-path", str(history_path), "--risk-path", str(risk_path), "--output-dir", str(tmp_path / "audits")]) == 0
-    report = json.loads(Path(json.loads(capsys.readouterr().out)["path"]).read_text())
+    report = json.loads(
+        Path(json.loads(capsys.readouterr().out)["path"]).read_text(encoding="utf-8")
+    )
     assert report["counts"]["eligible"] == 1
     assert report["risk_snapshot_complete"] is True
     assert report["risk_gate_passed"] is True
     assert report["production_recommendation_eligible"] is False
     assert report["source_ids"]["risk_snapshot"] == "jiaoch"
-    assert report["input_descriptor_sha256"]["risk_snapshot"] == json.loads(risk_path.read_text())["descriptor_sha256"]
+    assert report["input_descriptor_sha256"]["risk_snapshot"] == json.loads(
+        risk_path.read_text(encoding="utf-8")
+    )["descriptor_sha256"]
     by_symbol = {item["symbol"]: item for item in report["item_history_status"]}
     assert by_symbol["600001"]["eligible"] is False
     assert by_symbol["300001"]["eligible"] is True
@@ -1186,18 +1189,17 @@ def test_current_pool_publish_replace_failure_keeps_old_target_and_cleans_temp(
     assert not list(target.parent.glob(f".{target.name}.*.tmp"))
 
 
-def _fail_first_directory_fsync(monkeypatch: pytest.MonkeyPatch) -> list[int]:
-    real_fsync = jobs.os.fsync
-    directory_calls: list[int] = []
+def _fail_first_directory_fsync(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    real_fsync = jobs.fsync_directory
+    directory_calls: list[Path] = []
 
-    def fail_once(descriptor: int) -> None:
-        if stat.S_ISDIR(jobs.os.fstat(descriptor).st_mode):
-            directory_calls.append(descriptor)
-            if len(directory_calls) == 1:
-                raise OSError("simulated directory fsync failure")
-        real_fsync(descriptor)
+    def fail_once(directory: str | Path) -> None:
+        directory_calls.append(Path(directory))
+        if len(directory_calls) == 1:
+            raise OSError("simulated directory fsync failure")
+        real_fsync(directory)
 
-    monkeypatch.setattr(jobs.os, "fsync", fail_once)
+    monkeypatch.setattr(jobs, "fsync_directory", fail_once)
     return directory_calls
 
 

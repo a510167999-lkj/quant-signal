@@ -11,7 +11,9 @@ import pandas as pd
 import app.research_artifact_replay as research_artifact_replay_module
 import app.research_pit_store as research_pit_store_module
 from app.announcement_context import build_announcement_context
+from app.artifact_outcome_evidence import build_artifact_outcome_claim
 from app.research_artifact_replay import ArtifactNativeReplayAdapter
+from app.research_scope import is_mainboard_chinext_item
 from app.a_share_universe import (
     AShareUniverseProvider,
     _is_excluded_name,
@@ -76,6 +78,9 @@ MARKET_PROXY_SYMBOLS = [
     {"symbol": "159915", "market": "etf", "name": "创业板ETF"},
 ]
 
+STRATEGY_SIGNAL_WARMUP_SESSIONS = 90
+ARTIFACT_EVALUATION_WINDOW_SCHEMA_VERSION = "artifact-evaluation-window/v1"
+
 _ARTIFACT_LINEAR_PRICE_COLUMNS = (
     "open",
     "high",
@@ -98,6 +103,97 @@ _ARTIFACT_LINEAR_PRICE_COLUMNS = (
     "high20_prev",
     "low20_prev",
 )
+
+
+def _artifact_evaluation_window(
+    pit_universe: Any,
+    *,
+    requested_start_date: str,
+    analysis_end_date: str,
+) -> tuple[Dict[str, Any], List[str]]:
+    """Derive the honest strategy/benchmark window from audited calendar history.
+
+    Artifact-native signals require a fixed 90 completed-session prefix.  When
+    the artifact itself begins at the requested evaluation date, those sessions
+    are warmup rather than evaluable strategy sessions.  The cutoff is derived
+    only from the audited calendar contract, never from observed breadth,
+    candidates, or trades, so missing post-warmup data remains fail-closed.
+    """
+
+    def _iso_date(value: Any, label: str) -> str:
+        try:
+            normalized = _date_value(value).strftime("%Y-%m-%d")
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label} is not an ISO date") from exc
+        if str(value) != normalized:
+            raise ValueError(f"{label} is not a canonical ISO date")
+        return normalized
+
+    requested = _iso_date(requested_start_date, "requested start_date")
+    analysis_end = _iso_date(analysis_end_date, "analysis end_date")
+    artifact_start = _iso_date(
+        getattr(pit_universe, "start_date", None), "artifact history start_date"
+    )
+    artifact_end = _iso_date(
+        getattr(pit_universe, "end_date", None), "artifact history end_date"
+    )
+    if requested < artifact_start:
+        raise ValueError("requested start_date precedes audited artifact coverage")
+    if analysis_end > artifact_end:
+        raise ValueError("analysis end_date exceeds audited artifact coverage")
+    if analysis_end < requested:
+        raise ValueError("analysis end_date precedes requested start_date")
+
+    raw_history_sessions = pit_universe.open_sessions(artifact_start, analysis_end)
+    history_sessions = [
+        _iso_date(value, "audited open session") for value in raw_history_sessions
+    ]
+    if history_sessions != sorted(set(history_sessions)):
+        raise ValueError("audited open sessions are duplicated or unsorted")
+    if any(
+        session < artifact_start or session > analysis_end
+        for session in history_sessions
+    ):
+        raise ValueError("audited open session is outside artifact analysis range")
+    required_count = STRATEGY_SIGNAL_WARMUP_SESSIONS + 1
+    if len(history_sessions) < required_count:
+        raise ValueError(
+            f"artifact evaluation requires at least {required_count} audited open sessions"
+        )
+
+    warmup_cutoff = history_sessions[STRATEGY_SIGNAL_WARMUP_SESSIONS]
+    effective_floor = max(requested, warmup_cutoff)
+    raw_expected_sessions = pit_universe.open_sessions(effective_floor, analysis_end)
+    expected_sessions = [
+        _iso_date(value, "benchmark open session")
+        for value in raw_expected_sessions
+    ]
+    if expected_sessions != sorted(set(expected_sessions)):
+        raise ValueError("benchmark open sessions are duplicated or unsorted")
+    calendar_slice = [
+        session
+        for session in history_sessions
+        if effective_floor <= session <= analysis_end
+    ]
+    if expected_sessions != calendar_slice:
+        raise ValueError("benchmark open sessions disagree with audited calendar slice")
+    if not expected_sessions:
+        raise ValueError("artifact evaluation window has no open sessions")
+
+    effective_start = expected_sessions[0]
+    available_pre_evaluation = history_sessions.index(effective_start)
+    window = {
+        "schema_version": ARTIFACT_EVALUATION_WINDOW_SCHEMA_VERSION,
+        "requested_start_date": requested,
+        "artifact_history_start_date": artifact_start,
+        "analysis_end_date": analysis_end,
+        "required_warmup_sessions": STRATEGY_SIGNAL_WARMUP_SESSIONS,
+        "warmup_cutoff_date": warmup_cutoff,
+        "effective_evaluation_start_date": effective_start,
+        "available_pre_evaluation_sessions": available_pre_evaluation,
+        "expected_session_count": len(expected_sessions),
+    }
+    return window, expected_sessions
 
 
 def _artifact_causal_indicator_prefix(
@@ -286,6 +382,21 @@ def _artifact_open_verdict(
     return dict(cache[key])
 
 
+class ArtifactNativeUnresolvedExit(ValueError):
+    """A filled entry has no auditable sell fill before coverage ends."""
+
+    reason = "unfillable_through_coverage_end"
+
+    def __init__(self, symbol: str, signal_date: str, planned_exit_date: str) -> None:
+        self.symbol = str(symbol)
+        self.signal_date = str(signal_date)
+        self.planned_exit_date = str(planned_exit_date)
+        super().__init__(
+            "artifact-native exit remains unfillable through coverage end: "
+            f"{self.symbol} from {self.planned_exit_date}"
+        )
+
+
 def _artifact_native_time_exit_trade(
     *,
     adapter: ArtifactNativeReplayAdapter,
@@ -379,9 +490,8 @@ def _artifact_native_time_exit_trade(
             exit_position = candidate_position
             break
     if exit_verdict is None or exit_position is None:
-        raise ValueError(
-            f"artifact-native exit remains unfillable through coverage end: {symbol} "
-            f"from {sessions[planned_exit_position]}"
+        raise ArtifactNativeUnresolvedExit(
+            str(symbol), signal_date, sessions[planned_exit_position]
         )
 
     exit_date = sessions[exit_position]
@@ -405,41 +515,24 @@ def _artifact_native_time_exit_trade(
     ) * 1e-9:
         raise ValueError("artifact exit raw price disagrees with signal frame")
 
-    entry_total_return_price = float(entry_row["open"])
-    exit_total_return_price = float(exit_row["open"])
-    if entry_total_return_price <= 0 or exit_total_return_price <= 0:
-        raise ValueError("artifact outcome frame has a nonpositive signal open")
-
-    held = outcome_frame[
-        (outcome_frame["date"] >= entry_date) & (outcome_frame["date"] <= exit_date)
-    ].copy()
-    mark_to_market_path: List[Dict[str, Any]] = []
-    adverse = 0.0
-    favorable = 0.0
-    for _index, row in held.iterrows():
-        is_exit = str(row["date"]) == exit_date
-        open_price = exit_total_return_price if is_exit else float(row["open"])
-        high_price = open_price if is_exit else float(row["high"])
-        low_price = open_price if is_exit else float(row["low"])
-        close_price = open_price if is_exit else float(row["close"])
-        marks = {
-            "date": str(row["date"]),
-            "open_return_pct": round(
-                (open_price / entry_total_return_price - 1) * 100, 4
-            ),
-            "high_return_pct": round(
-                (high_price / entry_total_return_price - 1) * 100, 4
-            ),
-            "close_return_pct": round(
-                (close_price / entry_total_return_price - 1) * 100, 4
-            ),
-            "low_return_pct": round(
-                (low_price / entry_total_return_price - 1) * 100, 4
-            ),
+    held_dates = sessions[entry_position : exit_position + 1]
+    if any(value not in outcome_by_date.index for value in held_dates):
+        raise ValueError("artifact outcome frame is missing a held market session")
+    claim_bars = {
+        value: {
+            "trade_date": value,
+            **outcome_by_date.loc[value].to_dict(),
         }
-        mark_to_market_path.append(marks)
-        adverse = min(adverse, marks["low_return_pct"])
-        favorable = max(favorable, marks["high_return_pct"])
+        for value in held_dates
+    }
+    outcome_claim = build_artifact_outcome_claim(
+        bars_by_date=claim_bars,
+        held_dates=held_dates,
+        entry_date=entry_date,
+        exit_date=exit_date,
+        entry_raw_price=entry_raw_price,
+        exit_raw_price=exit_raw_price,
+    )
 
     realized = {
         "entry_date": entry_date,
@@ -447,14 +540,9 @@ def _artifact_native_time_exit_trade(
         "planned_exit_date": sessions[planned_exit_position],
         "exit_reason": "time_exit_next_open",
         "holding_days": max(1, exit_position - entry_position),
-        "mark_to_market_path": mark_to_market_path,
-        "return_pct": round(
-            (exit_total_return_price / entry_total_return_price - 1) * 100, 4
-        ),
-        "max_adverse_pct": round(adverse, 4),
-        "max_favorable_pct": round(favorable, 4),
-        "entry_raw_price": entry_raw_price,
-        "exit_raw_price": exit_raw_price,
+        "planned_holding_sessions": max(1, planned_exit_position - entry_position),
+        "actual_holding_sessions": max(1, exit_position - entry_position),
+        **outcome_claim,
         "exit_execution_evidence": exit_verdict,
         "price_basis": "raw_unadjusted_execution",
         "return_price_basis": "causal_total_return_open_to_open",
@@ -503,6 +591,7 @@ def _resolve_historical_universe(
     expected_coverage_audit_sha256: str = None,
     expected_artifact_root_sha256: str = None,
     expected_composite_root_sha256: str = None,
+    expected_composite_descriptor_file_sha256: str = None,
     expected_temporal_contract_sha256: str = None,
     expected_temporal_role: str = None,
 ) -> tuple[List[Dict[str, Any]], Any]:
@@ -525,6 +614,11 @@ def _resolve_historical_universe(
         raise ValueError("expected composite root requires a composite descriptor path")
     if composite_pit_descriptor_path and not expected_composite_root_sha256:
         raise ValueError("composite PIT universe requires expected composite root")
+    if (
+        expected_composite_descriptor_file_sha256
+        and not composite_pit_descriptor_path
+    ):
+        raise ValueError("expected composite descriptor hash requires a composite path")
     artifact_path = (
         composite_pit_descriptor_path
         or audited_pit_universe_path
@@ -547,6 +641,7 @@ def _resolve_historical_universe(
         universe = load_composite_universe_descriptor(
             composite_pit_descriptor_path,
             expected_composite_root_sha256=expected_composite_root_sha256,
+            expected_descriptor_file_sha256=expected_composite_descriptor_file_sha256,
         )
         if (
             universe.temporal_contract_sha256
@@ -615,7 +710,10 @@ def _batch_pit_eligible_dates_by_symbol(
                 raise
             continue
         for item in items:
-            if _is_excluded_name(str(item.get("name") or "")):
+            if (
+                _is_excluded_name(str(item.get("name") or ""))
+                or not is_mainboard_chinext_item(item)
+            ):
                 continue
             symbol = str(item.get("symbol") or "")
             if symbol:
@@ -661,6 +759,7 @@ def _build_historical_candidate_maps(
                 str(item.get("symbol") or ""): item
                 for item in historical_items
                 if not _is_excluded_name(str(item.get("name") or ""))
+                and is_mainboard_chinext_item(item)
             }
 
         snapshot = []
@@ -979,7 +1078,9 @@ def run_candidate_research_backtest(
                         }
                     )
             prior_outcomes = []
-            for index in range(90, len(frame) - hold_days - 1):
+            for index in range(
+                STRATEGY_SIGNAL_WARMUP_SESSIONS, len(frame) - hold_days - 1
+            ):
                 signal_date = str(frame.iloc[index]["date"])
                 signal = evaluate_signal(frame.iloc[: index + 1])
                 if signal["action"] not in {"BUY", "WATCH"} or signal["score"] < 2:
@@ -1340,6 +1441,7 @@ def _run_historical_universe_research_backtest_resolved(
     expected_coverage_audit_sha256: str = None,
     expected_artifact_root_sha256: str = None,
     expected_composite_root_sha256: str = None,
+    expected_composite_descriptor_file_sha256: str = None,
     temporal_contract_path: str = None,
     expected_temporal_contract_sha256: str = None,
     expected_temporal_role: str = None,
@@ -1367,6 +1469,9 @@ def _run_historical_universe_research_backtest_resolved(
     artifact_sessions: List[str] = []
     artifact_session_positions: Dict[str, int] = {}
     artifact_verdict_cache: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+    artifact_evaluation_window: Optional[Dict[str, Any]] = None
+    benchmark_start_date = start_date
+    benchmark_expected_sessions: Optional[List[str]] = None
     if getattr(pit_universe, "is_audited_store_artifact", False):
         adapter_temporal_kwargs = {}
         if expected_temporal_contract_sha256 is not None:
@@ -1397,6 +1502,17 @@ def _run_historical_universe_research_backtest_resolved(
         )
         if artifact_sessions != sorted(set(artifact_sessions)):
             raise ValueError("audited open sessions are duplicated or unsorted")
+        (
+            artifact_evaluation_window,
+            benchmark_expected_sessions,
+        ) = _artifact_evaluation_window(
+            pit_universe,
+            requested_start_date=start_date,
+            analysis_end_date=analysis_end_date,
+        )
+        benchmark_start_date = artifact_evaluation_window[
+            "effective_evaluation_start_date"
+        ]
         artifact_session_positions = {
             session: position for position, session in enumerate(artifact_sessions)
         }
@@ -1456,7 +1572,7 @@ def _run_historical_universe_research_backtest_resolved(
             if artifact_adapter is not None
             else len(frame) - hold_days - 1
         )
-        return range(90, stop)
+        return range(STRATEGY_SIGNAL_WARMUP_SESSIONS, stop)
 
     historical_signal_dates = {
         str(frame.iloc[index]["date"])
@@ -1501,6 +1617,7 @@ def _run_historical_universe_research_backtest_resolved(
             errors.append({"stage": "dragon_tiger_context", "message": str(exc)})
 
     all_trades: List[Dict[str, Any]] = []
+    unresolved_artifact_exits: List[Dict[str, str]] = []
     by_signal_date: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     market_context_cache: Dict[str, Dict[str, Any]] = {}
     market_returns_cache: Dict[str, Dict[str, Any]] = {}
@@ -1625,19 +1742,30 @@ def _run_historical_universe_research_backtest_resolved(
                     continue
 
                 if artifact_adapter is not None:
-                    artifact_trade = _artifact_native_time_exit_trade(
-                        adapter=artifact_adapter,
-                        verdict_cache=artifact_verdict_cache,
-                        symbol=str(symbol),
-                        signal_date=signal_date,
-                        sessions=artifact_sessions,
-                        session_positions=artifact_session_positions,
-                        artifact_start_date=pit_universe.start_date,
-                        hold_days=hold_days,
-                        settings=settings,
-                        analysis_frame=frame,
-                        analysis_date_positions=artifact_frame_date_positions,
-                    )
+                    try:
+                        artifact_trade = _artifact_native_time_exit_trade(
+                            adapter=artifact_adapter,
+                            verdict_cache=artifact_verdict_cache,
+                            symbol=str(symbol),
+                            signal_date=signal_date,
+                            sessions=artifact_sessions,
+                            session_positions=artifact_session_positions,
+                            artifact_start_date=pit_universe.start_date,
+                            hold_days=hold_days,
+                            settings=settings,
+                            analysis_frame=frame,
+                            analysis_date_positions=artifact_frame_date_positions,
+                        )
+                    except ArtifactNativeUnresolvedExit as exc:
+                        unresolved_artifact_exits.append(
+                            {
+                                "symbol": exc.symbol,
+                                "signal_date": exc.signal_date,
+                                "planned_exit_date": exc.planned_exit_date,
+                                "reason": exc.reason,
+                            }
+                        )
+                        continue
                     if artifact_trade is None:
                         continue
                     realized_payload, executable = artifact_trade
@@ -1872,9 +2000,13 @@ def _run_historical_universe_research_backtest_resolved(
     )
     stock_benchmark_summary = _stock_universe_equal_weight_benchmark(
         market_breadth_by_date,
-        start_date,
+        benchmark_start_date,
         analysis_end_date,
-        expected_sessions=pit_universe.open_sessions(start_date, analysis_end_date),
+        expected_sessions=(
+            benchmark_expected_sessions
+            if benchmark_expected_sessions is not None
+            else pit_universe.open_sessions(start_date, analysis_end_date)
+        ),
     )
     strict_audited_development_replay = (
         isinstance(
@@ -1974,6 +2106,7 @@ def _run_historical_universe_research_backtest_resolved(
             "market_context_schema_version": STOCK_MARKET_CONTEXT_SCHEMA_VERSION,
             "market_context_etf_dependent": False,
             "artifact_native_replay": artifact_adapter is not None,
+            "artifact_evaluation_window": artifact_evaluation_window,
             "market_data_source": "audited_artifact"
             if artifact_adapter is not None
             and not composite_audited_development_replay
@@ -1993,6 +2126,15 @@ def _run_historical_universe_research_backtest_resolved(
             "daily_prefilter_max_deep": max_deep,
             "historical_candidate_days": len(candidate_maps),
             "historical_market_breadth_days": len(market_breadth_by_date),
+            "artifact_unresolved_exit_count": len(unresolved_artifact_exits),
+            "artifact_unresolved_exits": sorted(
+                unresolved_artifact_exits,
+                key=lambda item: (
+                    item["signal_date"],
+                    item["symbol"],
+                    item["planned_exit_date"],
+                ),
+            ),
             "industry_rotation_context_enabled": bool(use_industry_rotation_context),
             "industry_rotation_max_boards": industry_rotation_max_boards
             if use_industry_rotation_context
@@ -2181,6 +2323,11 @@ def run_historical_universe_research_backtest(*args: Any, **kwargs: Any) -> Dict
         raise ValueError("audited backtest requires expected_artifact_root_sha256")
     if composite_path and not bound.arguments["expected_composite_root_sha256"]:
         raise ValueError("composite backtest requires expected_composite_root_sha256")
+    if (
+        bound.arguments["expected_composite_descriptor_file_sha256"]
+        and not composite_path
+    ):
+        raise ValueError("composite descriptor hash requires composite path")
     if composite_path and bound.arguments["expected_artifact_root_sha256"]:
         raise ValueError("composite backtest forbids a single artifact root anchor")
     if audited_path and bound.arguments["expected_composite_root_sha256"]:
@@ -2217,6 +2364,9 @@ def run_historical_universe_research_backtest(*args: Any, **kwargs: Any) -> Dict
         expected_artifact_root_sha256=bound.arguments["expected_artifact_root_sha256"],
         expected_composite_root_sha256=bound.arguments[
             "expected_composite_root_sha256"
+        ],
+        expected_composite_descriptor_file_sha256=bound.arguments[
+            "expected_composite_descriptor_file_sha256"
         ],
         expected_temporal_contract_sha256=bound.arguments[
             "expected_temporal_contract_sha256"

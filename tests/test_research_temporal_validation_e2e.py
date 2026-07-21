@@ -13,7 +13,11 @@ from app.artifact_outcome_evidence import replay_trade_outcome
 from app.indicators import add_indicators
 from app.research_pit import verify_research_evidence_bundle
 from app.research_pit_store import AuditedPointInTimeUniverse
-from app.research_validation import qualified_trades_sha256, validate_point_in_time_contract
+from app.research_validation import (
+    audited_authority_from_universe,
+    qualified_trades_sha256,
+    validate_point_in_time_contract,
+)
 from app.signals import evaluate_signal
 from app.strategy_signal_evidence import build_signal_snapshot
 from tests.test_research_pit import _write_verified_evidence
@@ -128,8 +132,9 @@ def test_strict_bundle_compiles_real_audited_artifact_into_development_validatio
             audited_universe=universe,
             artifact_root=str(evidence_root),
         )
+        authority = audited_authority_from_universe(universe)
         contract = {
-            "schema_version": "research_data_contract/v1",
+            "schema_version": "research_data_contract/v2",
             "artifact_role": "development_only",
             "point_in_time": True,
             "eligible_for_development_validation": True,
@@ -144,6 +149,19 @@ def test_strict_bundle_compiles_real_audited_artifact_into_development_validatio
             "universe_sha256": verified["universe_sha256"],
             "calendar_sha256": verified["calendar_sha256"],
             "source_manifest_sha256": verified["source_manifest_sha256"],
+            "artifact_root_sha256": universe.artifact_root_sha256,
+            "coverage_audit_sha256": universe.coverage_audit_sha256,
+            "temporal_contract_sha256": authority["temporal_contract_sha256"],
+            "temporal_role": authority["temporal_role"],
+            "audited_authority": authority,
+            "artifact_manifest_sha256": authority["artifact_manifest_sha256"],
+            "market_generation_root_sha256": authority[
+                "market_generation_root_sha256"
+            ],
+            "stock_generation_lineage_sha256": authority[
+                "stock_generation_lineage_sha256"
+            ],
+            "market_scope": verified["artifact_native_evidence"]["market_scope"],
             "evidence_bundle_path": Path(strict_descriptor["path"]).name,
             "evidence_bundle_sha256": verified["evidence_bundle_sha256"],
         }
@@ -160,6 +178,50 @@ def test_strict_bundle_compiles_real_audited_artifact_into_development_validatio
         assert validated["eligible_for_development_validation"] is True
         assert validated["eligible_for_final_validation"] is False
         assert validated["final_oos_eligible"] is False
+
+        for field in (
+            "artifact_root_sha256",
+            "coverage_audit_sha256",
+            "temporal_contract_sha256",
+            "temporal_role",
+            "artifact_manifest_sha256",
+            "market_generation_root_sha256",
+            "stock_generation_lineage_sha256",
+        ):
+            tampered = json.loads(json.dumps(contract))
+            tampered[field] = "wrong" if field == "temporal_role" else "f" * 64
+            with pytest.raises(ValueError, match="authority"):
+                validate_point_in_time_contract(
+                    {"research_data_contract": tampered},
+                    [trade],
+                    artifact_base_dir=str(evidence_root),
+                    declared_start_date=universe.start_date,
+                    declared_end_date=universe.end_date,
+                    audited_universe=universe,
+                )
+
+        nested_tamper = json.loads(json.dumps(contract))
+        nested_tamper["audited_authority"]["artifact_root_sha256"] = "f" * 64
+        with pytest.raises(ValueError, match="authority"):
+            validate_point_in_time_contract(
+                {"research_data_contract": nested_tamper},
+                [trade],
+                artifact_base_dir=str(evidence_root),
+                declared_start_date=universe.start_date,
+                declared_end_date=universe.end_date,
+                audited_universe=universe,
+            )
+
+        extra_field = {**contract, "unverified_note": "ambiguous"}
+        with pytest.raises(ValueError, match="fields"):
+            validate_point_in_time_contract(
+                {"research_data_contract": extra_field},
+                [trade],
+                artifact_base_dir=str(evidence_root),
+                declared_start_date=universe.start_date,
+                declared_end_date=universe.end_date,
+                audited_universe=universe,
+            )
         assert validated["verified_authority"]["temporal_role"] == "development"
     finally:
         universe.close()

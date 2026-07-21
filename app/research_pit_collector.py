@@ -88,6 +88,190 @@ class UrllibTushareTransport(_UrllibTushareTransport):
         )
 
 
+# w32tm 同步时间窗口:Windows 系统默认每天同步数次,超过 24h 视为失同步。
+_W32TM_MAX_SYNC_AGE = timedelta(hours=24)
+# w32tm 输出里代表"未真正 NTP 同步"的源字符串(硬件时钟)。
+_W32TM_UNSYNCHRONIZED_SOURCES = {"local cmos clock", "free-running system clock"}
+
+# 中英双解析:w32tm /query /status 在不同 Windows 语言下输出的键名不同。
+_W32TM_LAST_SYNC_KEYS = ("Last Successful Sync Time", "上次成功同步时间")
+_W32TM_SOURCE_KEYS = ("Source", "源")
+_W32TM_STRATUM_KEYS = ("Stratum", "层次")
+
+# Windows 区域设置决定的日期格式多样,逐一尝试。
+_W32TM_TIME_FORMATS = (
+    "%m/%d/%Y %I:%M:%S %p",   # 英文: 7/21/2026 11:00:00 AM
+    "%m/%d/%Y %H:%M:%S",       # 英文 24h
+    "%Y/%m/%d %H:%M:%S",       # 中文: 2026/7/21 15:06:14
+    "%Y-%m-%d %H:%M:%S",
+    "%#m/%d/%Y %I:%M:%S %p",   # Windows Python 单数字月(非标准 directive,但能跑)
+)
+
+
+def _parse_w32tm_sync_time(value: str) -> datetime | None:
+    """解析 w32tm 输出的"上次成功同步时间",返回 naive datetime(本地时区)。
+
+    w32tm 输出的是本机本地时间;稍后与 now_utc 对比前要先假定本地时区,转成 aware。
+    返回 None 表示无法解析。
+    """
+    raw = value.strip()
+    if not raw:
+        return None
+    for fmt in _W32TM_TIME_FORMATS:
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _windows_w32tm_probe(scrubbed_env: Mapping[str, str], checked_at: str) -> Mapping[str, Any]:
+    """Windows 平台的 NTP 同步证据收集;永远 fail-closed,绝不 crash。"""
+    try:
+        completed = subprocess.run(
+            ["w32tm", "/query", "/status"],
+            check=False,
+            capture_output=True,
+            timeout=5,
+            env=scrubbed_env,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return {
+            "source": "w32tm",
+            "synchronized": False,
+            "reason": "command_unavailable",
+            "checked_at": checked_at,
+        }
+
+    # Windows 中文系统上 w32tm 默认输出 OEM 编码(GBK),英文系统输出 ASCII。
+    # 先试 GBK(中文系统常见),失败再试 UTF-8;两路都失败用 replace 兜底。
+    out_bytes = completed.stdout
+    if isinstance(out_bytes, bytes):
+        stdout = _decode_windows_output(out_bytes)
+    else:
+        stdout = str(out_bytes or "")
+    if completed.returncode != 0 or not stdout:
+        return {
+            "source": "w32tm",
+            "synchronized": False,
+            "reason": "command_failed",
+            "returncode": completed.returncode,
+            "stderr": _safe_decode(completed.stderr),
+            "checked_at": checked_at,
+        }
+
+    last_sync_raw = _extract_w32tm_field(stdout, _W32TM_LAST_SYNC_KEYS)
+    source_raw = _extract_w32tm_field(stdout, _W32TM_SOURCE_KEYS)
+    stratum_raw = _extract_w32tm_field(stdout, _W32TM_STRATUM_KEYS)
+
+    if not last_sync_raw:
+        return {
+            "source": "w32tm",
+            "synchronized": False,
+            "reason": "last_sync_missing",
+            "checked_at": checked_at,
+        }
+    parsed = _parse_w32tm_sync_time(last_sync_raw)
+    if parsed is None:
+        return {
+            "source": "w32tm",
+            "synchronized": False,
+            "reason": "last_sync_unparseable",
+            "raw_last_sync": last_sync_raw[:100],
+            "checked_at": checked_at,
+        }
+
+    # 假定 w32tm 报告的是本机本地时间;转成 aware UTC 与 now_utc 对比。
+    # 没有可靠的方式从 w32tm 输出里读时区,故假设本机 local;now_utc 是 UTC,
+    # 两者对比用本地 now 减偏移。Python 3.9+ 用 astimezone 处理。
+    try:
+        local_aware = parsed.astimezone()
+    except (OverflowError, OSError, ValueError):
+        return {
+            "source": "w32tm",
+            "synchronized": False,
+            "reason": "timezone_conversion_failed",
+            "checked_at": checked_at,
+        }
+    now_utc = SystemTrustedClock.now_utc()
+    age = now_utc - local_aware.astimezone(timezone.utc)
+    if abs(age) > _W32TM_MAX_SYNC_AGE:
+        return {
+            "source": "w32tm",
+            "synchronized": False,
+            "reason": "stale_sync_over_24h",
+            "sync_age_hours": round(abs(age).total_seconds() / 3600, 2),
+            "last_sync_utc": local_aware.astimezone(timezone.utc).isoformat(),
+            "checked_at": checked_at,
+        }
+
+    source_text = (source_raw or "").strip()
+    # Windows 输出"Local CMOS Clock"或"Free-Running System Clock"表示硬件时钟未同步
+    if source_text.lower() in _W32TM_UNSYNCHRONIZED_SOURCES:
+        return {
+            "source": "w32tm",
+            "synchronized": False,
+            "reason": "local_cmos_unsynchronized",
+            "sync_source": source_text,
+            "checked_at": checked_at,
+        }
+
+    stratum_value: int | None = None
+    if stratum_raw:
+        match = re.match(r"\s*(\d+)", stratum_raw)
+        if match:
+            stratum_value = int(match.group(1))
+
+    return {
+        "source": "w32tm",
+        "synchronized": True,
+        "sync_source": source_text,
+        "stratum": stratum_value,
+        "last_sync_utc": local_aware.astimezone(timezone.utc).isoformat(),
+        "sync_age_seconds": round(abs(age).total_seconds(), 2),
+        "maximum_sync_age_seconds": int(_W32TM_MAX_SYNC_AGE.total_seconds()),
+        "checked_at": checked_at,
+    }
+
+
+def _extract_w32tm_field(stdout: str, keys: Sequence[str]) -> str | None:
+    """从 w32tm 输出里抓字段值,中英双键尝试。
+
+    w32tm 输出形如 `Source: ntp.aliyun.com,0x9`(英文)或 `源: ntp.aliyun.com,0x9`(中文)。
+    行内第一个冒号后到行尾就是值;trim 空白。
+    """
+    for key in keys:
+        pattern = re.compile(rf"^\s*{re.escape(key)}\s*:\s*(.*?)\s*$", re.MULTILINE)
+        match = pattern.search(stdout)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _safe_decode(value: Any) -> str:
+    """subprocess 输出可能是 bytes 或 str(测试注入),统一返回前 200 字符 str。"""
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = str(value or "")
+    return text[:200]
+
+
+def _decode_windows_output(data: bytes) -> str:
+    """Windows w32tm / system 命令输出编码处理。
+
+    中文 Windows 默认 OEM 编码是 GBK(code page 936),英文系统是 ASCII/UTF-8。
+    策略:先试 GBK(中文键 `上次成功同步时间` 才能正确解析),失败 fallback UTF-8,
+    再失败用 replace 兜底(至少英文键和数字还能解析)。
+    """
+    for encoding in ("gbk", "utf-8"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
 class SystemTrustedClock:
     """Fail-closed NTP attestation with injectable probe for managed hosts."""
 
@@ -183,6 +367,13 @@ class SystemTrustedClock:
                     "synchronized": False,
                     "checked_at": checked_at,
                 }
+        if platform.system() == "Windows":
+            # Windows 没有 timedatectl/sntp,用 w32tm /query /status 验证最近一次 NTP 同步。
+            # 判定同步:命令成功 + 解析出"上次成功同步时间" + 距今 ≤ 24 小时 + 源不是
+            # "Local CMOS Clock"(硬件时钟,未同步)。输出编码可能是 GBK / UTF-16 LE,
+            # capture_output=True + text=True 在中文 Windows 上默认 GBK 解码;保险起见
+            # 用 errors="replace" 让未知字节不致 raise。
+            return _windows_w32tm_probe(scrubbed_env, checked_at)
         return {"source": "unavailable", "synchronized": False, "checked_at": checked_at}
 
     def assert_synchronized(self) -> Mapping[str, Any]:

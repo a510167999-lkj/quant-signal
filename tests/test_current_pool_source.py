@@ -887,7 +887,7 @@ def test_fetch_binds_as_of_to_shanghai_collection_day(monkeypatch, tmp_path: Pat
     result = fetch_jiaoch_current_pool_descriptor(
         as_of="2026-07-13", output_dir=tmp_path, now_provider=lambda: now
     )
-    payload = json.loads(Path(result["path"]).read_text())
+    payload = json.loads(Path(result["path"]).read_text(encoding="utf-8"))
     assert payload["as_of"] == "2026-07-13"
     assert payload["retrieved_at"] == "2026-07-13T23:59:00+08:00"
     with pytest.raises(ValueError, match="collection day"):

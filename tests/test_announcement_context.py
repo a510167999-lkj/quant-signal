@@ -226,3 +226,45 @@ def test_announcement_provider_probes_denied_jiaoch_capability_only_once_concurr
 
     assert calls == {"jiaoch": 1, "cninfo": 8}
     assert all(payload["fallback_reason_code"] == "permission_denied" for payload in payloads)
+
+
+def test_fetch_jiaoch_distinguishes_transport_timeout_from_tls_and_connection(monkeypatch):
+    """URLError/timeout/SSL 必须映射到稳定细分 code,其他异常回退 transport_error。
+
+    这样运维和生产健康检查能在不开 DEBUG 日志的情况下分辨失败类型
+    (clock gate 阻塞 vs DNS/TCP vs TLS 证书 vs 真超时),前端 fallback 语义不变。
+    """
+    import socket
+    import ssl
+    from urllib.error import URLError
+
+    from app.announcement_context import UrllibTushareTransport
+
+    monkeypatch.setenv("JIAOCH_TOKEN", "test-token")
+    cases = [
+        (socket.timeout("timed out"), "transport_timeout"),
+        (ssl.SSLError("TLS handshake failed"), "transport_tls"),
+        (
+            URLError(socket.gaierror("name resolution failed")),
+            "transport_connection",
+        ),
+        (RuntimeError("unexpected"), "transport_error"),
+    ]
+    for raised, expected_code in cases:
+        class FailingTransport:
+            def post(self, **kwargs):
+                raise raised
+
+        monkeypatch.setattr(
+            "app.announcement_context.UrllibTushareTransport",
+            lambda **kwargs: FailingTransport(),
+        )
+        try:
+            fetch_jiaoch_announcements("600519", "20260101", "20260131")
+            raise AssertionError(f"expected AnnouncementSourceError for {expected_code}")
+        except AnnouncementSourceError as exc:
+            assert exc.code == expected_code, (
+                f"{type(raised).__name__} should map to {expected_code}, got {exc.code}"
+            )
+    # UrllibTushareTransport import 保留以便未来直接探测;当前 fetch 走 monkeypatch 路径
+    assert UrllibTushareTransport is not None

@@ -18,6 +18,12 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
+from app.research_authority import (
+    audited_authority_from_universe,
+    audited_coverage_from_universe,
+    is_composite_universe,
+)
+
 
 SCHEMA_VERSION = "pit_universe_artifact/v1"
 REQUIRED_SOURCE_HASHES = {
@@ -30,7 +36,8 @@ REQUIRED_MARKET_COMPONENTS = {
     "corporate_actions",
     "causal_signal_bars",
 }
-STRICT_EVIDENCE_SCHEMA_VERSION = "research_pit_evidence_bundle/v3"
+STRICT_EVIDENCE_SCHEMA_VERSION = "research_pit_evidence_bundle/v5"
+COMPOSITE_STRICT_EVIDENCE_SCHEMA_VERSION = "research_pit_evidence_bundle/v7"
 _AUDITED_AUTHORITY_KEYS = {
     "artifact_root_sha256",
     "coverage_audit_sha256",
@@ -693,27 +700,7 @@ def write_research_evidence_bundle(
 
 
 def _audited_authority_from_universe(audited_universe: Any) -> Dict[str, Any]:
-    authority = {
-        "artifact_root_sha256": audited_universe.artifact_root_sha256,
-        "coverage_audit_sha256": audited_universe.coverage_audit_sha256,
-        "temporal_contract_sha256": audited_universe.temporal_contract_sha256,
-        "temporal_role": audited_universe.temporal_role,
-        "artifact_manifest_sha256": audited_universe.manifest["manifest_sha256"],
-        "market_generation_root_sha256": audited_universe.manifest[
-            "market_generations"
-        ]["root_sha256"],
-        "stock_generation_lineage_sha256": audited_universe.manifest[
-            "stock_generation"
-        ]["lineage_sha256"],
-    }
-    if set(authority) != _AUDITED_AUTHORITY_KEYS:
-        raise ValueError("audited authority fields are incomplete")
-    if authority["temporal_role"] != "development":
-        raise ValueError("strict evidence requires development audited authority")
-    for key in _AUDITED_AUTHORITY_KEYS - {"temporal_role"}:
-        if not _valid_sha256(authority[key]):
-            raise ValueError(f"audited authority hash is invalid: {key}")
-    return authority
+    return audited_authority_from_universe(audited_universe)
 
 
 def write_strict_research_evidence_bundle(
@@ -753,7 +740,7 @@ def write_strict_research_evidence_bundle(
             "artifact-native evidence is not eligible for development validation"
         )
     authority = _audited_authority_from_universe(audited_universe)
-    coverage = deepcopy(audited_universe.manifest["coverage"])
+    coverage = audited_coverage_from_universe(audited_universe)
     hashes = {
         "universe_sha256": audited_universe.universe_sha256,
         "calendar_sha256": audited_universe.calendar_sha256,
@@ -766,12 +753,17 @@ def write_strict_research_evidence_bundle(
     if not all(_valid_sha256(value) for value in hashes.values()):
         raise ValueError("strict evidence contains an invalid contract hash")
     payload = {
-        "schema_version": STRICT_EVIDENCE_SCHEMA_VERSION,
+        "schema_version": (
+            COMPOSITE_STRICT_EVIDENCE_SCHEMA_VERSION
+            if is_composite_universe(audited_universe)
+            else STRICT_EVIDENCE_SCHEMA_VERSION
+        ),
         "artifact_role": "development_only",
         "artifacts": {"artifact_native_evidence": native_descriptor},
         "hashes": hashes,
         "coverage": coverage,
         "audited_authority": authority,
+        "market_scope": deepcopy(native["market_scope"]),
         "eligibility": {
             "development_integrity": True,
             "eligible_for_development_validation": True,
@@ -839,6 +831,8 @@ def _verify_strict_research_evidence_bundle(
     expected_authority = _audited_authority_from_universe(audited_universe)
     if payload.get("audited_authority") != expected_authority:
         raise ValueError("strict research evidence audited authority mismatch")
+    if payload.get("market_scope") != native.get("market_scope"):
+        raise ValueError("strict research evidence market scope mismatch")
     expected_hashes = {
         "universe_sha256": audited_universe.universe_sha256,
         "calendar_sha256": audited_universe.calendar_sha256,
@@ -850,7 +844,7 @@ def _verify_strict_research_evidence_bundle(
     }
     if payload.get("hashes") != expected_hashes:
         raise ValueError("strict research evidence contract hash mismatch")
-    coverage = deepcopy(audited_universe.manifest["coverage"])
+    coverage = audited_coverage_from_universe(audited_universe)
     if payload.get("coverage") != coverage:
         raise ValueError("strict research evidence coverage mismatch")
     expected_limitations = [
@@ -881,7 +875,11 @@ def _verify_strict_research_evidence_bundle(
         "final_oos_eligible": False,
         "eligibility": deepcopy(expected_eligibility),
         "integrity_only": False,
-        "schema_version": STRICT_EVIDENCE_SCHEMA_VERSION,
+        "schema_version": (
+            COMPOSITE_STRICT_EVIDENCE_SCHEMA_VERSION
+            if is_composite_universe(audited_universe)
+            else STRICT_EVIDENCE_SCHEMA_VERSION
+        ),
         "audited_authority": deepcopy(expected_authority),
         "artifact_native_evidence": native,
     }
@@ -894,7 +892,7 @@ def write_strict_qualified_trades_payload(
     strict_evidence_bundle_path: str,
     audited_universe: Any,
 ) -> Dict[str, Any]:
-    """Publish a new qualified payload with a verified v3 data contract.
+    """Publish a new qualified payload with the current verified data contract.
 
     The source qualified file remains immutable because artifact-native
     evidence binds its exact bytes.  This function creates a second,
@@ -946,7 +944,11 @@ def write_strict_qualified_trades_payload(
         raise ValueError("strict evidence source payload path mismatch")
     audited_authority = deepcopy(verified["audited_authority"])
     contract = {
-        "schema_version": "research_data_contract/v1",
+        "schema_version": (
+            "research_data_contract/v4"
+            if is_composite_universe(audited_universe)
+            else "research_data_contract/v2"
+        ),
         "artifact_role": "development_only",
         "point_in_time": True,
         "eligible_for_development_validation": True,
@@ -961,25 +963,31 @@ def write_strict_qualified_trades_payload(
         "universe_sha256": verified["universe_sha256"],
         "calendar_sha256": verified["calendar_sha256"],
         "source_manifest_sha256": verified["source_manifest_sha256"],
-        "artifact_root_sha256": audited_authority["artifact_root_sha256"],
-        "coverage_audit_sha256": audited_authority["coverage_audit_sha256"],
+        "artifact_root_sha256": audited_universe.artifact_root_sha256,
+        "coverage_audit_sha256": audited_universe.coverage_audit_sha256,
         "temporal_contract_sha256": audited_authority[
             "temporal_contract_sha256"
         ],
         "temporal_role": audited_authority["temporal_role"],
-        "artifact_manifest_sha256": audited_authority[
-            "artifact_manifest_sha256"
-        ],
-        "market_generation_root_sha256": audited_authority[
-            "market_generation_root_sha256"
-        ],
-        "stock_generation_lineage_sha256": audited_authority[
-            "stock_generation_lineage_sha256"
-        ],
         "audited_authority": audited_authority,
+        "market_scope": deepcopy(verified["artifact_native_evidence"]["market_scope"]),
         "evidence_bundle_path": bundle_descriptor["path"],
         "evidence_bundle_sha256": verified["evidence_bundle_sha256"],
     }
+    if not is_composite_universe(audited_universe):
+        contract.update(
+            {
+                "artifact_manifest_sha256": audited_authority[
+                    "artifact_manifest_sha256"
+                ],
+                "market_generation_root_sha256": audited_authority[
+                    "market_generation_root_sha256"
+                ],
+                "stock_generation_lineage_sha256": audited_authority[
+                    "stock_generation_lineage_sha256"
+                ],
+            }
+        )
     summary["research_data_contract"] = contract
     summary["research_proof_scope"] = {
         "artifact_role": "development_only",
@@ -1034,7 +1042,17 @@ def verify_research_evidence_bundle(
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("research evidence bundle is not valid JSON") from exc
     schema_version = payload.get("schema_version")
-    if schema_version == STRICT_EVIDENCE_SCHEMA_VERSION:
+    if schema_version in {
+        STRICT_EVIDENCE_SCHEMA_VERSION,
+        COMPOSITE_STRICT_EVIDENCE_SCHEMA_VERSION,
+    }:
+        expected_schema = (
+            COMPOSITE_STRICT_EVIDENCE_SCHEMA_VERSION
+            if is_composite_universe(audited_universe)
+            else STRICT_EVIDENCE_SCHEMA_VERSION
+        )
+        if schema_version != expected_schema:
+            raise ValueError("strict evidence schema does not match audited authority kind")
         return _verify_strict_research_evidence_bundle(
             bundle_path,
             payload,

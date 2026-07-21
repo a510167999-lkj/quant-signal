@@ -20,6 +20,7 @@ from app.current_pool_source import (
     _strict_json_loads,
     verify_current_pool_universe_descriptor,
 )
+from app.durable_io import fsync_directory
 from app.research_pit_store import MARKET_SESSION_VINTAGES, PITReceiptStore
 
 
@@ -264,11 +265,7 @@ def _write_content_addressed(
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, destination)
-            directory_descriptor = os.open(directory, os.O_RDONLY)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
+            fsync_directory(directory)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)

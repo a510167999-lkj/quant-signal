@@ -639,7 +639,7 @@ def _stock_relative_strength_context(
     }
 
 
-STOCK_UNIVERSE_BENCHMARK_SCHEMA_VERSION = "stock-universe-equal-weight-benchmark/v1"
+STOCK_UNIVERSE_BENCHMARK_SCHEMA_VERSION = "stock-universe-equal-weight-benchmark/v2"
 
 
 def _stock_universe_equal_weight_benchmark(
@@ -658,10 +658,22 @@ def _stock_universe_equal_weight_benchmark(
     空数据 fail closed，绝不静默给 0。
     """
     reasons: List[str] = []
+    expected_day_count = (
+        len(expected_sessions) if isinstance(expected_sessions, list) else None
+    )
+
+    def _window_fields() -> Dict[str, Any]:
+        return {
+            "stock_universe_benchmark_start_date": start_date,
+            "stock_universe_benchmark_end_date": analysis_end_date,
+            "stock_universe_benchmark_expected_days": expected_day_count,
+        }
+
     if not analysis_end_date:
         reasons.append("analysis_end_date missing")
         return {
             "schema_version": STOCK_UNIVERSE_BENCHMARK_SCHEMA_VERSION,
+            **_window_fields(),
             "stock_universe_equal_weight_daily_rebalanced_return_pct": None,
             "stock_universe_benchmark_days": 0,
             "stock_universe_benchmark_min_coverage_pct": None,
@@ -691,6 +703,7 @@ def _stock_universe_equal_weight_benchmark(
         reasons.append(reason)
         return {
             "schema_version": STOCK_UNIVERSE_BENCHMARK_SCHEMA_VERSION,
+            **_window_fields(),
             "stock_universe_equal_weight_daily_rebalanced_return_pct": None,
             "stock_universe_benchmark_days": len(included),
             "stock_universe_benchmark_min_coverage_pct": observed_min_coverage,
@@ -743,6 +756,7 @@ def _stock_universe_equal_weight_benchmark(
     reasons.append("compounded across %d eligible breadth days" % len(included))
     return {
         "schema_version": STOCK_UNIVERSE_BENCHMARK_SCHEMA_VERSION,
+        **_window_fields(),
         "stock_universe_equal_weight_daily_rebalanced_return_pct": round(
             (factor - 1.0) * 100.0, 2
         ),
