@@ -349,6 +349,32 @@ def test_stk_limit_allows_missing_optional_pre_close_but_keeps_exact_limits():
     ]
 
 
+@pytest.mark.parametrize("nan_value", [float("nan"), float("inf"), float("-inf")])
+def test_stk_limit_nonfinite_pre_close_degrades_to_none_not_fail_closed(nan_value):
+    """jiaoch stk_limit 对 ~22% symbol 返回 NaN pre_close(新股首日/复牌/数据缺失)。
+
+    NaN/inf pre_close 降级为 None(涨跌停区间仍用 up_limit/down_limit 验证),
+    不 fail-closed——否则大池 PIT 抓取无法完成。
+    """
+    rows = research_pit_store._normalize_rows(
+        "stk_limit",
+        "2024-01-02",
+        {"trade_date": "2024-01-02"},
+        list(NORMALIZED_FIELDS["stk_limit"]),
+        [["20240102", "600001.SH", nan_value, 11.0, 9.0]],
+    )
+
+    assert rows == [
+        {
+            "trade_date": "2024-01-02",
+            "ts_code": "600001.SH",
+            "pre_close": None,
+            "up_limit": 11.0,
+            "down_limit": 9.0,
+        }
+    ]
+
+
 def test_stk_limit_preserves_zero_limit_for_scope_reconciliation():
     rows = research_pit_store._normalize_rows(
         "stk_limit",

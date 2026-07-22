@@ -1250,11 +1250,19 @@ def _normalize_rows(
                     ),
                 }
             elif dataset == "stk_limit":
-                pre_close = (
-                    None
-                    if raw.get("pre_close") in {None, ""}
-                    else _finite_number(raw.get("pre_close"), "stk_limit pre_close", positive=True)
-                )
+                # pre_close 是涨跌停参考价,jiaoch 对新股首日/复牌等场景可能返回 NaN/inf。
+                # 缺失或非有限时降级为 None(涨跌停区间验证 _has_valid_expected_limit_interval
+                # 会返回 False,下游保守处理),不 fail-closed。
+                _raw_pre_close = raw.get("pre_close")
+                try:
+                    pre_close = (
+                        None
+                        if _raw_pre_close in {None, ""}
+                        or not math.isfinite(float(_raw_pre_close))
+                        else float(_raw_pre_close)
+                    )
+                except (TypeError, ValueError):
+                    pre_close = None
                 up_limit = _finite_number(
                     raw.get("up_limit"), "stk_limit up_limit", nonnegative=True
                 )
