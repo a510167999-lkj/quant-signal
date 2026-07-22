@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from app import current_pool_gate
 from app.research_partitions import (
     PartitionContractError,
     assert_final_oos_sealed,
@@ -16,6 +17,7 @@ from app.research_partitions import (
 
 
 CONTRACT_PATH = Path("data/research_partitions/frozen-v1.json")
+V2_CONTRACT_PATH = Path("data/research_partitions/frozen-v2.json")
 
 
 def _canonical_sha256(payload):
@@ -248,3 +250,81 @@ def test_valid_contract_with_top_or_nested_duplicate_key_is_rejected(tmp_path, d
 def test_datetime_objects_and_timestamp_strings_are_rejected(value):
     with pytest.raises(PartitionContractError):
         classify_date(load_temporal_partition_contract(CONTRACT_PATH), value)
+
+
+def test_current_pool_v2_contract_loads_with_a_valid_self_hash():
+    raw = json.loads(V2_CONTRACT_PATH.read_text(encoding="utf-8"))
+    contract = load_temporal_partition_contract(V2_CONTRACT_PATH)
+
+    assert contract["contract_sha256"] == _canonical_sha256(raw)
+    assert contract["policy_version"] == "current-pool-development-forward-oos/v2"
+    assert [role["name"] for role in contract["roles"]] == [
+        "development",
+        "embargo",
+        "final_oos",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2024-07-05", "development"),
+        ("2026-07-03", "development"),
+        ("2026-07-04", "embargo"),
+        ("2026-07-12", "embargo"),
+        ("2026-07-13", "final_oos"),
+    ],
+)
+def test_current_pool_v2_classifies_frozen_boundaries(value, expected):
+    assert classify_date(load_temporal_partition_contract(V2_CONTRACT_PATH), value) == expected
+
+
+def test_current_pool_v2_permits_development_only_and_seals_final_oos(monkeypatch):
+    contract = load_temporal_partition_contract(V2_CONTRACT_PATH)
+    evidence = contract["development_evidence"]["current_pool_coverage_audit"]
+    monkeypatch.setattr(
+        current_pool_gate,
+        "verify_current_pool_audit",
+        lambda _path: {
+            "canonical_sha256": evidence["canonical_sha256"],
+            "source_as_of": evidence["source_as_of"],
+        },
+    )
+
+    for operation in ("collect", "publish", "train", "validate", "backtest"):
+        assert_range_allowed(contract, "development", "2024-07-05", "2026-07-03", operation)
+    for role, start, end in (
+        ("embargo", "2026-07-04", "2026-07-12"),
+        ("final_oos", "2026-07-13", "2026-07-13"),
+    ):
+        with pytest.raises(PartitionContractError):
+            assert_range_allowed(contract, role, start, end, "backtest")
+    assert_final_oos_sealed(contract)
+
+
+def test_current_pool_v2_rejects_rehashed_evidence_tampering(tmp_path):
+    raw = json.loads(V2_CONTRACT_PATH.read_text(encoding="utf-8"))
+    raw["development_evidence"]["history_end"] = "2026-07-02"
+
+    with pytest.raises(PartitionContractError, match="development evidence"):
+        load_temporal_partition_contract(_write_contract(tmp_path, raw))
+
+
+def test_current_pool_v2_rejects_missing_audit_evidence(tmp_path, monkeypatch):
+    contract = load_temporal_partition_contract(V2_CONTRACT_PATH)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(PartitionContractError, match="evidence is unavailable"):
+        assert_range_allowed(contract, "development", "2024-07-05", "2026-07-03", "collect")
+
+
+def test_current_pool_v2_rejects_audit_evidence_hash_mismatch(monkeypatch):
+    contract = load_temporal_partition_contract(V2_CONTRACT_PATH)
+    monkeypatch.setattr(
+        current_pool_gate,
+        "verify_current_pool_audit",
+        lambda _path: {"canonical_sha256": "0" * 64, "source_as_of": "2026-07-22"},
+    )
+
+    with pytest.raises(PartitionContractError, match="evidence does not match"):
+        assert_range_allowed(contract, "development", "2024-07-05", "2026-07-03", "collect")

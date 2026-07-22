@@ -13,21 +13,33 @@ class PartitionContractError(ValueError):
     """The frozen temporal partition contract or a requested use is invalid."""
 
 
-_ROLE_NAMES = (
+_V1_ROLE_NAMES = (
     "development",
     "contaminated_diagnostic",
     "embargo",
     "final_oos",
 )
 _ROLE_KEYS = {"name", "start_date", "end_date", "sealed", "permitted_operations"}
-_TOP_LEVEL_KEYS = {
+_V1_TOP_LEVEL_KEYS = {
     "schema_version",
     "policy_version",
     "roles",
     "contamination_evidence",
     "contract_sha256",
 }
+_V2_TOP_LEVEL_KEYS = {
+    "schema_version",
+    "policy_version",
+    "roles",
+    "development_evidence",
+    "contract_sha256",
+}
 _EVIDENCE_KEYS = {"strategy_results", "real_pit_windows"}
+_V2_EVIDENCE_KEYS = {
+    "current_pool_coverage_audit",
+    "history_start",
+    "history_end",
+}
 _RESULT_KEYS = {"path", "sha256", "maximum_observed_date"}
 _WINDOW_KEYS = {
     "start_date",
@@ -35,15 +47,26 @@ _WINDOW_KEYS = {
     "coverage_audit_sha256",
     "artifact_root_sha256",
 }
-_OPERATIONS = {
+_V1_OPERATIONS = {
     "development": ["collect", "publish", "train", "validate", "backtest"],
     "contaminated_diagnostic": ["collect", "publish", "diagnose"],
     "embargo": [],
     "final_oos": [],
 }
-_BOUNDS = (
+_V1_BOUNDS = (
     ("2016-01-01", "2023-12-31", False),
     ("2024-01-01", "2026-07-03", False),
+    ("2026-07-04", "2026-07-12", True),
+    ("2026-07-13", None, True),
+)
+_V2_ROLE_NAMES = ("development", "embargo", "final_oos")
+_V2_OPERATIONS = {
+    "development": ["collect", "publish", "train", "validate", "backtest"],
+    "embargo": [],
+    "final_oos": [],
+}
+_V2_BOUNDS = (
+    ("2024-07-05", "2026-07-03", False),
     ("2026-07-04", "2026-07-12", True),
     ("2026-07-13", None, True),
 )
@@ -59,6 +82,15 @@ _EXPECTED_RESULTS = [
         "maximum_observed_date": "2026-07-03",
     },
 ]
+_EXPECTED_V2_EVIDENCE = {
+    "current_pool_coverage_audit": {
+        "path": "data/research_artifacts/current_pool_audits/6de58a9b42ef6134219ea2b155afa43836cde24cc86bafeb2f71f3653830cf55.json",
+        "canonical_sha256": "6de58a9b42ef6134219ea2b155afa43836cde24cc86bafeb2f71f3653830cf55",
+        "source_as_of": "2026-07-22",
+    },
+    "history_start": "2024-07-05",
+    "history_end": "2026-07-03",
+}
 _EXPECTED_WINDOWS = [
     {
         "start_date": "2024-01-02",
@@ -118,29 +150,25 @@ def _reject_json_constant(value: str) -> None:
     raise PartitionContractError(f"non-finite JSON constant is forbidden: {value}")
 
 
-def _validate_contract(contract: Any) -> None:
-    _require_exact_keys(contract, _TOP_LEVEL_KEYS, "contract")
-    if contract["schema_version"] != "research-temporal-partitions/v1":
-        raise PartitionContractError("unsupported schema_version")
-    if contract["policy_version"] != "contamination-aware-forward-oos/v1":
-        raise PartitionContractError("unsupported policy_version")
-    digest = contract["contract_sha256"]
-    if not isinstance(digest, str) or digest != _canonical_sha256(contract):
-        raise PartitionContractError("contract hash mismatch")
-
-    roles = contract["roles"]
-    if not isinstance(roles, list) or len(roles) != 4:
-        raise PartitionContractError("roles must contain exactly four entries")
+def _validate_roles(
+    roles: Any,
+    *,
+    role_names: tuple[str, ...],
+    bounds: tuple[tuple[str, str | None, bool], ...],
+    operations: Mapping[str, list[str]],
+) -> None:
+    if not isinstance(roles, list) or len(roles) != len(role_names):
+        raise PartitionContractError("roles have an invalid count")
     previous_end = None
-    for index, (role, name, bounds) in enumerate(zip(roles, _ROLE_NAMES, _BOUNDS)):
+    for index, (role, name, role_bounds) in enumerate(zip(roles, role_names, bounds)):
         _require_exact_keys(role, _ROLE_KEYS, f"role {index}")
-        start_text, end_text, sealed = bounds
+        start_text, end_text, sealed = role_bounds
         if role != {
             "name": name,
             "start_date": start_text,
             "end_date": end_text,
             "sealed": sealed,
-            "permitted_operations": _OPERATIONS[name],
+            "permitted_operations": operations[name],
         }:
             raise PartitionContractError(
                 f"role {name} sealed state or fields differ from frozen policy"
@@ -149,13 +177,31 @@ def _validate_contract(contract: Any) -> None:
             raise PartitionContractError(f"role {name} sealed must be a boolean")
         start = _parse_date(role["start_date"])
         end = _parse_date(role["end_date"]) if role["end_date"] is not None else None
-        if index < 3 and end is None:
+        if index < len(role_names) - 1 and end is None:
             raise PartitionContractError("only final_oos may be open-ended")
-        if index == 3 and end is not None:
+        if index == len(role_names) - 1 and end is not None:
             raise PartitionContractError("final_oos must be open-ended")
         if previous_end is not None and start != previous_end + timedelta(days=1):
             raise PartitionContractError("roles have a gap or overlap")
         previous_end = end
+
+
+def _validate_v1_contract(contract: Any) -> None:
+    _require_exact_keys(contract, _V1_TOP_LEVEL_KEYS, "contract")
+    if contract["schema_version"] != "research-temporal-partitions/v1":
+        raise PartitionContractError("unsupported schema_version")
+    if contract["policy_version"] != "contamination-aware-forward-oos/v1":
+        raise PartitionContractError("unsupported policy_version")
+    digest = contract["contract_sha256"]
+    if not isinstance(digest, str) or digest != _canonical_sha256(contract):
+        raise PartitionContractError("contract hash mismatch")
+
+    _validate_roles(
+        contract["roles"],
+        role_names=_V1_ROLE_NAMES,
+        bounds=_V1_BOUNDS,
+        operations=_V1_OPERATIONS,
+    )
 
     evidence = contract["contamination_evidence"]
     _require_exact_keys(evidence, _EVIDENCE_KEYS, "contamination_evidence")
@@ -172,6 +218,55 @@ def _validate_contract(contract: Any) -> None:
     _require_exact_keys(windows[0], _WINDOW_KEYS, "real PIT window")
     if windows != _EXPECTED_WINDOWS:
         raise PartitionContractError("real PIT evidence differs from frozen values")
+
+
+def _validate_v2_contract(contract: Any) -> None:
+    _require_exact_keys(contract, _V2_TOP_LEVEL_KEYS, "contract")
+    if contract["schema_version"] != "research-temporal-partitions/v1":
+        raise PartitionContractError("unsupported schema_version")
+    if contract["policy_version"] != "current-pool-development-forward-oos/v2":
+        raise PartitionContractError("unsupported policy_version")
+    digest = contract["contract_sha256"]
+    if not isinstance(digest, str) or digest != _canonical_sha256(contract):
+        raise PartitionContractError("contract hash mismatch")
+    _validate_roles(
+        contract["roles"],
+        role_names=_V2_ROLE_NAMES,
+        bounds=_V2_BOUNDS,
+        operations=_V2_OPERATIONS,
+    )
+    evidence = contract["development_evidence"]
+    _require_exact_keys(evidence, _V2_EVIDENCE_KEYS, "development_evidence")
+    if evidence != _EXPECTED_V2_EVIDENCE:
+        raise PartitionContractError("current-pool development evidence differs from frozen values")
+
+
+def _validate_contract(contract: Any) -> None:
+    if not isinstance(contract, dict):
+        raise PartitionContractError("contract has missing or unknown fields")
+    policy = contract.get("policy_version")
+    if policy == "contamination-aware-forward-oos/v1":
+        _validate_v1_contract(contract)
+    elif policy == "current-pool-development-forward-oos/v2":
+        _validate_v2_contract(contract)
+    else:
+        raise PartitionContractError("unsupported policy_version")
+
+
+def _assert_v2_development_evidence(contract: Mapping[str, Any]) -> None:
+    from app.current_pool_gate import CurrentPoolGateError, verify_current_pool_audit
+
+    evidence = contract["development_evidence"]
+    audit = evidence["current_pool_coverage_audit"]
+    try:
+        verified = verify_current_pool_audit(audit["path"])
+    except CurrentPoolGateError as exc:
+        raise PartitionContractError("current-pool development evidence is unavailable") from exc
+    if (
+        verified["canonical_sha256"] != audit["canonical_sha256"]
+        or verified["source_as_of"] != audit["source_as_of"]
+    ):
+        raise PartitionContractError("current-pool development evidence does not match contract")
 
 
 def load_temporal_partition_contract(path: Any) -> dict[str, Any]:
@@ -208,8 +303,16 @@ def assert_range_allowed(
     """Reject a range unless it stays in *role* and permits *operation*."""
 
     _validate_contract(contract)
-    if role not in _ROLE_NAMES or not isinstance(operation, str):
+    if not isinstance(operation, str):
         raise PartitionContractError("unknown role or operation")
+    role_names = {item["name"] for item in contract["roles"]}
+    if role not in role_names:
+        raise PartitionContractError("unknown role or operation")
+    if (
+        contract["policy_version"] == "current-pool-development-forward-oos/v2"
+        and role == "development"
+    ):
+        _assert_v2_development_evidence(contract)
     start_date = _parse_date(start)
     end_date = _parse_date(end)
     if start_date > end_date:
@@ -225,9 +328,9 @@ def assert_final_oos_sealed(contract: Mapping[str, Any]) -> None:
     """Fail unless final OOS is sealed, open-ended, and has no operations."""
 
     _validate_contract(contract)
-    final = contract["roles"][-1]
+    final = next((role for role in contract["roles"] if role["name"] == "final_oos"), None)
     if (
-        final.get("name") != "final_oos"
+        not isinstance(final, Mapping)
         or final.get("sealed") is not True
         or final.get("end_date") is not None
         or final.get("permitted_operations") != []

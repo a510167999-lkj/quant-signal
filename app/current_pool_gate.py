@@ -265,6 +265,17 @@ def _read_verified_audit(path: str | Path) -> dict[str, Any]:
         os.close(descriptor)
 
 
+def verify_current_pool_audit(path: str | Path) -> dict[str, Any]:
+    """Verify immutable audit bytes without applying production freshness limits."""
+
+    try:
+        return _read_verified_audit(path)
+    except CurrentPoolGateError:
+        raise
+    except Exception as exc:
+        raise CurrentPoolGateError("current-pool audit is invalid") from exc
+
+
 def load_current_pool_audit(
     path: str | Path,
     *,
@@ -281,7 +292,7 @@ def load_current_pool_audit(
             or max_age_hours <= 0
         ):
             raise CurrentPoolGateError("current-pool max age must be a positive integer")
-        verified = _read_verified_audit(path)
+        verified = verify_current_pool_audit(path)
         age_hours = _source_age_hours(verified["source_as_of"], now)
         if expected_source_dates is not None:
             expected = {str(value)[:10] for value in expected_source_dates}
