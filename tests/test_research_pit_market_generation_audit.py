@@ -378,7 +378,11 @@ def _market_receipt_sha256(ref):
 def test_two_day_audit_binds_per_session_market_generation_coverage(tmp_path):
     store, first, second = _build_full_store(tmp_path)
 
-    audit = store.audit_coverage(start_date="2024-01-02", end_date="2024-01-03")
+    audit = store.audit_coverage(
+        start_date="2024-01-02",
+        end_date="2024-01-03",
+        calendar_exchanges=("SSE", "SZSE"),  # 测试 fixture 注入了两市 calendar
+    )
 
     assert audit["status"] == "passed"
     assert audit["final_oos_eligible"] is False

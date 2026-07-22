@@ -1838,9 +1838,13 @@ def test_controlled_collector_fails_closed_on_immutable_success_body_conflict(
     assert store.receipt_count() == 1
 
 
-def test_collect_trade_calendars_only_fetches_two_exchanges_and_verifies_lineage(
+def test_collect_trade_calendars_jiaoch_fetches_sse_only_and_verifies_lineage(
     tmp_path,
 ):
+    """jiaoch source 的 trade_cal 只维护 SSE(SZSE 空),collector 只抓 SSE 一个交易所。
+
+    官方 tushare 等其他 source 仍要求两市完整 controlled receipt(见其他测试)。
+    """
     api = _api()
 
     class CalendarOnlyTransport:
@@ -1894,22 +1898,21 @@ def test_collect_trade_calendars_only_fetches_two_exchanges_and_verifies_lineage
 
     assert report["status"] == "complete"
     assert report["mode"] == "trade_calendars_only"
-    assert report["planned_receipt_count"] == 2
-    assert report["controlled_receipt_count"] == 2
+    assert report["planned_receipt_count"] == 1
+    assert report["controlled_receipt_count"] == 1
     assert report["controlled_request_lineage_complete"] is True
-    assert report["attempt_count"] == 2
-    assert report["stored_count"] == 2
+    assert report["attempt_count"] == 1
+    assert report["stored_count"] == 1
     assert report["reused_count"] == 0
     assert report["skipped_count"] == 0
     assert report["workers"] == 2
     assert report["final_oos_eligible"] is False
     assert report["promotion_eligible"] is True
     assert {call["api_name"] for call in transport.calls} == {"trade_cal"}
-    assert {call["params"]["exchange"] for call in transport.calls} == {"SSE", "SZSE"}
-    assert len(transport.calls) == 2
+    assert {call["params"]["exchange"] for call in transport.calls} == {"SSE"}
+    assert len(transport.calls) == 1
     assert {row["exchange"] for row in report["calendar_receipts"]} == {
         "SSE",
-        "SZSE",
     }
     assert all(
         len(row["request_semantics_sha256"]) == 64 and len(row["receipt_raw_sha256"]) == 64
@@ -1935,7 +1938,7 @@ def test_collect_trade_calendars_only_fetches_two_exchanges_and_verifies_lineage
 
     assert resumed["attempt_count"] == 0
     assert resumed["stored_count"] == 0
-    assert resumed["skipped_count"] == 2
+    assert resumed["skipped_count"] == 1
     assert resumed["controlled_request_lineage_complete"] is True
     assert resumed_transport.calls == []
 
@@ -1988,7 +1991,7 @@ def test_collect_runs_two_calendars_eight_master_shards_and_only_open_daily_sess
     events = []
 
     class PlanningStore:
-        def common_open_sessions(self, *, start_date, end_date):
+        def common_open_sessions(self, *, start_date, end_date, exchanges=("SSE",)):
             events.append(("calendar_gate", start_date, end_date))
             return ["2024-01-02", "2024-01-03"]
 
@@ -2079,7 +2082,7 @@ def test_official_collect_rejects_a_store_without_generation_capabilities():
     api = _api()
 
     class LegacyOnlyStore:
-        def common_open_sessions(self, *, start_date, end_date):
+        def common_open_sessions(self, *, start_date, end_date, exchanges=("SSE",)):
             return ["2024-01-02"]
 
     collector = _collector(
@@ -2753,7 +2756,7 @@ def test_current_pool_market_only_collects_calendars_and_market_generations_only
     events = []
 
     class MarketPlanningStore:
-        def common_open_sessions(self, *, start_date, end_date):
+        def common_open_sessions(self, *, start_date, end_date, exchanges=("SSE",)):
             assert (start_date, end_date) == ("2024-01-01", "2024-01-03")
             events.append("common_open_sessions")
             return ["2024-01-02", "2024-01-03"]
@@ -2842,7 +2845,7 @@ def test_current_pool_market_only_uses_published_generation_resume(tmp_path):
     api = _api()
 
     class MarketPlanningStore:
-        def common_open_sessions(self, *, start_date, end_date):
+        def common_open_sessions(self, *, start_date, end_date, exchanges=("SSE",)):
             return ["2024-01-02", "2024-01-03"]
 
     collector = _collector(
@@ -2980,7 +2983,7 @@ def test_current_pool_market_checkpoint_replaces_stale_state_before_calendar_and
     )
 
     class MarketPlanningStore:
-        def common_open_sessions(self, *, start_date, end_date):
+        def common_open_sessions(self, *, start_date, end_date, exchanges=("SSE",)):
             pytest.fail("calendar failure must stop before session planning")
 
     collector = _collector(
@@ -3110,7 +3113,7 @@ def test_current_pool_market_only_real_store_calls_only_calendar_and_four_market
         progress_path=tmp_path / "progress.json",
     )
     called_apis = [call["api_name"] for call in transport.calls]
-    assert called_apis.count("trade_cal") == 2
+    assert called_apis.count("trade_cal") == 1  # jiaoch 只抓 SSE
     for api_name in ("daily", "adj_factor", "stk_limit", "suspend_d"):
         assert called_apis.count(api_name) == 2
     assert set(called_apis) == {
@@ -3141,7 +3144,7 @@ def test_current_pool_market_only_persists_last_completed_batch_on_failure(tmp_p
     progress_path = tmp_path / "nested" / "progress.json"
 
     class MarketPlanningStore:
-        def common_open_sessions(self, *, start_date, end_date):
+        def common_open_sessions(self, *, start_date, end_date, exchanges=("SSE",)):
             return [
                 "2024-01-02",
                 "2024-01-03",
@@ -3215,7 +3218,7 @@ def test_current_pool_market_only_records_successful_partial_batch_on_failure(tm
     partial_success = threading.Event()
 
     class MarketPlanningStore:
-        def common_open_sessions(self, *, start_date, end_date):
+        def common_open_sessions(self, *, start_date, end_date, exchanges=("SSE",)):
             return [
                 "2024-01-02",
                 "2024-01-03",

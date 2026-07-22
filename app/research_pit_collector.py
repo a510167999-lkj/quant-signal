@@ -487,7 +487,17 @@ def build_stock_basic_specs() -> list[FetchSpec]:
     ]
 
 
-def build_trade_cal_specs(*, start_date: str, end_date: str) -> list[FetchSpec]:
+def build_trade_cal_specs(
+    *,
+    start_date: str,
+    end_date: str,
+    exchanges: Sequence[str] = ("SSE", "SZSE"),
+) -> list[FetchSpec]:
+    """Build trade_cal fetch specs.
+
+    exchanges defaults to both SSE and SZSE per tushare API. Callers facing the
+    jiaoch source (whose trade_cal only maintains SSE) should pass exchanges=("SSE",).
+    """
     start = _iso_date(start_date)
     end = _iso_date(end_date)
     if end < start:
@@ -511,7 +521,7 @@ def build_trade_cal_specs(*, start_date: str, end_date: str) -> list[FetchSpec]:
             fields=TRADE_CAL_FIELDS,
             row_cap=internal_guard,
         )
-        for exchange in ("SSE", "SZSE")
+        for exchange in exchanges
     ]
 
 
@@ -2026,7 +2036,10 @@ class ControlledTushareCollector:
                 raise PITCollectionError(
                     "market-only collection requires verified common-open calendar sessions"
                 )
-            raw_sessions = self.store.common_open_sessions(start_date=start, end_date=end)
+            calendar_exchanges = ("SSE",) if self.source_profile == "jiaoch" else ("SSE", "SZSE")
+            raw_sessions = self.store.common_open_sessions(
+                start_date=start, end_date=end, exchanges=calendar_exchanges
+            )
             sessions = [_iso_date(session) for session in raw_sessions]
             if sessions != sorted(set(sessions)):
                 raise PITCollectionError("common-open sessions must be unique and sorted")
@@ -2142,7 +2155,10 @@ class ControlledTushareCollector:
         except PartitionContractError as exc:
             raise PITCollectionError(str(exc)) from exc
 
-        specs = build_trade_cal_specs(start_date=start, end_date=end)
+        # jiaoch trade_cal 只维护 SSE(SZSE/CFFEX/SHFE/DCE 全空,A 股两市日历同步);
+        # 官方 tushare 等其他 source 仍要求两市完整 controlled receipt。
+        calendar_exchanges = ("SSE",) if self.source_profile == "jiaoch" else ("SSE", "SZSE")
+        specs = build_trade_cal_specs(start_date=start, end_date=end, exchanges=calendar_exchanges)
         results = self._run_phase(
             [
                 (

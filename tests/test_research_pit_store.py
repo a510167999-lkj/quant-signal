@@ -1342,15 +1342,25 @@ def test_bse_cannot_be_claimed_in_scope_without_a_supported_market_policy(tmp_pa
         )
 
 
-def test_full_market_audit_cannot_be_downgraded_to_one_exchange(tmp_path):
+def test_calendar_audit_accepts_sse_only_for_jiaoch_source_constraint(tmp_path):
+    """jiaoch trade_cal 只维护 SSE(SZSE 空),A 股两市日历同步。
+
+    audit_coverage 默认只要求 SSE(CALENDAR_SOURCE_EXCHANGES)。传入 SSE 单源
+    应该被接受(不再强制两市);传入 BSE 等不支持的交易所仍 fail-closed。
+    """
     store = PITReceiptStore(str(tmp_path))
 
-    with pytest.raises(PITReceiptError, match="full-market exchange policy"):
+    # SSE 单源应被接受(默认值就是这个)
+    # 这里只是验证不抛 "full-market exchange policy" 错误(实际 audit 还需要 receipt,
+    # 会因 calendar 数据缺失而失败,但不是 exchange policy 错误)
+    with pytest.raises(PITReceiptError) as exc_info:
         store.audit_coverage(
             start_date="2024-01-02",
             end_date="2024-01-03",
             calendar_exchanges=("SSE",),
         )
+    # 错误应该是 calendar 数据缺失,不是 "full-market exchange policy"
+    assert "full-market exchange policy" not in str(exc_info.value)
 
 
 def test_market_scope_cannot_be_changed_to_exclude_every_security(tmp_path):

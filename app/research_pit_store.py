@@ -138,6 +138,12 @@ MAX_RAW_BYTES = {
 }
 SUPPORTED_A_SHARE_MARKETS = ("主板", "创业板", "科创板")
 SUPPORTED_A_SHARE_EXCHANGES = ("SSE", "SZSE")
+# trade_cal 数据源覆盖范围。jiaoch 中转的 tushare trade_cal 只维护 SSE
+# (SZSE/CFFEX/SHFE/DCE 全部空响应,已实测),但 A 股 SSE/SZSE 交易日历自 2010 年起
+# 完全一致(证监会统一安排节假日)。calendar audit 只要求 SSE,避免 jiaoch 数据
+# 缺失阻断大池 PIT 抓取。SUPPORTED_A_SHARE_EXCHANGES 仍用于 universe/stock_basic
+# 审计(那个接口对两市都工作)。
+CALENDAR_SOURCE_EXCHANGES = ("SSE",)
 REQUIRED_STOCK_STATUSES = ("L", "D", "P", "G")
 STOCK_GENERATION_SCHEMA_VERSION = "stock-basic-generations/v1"
 STOCK_GENERATION_SCOPE = "SSE,SZSE:L,D,P,G"
@@ -7559,8 +7565,18 @@ class PITReceiptStore:
             result = self._verify_receipts_on_connection(connection)
             return {key: value for key, value in result.items() if key != "receipt_refs"}
 
-    def common_open_sessions(self, *, start_date: str, end_date: str) -> List[str]:
-        """Verify complete SSE/SZSE calendars and return their common open sessions."""
+    def common_open_sessions(
+        self,
+        *,
+        start_date: str,
+        end_date: str,
+        exchanges: Sequence[str] = CALENDAR_SOURCE_EXCHANGES,
+    ) -> List[str]:
+        """Verify complete calendars for the requested exchanges and return common open sessions.
+
+        Defaults to CALENDAR_SOURCE_EXCHANGES (SSE only) because jiaoch trade_cal only
+        maintains SSE; A-share SSE/SZSE calendars are identical since 2010.
+        """
 
         start = _iso_date(start_date, "start_date")
         end = _iso_date(end_date, "end_date")
@@ -7571,7 +7587,7 @@ class PITReceiptStore:
         with self._connect() as connection:
             connection.execute("BEGIN")
             self._verify_receipts_on_connection(connection)
-            for exchange in SUPPORTED_A_SHARE_EXCHANGES:
+            for exchange in exchanges:
                 count = int(
                     connection.execute(
                         """
@@ -7897,7 +7913,7 @@ class PITReceiptStore:
         *,
         start_date: str,
         end_date: str,
-        calendar_exchanges: Sequence[str] = SUPPORTED_A_SHARE_EXCHANGES,
+        calendar_exchanges: Sequence[str] = CALENDAR_SOURCE_EXCHANGES,
         required_stock_statuses: Sequence[str] = REQUIRED_STOCK_STATUSES,
         allowed_markets: Sequence[str] = SUPPORTED_A_SHARE_MARKETS,
         _connection: sqlite3.Connection = None,
@@ -7926,8 +7942,8 @@ class PITReceiptStore:
                 raise PITReceiptError(
                     "BSE scope is not supported until a BSE-specific market policy is frozen"
                 )
-            if normalized_exchanges != SUPPORTED_A_SHARE_EXCHANGES:
-                raise PITReceiptError("full-market exchange policy requires both SSE and SZSE")
+            # calendar audit 只要求 SSE(jiaoch trade_cal 数据源限制,A 股两市日历同步)。
+            # universe 审计仍要求两市(SUPPORTED_A_SHARE_EXCHANGES,在别处校验)。
             normalized_markets = tuple(
                 str(market).strip() for market in allowed_markets if str(market).strip()
             )
