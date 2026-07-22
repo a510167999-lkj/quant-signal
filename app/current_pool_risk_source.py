@@ -257,21 +257,31 @@ def build_current_pool_risk_descriptor(*, as_of: str, retrieved_at: str, univers
         start_param = f"{year}0101"
         end_param = min(date(year, 12, 31), date.fromisoformat(canonical_as_of)).strftime("%Y%m%d")
         partition = collect("namechange", {"start_date": start_param, "end_date": end_param}, _NAMECHANGE_FIELDS)
+        # jiaoch namechange API 按 end_date 范围返回,会包括 start_date 早于本年的"在请求期间
+        # 仍有效的名称变更"(实测 1994 partition 返回过 1996 start_date 的行)。把这些跨年
+        # 行静默过滤——它们的 start_date 属于更早的 partition,会在那里被收录。去重逻辑
+        # (seen_name_rows)只对本 partition 内的重复行 fail-closed,防止 jiaoch 异常重复
+        # 导致同一变更被记录两次。
+        owned_rows = []
         for row in partition:
             start = _date(row["start_date"], "start_date")
-            if not (start_param <= start.replace("-", "") <= end_param):
-                raise ValueError("namechange start_date does not belong to requested partition")
+            if start is None or not (start_param <= start.replace("-", "") <= end_param):
+                continue
+            owned_rows.append(row)
             identity = _canonical_json(row)
             if identity in seen_name_rows:
                 raise ValueError("duplicate namechange row across partitions")
             seen_name_rows.add(identity)
-        name_rows.extend(partition)
+        name_rows.extend(owned_rows)
 
     flags = {symbol: {"ts_code": symbol, "is_st": False, "st_type": None, "is_suspended": False, "suspension_reason": None, "active_name": None} for symbol in universe}
     for row in st_rows:
         symbol = str(row["ts_code"] or "").strip()
+        # jiaoch risk API 可能返回 universe 当前快照之外的 symbol(例如 stock_basic
+        # 把 D/P 状态的股票排除,但 stock_st/namechange 仍保留它们的历史/当前记录)。
+        # 对 universe 外的 symbol 静默跳过——这些 symbol 不会进入推荐池,不需要风险标记。
         if symbol not in universe:
-            raise ValueError("risk response contained unknown symbol")
+            continue
         if _date(row["trade_date"], "trade_date") != canonical_as_of:
             raise ValueError("stock_st returned wrong trade date")
         st_type = str(row["type"] or "").strip()
@@ -287,7 +297,7 @@ def build_current_pool_risk_descriptor(*, as_of: str, retrieved_at: str, univers
     for row in suspend_rows:
         symbol = str(row["ts_code"] or "").strip()
         if symbol not in universe:
-            raise ValueError("risk response contained unknown symbol")
+            continue
         if _date(row["trade_date"], "trade_date") != canonical_as_of:
             raise ValueError("suspend_d returned wrong trade date")
         kind = str(row["suspend_type"] or "").strip()
@@ -304,10 +314,14 @@ def build_current_pool_risk_descriptor(*, as_of: str, retrieved_at: str, univers
         elif events == {"R"}:
             flags[symbol]["is_suspended"] = True
             flags[symbol]["suspension_reason"] = "resume_day_no_new_entry"
+    # jiaoch namechange 可能在 as_of 时点返回多条有效记录(例如过渡期 [2020,2024] 旧名
+    # 和 [2023,2025] 新名都覆盖 as_of)。按 start_date 倒序排序,取最新的作为 active name,
+    # 不 fail-closed(时点上"最新生效的名称"就是正确答案)。
+    name_active: dict[str, list[tuple[str, str]]] = {}
     for row in name_rows:
         symbol = str(row["ts_code"] or "").strip()
         if symbol not in universe:
-            raise ValueError("risk response contained unknown symbol")
+            continue
         start = _date(row["start_date"], "start_date")
         end = _date(row["end_date"], "end_date", optional=True)
         _date(row["ann_date"], "ann_date", optional=True)
@@ -315,11 +329,14 @@ def build_current_pool_risk_descriptor(*, as_of: str, retrieved_at: str, univers
             name = str(row["name"] or "").strip()
             if not name:
                 raise ValueError("active namechange name is missing")
-            if flags[symbol]["active_name"] not in {None, name}:
-                raise ValueError("multiple active names for symbol")
-            flags[symbol]["active_name"] = name
-            if is_st_risk_name(name):
-                flags[symbol]["is_st"] = True
+            name_active.setdefault(symbol, []).append((start, name))
+    for symbol, candidates in name_active.items():
+        # 取 start_date 最新的那条;同 start_date 多条时按字典序取最大(确定性)
+        candidates.sort(key=lambda pair: (pair[0], pair[1]), reverse=True)
+        active_name = candidates[0][1]
+        flags[symbol]["active_name"] = active_name
+        if is_st_risk_name(active_name):
+            flags[symbol]["is_st"] = True
     payload = {
         "schema": SCHEMA_VERSION,
         "source_id": "jiaoch",

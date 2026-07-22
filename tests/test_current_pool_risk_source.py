@@ -191,22 +191,130 @@ def test_rejects_tampered_universe_and_wrong_collection_day_before_fetch(tmp_pat
     assert called is False
 
 
-@pytest.mark.parametrize("mode", ["wrong_year", "duplicate"])
-def test_namechange_partition_must_own_start_date_and_rows_cannot_repeat(tmp_path: Path, mode: str):
+@pytest.mark.parametrize("mode", ["cross_year_filtered", "duplicate_still_rejected"])
+def test_namechange_partition_filters_cross_year_rows_but_rejects_duplicates(tmp_path: Path, mode: str):
+    """jiaoch namechange API 按 end_date 范围返回,会包括 start_date 跨年的"仍有效"行。
+
+    codex 原来对每个 partition 强制 start_date ∈ [year0101, year1231],这与 jiaoch API
+    语义不符(实测 1994 partition 返回了 1996 start_date 的行)。修复:跨年行被静默
+    过滤(按真实 start_date 归属到自己的 partition),但同一 partition 内重复行仍
+    fail-closed(防止 jiaoch 返回异常导致重复风险记录)。
+    """
     universe = _universe(tmp_path)
 
     def fetch(api_name, params, fields):
         if api_name != "namechange":
             return _envelope(fields, [])
-        if mode == "wrong_year" and params["start_date"] == "20250101":
-            return _envelope(fields, [["600000.SH", "ST浦发", "20260101", None, "20251231", "风险警示"]])
-        if mode == "duplicate" and params["start_date"] == "20250101":
-            row = ["600000.SH", "旧名", "20250101", None, "20250101", "更名"]
-            return _envelope(fields, [row, row])
+        if params["start_date"] == "20250101":
+            if mode == "cross_year_filtered":
+                # 跨年行(start_date 在 2026 不属于 2025 partition)+ 本年正常行
+                return _envelope(
+                    fields,
+                    [
+                        ["600000.SH", "未来名称", "20260101", None, "20251231", "其他"],
+                        ["600000.SH", "本年名称", "20250601", None, None, "更名"],
+                    ],
+                )
+            if mode == "duplicate_still_rejected":
+                row = ["600000.SH", "旧名", "20250101", None, "20250101", "更名"]
+                return _envelope(fields, [row, row])
         return _envelope(fields, [])
 
-    with pytest.raises(ValueError):
-        build_current_pool_risk_descriptor(as_of="2026-07-13", retrieved_at="2026-07-13T09:30:00+08:00", universe_path=universe, output_dir=tmp_path / "risk", fetch_partition=fetch)
+    if mode == "cross_year_filtered":
+        # 跨年行被过滤,build 应成功完成
+        build_current_pool_risk_descriptor(
+            as_of="2026-07-13",
+            retrieved_at="2026-07-13T09:30:00+08:00",
+            universe_path=universe,
+            output_dir=tmp_path / "risk",
+            fetch_partition=fetch,
+        )
+    else:
+        # 重复行仍 fail-closed
+        with pytest.raises(ValueError):
+            build_current_pool_risk_descriptor(
+                as_of="2026-07-13",
+                retrieved_at="2026-07-13T09:30:00+08:00",
+                universe_path=universe,
+                output_dir=tmp_path / "risk",
+                fetch_partition=fetch,
+            )
+
+
+def test_risk_api_symbols_outside_universe_are_silently_dropped(tmp_path: Path):
+    """jiaoch risk API 可能返回 universe 当前快照外的 symbol(例如已退市但在 namechange
+    仍有历史记录的股票)。对 universe 外的 symbol 静默跳过,不 fail-closed。
+    """
+    universe = _universe(tmp_path)
+
+    def fetch(api_name, params, fields):
+        if api_name == "stock_st":
+            # fields = ts_code, name, type, type_name, trade_date
+            # 第一个 symbol 在 universe 内,第二个不在
+            return _envelope(
+                fields,
+                [
+                    ["600000.SH", "ST浦发", "ST", "风险警示", "20260713"],
+                    ["999999.SH", "假股票", "ST", "假", "20260713"],
+                ],
+            )
+        if api_name == "suspend_d":
+            # fields = ts_code, trade_date, suspend_timing, suspend_type
+            return _envelope(
+                fields,
+                [["999999.SZ", "20260713", "S", "停牌"]],
+            )
+        if api_name == "namechange":
+            # fields = ts_code, name, start_date, end_date, ann_date, change_reason
+            return _envelope(
+                fields,
+                [["999999.BJ", "假更名", "20250101", None, None, "更名"]],
+            )
+        return _envelope(fields, [])
+
+    # 应该成功完成,universe 外的行被静默跳过
+    build_current_pool_risk_descriptor(
+        as_of="2026-07-13",
+        retrieved_at="2026-07-13T09:30:00+08:00",
+        universe_path=universe,
+        output_dir=tmp_path / "risk",
+        fetch_partition=fetch,
+    )
+
+
+def test_multiple_active_namechange_rows_pick_latest_start_date(tmp_path: Path):
+    """jiaoch namechange 可能在 as_of 时点返回多条有效记录(过渡期重叠)。
+
+    按 start_date 最新那条作为 active name,不 fail-closed——时点上"最新生效的名称"
+    就是正确答案,避免一次公司重组的多阶段名称变更触发误判。
+    """
+    universe = _universe(tmp_path)
+
+    def fetch(api_name, params, fields):
+        if api_name == "namechange" and params["start_date"] == "20250101":
+            # 同 symbol 两条都覆盖 as_of=2026-07-13
+            return _envelope(
+                fields,
+                [
+                    ["600000.SH", "旧名过渡期", "20200601", "20241231", None, "更名"],  # end < as_of 不应生效
+                    ["600000.SH", "中期名", "20230101", "20251231", None, "更名"],  # 覆盖 as_of
+                    ["600000.SH", "最新名", "20250601", None, None, "更名"],  # 覆盖 as_of 且 start 最新
+                ],
+            )
+        return _envelope(fields, [])
+
+    result = build_current_pool_risk_descriptor(
+        as_of="2026-07-13",
+        retrieved_at="2026-07-13T09:30:00+08:00",
+        universe_path=universe,
+        output_dir=tmp_path / "risk",
+        fetch_partition=fetch,
+    )
+    # 通过 descriptor 文件读出来验证 active_name 选了最新 start_date 那条
+    import json as _json
+    payload = _json.loads(open(result["path"], encoding="utf-8").read())
+    by_symbol = {row["ts_code"]: row for row in payload["items"]}
+    assert by_symbol["600000.SH"]["active_name"] == "最新名"
 
 
 @pytest.mark.parametrize("mutation", ["wrong_trade_date", "expired", "blank_type"])
