@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -229,10 +229,17 @@ def _candidate_trades_from_bars(
     *,
     membership_by_date: Mapping[str, Mapping[str, str]] | None = None,
     membership_name_column: str | None = None,
+    required_signal_column: str | None = None,
+    signal_tags: Sequence[str] = ("breakout_20d",),
     current_universe_bias: bool = True,
 ) -> list[dict[str, Any]]:
     """Build the one frozen simple-rule candidate set from verified raw bars."""
 
+    normalized_signal_tags = tuple(str(tag).strip() for tag in signal_tags if str(tag).strip())
+    if not normalized_signal_tags:
+        raise CurrentPoolDevelopmentReplayError("signal tags cannot be empty")
+    if required_signal_column is not None and required_signal_column not in bars:
+        raise CurrentPoolDevelopmentReplayError("required signal column is missing")
     trades: list[dict[str, Any]] = []
     for ts_code, group in bars.groupby("ts_code", sort=True):
         frame = group.sort_values("date", kind="mergesort").reset_index(drop=True).copy()
@@ -242,6 +249,10 @@ def _candidate_trades_from_bars(
             SIMPLE_BREAKOUT_SPEC["lookback_sessions"], min_periods=SIMPLE_BREAKOUT_SPEC["lookback_sessions"]
         ).max()
         for index in breakout[breakout].index:
+            if required_signal_column is not None:
+                filter_value = frame.at[index, required_signal_column]
+                if pd.isna(filter_value) or not bool(filter_value):
+                    continue
             signal_date = str(frame.at[index, "date"])
             symbol = str(ts_code)[:6]
             if membership_by_date is not None:
@@ -296,7 +307,7 @@ def _candidate_trades_from_bars(
                         if current_universe_bias
                         else "audited_pit_development"
                     ),
-                    "signal_tags": ["breakout_20d"],
+                    "signal_tags": list(normalized_signal_tags),
                     "entry_executability": executable,
                     "current_universe_bias": current_universe_bias,
                 }

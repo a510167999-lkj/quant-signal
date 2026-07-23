@@ -186,3 +186,142 @@ def test_exact_membership_bar_query_keeps_post_signal_market_path():
     assert bars.loc[bars["ts_code"] == "000001.SZ", "membership_name"].notna().all()
     assert bars.loc[bars["ts_code"] == "000002.SZ", "membership_name"].notna().all()
     assert bars.loc[bars["ts_code"] == "000003.SZ", "membership_name"].isna().all()
+
+
+def test_breadth_ma20_uses_exact_eligible_denominator():
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        "CREATE TABLE market_session_generation_head "
+        "(trade_date TEXT, generation_id TEXT)"
+    )
+    connection.execute(
+        "CREATE TABLE daily_universe (trade_date TEXT, ts_code TEXT, name TEXT)"
+    )
+    rows = []
+    membership = []
+    market_sessions = []
+    for index in range(20):
+        session = f"2025-01-{index + 1:02d}"
+        market_sessions.append((session, f"g{index + 1}"))
+        for symbol, close in (
+            ("000001.SZ", 10.0),
+            ("000002.SZ", 20.0 - index * 0.1),
+        ):
+            rows.append(
+                {
+                    "date": session,
+                    "ts_code": symbol,
+                    "open": close,
+                    "high": close,
+                    "low": close,
+                    "close": close,
+                    "pre_close": close,
+                    "amount": 100_000_000.0,
+                    "adj_factor": 1.0,
+                    "suspended": False,
+                    "membership_name": "历史名称",
+                }
+            )
+            membership.append((session, symbol, "历史名称"))
+    connection.executemany(
+        "INSERT INTO daily_universe VALUES (?, ?, ?)",
+        membership,
+    )
+    connection.executemany(
+        "INSERT INTO market_session_generation_head VALUES (?, ?)",
+        market_sessions,
+    )
+
+    bars, context = replay._apply_breadth_ma20_filter(
+        connection,
+        pd.DataFrame(rows),
+        start_date="2025-01-01",
+        end_date="2025-01-20",
+    )
+
+    last = bars[bars["date"] == "2025-01-20"]
+    assert last["breadth_ma20_gte_50"].all()
+    assert context["pass_session_count"] == 1
+    assert context["threshold_pct"] == 50.0
+    assert context["missing_market_rows"] == (
+        "included_in_denominator_as_not_above_ma20"
+    )
+
+
+def test_breadth_ma20_counts_missing_market_row_as_not_above():
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        "CREATE TABLE market_session_generation_head "
+        "(trade_date TEXT, generation_id TEXT)"
+    )
+    connection.execute(
+        "CREATE TABLE daily_universe (trade_date TEXT, ts_code TEXT, name TEXT)"
+    )
+    rows = []
+    membership = []
+    market_sessions = []
+    for index in range(20):
+        session = f"2025-01-{index + 1:02d}"
+        market_sessions.append((session, f"g{index + 1}"))
+        membership.extend(
+            (
+                (session, "000001.SZ", "历史名称"),
+                (session, "000002.SZ", "历史名称"),
+            )
+        )
+        rows.append(
+            {
+                "date": session,
+                "ts_code": "000001.SZ",
+                "open": 10.0,
+                "high": 10.0,
+                "low": 10.0,
+                "close": 10.0,
+                "pre_close": 10.0,
+                "amount": 100_000_000.0,
+                "adj_factor": 1.0,
+                "suspended": False,
+                "membership_name": "历史名称",
+            }
+        )
+    connection.executemany(
+        "INSERT INTO daily_universe VALUES (?, ?, ?)",
+        membership,
+    )
+    connection.executemany(
+        "INSERT INTO market_session_generation_head VALUES (?, ?)",
+        market_sessions,
+    )
+
+    bars, context = replay._apply_breadth_ma20_filter(
+        connection,
+        pd.DataFrame(rows),
+        start_date="2025-01-01",
+        end_date="2025-01-20",
+    )
+
+    last = bars[bars["date"] == "2025-01-20"]
+    assert last["breadth_ma20_gte_50"].all()
+    assert context["maximum_pct"] == 50.0
+    assert context["pass_session_count"] == 1
+
+
+def test_breadth_replay_wrapper_freezes_one_registered_filter(monkeypatch):
+    captured = {}
+
+    def run(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(replay, "run_audited_pit_development_replay", run)
+
+    assert replay.run_audited_pit_breadth_development_replay(example=1) == {
+        "ok": True
+    }
+    assert captured["_strategy_spec"] == replay.BREADTH_MA20_BREAKOUT_SPEC
+    assert captured["_required_signal_column"] == "breadth_ma20_gte_50"
+    assert captured["_result_schema_version"] == (
+        "audited-pit-breadth-development-replay-result/v1"
+    )

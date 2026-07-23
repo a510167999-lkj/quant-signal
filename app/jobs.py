@@ -11,7 +11,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from app.a_share_universe import select_deep_scan_candidates
-from app.audited_pit_development_replay import run_audited_pit_development_replay
+from app.audited_pit_development_replay import (
+    run_audited_pit_breadth_development_replay,
+    run_audited_pit_development_replay,
+)
 from app.artifact_native_evidence import (
     build_artifact_native_evidence,
     verify_artifact_native_evidence,
@@ -4095,6 +4098,28 @@ def main(argv=None) -> int:
     audited_pit_development_replay.add_argument("--end-date", required=True)
     audited_pit_development_replay.add_argument("--output-dir", required=True)
 
+    audited_pit_breadth_replay = subparsers.add_parser(
+        "research-audited-pit-breadth-development-replay"
+    )
+    audited_pit_breadth_replay.add_argument(
+        "--audited-pit-universe-path", required=True
+    )
+    audited_pit_breadth_replay.add_argument(
+        "--expected-coverage-audit-sha256", required=True
+    )
+    audited_pit_breadth_replay.add_argument(
+        "--expected-artifact-root-sha256", required=True
+    )
+    audited_pit_breadth_replay.add_argument(
+        "--temporal-contract-path", required=True
+    )
+    audited_pit_breadth_replay.add_argument(
+        "--expected-temporal-contract-sha256", required=True
+    )
+    audited_pit_breadth_replay.add_argument("--start-date", required=True)
+    audited_pit_breadth_replay.add_argument("--end-date", required=True)
+    audited_pit_breadth_replay.add_argument("--output-dir", required=True)
+
     pit_publish = subparsers.add_parser("research-pit-publish-universe")
     pit_publish.add_argument("--store-dir", required=True)
     pit_publish.add_argument("--start-date", required=True)
@@ -4455,6 +4480,21 @@ def main(argv=None) -> int:
 
     if args.command == "research-audited-pit-development-replay":
         report = run_audited_pit_development_replay(
+            settings=settings or get_settings(),
+            audited_pit_universe_path=args.audited_pit_universe_path,
+            expected_coverage_audit_sha256=args.expected_coverage_audit_sha256,
+            expected_artifact_root_sha256=args.expected_artifact_root_sha256,
+            temporal_contract_path=args.temporal_contract_path,
+            expected_temporal_contract_sha256=args.expected_temporal_contract_sha256,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            output_dir=args.output_dir,
+        )
+        _print_json(report)
+        return 0
+
+    if args.command == "research-audited-pit-breadth-development-replay":
+        report = run_audited_pit_breadth_development_replay(
             settings=settings or get_settings(),
             audited_pit_universe_path=args.audited_pit_universe_path,
             expected_coverage_audit_sha256=args.expected_coverage_audit_sha256,

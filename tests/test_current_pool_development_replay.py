@@ -186,6 +186,41 @@ def test_exact_membership_rejects_st_name_on_signal_date():
     assert trades == []
 
 
+def test_required_signal_filter_is_frozen_into_trade_tags():
+    rows = []
+    for index in range(27):
+        close = 10.0 if index < 20 else 11.0
+        rows.append(
+            {
+                "date": f"2025-01-{index + 1:02d}",
+                "ts_code": "000001.SZ",
+                "open": close,
+                "high": 11.0 if index >= 20 else 10.0,
+                "low": close,
+                "close": close,
+                "pre_close": 10.0,
+                "amount": 100_000_000.0,
+                "adj_factor": 1.0,
+                "suspended": False,
+                "membership_name": "历史名称",
+                "breadth_ma20_gte_50": index == 20,
+            }
+        )
+
+    trades = _candidate_trades_from_bars(
+        pd.DataFrame(rows),
+        {},
+        Settings(),
+        membership_name_column="membership_name",
+        required_signal_column="breadth_ma20_gte_50",
+        signal_tags=("breakout_20d", "breadth_ma20_gte_50"),
+        current_universe_bias=False,
+    )
+
+    assert trades
+    assert trades[0]["signal_tags"] == ["breakout_20d", "breadth_ma20_gte_50"]
+
+
 class _MembershipUniverse:
     def __init__(self, connection):
         self._connection = connection

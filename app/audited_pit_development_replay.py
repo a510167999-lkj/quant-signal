@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from app.a_share_universe import _is_excluded_name
 from app.config import Settings
 from app.current_pool_development_replay import (
     SIMPLE_BREAKOUT_SPEC,
@@ -21,6 +23,22 @@ from app.research_sweep import sweep_qualified_trades
 
 class AuditedPITDevelopmentReplayError(ValueError):
     """The audited PIT development replay inputs are incomplete or inconsistent."""
+
+
+BREADTH_MA20_BREAKOUT_SPEC = {
+    **SIMPLE_BREAKOUT_SPEC,
+    "schema_version": "development-breakout-breadth-ma20/v1",
+    "required_signal_tags": ["breakout_20d", "breadth_ma20_gte_50"],
+    "market_filter": {
+        "tag": "breadth_ma20_gte_50",
+        "threshold_pct": 50.0,
+        "comparison": "gte",
+        "price_basis": "causal_adjusted_close",
+        "moving_average_sessions": 20,
+        "eligible_denominator": "exact_signal_date_mainboard_chinext_non_risk_members",
+        "missing_market_rows": "included_in_denominator_as_not_above_ma20",
+    },
+}
 
 
 def _producer_code_binding() -> dict[str, Any]:
@@ -168,6 +186,107 @@ def _load_exact_membership_bars(
     return frame
 
 
+def _apply_breadth_ma20_filter(
+    connection: Any,
+    bars: Any,
+    *,
+    start_date: str,
+    end_date: str,
+) -> tuple[Any, dict[str, Any]]:
+    import pandas as pd
+
+    def eligible_member(ts_code: Any, name: Any) -> int:
+        return int(
+            is_mainboard_chinext_symbol(ts_code)
+            and bool(str(name or "").strip())
+            and not _is_excluded_name(str(name or ""))
+        )
+
+    connection.create_function(
+        "pit_is_eligible_member",
+        2,
+        eligible_member,
+        deterministic=True,
+    )
+    eligible_counts = {
+        str(row["trade_date"]): int(row["eligible_count"])
+        for row in connection.execute(
+            """
+            SELECT trade_date, COUNT(*) AS eligible_count
+            FROM daily_universe
+            WHERE trade_date BETWEEN ? AND ?
+              AND pit_is_eligible_member(ts_code, name) = 1
+            GROUP BY trade_date
+            ORDER BY trade_date
+            """,
+            (start_date, end_date),
+        )
+    }
+    market_sessions = {
+        str(row["trade_date"])
+        for row in connection.execute(
+            """
+            SELECT trade_date FROM market_session_generation_head
+            WHERE trade_date BETWEEN ? AND ?
+            """,
+            (start_date, end_date),
+        )
+    }
+    if (
+        not eligible_counts
+        or set(eligible_counts) != market_sessions
+        or any(count <= 0 for count in eligible_counts.values())
+    ):
+        raise AuditedPITDevelopmentReplayError("breadth eligible membership is incomplete")
+
+    frame = bars.copy()
+    signal_close = frame["close"] * frame["adj_factor"]
+    ma20 = signal_close.groupby(frame["ts_code"], sort=False).transform(
+        lambda values: values.rolling(20, min_periods=20).mean()
+    )
+    observed_eligible = frame["membership_name"].map(
+        lambda value: (
+            False
+            if pd.isna(value)
+            else bool(str(value or "").strip())
+            and not _is_excluded_name(str(value or ""))
+        )
+    )
+    above_ma20 = observed_eligible & ma20.notna() & (signal_close >= ma20)
+    numerators = (
+        pd.DataFrame({"date": frame["date"], "above_ma20": above_ma20.astype(int)})
+        .groupby("date", sort=True)["above_ma20"]
+        .sum()
+        .to_dict()
+    )
+    breadth_by_date = {
+        session: round(float(numerators.get(session, 0)) / count * 100.0, 2)
+        for session, count in eligible_counts.items()
+    }
+    threshold = float(BREADTH_MA20_BREAKOUT_SPEC["market_filter"]["threshold_pct"])
+    frame["breadth_ma20_gte_50"] = frame["date"].map(
+        lambda value: breadth_by_date.get(str(value), -1.0) >= threshold
+    )
+    values = pd.Series(list(breadth_by_date.values()), dtype=float)
+    return frame, {
+        "schema_version": "audited-pit-breadth-ma20-context/v1",
+        "tag": "breadth_ma20_gte_50",
+        "threshold_pct": threshold,
+        "session_count": len(breadth_by_date),
+        "pass_session_count": sum(value >= threshold for value in breadth_by_date.values()),
+        "minimum_pct": round(float(values.min()), 2),
+        "median_pct": round(float(values.median()), 2),
+        "maximum_pct": round(float(values.max()), 2),
+        "breadth_by_date_sha256": _sha256(breadth_by_date),
+        "eligible_denominator": (
+            "exact_signal_date_mainboard_chinext_non_risk_members"
+        ),
+        "missing_market_rows": "included_in_denominator_as_not_above_ma20",
+        "price_basis": "raw_close_times_session_adj_factor",
+        "moving_average_sessions": 20,
+    }
+
+
 def run_audited_pit_development_replay(
     *,
     settings: Settings,
@@ -179,7 +298,15 @@ def run_audited_pit_development_replay(
     start_date: str,
     end_date: str,
     output_dir: str | Path,
+    _strategy_spec: Mapping[str, Any] | None = None,
+    _prepare_bars: Callable[..., tuple[Any, dict[str, Any]]] | None = None,
+    _required_signal_column: str | None = None,
+    _result_schema_version: str = "audited-pit-development-replay-result/v1",
 ) -> dict[str, Any]:
+    strategy_spec = dict(_strategy_spec or SIMPLE_BREAKOUT_SPEC)
+    required_signal_tags = list(
+        strategy_spec.get("required_signal_tags") or [strategy_spec["signal_tag"]]
+    )
     contract = load_temporal_partition_contract(temporal_contract_path)
     if contract["contract_sha256"] != expected_temporal_contract_sha256:
         raise AuditedPITDevelopmentReplayError("temporal contract hash mismatch")
@@ -210,11 +337,21 @@ def run_audited_pit_development_replay(
             start_date=start_date,
             end_date=end_date,
         )
+        preparation_source = {}
+        if _prepare_bars is not None:
+            bars, preparation_source = _prepare_bars(
+                universe._require_open(),
+                bars,
+                start_date=start_date,
+                end_date=end_date,
+            )
         trades = _candidate_trades_from_bars(
             bars,
             {},
             settings,
             membership_name_column="membership_name",
+            required_signal_column=_required_signal_column,
+            signal_tags=required_signal_tags,
             current_universe_bias=False,
         )
         source = {
@@ -227,33 +364,35 @@ def run_audited_pit_development_replay(
             "market_scope": market_scope_contract(),
             "producer_code": _producer_code_binding(),
         }
+        if preparation_source:
+            source["signal_context"] = preparation_source
     finally:
         universe.close()
 
     sweep = sweep_qualified_trades(
         trades,
-        hold_days=SIMPLE_BREAKOUT_SPEC["hold_days"],
-        top_n=SIMPLE_BREAKOUT_SPEC["top_n"],
-        max_active_positions=SIMPLE_BREAKOUT_SPEC["max_active_positions"],
+        hold_days=strategy_spec["hold_days"],
+        top_n=strategy_spec["top_n"],
+        max_active_positions=strategy_spec["max_active_positions"],
         min_trades=20,
         target_win_rate_pct=52.0,
         target_drawdown_pct=15.0,
         target_one_year_return_pct=50.0,
         target_profit_factor=1.3,
         target_calmar=1.5,
-        exposure_multipliers=[SIMPLE_BREAKOUT_SPEC["exposure_multiplier"]],
-        annual_financing_rate_pct=SIMPLE_BREAKOUT_SPEC["annual_financing_rate_pct"],
-        roundtrip_cost_bps=SIMPLE_BREAKOUT_SPEC["roundtrip_cost_bps"],
-        slippage_bps=SIMPLE_BREAKOUT_SPEC["slippage_bps"],
-        capital_model=SIMPLE_BREAKOUT_SPEC["capital_model"],
-        required_signal_tags=[SIMPLE_BREAKOUT_SPEC["signal_tag"]],
+        exposure_multipliers=[strategy_spec["exposure_multiplier"]],
+        annual_financing_rate_pct=strategy_spec["annual_financing_rate_pct"],
+        roundtrip_cost_bps=strategy_spec["roundtrip_cost_bps"],
+        slippage_bps=strategy_spec["slippage_bps"],
+        capital_model=strategy_spec["capital_model"],
+        required_signal_tags=required_signal_tags,
         fixed_spec=True,
     )
     payload = {
-        "schema_version": "audited-pit-development-replay-result/v1",
+        "schema_version": _result_schema_version,
         "strategy": {
-            **SIMPLE_BREAKOUT_SPEC,
-            "strategy_sha256": _sha256(SIMPLE_BREAKOUT_SPEC),
+            **strategy_spec,
+            "strategy_sha256": _sha256(strategy_spec),
         },
         "source": source,
         "scope": {
@@ -270,3 +409,13 @@ def run_audited_pit_development_replay(
         "sweep": sweep,
     }
     return {**payload, "artifact": _write_content_addressed(output_dir, payload)}
+
+
+def run_audited_pit_breadth_development_replay(**kwargs: Any) -> dict[str, Any]:
+    return run_audited_pit_development_replay(
+        **kwargs,
+        _strategy_spec=BREADTH_MA20_BREAKOUT_SPEC,
+        _prepare_bars=_apply_breadth_ma20_filter,
+        _required_signal_column="breadth_ma20_gte_50",
+        _result_schema_version="audited-pit-breadth-development-replay-result/v1",
+    )
