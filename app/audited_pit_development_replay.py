@@ -41,6 +41,21 @@ BREADTH_MA20_BREAKOUT_SPEC = {
 }
 
 
+MODERATE_AMOUNT_BREAKOUT_SPEC = {
+    **SIMPLE_BREAKOUT_SPEC,
+    "schema_version": "development-breakout-moderate-amount/v1",
+    "required_signal_tags": ["breakout_20d", "amount_ratio_gte_1_lt_2"],
+    "signal_filter": {
+        "tag": "amount_ratio_gte_1_lt_2",
+        "numerator": "signal_date_amount",
+        "denominator": "prior_20_observed_bars_amount_median",
+        "minimum_inclusive": 1.0,
+        "maximum_exclusive": 2.0,
+        "missing_values": "reject",
+    },
+}
+
+
 def _producer_code_binding() -> dict[str, Any]:
     module_names = (
         "a_share_universe.py",
@@ -287,6 +302,62 @@ def _apply_breadth_ma20_filter(
     }
 
 
+def _apply_moderate_amount_filter(
+    _connection: Any,
+    bars: Any,
+    *,
+    start_date: str,
+    end_date: str,
+) -> tuple[Any, dict[str, Any]]:
+    import pandas as pd
+
+    frame = bars.copy()
+    prior20_median = frame.groupby("ts_code", sort=False)["amount"].transform(
+        lambda values: values.shift(1).rolling(20, min_periods=20).median()
+    )
+    amount = pd.to_numeric(frame["amount"], errors="coerce")
+    ratio = amount / prior20_median
+    minimum = float(
+        MODERATE_AMOUNT_BREAKOUT_SPEC["signal_filter"]["minimum_inclusive"]
+    )
+    maximum = float(
+        MODERATE_AMOUNT_BREAKOUT_SPEC["signal_filter"]["maximum_exclusive"]
+    )
+    frame["amount_ratio_gte_1_lt_2"] = (
+        ratio.notna()
+        & (prior20_median > 0)
+        & (ratio >= minimum)
+        & (ratio < maximum)
+    )
+    valid = ratio[ratio.notna() & (prior20_median > 0)]
+    passing = frame["amount_ratio_gte_1_lt_2"]
+    values_digest = hashlib.sha256()
+    for date, ts_code, pass_value in zip(
+        frame["date"],
+        frame["ts_code"],
+        passing,
+    ):
+        values_digest.update(
+            f"{date}\0{ts_code}\0{int(bool(pass_value))}\n".encode("utf-8")
+        )
+    return frame, {
+        "schema_version": "audited-pit-moderate-amount-context/v1",
+        "tag": "amount_ratio_gte_1_lt_2",
+        "start_date": start_date,
+        "end_date": end_date,
+        "lookback_observed_bars": 20,
+        "denominator_statistic": "median",
+        "minimum_inclusive": minimum,
+        "maximum_exclusive": maximum,
+        "valid_bar_count": int(valid.size),
+        "pass_bar_count": int(passing.sum()),
+        "minimum_ratio": round(float(valid.min()), 4) if not valid.empty else None,
+        "median_ratio": round(float(valid.median()), 4) if not valid.empty else None,
+        "maximum_ratio": round(float(valid.max()), 4) if not valid.empty else None,
+        "filter_values_sha256": values_digest.hexdigest(),
+    }
+
+
 def run_audited_pit_development_replay(
     *,
     settings: Settings,
@@ -418,4 +489,18 @@ def run_audited_pit_breadth_development_replay(**kwargs: Any) -> dict[str, Any]:
         _prepare_bars=_apply_breadth_ma20_filter,
         _required_signal_column="breadth_ma20_gte_50",
         _result_schema_version="audited-pit-breadth-development-replay-result/v1",
+    )
+
+
+def run_audited_pit_moderate_amount_development_replay(
+    **kwargs: Any,
+) -> dict[str, Any]:
+    return run_audited_pit_development_replay(
+        **kwargs,
+        _strategy_spec=MODERATE_AMOUNT_BREAKOUT_SPEC,
+        _prepare_bars=_apply_moderate_amount_filter,
+        _required_signal_column="amount_ratio_gte_1_lt_2",
+        _result_schema_version=(
+            "audited-pit-moderate-amount-development-replay-result/v1"
+        ),
     )

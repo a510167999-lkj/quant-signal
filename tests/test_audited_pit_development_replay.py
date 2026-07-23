@@ -325,3 +325,54 @@ def test_breadth_replay_wrapper_freezes_one_registered_filter(monkeypatch):
     assert captured["_result_schema_version"] == (
         "audited-pit-breadth-development-replay-result/v1"
     )
+
+
+def test_moderate_amount_filter_uses_prior_bars_and_excludes_upper_bound():
+    rows = []
+    for symbol, signal_amount in (
+        ("000001.SZ", 100.0),
+        ("000002.SZ", 200.0),
+    ):
+        for index in range(21):
+            rows.append(
+                {
+                    "date": f"2025-01-{index + 1:02d}",
+                    "ts_code": symbol,
+                    "amount": signal_amount if index == 20 else 100.0,
+                }
+            )
+
+    bars, context = replay._apply_moderate_amount_filter(
+        None,
+        pd.DataFrame(rows),
+        start_date="2025-01-01",
+        end_date="2025-01-21",
+    )
+
+    last = bars[bars["date"] == "2025-01-21"].set_index("ts_code")
+    assert bool(last.at["000001.SZ", "amount_ratio_gte_1_lt_2"]) is True
+    assert bool(last.at["000002.SZ", "amount_ratio_gte_1_lt_2"]) is False
+    assert context["valid_bar_count"] == 2
+    assert context["pass_bar_count"] == 1
+    assert context["minimum_inclusive"] == 1.0
+    assert context["maximum_exclusive"] == 2.0
+    assert len(context["filter_values_sha256"]) == 64
+
+
+def test_moderate_amount_wrapper_freezes_one_registered_filter(monkeypatch):
+    captured = {}
+
+    def run(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(replay, "run_audited_pit_development_replay", run)
+
+    assert replay.run_audited_pit_moderate_amount_development_replay(example=1) == {
+        "ok": True
+    }
+    assert captured["_strategy_spec"] == replay.MODERATE_AMOUNT_BREAKOUT_SPEC
+    assert captured["_required_signal_column"] == "amount_ratio_gte_1_lt_2"
+    assert captured["_result_schema_version"] == (
+        "audited-pit-moderate-amount-development-replay-result/v1"
+    )
