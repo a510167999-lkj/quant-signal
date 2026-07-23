@@ -23,6 +23,19 @@ def _max_drawdown_pct_from_points(
     equity_points: List[Dict[str, Any]],
     start_equity: float = 1.0,
 ) -> float:
+    return round(
+        _max_drawdown_pct_from_points_raw(
+            equity_points,
+            start_equity=start_equity,
+        ),
+        2,
+    )
+
+
+def _max_drawdown_pct_from_points_raw(
+    equity_points: List[Dict[str, Any]],
+    start_equity: float = 1.0,
+) -> float:
     peak = start_equity or 1.0
     max_drawdown = 0.0
     for point in equity_points:
@@ -31,7 +44,7 @@ def _max_drawdown_pct_from_points(
         if peak:
             max_drawdown = min(max_drawdown, drawdown_equity / peak - 1)
         peak = max(peak, close_equity)
-    return round(max_drawdown * 100, 2)
+    return max_drawdown * 100
 
 
 def _equity_points_from_basket_returns(

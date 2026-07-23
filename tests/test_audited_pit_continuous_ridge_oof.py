@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import date, timedelta
+import json
 import math
 
 import numpy as np
@@ -216,6 +218,93 @@ def test_midrank_ties_share_rank_and_list_date_is_fail_closed():
     assert not future_features["ts_code"].eq("300001.SZ").any()
 
 
+@pytest.mark.parametrize(
+    "invalid_list_date",
+    (
+        " 2020-01-01",
+        "2020-01-01 ",
+        "20200101",
+        "2020/01/01",
+    ),
+)
+def test_list_date_noncanonical_text_is_fail_closed(invalid_list_date):
+    sessions = _sessions(61)
+    bars = _bars(
+        sessions,
+        ts_codes=("000001.SZ", "000002.SZ", "300001.SZ"),
+    )
+    bars.loc[
+        bars["ts_code"].eq("300001.SZ"),
+        "membership_list_date",
+    ] = invalid_list_date
+
+    features, receipt = ridge._build_exact_cross_section_features(
+        bars,
+        sessions,
+        minimum_cross_section_members=2,
+    )
+
+    assert not features["ts_code"].eq("300001.SZ").any()
+    assert receipt["status_counts"]["invalid_membership_list_date"] >= 1
+
+
+@pytest.mark.parametrize("invalid_amount", (0.0, -1.0, float("nan")))
+def test_unused_t_minus_60_amount_does_not_change_feature_pool(
+    invalid_amount,
+):
+    sessions = _sessions(61)
+    bars = _bars(sessions, ts_codes=("000001.SZ", "300001.SZ"))
+    bars.loc[
+        bars["ts_code"].eq("000001.SZ")
+        & bars["date"].eq(sessions[0]),
+        "amount",
+    ] = invalid_amount
+
+    features, receipt = ridge._build_exact_cross_section_features(
+        bars,
+        sessions,
+        minimum_cross_section_members=1,
+    )
+
+    final = features[features["signal_date"].eq(sessions[-1])]
+    assert final["ts_code"].tolist() == ["000001.SZ", "300001.SZ"]
+
+
+@pytest.mark.parametrize("invalid_amount", (0.0, -1.0, float("nan")))
+def test_used_60_session_amount_window_is_fail_closed(invalid_amount):
+    sessions = _sessions(61)
+    bars = _bars(sessions, ts_codes=("000001.SZ", "300001.SZ"))
+    bars.loc[
+        bars["ts_code"].eq("000001.SZ")
+        & bars["date"].eq(sessions[1]),
+        "amount",
+    ] = invalid_amount
+
+    features, receipt = ridge._build_exact_cross_section_features(
+        bars,
+        sessions,
+        minimum_cross_section_members=1,
+    )
+
+    final = features[features["signal_date"].eq(sessions[-1])]
+    assert final["ts_code"].tolist() == ["300001.SZ"]
+    assert receipt["status_counts"]["signal_ineligible"] >= 1
+
+
+def test_partial_midrank_ties_are_invariant_to_input_permutation():
+    raw = np.asarray([3.0, 1.0, 1.0, 4.0])
+    expected = np.asarray([0.2, -0.4, -0.4, 0.6])
+    actual = ridge._deterministic_midrank(raw)
+
+    assert actual.tolist() == pytest.approx(expected.tolist())
+
+    permutation = np.asarray([2, 0, 3, 1])
+    permuted = ridge._deterministic_midrank(raw[permutation])
+    restored = np.empty_like(permuted)
+    restored[permutation] = permuted
+    assert restored.tolist() == pytest.approx(expected.tolist())
+
+
 def test_features_require_every_global_session_and_ignore_future_bars():
     sessions = _sessions(62)
     bars = _bars(sessions, ts_codes=("000001.SZ", "300001.SZ"))
@@ -315,7 +404,7 @@ def _feature_row(
 
 
 def test_purged_oof_uses_only_mature_complete_training_outcomes():
-    sessions = _sessions(6)
+    sessions = _sessions(7)
     features = pd.DataFrame(
         [
             _feature_row("000001|a", sessions[0], -2.0),
@@ -352,13 +441,13 @@ def test_purged_oof_uses_only_mature_complete_training_outcomes():
         },
         {
             "candidate_key": "000005|v1",
-            "exit_date": sessions[5],
+            "exit_date": sessions[6],
             "return_pct": -99.0,
             "right_censored": False,
         },
         {
             "candidate_key": "000006|v2",
-            "exit_date": sessions[5],
+            "exit_date": sessions[6],
             "return_pct": 99.0,
             "right_censored": False,
         },
@@ -534,6 +623,95 @@ def test_positive_pool_and_baseline_share_candidates_with_stable_entity_cap():
     assert day["decisions"][0]["decision"] == "active_security"
 
 
+def _coherently_rehash_feature_receipt(features, receipt):
+    replayed = deepcopy(receipt)
+    ordered_features = features.sort_values(
+        ["signal_date", "security_id", "source_ts_code"],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    groups = []
+    for original_group in replayed["cross_section_groups"]:
+        signal_date = original_group["signal_date"]
+        group = ordered_features[
+            ordered_features["signal_date"].eq(signal_date)
+        ].sort_values(
+            ["security_id", "source_ts_code"],
+            kind="mergesort",
+        )
+        member_keys = group["security_id"].astype(str).tolist()
+        breadth_inputs = [
+            {
+                "security_id": str(row.security_id),
+                "above_ma20": bool(row.above_ma20),
+            }
+            for row in group.itertuples(index=False)
+        ]
+        return_inputs = [
+            {
+                "security_id": str(row.security_id),
+                "value": float(row.return_5d_pct),
+            }
+            for row in group.itertuples(index=False)
+        ]
+        rebuilt_group = {
+            **original_group,
+            "member_count": len(group),
+            "member_keys_sha256": ridge._sha256(member_keys),
+            "breadth_inputs_sha256": ridge._sha256(breadth_inputs),
+            "return_5d_inputs_sha256": ridge._sha256(return_inputs),
+            "raw_feature_inputs_sha256": {
+                name: ridge._sha256(
+                    [
+                        {
+                            "security_id": str(row.security_id),
+                            "value": float(getattr(row, name)),
+                        }
+                        for row in group.itertuples(index=False)
+                    ]
+                )
+                for name in ridge.RAW_STOCK_FEATURE_NAMES
+            },
+            "ranked_feature_outputs_sha256": {
+                name: ridge._sha256(
+                    [
+                        {
+                            "security_id": str(row.security_id),
+                            "value": float(getattr(row, name)),
+                        }
+                        for row in group.itertuples(index=False)
+                    ]
+                )
+                for name in ridge.RANKED_STOCK_FEATURE_NAMES
+            },
+            "cross_section_above_ma20_fraction": (
+                sum(item["above_ma20"] for item in breadth_inputs)
+                / len(breadth_inputs)
+            ),
+            "cross_section_median_return_5d_pct": (
+                ridge._deterministic_median(
+                    [item["value"] for item in return_inputs]
+                )
+            ),
+        }
+        rebuilt_group.pop("statistics_sha256", None)
+        rebuilt_group["statistics_sha256"] = ridge._sha256(rebuilt_group)
+        groups.append(rebuilt_group)
+
+    replayed["cross_section_group_count"] = len(groups)
+    replayed["cross_section_groups"] = groups
+    replayed["cross_section_groups_sha256"] = ridge._sha256(groups)
+    replayed["feature_row_count"] = len(ordered_features)
+    replayed["feature_rows_sha256"] = ridge._sha256(
+        [
+            ridge._feature_row_payload(row)
+            for row in ordered_features.to_dict("records")
+        ]
+    )
+    replayed.pop("receipt_sha256", None)
+    replayed["receipt_sha256"] = ridge._sha256(replayed)
+    return replayed
+
+
 def test_feature_receipt_replays_and_rejects_member_or_statistic_tampering():
     sessions = _sessions(61)
     features, receipt = ridge._build_exact_cross_section_features(
@@ -545,6 +723,7 @@ def test_feature_receipt_replays_and_rejects_member_or_statistic_tampering():
     verified = ridge.verify_feature_receipt(features, receipt)
     assert verified["verified"] is True
     assert verified["receipt_sha256"] == receipt["receipt_sha256"]
+    assert _coherently_rehash_feature_receipt(features, receipt) == receipt
 
     tampered_features = features.copy()
     tampered_features.loc[
@@ -553,17 +732,42 @@ def test_feature_receipt_replays_and_rejects_member_or_statistic_tampering():
     with pytest.raises(ValueError, match="feature receipt"):
         ridge.verify_feature_receipt(tampered_features, receipt)
 
-    tampered_receipt = {
-        **receipt,
-        "cross_section_groups": [
-            {
-                **receipt["cross_section_groups"][0],
-                "cross_section_above_ma20_fraction": 0.75,
-            }
-        ],
-    }
+    tampered_member_features = features.copy()
+    tampered_member_features.loc[
+        tampered_member_features.index[0],
+        "security_id",
+    ] = "cn-a-share:000000.SZ"
+    coherently_rehashed_member_receipt = _coherently_rehash_feature_receipt(
+        tampered_member_features,
+        receipt,
+    )
     with pytest.raises(ValueError, match="feature receipt"):
-        ridge.verify_feature_receipt(features, tampered_receipt)
+        ridge.verify_feature_receipt(
+            tampered_member_features,
+            coherently_rehashed_member_receipt,
+        )
+
+    coherently_rehashed_statistic_receipt = deepcopy(receipt)
+    statistic_group = coherently_rehashed_statistic_receipt[
+        "cross_section_groups"
+    ][0]
+    statistic_group["cross_section_above_ma20_fraction"] = 0.75
+    statistic_group.pop("statistics_sha256", None)
+    statistic_group["statistics_sha256"] = ridge._sha256(statistic_group)
+    coherently_rehashed_statistic_receipt["cross_section_groups_sha256"] = (
+        ridge._sha256(
+            coherently_rehashed_statistic_receipt["cross_section_groups"]
+        )
+    )
+    coherently_rehashed_statistic_receipt.pop("receipt_sha256", None)
+    coherently_rehashed_statistic_receipt["receipt_sha256"] = ridge._sha256(
+        coherently_rehashed_statistic_receipt
+    )
+    with pytest.raises(ValueError, match="feature receipt"):
+        ridge.verify_feature_receipt(
+            features,
+            coherently_rehashed_statistic_receipt,
+        )
 
 
 def test_continuous_label_subtracts_exact_friction_without_clipping():
@@ -574,6 +778,17 @@ def test_continuous_label_subtracts_exact_friction_without_clipping():
     assert ridge._signal_date_weights(
         ["d1", "d2", "d2", "d2"]
     ).tolist() == pytest.approx([1.0, 1 / 3, 1 / 3, 1 / 3])
+
+
+def test_label_friction_is_bound_to_execution_costs(monkeypatch):
+    monkeypatch.setitem(
+        ridge.CONTINUOUS_RIDGE_OOF_SPEC["label"],
+        "friction_percentage_points",
+        0.44,
+    )
+
+    with pytest.raises(ValueError, match="label friction"):
+        ridge._assert_shared_strict_execution_contract()
 
 
 def test_483_sessions_form_six_contiguous_nonoverlapping_oof_folds():
@@ -683,6 +898,129 @@ def test_uniform_tail_cutoff_precedes_entry_and_outcome_queries(monkeypatch):
     assert result["completed_candidates"] == [keep]
 
 
+def test_bulk_next_open_adapter_matches_strict_fill_gate_without_requeries():
+    sessions = _sessions(4)
+    refs = [
+        {
+            "trade_date": trade_date,
+            "generation_id": f"generation-{index}",
+            "manifest_sha256": f"{index + 1:064x}",
+            "lineage_sha256": f"{index + 11:064x}",
+            "vintage": "historical_backfill",
+        }
+        for index, trade_date in enumerate(sessions)
+    ]
+    rows = [
+        {
+            "generation_id": refs[0]["generation_id"],
+            "trade_date": sessions[0],
+            "ts_code": "000001.SZ",
+            "open": 10.0,
+            "limit_generation_id": refs[0]["generation_id"],
+            "pre_close": 9.8,
+            "up_limit": 10.8,
+            "down_limit": 8.8,
+            "suspended": 0,
+        },
+        {
+            "generation_id": refs[1]["generation_id"],
+            "trade_date": sessions[1],
+            "ts_code": "000001.SZ",
+            "open": 10.1,
+            "limit_generation_id": None,
+            "pre_close": None,
+            "up_limit": None,
+            "down_limit": None,
+            "suspended": 0,
+        },
+        {
+            "generation_id": refs[2]["generation_id"],
+            "trade_date": sessions[2],
+            "ts_code": "000001.SZ",
+            "open": 10.2,
+            "limit_generation_id": refs[2]["generation_id"],
+            "pre_close": 10.0,
+            "up_limit": 11.0,
+            "down_limit": 9.0,
+            "suspended": 1,
+        },
+        {
+            "generation_id": refs[0]["generation_id"],
+            "trade_date": sessions[0],
+            "ts_code": "300001.SZ",
+            "open": 22.0,
+            "limit_generation_id": refs[0]["generation_id"],
+            "pre_close": 20.0,
+            "up_limit": 22.0,
+            "down_limit": 18.0,
+            "suspended": 0,
+        },
+    ]
+
+    class FakeConnection:
+        def __init__(self):
+            self.calls = 0
+
+        def execute(self, query, params):
+            self.calls += 1
+            assert "market_session_generation_rows_stk_limit" in query
+            assert "market_session_generation_rows_suspend_d" in query
+            assert "upper(trim(suspension.suspend_type)) = 'S'" in query
+            assert params == (sessions[0], sessions[-1])
+            return list(rows)
+
+    class BaseAdapter:
+        contract_sha256 = "a" * 64
+        artifact_root_sha256 = "b" * 64
+
+        def baseline_scenarios(self):
+            return ()
+
+    connection = FakeConnection()
+    adapter, receipt = ridge._load_bulk_next_open_replay_adapter(
+        connection,
+        base_adapter=BaseAdapter(),
+        market_generation_refs=refs,
+        sessions=sessions,
+    )
+
+    assert connection.calls == 1
+    assert adapter.next_open("000001", sessions[0], "buy") == {
+        "fillable": True,
+        "reason": "raw_open",
+        "raw_price": 10.0,
+        "generation_proof": refs[0],
+    }
+    assert (
+        adapter.next_open("000001", sessions[1], "buy")["reason"]
+        == "missing_price_limit"
+    )
+    assert (
+        adapter.next_open("000001", sessions[2], "sell")["reason"]
+        == "suspended"
+    )
+    assert (
+        adapter.next_open("000001", sessions[3], "sell")["reason"]
+        == "missing_raw_bar"
+    )
+    assert (
+        adapter.next_open("300001", sessions[0], "buy")["reason"]
+        == "buy_open_locked_limit"
+    )
+    assert adapter.next_open("300001", sessions[0], "sell")["fillable"] is True
+    with pytest.raises(ridge.PITReceiptError, match="unknown symbol"):
+        adapter.next_open("600001", sessions[0], "buy")
+    assert len(adapter.contract_sha256) == 64
+    assert receipt["evidence_row_count"] == 4
+    assert receipt["receipt_sha256"] == ridge._sha256(
+        {
+            key: value
+            for key, value in receipt.items()
+            if key != "receipt_sha256"
+        }
+    )
+
+
 def test_selected_censor_blocks_each_evidence_gate(monkeypatch):
     passing_metrics = {
         "trade_win_rate_pct": 60.0,
@@ -710,29 +1048,33 @@ def test_selected_censor_blocks_each_evidence_gate(monkeypatch):
         "000001",
         "2025-01-02",
         security_id="entity-a",
-        industry="科技",
+        industry="industry-a",
         amount=1.0,
         predicted=10.0,
         exit_date="2026-07-03",
         right_censored=True,
     )
-    complete = _outcome_candidate(
-        "000002",
-        "2025-01-02",
-        security_id="entity-b",
-        industry="金融",
-        amount=100.0,
-        predicted=1.0,
-        exit_date="2025-01-10",
-    )
+    censor["censor_reason"] = "no_strict_sell_fill_through_coverage_end"
+    complete = [
+        _outcome_candidate(
+            f"00000{index + 2}",
+            "2025-01-02",
+            security_id=f"entity-{chr(ord('b') + index)}",
+            industry=f"industry-{chr(ord('b') + index)}",
+            amount=400.0 - index * 100.0,
+            predicted=3.0 - index,
+            exit_date="2025-01-10",
+        )
+        for index in range(3)
+    ]
 
     main, _ = ridge._evaluate_fixed_oof(
-        [censor, complete],
+        [censor, *complete],
         rank_mode="predicted_net_return",
         evaluation_session_dates=_sessions(366),
     )
     baseline, _ = ridge._evaluate_fixed_oof(
-        [censor, complete],
+        [censor, *complete],
         rank_mode="signal_date_amount",
         evaluation_session_dates=_sessions(366),
     )
@@ -742,6 +1084,69 @@ def test_selected_censor_blocks_each_evidence_gate(monkeypatch):
     assert main_row["evidence_complete"] is False
     assert baseline_row["evidence_complete"] is True
     assert ridge._advancement_gate_passes(main_row, baseline_row) is False
+
+
+def test_fixed_oof_gates_use_unrounded_float64_metrics(monkeypatch):
+    monkeypatch.setitem(
+        ridge.CONTINUOUS_RIDGE_OOF_SPEC["advancement_thresholds"],
+        "minimum_complete_trades",
+        1,
+    )
+    rounded_pass_raw_fail = {
+        "gate_metric_basis": "unrounded_float64",
+        "trade_win_rate_pct": 52.0,
+        "trade_win_rate_pct_raw": 51.9999,
+        "portfolio_max_drawdown_pct": -15.0,
+        "portfolio_max_drawdown_pct_raw": -15.0001,
+        "trade_profit_factor": 1.3,
+        "trade_profit_factor_raw": 1.2999,
+        "rolling_1y_latest_full_window": True,
+        "rolling_1y_latest_return_pct": 50.0,
+        "rolling_1y_latest_return_pct_raw": 49.9999,
+        "calmar_latest_12m": 1.5,
+        "calmar_latest_12m_raw": 1.4999,
+        "rolling_1y_windows": [
+            {
+                "return_pct": 50.0,
+                "return_pct_raw": 49.9999,
+                "max_drawdown_pct": -15.0,
+                "max_drawdown_pct_raw": -15.0001,
+                "payoff_ratio": 1.3,
+                "payoff_ratio_raw": 1.2999,
+                "profit_factor": 1.3,
+                "profit_factor_raw": 1.2999,
+                "calmar": 1.5,
+                "calmar_raw": 1.4999,
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        ridge,
+        "_trade_metrics",
+        lambda *args, **kwargs: rounded_pass_raw_fail,
+    )
+    candidate = _outcome_candidate(
+        "000001",
+        "2025-01-02",
+        security_id="entity-a",
+        industry="industry-a",
+        amount=1.0,
+        predicted=1.0,
+        exit_date="2025-01-10",
+    )
+
+    sweep, _ = ridge._evaluate_fixed_oof(
+        [candidate],
+        rank_mode="predicted_net_return",
+        evaluation_session_dates=_sessions(366),
+    )
+    row = sweep["top"][0]
+
+    assert row["gate_metric_basis"] == "unrounded_float64"
+    assert row["target_full_development_quality_pass"] is False
+    assert row["target_latest_12m_pass"] is False
+    assert row["target_rolling_12m_stability_pass"] is False
+    assert row["target_all_pass"] is False
 
 
 def _sidecar_payload(
@@ -758,6 +1163,79 @@ def _sidecar_payload(
         "producer_code": producer_code,
         "data": [1, 2, 3],
     }
+
+
+def test_compact_receipt_summary_replaces_full_self_hash_and_is_verifiable():
+    full_receipt = {
+        "schema_version": "full-receipt/v1",
+        "event_count": 2,
+        "events": [{"key": "a"}, {"key": "b"}],
+        "events_sha256": ridge._sha256([{"key": "a"}, {"key": "b"}]),
+    }
+    full_receipt["receipt_sha256"] = ridge._sha256(full_receipt)
+
+    summary = ridge._compact_receipt_summary(
+        full_receipt,
+        omitted_fields={
+            "events": {
+                "count_field": "event_count",
+                "sha256_field": "events_sha256",
+            }
+        },
+    )
+
+    assert "events" not in summary
+    assert "receipt_sha256" not in summary
+    assert summary["full_receipt_sha256"] == full_receipt["receipt_sha256"]
+    assert summary["omitted_fields"]["events"] == {
+        "count": 2,
+        "sha256": full_receipt["events_sha256"],
+    }
+    ridge._verify_compact_receipt_summary(summary)
+    tampered = {**summary, "event_count": 3}
+    with pytest.raises(ValueError, match="summary"):
+        ridge._verify_compact_receipt_summary(tampered)
+    forged_full_hash = {
+        **full_receipt,
+        "receipt_sha256": "f" * 64,
+    }
+    with pytest.raises(ValueError, match="full receipt"):
+        ridge._compact_receipt_summary(
+            forged_full_hash,
+            omitted_fields={
+                "events": {
+                    "count_field": "event_count",
+                    "sha256_field": "events_sha256",
+                }
+            },
+        )
+    forged_content_hash = {
+        **full_receipt,
+        "events_sha256": "0" * 64,
+    }
+    forged_content_hash["receipt_sha256"] = ridge._sha256(
+        {
+            key: value
+            for key, value in forged_content_hash.items()
+            if key != "receipt_sha256"
+        }
+    )
+    with pytest.raises(ValueError, match="omitted evidence"):
+        ridge._compact_receipt_summary(
+            forged_content_hash,
+            omitted_fields={
+                "events": {
+                    "count_field": "event_count",
+                    "sha256_field": "events_sha256",
+                }
+            },
+        )
+
+
+def test_producer_binding_includes_pdf_parser_version():
+    producer = ridge._producer_binding()
+
+    assert producer["pypdf_version"]
 
 
 def test_result_bundle_is_content_addressed_path_stable_and_drift_closed(
@@ -836,6 +1314,274 @@ def test_result_bundle_is_content_addressed_path_stable_and_drift_closed(
             sidecar_payloads=sidecars,
             expected_producer_code=producer,
         )
+
+
+def test_end_to_end_runner_stays_development_only(monkeypatch, tmp_path):
+    from app.config import Settings
+
+    sessions = _sessions(196)
+    ts_codes = ("000001.SZ", "000002.SZ", "000003.SZ", "300001.SZ")
+    rows = []
+    for offset, ts_code in enumerate(ts_codes):
+        growth = 0.0015 + offset * 0.0005
+        for index, trade_date in enumerate(sessions):
+            close = 100.0 * (1.0 + growth) ** index
+            rows.append(
+                {
+                    "date": trade_date,
+                    "ts_code": ts_code,
+                    "source_ts_code": ts_code,
+                    "security_id": f"cn-a-share:{ts_code}",
+                    "security_code_transition_id": None,
+                    "security_code_transition_contract_sha256": "d" * 64,
+                    "open": close,
+                    "high": close * 1.01,
+                    "low": close * 0.99,
+                    "close": close,
+                    "pre_close": close / (1.0 + growth),
+                    "amount": 1_000_000.0 + offset * 10_000.0 + index,
+                    "adj_factor": 1.0,
+                    "membership_name": f"normal-{offset}",
+                    "membership_industry": f"industry-{offset}",
+                    "membership_list_date": "2020-01-01",
+                    "membership_receipt_dataset": "bak_basic",
+                    "membership_receipt_partition": trade_date,
+                    "suspended": 0,
+                }
+            )
+    bars = pd.DataFrame(rows)
+    bar_receipt = {
+        "schema_version": "test-ranked-loader/v2",
+        "security_code_transition_application_receipt_sha256": "e" * 64,
+    }
+    bar_receipt["receipt_sha256"] = ridge._sha256(bar_receipt)
+    coverage_sha = "a" * 64
+    artifact_root_sha = "b" * 64
+    temporal_sha = "c" * 64
+    transition_receipt = {
+        "schema_version": "test-transition/v1",
+        "contract_sha256": "d" * 64,
+        "contract": {"schema_version": "test-transition-contract/v1"},
+        "receipt_sha256": "f" * 64,
+    }
+    market_generation_refs = [
+        {
+            "trade_date": trade_date,
+            "generation_id": f"generation-{trade_date}",
+            "manifest_sha256": "2" * 64,
+            "lineage_sha256": "3" * 64,
+            "vintage": "historical_backfill",
+        }
+        for trade_date in sessions
+    ]
+    outcome_query_order = []
+    oof_feature_signal_dates = []
+    original_tail_cutoff = ridge._apply_uniform_tail_cutoff
+    original_oof_builder = ridge._build_purged_oof_scores
+
+    def tracked_tail_cutoff(*args, **kwargs):
+        outcome_query_order.append("tail_cutoff")
+        return original_tail_cutoff(*args, **kwargs)
+
+    def tracked_suspension_loader(*args, **kwargs):
+        outcome_query_order.append("suspension_evidence")
+        return {}
+
+    def tracked_terminal_loader(*args, **kwargs):
+        outcome_query_order.append("terminal_listing_evidence")
+        return {}
+
+    def tracked_bulk_loader(*args, **kwargs):
+        outcome_query_order.append("bulk_next_open_evidence")
+        receipt = {
+            "schema_version": "test-bulk-next-open/v2",
+            "evidence_row_count": len(bars),
+            "receipt_sha256": "4" * 64,
+        }
+        return kwargs["base_adapter"], receipt
+
+    def tracked_oof_builder(features, *args, **kwargs):
+        oof_feature_signal_dates.extend(
+            features["signal_date"].astype(str).tolist()
+        )
+        return original_oof_builder(features, *args, **kwargs)
+
+    class FakeUniverse:
+        start_date = sessions[0]
+        end_date = sessions[-1]
+        coverage_audit_sha256 = coverage_sha
+        artifact_root_sha256 = artifact_root_sha
+        temporal_contract_sha256 = temporal_sha
+        temporal_role = "development"
+        manifest = {
+            "market_generations": {"refs": market_generation_refs}
+        }
+
+        def _require_open(self):
+            return object()
+
+        def close(self):
+            return None
+
+    by_key = {
+        (str(row.ts_code)[:6], str(row.date)): row
+        for row in bars.itertuples(index=False)
+    }
+
+    class FakeAdapter:
+        contract_sha256 = "1" * 64
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def next_open(self, symbol, trade_date, side="buy"):
+            row = by_key[(symbol, trade_date)]
+            return {
+                "fillable": True,
+                "reason": "raw_open",
+                "raw_price": float(row.open),
+                "generation_proof": {
+                    "trade_date": trade_date,
+                    "generation_id": f"generation-{trade_date}",
+                    "manifest_sha256": "2" * 64,
+                    "lineage_sha256": "3" * 64,
+                    "vintage": "historical_backfill",
+                    "resolved_ts_code": str(row.source_ts_code),
+                },
+            }
+
+    monkeypatch.setitem(
+        ridge.CONTINUOUS_RIDGE_OOF_SPEC,
+        "minimum_cross_section_members",
+        4,
+    )
+    monkeypatch.setitem(
+        ridge.CONTINUOUS_RIDGE_OOF_SPEC,
+        "required_market_session_count",
+        len(sessions),
+    )
+    monkeypatch.setitem(
+        ridge.CONTINUOUS_RIDGE_OOF_SPEC,
+        "required_oof_fold_count",
+        2,
+    )
+    monkeypatch.setattr(
+        ridge,
+        "load_temporal_partition_contract",
+        lambda _path: {"contract_sha256": temporal_sha},
+    )
+    monkeypatch.setattr(
+        ridge,
+        "assert_range_allowed",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        ridge,
+        "load_security_code_transition_evidence",
+        lambda *_args, **_kwargs: dict(transition_receipt),
+    )
+    monkeypatch.setattr(
+        ridge.AuditedPointInTimeUniverse,
+        "from_file",
+        lambda *_args, **_kwargs: FakeUniverse(),
+    )
+    monkeypatch.setattr(
+        ridge,
+        "_exact_membership_sessions",
+        lambda *_args, **_kwargs: sessions,
+    )
+    monkeypatch.setattr(
+        ridge,
+        "_load_ranked_liquidity_bars",
+        lambda *_args, **_kwargs: (bars.copy(), dict(bar_receipt)),
+    )
+    monkeypatch.setattr(
+        ridge,
+        "_load_suspension_evidence",
+        tracked_suspension_loader,
+    )
+    monkeypatch.setattr(
+        ridge,
+        "_load_terminal_listing_evidence",
+        tracked_terminal_loader,
+    )
+    monkeypatch.setattr(
+        ridge,
+        "_load_bulk_next_open_replay_adapter",
+        tracked_bulk_loader,
+    )
+    monkeypatch.setattr(
+        ridge,
+        "_apply_uniform_tail_cutoff",
+        tracked_tail_cutoff,
+    )
+    monkeypatch.setattr(
+        ridge,
+        "_build_purged_oof_scores",
+        tracked_oof_builder,
+    )
+    monkeypatch.setattr(
+        ridge,
+        "remap_security_code_transition_suspension_evidence",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        ridge,
+        "remap_security_code_transition_terminal_evidence",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(ridge, "ArtifactNativeReplayAdapter", FakeAdapter)
+    monkeypatch.setattr(
+        ridge,
+        "SecurityCodeTransitionReplayAdapter",
+        lambda adapter, **_kwargs: adapter,
+    )
+
+    result = ridge.run_audited_pit_ranked_liquidity_ridge_oof(
+        settings=Settings(),
+        audited_pit_universe_path=tmp_path / "universe.sqlite3",
+        expected_coverage_audit_sha256=coverage_sha,
+        expected_artifact_root_sha256=artifact_root_sha,
+        temporal_contract_path=tmp_path / "temporal.json",
+        expected_temporal_contract_sha256=temporal_sha,
+        security_code_transition_evidence_root=tmp_path / "transition",
+        expected_security_code_transition_contract_sha256="d" * 64,
+        start_date=sessions[0],
+        end_date=sessions[-1],
+        output_dir=tmp_path / "output",
+    )
+
+    assert result["scope"]["development_only"] is True
+    assert result["scope"]["embargo_consumed"] is False
+    assert result["scope"]["final_oos_consumed"] is False
+    assert result["scope"]["eligible_for_profile_registration"] is False
+    assert outcome_query_order == [
+        "tail_cutoff",
+        "suspension_evidence",
+        "terminal_listing_evidence",
+        "bulk_next_open_evidence",
+    ]
+    assert max(oof_feature_signal_dates) == sessions[-7]
+    assert result["feature_candidate_count"] > 0
+    assert result["oof_candidate_count"] > 0
+    assert sorted(result["runtime_sidecars"]) == [
+        "execution",
+        "features",
+        "models",
+        "selection",
+    ]
+    progress = json.loads(
+        (
+            tmp_path
+            / "output"
+            / ".ranked_liquidity_v2_progress.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert progress["stage"] == "completed"
+    assert (
+        progress["artifact_sha256"]
+        == result["artifact"]["artifact_sha256"]
+    )
 
 
 def test_jobs_cli_dispatches_ranked_liquidity_ridge_oof(

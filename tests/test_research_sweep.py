@@ -52,6 +52,39 @@ def test_trade_metrics_exposes_full_rolling_12m_and_window_calmar():
     assert "payoff_ratio" in latest
     assert "profit_factor" in latest
     assert "calmar" in latest
+    assert metrics["gate_metric_basis"] == "unrounded_float64"
+    assert metrics["rolling_1y_latest_return_pct_raw"] == latest["return_pct_raw"]
+    assert (
+        metrics["rolling_1y_latest_max_drawdown_pct_raw"]
+        == latest["max_drawdown_pct_raw"]
+    )
+    for rounded_name in (
+        "return_pct",
+        "max_drawdown_pct",
+        "payoff_ratio",
+        "profit_factor",
+    ):
+        raw_name = f"{rounded_name}_raw"
+        assert raw_name in latest
+        if latest[raw_name] is not None:
+            assert latest[rounded_name] == round(latest[raw_name], 2)
+    assert metrics["trade_win_rate_pct"] == round(
+        metrics["trade_win_rate_pct_raw"],
+        2,
+    )
+    assert metrics["trade_profit_factor"] == round(
+        metrics["trade_profit_factor_raw"],
+        2,
+    )
+    assert metrics["portfolio_max_drawdown_pct"] == round(
+        metrics["portfolio_max_drawdown_pct_raw"],
+        2,
+    )
+    assert metrics["calmar_latest_12m"] == round(
+        latest["return_pct"] / abs(latest["max_drawdown_pct"]),
+        2,
+    )
+    assert metrics["calmar_latest_12m_raw"] == latest["calmar_raw"]
     if latest["max_drawdown_pct"]:
         expected_calmar = latest["return_pct"] / abs(latest["max_drawdown_pct"])
         assert metrics["calmar_latest_12m"] == round(expected_calmar, 2)

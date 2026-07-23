@@ -12,7 +12,7 @@ from app.research_equity import (
     _equity_points_from_basket_returns,
     _equity_points_from_slot_daily_returns,
     _equity_points_from_slot_exit_returns,
-    _max_drawdown_pct_from_points,
+    _max_drawdown_pct_from_points_raw,
 )
 from app.research_portfolio import _select_with_portfolio_controls
 from app.signal_tags import (
@@ -246,13 +246,20 @@ def _latest_window_portfolio_stats(
     segment = equity_points[start_index:]
     if not segment or not start_equity:
         return {}
+    return_pct_raw = (end["equity"] / start_equity - 1) * 100
+    max_drawdown_pct_raw = _max_drawdown_pct_from_points_raw(
+        segment,
+        start_equity=start_equity,
+    )
     return {
         "start_date": segment[0]["signal_date"],
         "end_date": end["signal_date"],
         "signal_days": len(segment),
         "trade_count": sum(int(point.get("count") or 0) for point in segment),
-        "return_pct": round((end["equity"] / start_equity - 1) * 100, 2),
-        "max_drawdown_pct": _max_drawdown_pct_from_points(segment, start_equity=start_equity),
+        "return_pct": round(return_pct_raw, 2),
+        "return_pct_raw": return_pct_raw,
+        "max_drawdown_pct": round(max_drawdown_pct_raw, 2),
+        "max_drawdown_pct_raw": max_drawdown_pct_raw,
     }
 
 
@@ -279,6 +286,11 @@ def _rolling_12m_window_stats(
         segment = equity_points[start_index : end_index + 1]
         if not segment or not start_equity:
             continue
+        return_pct_raw = (end["equity"] / start_equity - 1) * 100
+        max_drawdown_pct_raw = _max_drawdown_pct_from_points_raw(
+            segment,
+            start_equity=start_equity,
+        )
         windows.append(
             {
                 "start_date": max(start_cutoff, history_start).strftime(
@@ -287,8 +299,10 @@ def _rolling_12m_window_stats(
                 "end_date": end["signal_date"],
                 "signal_days": len(segment),
                 "trade_count": sum(int(point.get("count") or 0) for point in segment),
-                "return_pct": round((end["equity"] / start_equity - 1) * 100, 2),
-                "max_drawdown_pct": _max_drawdown_pct_from_points(segment, start_equity=start_equity),
+                "return_pct": round(return_pct_raw, 2),
+                "return_pct_raw": return_pct_raw,
+                "max_drawdown_pct": round(max_drawdown_pct_raw, 2),
+                "max_drawdown_pct_raw": max_drawdown_pct_raw,
             }
         )
     return windows
@@ -570,22 +584,40 @@ def _trade_metrics(
         payoff_ratio = average_win / average_loss if average_win is not None and average_loss else None
         gross_loss = abs(sum(losses))
         profit_factor = sum(wins) / gross_loss if gross_loss else None
+        win_rate = (
+            len(wins) / len(window_trades) * 100
+            if window_trades
+            else None
+        )
+        drawdown_raw = window.get("max_drawdown_pct_raw")
+        window_return_raw = window.get("return_pct_raw")
+        calmar_raw = (
+            float(window_return_raw) / abs(float(drawdown_raw))
+            if window_return_raw is not None
+            and drawdown_raw not in {None, 0}
+            else None
+        )
         drawdown = window.get("max_drawdown_pct")
+        window_return = window.get("return_pct")
         calmar = (
-            float(window.get("return_pct")) / abs(float(drawdown))
-            if window.get("return_pct") is not None and drawdown not in {None, 0}
+            float(window_return) / abs(float(drawdown))
+            if window_return is not None and drawdown not in {None, 0}
             else None
         )
         return {
             "selected_trade_count": len(window_trades),
             "win_count": len(wins),
             "nonwin_count": len(window_trades) - len(wins),
-            "win_rate_pct": round(len(wins) / len(window_trades) * 100, 2)
-            if window_trades
+            "win_rate_pct": round(win_rate, 2)
+            if win_rate is not None
             else None,
+            "win_rate_pct_raw": win_rate,
             "payoff_ratio": round(payoff_ratio, 2) if payoff_ratio is not None else None,
+            "payoff_ratio_raw": payoff_ratio,
             "profit_factor": round(profit_factor, 2) if profit_factor is not None else None,
+            "profit_factor_raw": profit_factor,
             "calmar": round(calmar, 2) if calmar is not None else None,
+            "calmar_raw": calmar_raw,
         }
 
     rolling_1y_windows = [
@@ -622,12 +654,24 @@ def _trade_metrics(
     gross_profit = sum(winning_returns)
     gross_loss = abs(sum(losing_returns))
     profit_factor = gross_profit / gross_loss if gross_loss else None
-    max_drawdown = (
-        _max_drawdown_pct_from_points(metric_equity_points)
+    max_drawdown_raw = (
+        _max_drawdown_pct_from_points_raw(metric_equity_points)
         if metric_equity_points
         else None
     )
+    max_drawdown = (
+        round(max_drawdown_raw, 2)
+        if max_drawdown_raw is not None
+        else None
+    )
     latest_return = latest_1y.get("return_pct")
+    latest_return_raw = latest_1y.get("return_pct_raw")
+    calmar_raw = (
+        float(latest_return_raw) / abs(float(max_drawdown_raw))
+        if latest_return_raw is not None
+        and max_drawdown_raw not in {None, 0}
+        else None
+    )
     calmar = (
         float(latest_return) / abs(float(max_drawdown))
         if latest_return is not None and max_drawdown not in {None, 0}
@@ -635,10 +679,32 @@ def _trade_metrics(
     )
     latest_rolling = rolling_1y_windows[-1] if rolling_1y_windows else {}
     latest_rolling_drawdown = latest_rolling.get("max_drawdown_pct")
+    latest_rolling_drawdown_raw = latest_rolling.get(
+        "max_drawdown_pct_raw"
+    )
+    latest_rolling_return_raw = latest_rolling.get("return_pct_raw")
+    calmar_latest_12m_raw = (
+        float(latest_rolling_return_raw)
+        / abs(float(latest_rolling_drawdown_raw))
+        if latest_rolling_return_raw is not None
+        and latest_rolling_drawdown_raw not in {None, 0}
+        else None
+    )
     calmar_latest_12m = (
-        float(latest_rolling.get("return_pct")) / abs(float(latest_rolling_drawdown))
+        float(latest_rolling.get("return_pct"))
+        / abs(float(latest_rolling_drawdown))
         if latest_rolling.get("return_pct") is not None
         and latest_rolling_drawdown not in {None, 0}
+        else None
+    )
+    trade_win_rate_raw = (
+        len(wins) / len(selected) * 100
+        if selected
+        else None
+    )
+    compounded_return_raw = (
+        (metric_equity_points[-1]["equity"] - 1) * 100
+        if metric_equity_points
         else None
     )
 
@@ -652,13 +718,19 @@ def _trade_metrics(
         "trade_return_basis": "net_after_roundtrip_cost_and_slippage",
         "quality_trade_cost_pct": round(quality_cost_pct, 4),
         "capital_model": capital_model,
+        "gate_metric_basis": "unrounded_float64",
         "trade_win_count": len(wins),
         "trade_nonwin_count": len(selected) - len(wins),
-        "trade_win_rate_pct": round(len(wins) / len(selected) * 100, 2) if selected else None,
+        "trade_win_rate_pct": round(trade_win_rate_raw, 2)
+        if trade_win_rate_raw is not None
+        else None,
+        "trade_win_rate_pct_raw": trade_win_rate_raw,
         "trade_payoff_ratio": round(payoff_ratio, 2) if payoff_ratio is not None else None,
+        "trade_payoff_ratio_raw": payoff_ratio,
         "trade_profit_factor": round(profit_factor, 2)
         if profit_factor is not None
         else None,
+        "trade_profit_factor_raw": profit_factor,
         "trade_avg_return_pct": round(sum(returns) / len(returns), 2) if returns else None,
         "trade_median_return_pct": round(float(pd.Series(returns).median()), 2)
         if returns
@@ -669,21 +741,26 @@ def _trade_metrics(
         )
         if adverse
         else None,
-        "portfolio_compounded_return_pct": round(
-            (metric_equity_points[-1]["equity"] - 1) * 100,
-            2,
-        )
-        if metric_equity_points
+        "portfolio_compounded_return_pct": round(compounded_return_raw, 2)
+        if compounded_return_raw is not None
         else None,
+        "portfolio_compounded_return_pct_raw": compounded_return_raw,
         "portfolio_max_drawdown_pct": max_drawdown,
+        "portfolio_max_drawdown_pct_raw": max_drawdown_raw,
         "portfolio_calmar_latest_1y": round(calmar, 2) if calmar is not None else None,
+        "portfolio_calmar_latest_1y_raw": calmar_raw,
         "portfolio_calmar_latest_1y_method": "latest_365d_return_over_full_history_drawdown_legacy",
         "calmar_latest_12m": round(calmar_latest_12m, 2)
         if calmar_latest_12m is not None
         else None,
+        "calmar_latest_12m_raw": calmar_latest_12m_raw,
         "calmar_latest_12m_method": "latest_365d_return_over_latest_365d_drawdown",
         "rolling_1y_latest_return_pct": latest_return,
+        "rolling_1y_latest_return_pct_raw": latest_return_raw,
         "rolling_1y_latest_max_drawdown_pct": latest_rolling_drawdown,
+        "rolling_1y_latest_max_drawdown_pct_raw": (
+            latest_rolling_drawdown_raw
+        ),
         "rolling_1y_windows": rolling_1y_windows,
         "rolling_1y_latest_full_window": rolling_full_window,
         "rolling_1y_latest_trade_count": rolling_trade_count,

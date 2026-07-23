@@ -12,7 +12,9 @@ from typing import Any, Dict, List
 import pandas as pd
 
 from app.research_common import _date_value
-from app.research_equity import _max_drawdown_pct_from_points
+from app.research_equity import (
+    _max_drawdown_pct_from_points_raw,
+)
 
 
 def _window_portfolio_stats(
@@ -41,14 +43,21 @@ def _window_portfolio_stats(
         segment = equity_points[start_index : end_index + 1]
         if not segment or not start_equity:
             continue
+        return_pct_raw = (end["equity"] / start_equity - 1) * 100
+        max_drawdown_pct_raw = _max_drawdown_pct_from_points_raw(
+            segment,
+            start_equity=start_equity,
+        )
         windows.append(
             {
                 "start_date": segment[0]["signal_date"],
                 "end_date": end["signal_date"],
                 "signal_days": len(segment),
                 "trade_count": sum(int(point.get("count") or 0) for point in segment),
-                "return_pct": round((end["equity"] / start_equity - 1) * 100, 2),
-                "max_drawdown_pct": _max_drawdown_pct_from_points(segment, start_equity=start_equity),
+                "return_pct": round(return_pct_raw, 2),
+                "return_pct_raw": return_pct_raw,
+                "max_drawdown_pct": round(max_drawdown_pct_raw, 2),
+                "max_drawdown_pct_raw": max_drawdown_pct_raw,
             }
         )
 

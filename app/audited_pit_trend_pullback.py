@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import operator
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -366,6 +367,61 @@ def _assert_execution_resolution_matches_frame(
         )
 
 
+def _resolve_frame_date_positions(
+    *,
+    frame: pd.DataFrame,
+    prevalidated_date_positions: Mapping[str, int] | None,
+) -> Mapping[str, int]:
+    if prevalidated_date_positions is None:
+        if frame["date"].astype(str).duplicated().any():
+            raise AuditedPITDevelopmentReplayError(
+                "symbol frame contains duplicate market dates"
+            )
+        return {
+            str(value): int(position)
+            for position, value in enumerate(frame["date"].tolist())
+        }
+    if len(prevalidated_date_positions) != len(frame):
+        raise AuditedPITDevelopmentReplayError(
+            "prevalidated date positions row count differs from frame"
+        )
+    return prevalidated_date_positions
+
+
+def _frame_date_position(
+    *,
+    frame: pd.DataFrame,
+    date_positions: Mapping[str, int],
+    trade_date: str,
+    validate_precomputed: bool,
+) -> int | None:
+    missing_position = object()
+    raw_position = date_positions.get(trade_date, missing_position)
+    if raw_position is missing_position:
+        return None
+    if not validate_precomputed:
+        return int(raw_position)
+    if isinstance(raw_position, bool):
+        raise AuditedPITDevelopmentReplayError(
+            "prevalidated date position is not an integer"
+        )
+    try:
+        position = operator.index(raw_position)
+    except TypeError as exc:
+        raise AuditedPITDevelopmentReplayError(
+            "prevalidated date position is not an integer"
+        ) from exc
+    if position < 0 or position >= len(frame):
+        raise AuditedPITDevelopmentReplayError(
+            "prevalidated date position is outside the frame"
+        )
+    if str(frame.iloc[position]["date"]) != trade_date:
+        raise AuditedPITDevelopmentReplayError(
+            "prevalidated date position does not match frame date"
+        )
+    return position
+
+
 def _strict_close_stop_trade(
     *,
     adapter: ArtifactNativeReplayAdapter,
@@ -383,6 +439,7 @@ def _strict_close_stop_trade(
     terminal_listing_evidence: Mapping[
         str, Mapping[str, Any]
     ] | None = None,
+    prevalidated_date_positions: Mapping[str, int] | None = None,
 ) -> tuple[
     dict[str, Any] | None,
     dict[str, Any] | None,
@@ -420,15 +477,27 @@ def _strict_close_stop_trade(
         event["entry_reason"] = buy.get("reason")
         return None, None, event
 
-    if frame["date"].astype(str).duplicated().any():
-        raise AuditedPITDevelopmentReplayError(
-            "symbol frame contains duplicate market dates"
+    date_positions = _resolve_frame_date_positions(
+        frame=frame,
+        prevalidated_date_positions=prevalidated_date_positions,
+    )
+
+    def _date_position(trade_date: str) -> int | None:
+        return _frame_date_position(
+            frame=frame,
+            date_positions=date_positions,
+            trade_date=trade_date,
+            validate_precomputed=prevalidated_date_positions is not None,
         )
-    date_positions = {
-        str(value): int(position)
-        for position, value in enumerate(frame["date"].tolist())
-    }
-    entry_index = date_positions.get(entry_date)
+
+    if prevalidated_date_positions is not None:
+        mapped_signal_index = _date_position(signal_date)
+        if mapped_signal_index != int(signal_index):
+            raise AuditedPITDevelopmentReplayError(
+                "prevalidated date position does not match signal index"
+            )
+
+    entry_index = _date_position(entry_date)
     if entry_index is None:
         raise AuditedPITDevelopmentReplayError(
             "strict fill verdict has no matching entry bar"
@@ -471,7 +540,7 @@ def _strict_close_stop_trade(
         entry_position, min(planned_exit_position, len(sessions))
     ):
         candidate_date = str(sessions[candidate_position])
-        row_index = date_positions.get(candidate_date)
+        row_index = _date_position(candidate_date)
         if row_index is None:
             continue
         row = frame.iloc[row_index]
@@ -500,7 +569,7 @@ def _strict_close_stop_trade(
         verdict = _artifact_open_verdict(
             adapter, verdict_cache, str(symbol), candidate_date, "sell"
         )
-        candidate_row_index = date_positions.get(candidate_date)
+        candidate_row_index = _date_position(candidate_date)
         if candidate_row_index is not None:
             _assert_execution_resolution_matches_frame(
                 frame=frame,
@@ -524,6 +593,7 @@ def _strict_close_stop_trade(
     if exit_position is None or exit_verdict is None:
         censored = _build_censored_position(
             frame=frame,
+            date_positions=date_positions,
             sessions=sessions,
             entry_position=entry_position,
             entry_date=entry_date,
@@ -552,7 +622,7 @@ def _strict_close_stop_trade(
         return None, censored, event
 
     exit_date = str(sessions[exit_position])
-    exit_index = date_positions.get(exit_date)
+    exit_index = _date_position(exit_date)
     if exit_index is None:
         raise AuditedPITDevelopmentReplayError(
             "strict fill verdict has no matching exit bar"
@@ -571,9 +641,12 @@ def _strict_close_stop_trade(
     held_market_sessions = [
         str(value) for value in sessions[entry_position : exit_position + 1]
     ]
-    observed_held_dates = [
-        value for value in held_market_sessions if value in date_positions
-    ]
+    observed_positions: dict[str, int] = {}
+    for trade_date in held_market_sessions:
+        row_index = _date_position(trade_date)
+        if row_index is not None:
+            observed_positions[trade_date] = row_index
+    observed_held_dates = list(observed_positions)
     if (
         not observed_held_dates
         or observed_held_dates[0] != entry_date
@@ -584,7 +657,7 @@ def _strict_close_stop_trade(
         )
     claim_bars = {}
     for trade_date in observed_held_dates:
-        row = frame.iloc[date_positions[trade_date]]
+        row = frame.iloc[observed_positions[trade_date]]
         claim_bars[trade_date] = {
             "trade_date": trade_date,
             "raw_open": row["open"],
@@ -602,7 +675,8 @@ def _strict_close_stop_trade(
         exit_raw_price=exit_raw_price,
     )
     missing_marks = [
-        value for value in held_market_sessions if value not in date_positions
+        value for value in held_market_sessions
+        if value not in observed_positions
     ]
     suspension_carry_forward_evidence: list[dict[str, Any]] = []
     for trade_date in missing_marks:
@@ -693,6 +767,7 @@ def _strict_close_stop_trade(
         suspension_evidence=suspension_evidence or {},
         hold_days=hold_days,
         stop_loss_pct=stop_loss_pct,
+        prevalidated_date_positions=date_positions,
     )
     realized["close_stop_verification"] = verification
     realized["source_execution_requery_verification"] = (
@@ -717,6 +792,7 @@ def _strict_close_stop_trade(
 def _build_censored_position(
     *,
     frame: pd.DataFrame,
+    date_positions: Mapping[str, int],
     sessions: Sequence[str],
     entry_position: int,
     entry_date: str,
@@ -738,11 +814,16 @@ def _build_censored_position(
         raise AuditedPITDevelopmentReplayError(
             "right-censored position contains a fillable sell attempt"
         )
-    date_positions = {
-        str(value): int(position)
-        for position, value in enumerate(frame["date"].tolist())
-    }
-    entry_index = date_positions.get(entry_date)
+
+    def _date_position(trade_date: str) -> int | None:
+        return _frame_date_position(
+            frame=frame,
+            date_positions=date_positions,
+            trade_date=trade_date,
+            validate_precomputed=True,
+        )
+
+    entry_index = _date_position(entry_date)
     if entry_index is None:
         raise AuditedPITDevelopmentReplayError(
             "right-censored position has no entry bar"
@@ -765,7 +846,7 @@ def _build_censored_position(
         else None
     )
     for session_index, trade_date in enumerate(held_market_sessions):
-        row_index = date_positions.get(trade_date)
+        row_index = _date_position(trade_date)
         if row_index is not None:
             row = frame.iloc[row_index]
 
@@ -972,6 +1053,7 @@ def _verify_completed_close_stop_trade(
     ],
     hold_days: int,
     stop_loss_pct: float,
+    prevalidated_date_positions: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     signal_date = str(frame.at[signal_index, "date"])
     signal_position = session_positions.get(signal_date)
@@ -996,12 +1078,27 @@ def _verify_completed_close_stop_trade(
         raise AuditedPITDevelopmentReplayError(
             "close-stop verification dates are inconsistent"
         )
-    date_positions = {
-        str(value): int(position)
-        for position, value in enumerate(frame["date"].tolist())
-    }
-    entry_index = date_positions.get(entry_date)
-    exit_index = date_positions.get(exit_date)
+    date_positions = _resolve_frame_date_positions(
+        frame=frame,
+        prevalidated_date_positions=prevalidated_date_positions,
+    )
+
+    def _date_position(trade_date: str) -> int | None:
+        return _frame_date_position(
+            frame=frame,
+            date_positions=date_positions,
+            trade_date=trade_date,
+            validate_precomputed=prevalidated_date_positions is not None,
+        )
+
+    if prevalidated_date_positions is not None:
+        mapped_signal_index = _date_position(signal_date)
+        if mapped_signal_index != int(signal_index):
+            raise AuditedPITDevelopmentReplayError(
+                "prevalidated date position does not match signal index"
+            )
+    entry_index = _date_position(entry_date)
+    exit_index = _date_position(exit_date)
     if entry_index is None or exit_index is None:
         raise AuditedPITDevelopmentReplayError(
             "close-stop verification entry or exit bar is missing"
@@ -1052,7 +1149,7 @@ def _verify_completed_close_stop_trade(
         entry_position, min(planned_position, len(sessions))
     ):
         candidate_date = str(sessions[candidate_position])
-        row_index = date_positions.get(candidate_date)
+        row_index = _date_position(candidate_date)
         if row_index is None:
             continue
         close_total_return_price = (
@@ -1134,17 +1231,22 @@ def _verify_completed_close_stop_trade(
     held_market_sessions = [
         str(value) for value in sessions[entry_position : exit_position + 1]
     ]
-    observed_dates = [
-        value for value in held_market_sessions if value in date_positions
-    ]
+    observed_positions: dict[str, int] = {}
+    for trade_date in held_market_sessions:
+        row_index = _date_position(trade_date)
+        if row_index is not None:
+            observed_positions[trade_date] = row_index
+    observed_dates = list(observed_positions)
     claim_bars = {
         trade_date: {
             "trade_date": trade_date,
-            "raw_open": frame.at[date_positions[trade_date], "open"],
-            "raw_high": frame.at[date_positions[trade_date], "high"],
-            "raw_low": frame.at[date_positions[trade_date], "low"],
-            "raw_close": frame.at[date_positions[trade_date], "close"],
-            "bar_adj_factor": frame.at[date_positions[trade_date], "adj_factor"],
+            "raw_open": frame.at[observed_positions[trade_date], "open"],
+            "raw_high": frame.at[observed_positions[trade_date], "high"],
+            "raw_low": frame.at[observed_positions[trade_date], "low"],
+            "raw_close": frame.at[observed_positions[trade_date], "close"],
+            "bar_adj_factor": frame.at[
+                observed_positions[trade_date], "adj_factor"
+            ],
         }
         for trade_date in observed_dates
     }
@@ -1176,7 +1278,8 @@ def _verify_completed_close_stop_trade(
             "close-stop verification observed marks mismatch"
         )
     missing_dates = [
-        value for value in held_market_sessions if value not in date_positions
+        value for value in held_market_sessions
+        if value not in observed_positions
     ]
     expected_suspensions = [
         {

@@ -169,6 +169,154 @@ def test_close_stop_is_decided_at_close_and_retries_blocked_next_open():
     ]
 
 
+def test_prevalidated_date_positions_preserve_strict_trade_output(monkeypatch):
+    frame = _execution_frame([100.0, 94.0, 93.0, 92.0, 95.0, 96.0, 97.0, 98.0])
+    frame.loc[1, "open"] = 100.0
+    frame.loc[2, "open"] = 93.0
+    frame.loc[3, "open"] = 92.0
+    sessions = frame["date"].tolist()
+    verdicts = {
+        (sessions[1], "buy"): _fillable(100.0),
+        (sessions[2], "sell"): _blocked(),
+        (sessions[3], "sell"): _fillable(92.0),
+    }
+    default_adapter = _FakeAdapter(verdicts)
+    prevalidated_adapter = _FakeAdapter(verdicts)
+    common = {
+        "frame": frame,
+        "symbol": "000001",
+        "signal_index": 0,
+        "sessions": sessions,
+        "session_positions": {
+            date: index for index, date in enumerate(sessions)
+        },
+        "suspension_evidence": {},
+        "hold_days": 5,
+        "stop_loss_pct": 5.0,
+    }
+
+    default_result = pullback._strict_close_stop_trade(
+        adapter=default_adapter,
+        verdict_cache={},
+        **common,
+    )
+    prevalidated_positions = {
+        date: index for index, date in enumerate(sessions)
+    }
+    original_tolist = pd.Series.tolist
+    date_tolist_calls = 0
+
+    def _count_date_tolist(series):
+        nonlocal date_tolist_calls
+        if series.name == "date":
+            date_tolist_calls += 1
+        return original_tolist(series)
+
+    monkeypatch.setattr(pd.Series, "tolist", _count_date_tolist)
+    prevalidated_result = pullback._strict_close_stop_trade(
+        adapter=prevalidated_adapter,
+        verdict_cache={},
+        prevalidated_date_positions=prevalidated_positions,
+        **common,
+    )
+
+    assert prevalidated_result == default_result
+    assert prevalidated_adapter.calls == default_adapter.calls
+    assert date_tolist_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("invalid_case", "error"),
+    [
+        ("wrong_date", "does not match frame date"),
+        ("missing_date", "row count"),
+        ("non_integer", "not an integer"),
+        ("outside_frame", "outside the frame"),
+    ],
+)
+def test_invalid_prevalidated_date_positions_fail_closed(
+    invalid_case,
+    error,
+):
+    frame = _execution_frame([100.0] * 8)
+    sessions = frame["date"].tolist()
+    invalid_positions = {
+        date: index for index, date in enumerate(sessions)
+    }
+    if invalid_case == "wrong_date":
+        invalid_positions[sessions[1]] = 0
+    elif invalid_case == "missing_date":
+        invalid_positions.pop(sessions[-1])
+    elif invalid_case == "non_integer":
+        invalid_positions[sessions[1]] = 1.0
+    else:
+        invalid_positions[sessions[1]] = len(frame)
+    adapter = _FakeAdapter(
+        {
+            (sessions[1], "buy"): _fillable(100.0),
+            (sessions[6], "sell"): _fillable(100.0),
+        }
+    )
+
+    with pytest.raises(AuditedPITDevelopmentReplayError, match=error):
+        pullback._strict_close_stop_trade(
+            adapter=adapter,
+            verdict_cache={},
+            frame=frame,
+            symbol="000001",
+            signal_index=0,
+            sessions=sessions,
+            session_positions={
+                date: index for index, date in enumerate(sessions)
+            },
+            suspension_evidence={},
+            hold_days=5,
+            stop_loss_pct=5.0,
+            prevalidated_date_positions=invalid_positions,
+        )
+
+
+def test_prevalidated_date_positions_avoid_censored_path_rebuild(monkeypatch):
+    frame = _execution_frame([100.0, 94.0, 93.0, 92.0, 91.0, 90.0, 89.0, 88.0])
+    sessions = frame["date"].tolist()
+    verdicts = {(sessions[1], "buy"): _fillable(100.0)}
+    verdicts.update(
+        {(date, "sell"): _blocked("suspended") for date in sessions[2:]}
+    )
+    original_tolist = pd.Series.tolist
+    date_tolist_calls = 0
+
+    def _count_date_tolist(series):
+        nonlocal date_tolist_calls
+        if series.name == "date":
+            date_tolist_calls += 1
+        return original_tolist(series)
+
+    monkeypatch.setattr(pd.Series, "tolist", _count_date_tolist)
+    trade, censored, event = pullback._strict_close_stop_trade(
+        adapter=_FakeAdapter(verdicts),
+        verdict_cache={},
+        frame=frame,
+        symbol="000001",
+        signal_index=0,
+        sessions=sessions,
+        session_positions={
+            date: index for index, date in enumerate(sessions)
+        },
+        suspension_evidence={},
+        hold_days=5,
+        stop_loss_pct=5.0,
+        prevalidated_date_positions={
+            date: index for index, date in enumerate(sessions)
+        },
+    )
+
+    assert trade is None
+    assert censored is not None
+    assert event["status"] == "entered_unresolved_exit"
+    assert date_tolist_calls == 0
+
+
 def test_no_close_trigger_exits_at_fifth_session_next_open():
     frame = _execution_frame([100.0] * 8)
     sessions = frame["date"].tolist()
