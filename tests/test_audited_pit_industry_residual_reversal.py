@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from app import audited_pit_industry_residual_reversal as residual
+from app import research_security_code_transition as transition
 
 
 def test_frozen_spec_binds_entry_offsets_gates_baseline_and_overlap():
@@ -37,6 +38,17 @@ def test_frozen_spec_binds_entry_offsets_gates_baseline_and_overlap():
         "signal_date",
         "entry_date",
     ]
+    assert spec["security_identity"] == {
+        "stable_key": "security_id",
+        "canonical_symbol_policy": "predecessor_code",
+        "market_bar_code_field": "source_ts_code",
+        "execution_code_policy": "actual_code_on_trade_date",
+        "pre_effective_successor_policy": "exclude_provider_backfill",
+        "share_quantity_transition_ratio": 1.0,
+        "transition_contract_sha256": (
+            transition.SECURITY_CODE_TRANSITION_CONTRACT_SHA256
+        ),
+    }
 
 
 def _sessions(count: int = 65) -> list[str]:
@@ -77,6 +89,64 @@ def _bars(
                 }
             )
     return pd.DataFrame(rows)
+
+
+def test_symbol_features_continue_across_official_code_transition():
+    sessions = [
+        value.strftime("%Y-%m-%d")
+        for value in pd.bdate_range("2024-11-25", periods=70)
+    ]
+    effective = "2025-02-17"
+    rows = []
+    for index, trade_date in enumerate(sessions):
+        close = 60.0 + index * 0.1
+        pre_close = 60.0 + max(0, index - 1) * 0.1
+        codes = (
+            ["300114.SZ", "302132.SZ"]
+            if trade_date < effective
+            else ["302132.SZ"]
+        )
+        for ts_code in codes:
+            rows.append(
+                {
+                    "date": trade_date,
+                    "ts_code": ts_code,
+                    "open": close,
+                    "high": close * 1.01,
+                    "low": close * 0.99,
+                    "close": close,
+                    "pre_close": pre_close,
+                    "amount": 1_000_000.0,
+                    "adj_factor": 1.0,
+                    "membership_name": (
+                        "中航电测"
+                        if ts_code == "300114.SZ"
+                        else "中航成飞"
+                    ),
+                    "membership_industry": "电器仪表",
+                    "membership_receipt_dataset": "bak_basic",
+                    "membership_receipt_partition": trade_date,
+                    "suspended": 0,
+                }
+            )
+    canonical, _ = transition.apply_security_code_transition_contract(
+        pd.DataFrame(rows),
+        sessions=sessions,
+        contract=transition.SECURITY_CODE_TRANSITION_CONTRACT,
+    )
+
+    features, _ = residual._build_symbol_return_features(
+        canonical,
+        sessions,
+    )
+    latest = features[
+        (features["ts_code"] == "300114.SZ")
+        & (features["date"] == sessions[-1])
+    ].iloc[0]
+
+    assert latest["source_ts_code"] == "302132.SZ"
+    assert latest["security_id"] == "cn-a-share:300114.SZ"
+    assert latest["observed_history_count"] == 70
 
 
 @pytest.mark.parametrize("missing_offset", [1, 5])
@@ -274,7 +344,7 @@ def test_industry_median_includes_target_and_requires_ten_complete_members():
     assert complete["industry_median_r5"].unique().tolist() == [4.5]
     assert receipt["group_count"] == 1
     assert receipt["groups"][0]["member_keys"] == [
-        f"{index + 1:06d}.SZ" for index in range(10)
+        f"cn-a-share:{index + 1:06d}.SZ" for index in range(10)
     ]
     assert receipt["groups"][0]["membership_receipt_refs"] == [
         {"dataset": "bak_basic", "partition": "2025-01-01"}
@@ -349,12 +419,68 @@ def test_raw_candidate_receipt_binds_features_and_signal_industry():
         "000005",
     ]
     assert all(candidate["signal_industry"] == "行业A" for candidate in candidates)
+    assert all(
+        candidate["signal_ts_code"] == candidate["ts_code"]
+        for candidate in candidates
+    )
+    assert all(
+        candidate["security_id"] == f"cn-a-share:{candidate['ts_code']}"
+        for candidate in candidates
+    )
     assert receipt["raw_candidate_count"] == 5
     assert receipt["raw_candidate_keys"] == [
         f"{signal_date}|{symbol}"
         for symbol in ["000001", "000002", "000003", "000004", "000005"]
     ]
     assert len(receipt["raw_candidate_feature_values_sha256"]) == 64
+
+
+def test_candidate_preserves_stable_and_signal_date_actual_codes():
+    signal_date = "2025-02-17"
+    members = pd.DataFrame(
+        [
+            {
+                "date": signal_date,
+                "ts_code": f"{index + 1:06d}.SZ",
+                "symbol": f"{index + 1:06d}",
+                "name": f"测试{index}",
+                "industry_key": "行业A",
+                "r1": float(9 - index),
+                "r5": float(index),
+                "amount": 1_000_000.0 + index,
+                "membership_receipt_dataset": "bak_basic",
+                "membership_receipt_partition": signal_date,
+            }
+            for index in range(10)
+        ]
+    )
+    enriched, _ = residual._build_industry_features(members)
+    target = enriched["ts_code"] == "000001.SZ"
+    enriched.loc[target, "ts_code"] = "300114.SZ"
+    enriched.loc[target, "symbol"] = "300114"
+    enriched.loc[target, "source_ts_code"] = "302132.SZ"
+    enriched.loc[target, "security_id"] = "cn-a-share:300114.SZ"
+    enriched.loc[target, "security_code_transition_id"] = "a" * 64
+    enriched.loc[
+        target,
+        "security_code_transition_contract_sha256",
+    ] = transition.SECURITY_CODE_TRANSITION_CONTRACT_SHA256
+    frames = {
+        str(row.symbol): pd.DataFrame([{"date": signal_date}])
+        for row in enriched.itertuples(index=False)
+    }
+
+    candidates, _ = residual._build_residual_raw_candidates(
+        enriched,
+        frames_by_symbol=frames,
+    )
+    candidate = next(
+        item for item in candidates if item["symbol"] == "300114"
+    )
+
+    assert candidate["ts_code"] == "300114.SZ"
+    assert candidate["signal_ts_code"] == "302132.SZ"
+    assert candidate["security_id"] == "cn-a-share:300114.SZ"
 
 
 def test_uniform_tail_cutoff_is_shared_and_precedes_entry():
@@ -1181,6 +1307,12 @@ def test_runner_requires_frozen_settings_before_opening_artifacts(tmp_path):
             expected_artifact_root_sha256="b" * 64,
             temporal_contract_path=tmp_path / "temporal.json",
             expected_temporal_contract_sha256="c" * 64,
+            security_code_transition_evidence_root=(
+                tmp_path / "transition-evidence"
+            ),
+            expected_security_code_transition_contract_sha256=(
+                transition.SECURITY_CODE_TRANSITION_CONTRACT_SHA256
+            ),
             start_date="2025-01-02",
             end_date="2026-07-03",
             output_dir=tmp_path / "output",
@@ -1231,6 +1363,10 @@ def test_jobs_cli_dispatches_industry_residual_replay(monkeypatch, tmp_path):
             str(tmp_path / "temporal.json"),
             "--expected-temporal-contract-sha256",
             "c" * 64,
+            "--security-code-transition-evidence-root",
+            str(tmp_path / "transition-evidence"),
+            "--expected-security-code-transition-contract-sha256",
+            transition.SECURITY_CODE_TRANSITION_CONTRACT_SHA256,
             "--start-date",
             "2025-01-02",
             "--end-date",
@@ -1244,6 +1380,13 @@ def test_jobs_cli_dispatches_industry_residual_replay(monkeypatch, tmp_path):
     assert captured["settings"] == "settings"
     assert captured["start_date"] == "2025-01-02"
     assert captured["end_date"] == "2026-07-03"
+    assert captured["security_code_transition_evidence_root"] == str(
+        tmp_path / "transition-evidence"
+    )
+    assert (
+        captured["expected_security_code_transition_contract_sha256"]
+        == transition.SECURITY_CODE_TRANSITION_CONTRACT_SHA256
+    )
 
 
 def test_end_to_end_replay_is_development_only_and_path_stable(
@@ -1282,16 +1425,40 @@ def test_end_to_end_replay_is_development_only_and_path_stable(
                     "suspended": 0,
                 }
             )
-    bars = pd.DataFrame(rows)
+    bars, transition_application_receipt = (
+        transition.apply_security_code_transition_contract(
+            pd.DataFrame(rows),
+            sessions=sessions,
+            contract=transition.SECURITY_CODE_TRANSITION_CONTRACT,
+        )
+    )
     bar_receipt = {
-        "schema_version": "test-loader/v1",
+        "schema_version": "test-loader/v2",
         "matched_exact_membership_row_count": len(bars),
         "missing_exact_membership_row_count": 0,
+        "security_code_transition_application": (
+            transition_application_receipt
+        ),
+        "security_code_transition_application_receipt_sha256": (
+            transition_application_receipt["receipt_sha256"]
+        ),
     }
     bar_receipt["receipt_sha256"] = residual._sha256(bar_receipt)
     coverage_sha = "a" * 64
     artifact_root_sha = "b" * 64
     temporal_sha = "c" * 64
+    transition_evidence_receipt = {
+        "schema_version": "test-transition-evidence/v1",
+        "contract_sha256": (
+            transition.SECURITY_CODE_TRANSITION_CONTRACT_SHA256
+        ),
+        "contract": deepcopy(
+            transition.SECURITY_CODE_TRANSITION_CONTRACT
+        ),
+    }
+    transition_evidence_receipt["receipt_sha256"] = residual._sha256(
+        transition_evidence_receipt
+    )
 
     class FakeUniverse:
         start_date = sessions[0]
@@ -1313,6 +1480,7 @@ def test_end_to_end_replay_is_development_only_and_path_stable(
     }
 
     class FakeAdapter:
+        artifact_root_sha256 = artifact_root_sha
         contract_sha256 = "d" * 64
 
         def __init__(self, *_args, **_kwargs):
@@ -1342,6 +1510,13 @@ def test_end_to_end_replay_is_development_only_and_path_stable(
         residual,
         "assert_range_allowed",
         lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        residual,
+        "load_security_code_transition_evidence",
+        lambda *_args, **_kwargs: deepcopy(
+            transition_evidence_receipt
+        ),
     )
     monkeypatch.setattr(
         residual.AuditedPointInTimeUniverse,
@@ -1377,6 +1552,12 @@ def test_end_to_end_replay_is_development_only_and_path_stable(
         "expected_artifact_root_sha256": artifact_root_sha,
         "temporal_contract_path": tmp_path / "temporal.json",
         "expected_temporal_contract_sha256": temporal_sha,
+        "security_code_transition_evidence_root": (
+            tmp_path / "transition-evidence"
+        ),
+        "expected_security_code_transition_contract_sha256": (
+            transition.SECURITY_CODE_TRANSITION_CONTRACT_SHA256
+        ),
         "start_date": sessions[0],
         "end_date": sessions[-1],
     }
@@ -1393,6 +1574,21 @@ def test_end_to_end_replay_is_development_only_and_path_stable(
     assert first["scope"]["final_oos_consumed"] is False
     assert first["completed_candidate_count"] == 1
     assert first["right_censored_position_count"] == 0
+    assert first["source"][
+        "security_code_transition_contract_sha256"
+    ] == transition.SECURITY_CODE_TRANSITION_CONTRACT_SHA256
+    assert first["source"][
+        "security_code_transition_evidence_receipt_sha256"
+    ] == transition_evidence_receipt["receipt_sha256"]
+    assert first["source"][
+        "security_code_transition_application_receipt_sha256"
+    ] == transition_application_receipt["receipt_sha256"]
+    assert first["source"][
+        "base_artifact_native_replay_contract_sha256"
+    ] == FakeAdapter.contract_sha256
+    assert first["source"][
+        "artifact_native_replay_contract_sha256"
+    ] != FakeAdapter.contract_sha256
     assert first["artifact"]["artifact_sha256"] == second["artifact"][
         "artifact_sha256"
     ]
@@ -1419,5 +1615,19 @@ def test_end_to_end_replay_is_development_only_and_path_stable(
         sidecar_body = json.loads(
             Path(sidecar["path"]).read_text(encoding="utf-8")
         )
+        for key in (
+            "security_code_transition_contract_sha256",
+            "security_code_transition_evidence_receipt_sha256",
+            "security_code_transition_application_receipt_sha256",
+            "base_artifact_native_replay_contract_sha256",
+            "artifact_native_replay_contract_sha256",
+        ):
+            assert sidecar_body["source"][key] == first["source"][key]
+        if sidecar_body["schema_version"] == (
+            "audited-pit-industry-feature-sidecar/v2"
+        ):
+            assert sidecar_body[
+                "security_code_transition_evidence"
+            ] == transition_evidence_receipt
         sidecar_hash = sidecar_body.pop("artifact_sha256")
         assert sidecar_hash == residual._sha256(sidecar_body)

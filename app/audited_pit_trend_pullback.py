@@ -251,6 +251,7 @@ def _load_suspension_evidence(
         evidence[(symbol, trade_date)].append(
             {
                 "symbol": symbol,
+                "ts_code": str(row["ts_code"]),
                 "trade_date": trade_date,
                 "suspend_type": str(row["suspend_type"]),
                 "suspend_timing": row["suspend_timing"],
@@ -339,6 +340,32 @@ def _strategy_entry_filter(
     )
 
 
+def _assert_execution_resolution_matches_frame(
+    *,
+    frame: pd.DataFrame,
+    row_index: int,
+    verdict: Mapping[str, Any],
+) -> None:
+    if "source_ts_code" not in frame.columns:
+        return
+    row = frame.iloc[int(row_index)]
+    source_ts_code = str(row["source_ts_code"] or "").strip().upper()
+    proof = verdict.get("generation_proof")
+    resolved_ts_code = (
+        str(proof.get("resolved_ts_code") or "").strip().upper()
+        if isinstance(proof, Mapping)
+        else ""
+    )
+    if (
+        not source_ts_code
+        or resolved_ts_code != source_ts_code
+        or str(proof.get("trade_date") or "") != str(row["date"])
+    ):
+        raise AuditedPITDevelopmentReplayError(
+            "execution proof resolved security code differs from frozen bar"
+        )
+
+
 def _strict_close_stop_trade(
     *,
     adapter: ArtifactNativeReplayAdapter,
@@ -406,6 +433,11 @@ def _strict_close_stop_trade(
         raise AuditedPITDevelopmentReplayError(
             "strict fill verdict has no matching entry bar"
         )
+    _assert_execution_resolution_matches_frame(
+        frame=frame,
+        row_index=entry_index,
+        verdict=buy,
+    )
     entry_row = frame.iloc[entry_index]
     entry_raw_price = float(buy["raw_price"])
     if not math.isclose(
@@ -468,6 +500,13 @@ def _strict_close_stop_trade(
         verdict = _artifact_open_verdict(
             adapter, verdict_cache, str(symbol), candidate_date, "sell"
         )
+        candidate_row_index = date_positions.get(candidate_date)
+        if candidate_row_index is not None:
+            _assert_execution_resolution_matches_frame(
+                frame=frame,
+                row_index=candidate_row_index,
+                verdict=verdict,
+            )
         exit_attempts.append(
             {
                 "trade_date": candidate_date,

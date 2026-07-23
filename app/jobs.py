@@ -4313,6 +4313,13 @@ def main(argv=None) -> int:
         "--expected-temporal-contract-sha256", required=True
     )
     audited_pit_industry_residual.add_argument(
+        "--security-code-transition-evidence-root", required=True
+    )
+    audited_pit_industry_residual.add_argument(
+        "--expected-security-code-transition-contract-sha256",
+        required=True,
+    )
+    audited_pit_industry_residual.add_argument(
         "--start-date", required=True
     )
     audited_pit_industry_residual.add_argument("--end-date", required=True)
@@ -4830,6 +4837,12 @@ def main(argv=None) -> int:
             temporal_contract_path=args.temporal_contract_path,
             expected_temporal_contract_sha256=(
                 args.expected_temporal_contract_sha256
+            ),
+            security_code_transition_evidence_root=(
+                args.security_code_transition_evidence_root
+            ),
+            expected_security_code_transition_contract_sha256=(
+                args.expected_security_code_transition_contract_sha256
             ),
             start_date=args.start_date,
             end_date=args.end_date,

@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from datetime import date
 import hashlib
+from importlib.metadata import version as package_version
 import math
 from pathlib import Path
 import sys
@@ -22,6 +23,7 @@ from app.audited_pit_development_replay import (
 )
 from app.audited_pit_trend_pullback import (
     TREND_PULLBACK_SPEC,
+    _assert_execution_resolution_matches_frame,
     _fixed_signal_masks,
     _load_suspension_evidence,
     _load_terminal_listing_evidence,
@@ -50,11 +52,20 @@ from app.research_scope import (
     is_mainboard_chinext_symbol,
     market_scope_contract,
 )
+from app.research_security_code_transition import (
+    SECURITY_CODE_TRANSITION_CONTRACT_SHA256,
+    SecurityCodeTransitionEvidenceError,
+    SecurityCodeTransitionReplayAdapter,
+    apply_security_code_transition_contract,
+    load_security_code_transition_evidence,
+    remap_security_code_transition_suspension_evidence,
+    remap_security_code_transition_terminal_evidence,
+)
 from app.research_sweep import _trade_metrics
 
 
 INDUSTRY_RESIDUAL_SPEC = {
-    "schema_version": "development-pit-industry-residual-reversal-strict/v1",
+    "schema_version": "development-pit-industry-residual-reversal-strict/v2",
     "signal_tag": "industry_residual_reversal_5d_1d",
     "signal_price_basis": "raw_close_times_session_adj_factor",
     "membership_application": "signal_date_only",
@@ -122,6 +133,17 @@ INDUSTRY_RESIDUAL_SPEC = {
         "candidate_key_fields": ["symbol", "signal_date", "entry_date"],
         "used_as_filter": False,
     },
+    "security_identity": {
+        "stable_key": "security_id",
+        "canonical_symbol_policy": "predecessor_code",
+        "market_bar_code_field": "source_ts_code",
+        "execution_code_policy": "actual_code_on_trade_date",
+        "pre_effective_successor_policy": "exclude_provider_backfill",
+        "share_quantity_transition_ratio": 1.0,
+        "transition_contract_sha256": (
+            SECURITY_CODE_TRANSITION_CONTRACT_SHA256
+        ),
+    },
     "advancement_thresholds": {
         "minimum_complete_trades": 20,
         "minimum_full_win_rate_pct": 52.0,
@@ -162,6 +184,7 @@ def _producer_binding() -> dict[str, Any]:
         "research_common.py",
         "research_equity.py",
         "research_portfolio.py",
+        "research_security_code_transition.py",
         "research_sweep.py",
     )
     dependency_modules = [
@@ -180,9 +203,10 @@ def _producer_binding() -> dict[str, Any]:
         "python_version": sys.version,
         "numpy_version": np.__version__,
         "pandas_version": pd.__version__,
+        "pypdf_version": package_version("pypdf"),
     }
     return {
-        "schema_version": "audited-pit-industry-residual-producer/v1",
+        "schema_version": "audited-pit-industry-residual-producer/v2",
         **identity,
         "root_sha256": _sha256(identity),
     }
@@ -211,14 +235,33 @@ def _frames_by_symbol(bars: pd.DataFrame) -> dict[str, pd.DataFrame]:
     }
     if not required.issubset(bars.columns):
         raise ValueError("industry residual bars cannot build symbol frames")
+    values = bars.copy()
+    if "source_ts_code" not in values:
+        values["source_ts_code"] = values["ts_code"].astype(str)
+    if "security_id" not in values:
+        values["security_id"] = values["ts_code"].map(
+            lambda value: f"cn-a-share:{value}"
+        )
+    if "security_code_transition_id" not in values:
+        values["security_code_transition_id"] = None
+    if "security_code_transition_contract_sha256" not in values:
+        values["security_code_transition_contract_sha256"] = None
     frames: dict[str, pd.DataFrame] = {}
     ts_codes_by_symbol: dict[str, str] = {}
-    for ts_code, group in bars.groupby("ts_code", sort=True):
+    for ts_code, group in values.groupby("ts_code", sort=True):
         symbol = str(ts_code)[:6]
         previous = ts_codes_by_symbol.get(symbol)
         if previous is not None and previous != str(ts_code):
             raise ValueError("industry residual symbol code is ambiguous")
         ts_codes_by_symbol[symbol] = str(ts_code)
+        if group["security_id"].astype(str).nunique() != 1:
+            raise ValueError(
+                "industry residual frame has ambiguous stable security identity"
+            )
+        if group["source_ts_code"].astype(str).str.len().ne(9).any():
+            raise ValueError(
+                "industry residual frame has invalid source security codes"
+            )
         frame = group.sort_values("date", kind="mergesort").reset_index(
             drop=True
         )
@@ -243,7 +286,15 @@ def _load_industry_feature_bars(
     *,
     start_date: str,
     end_date: str,
+    sessions: Sequence[str] | None = None,
+    security_code_transition_contract: Mapping[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if (sessions is None) != (
+        security_code_transition_contract is None
+    ):
+        raise AuditedPITDevelopmentReplayError(
+            "industry feature loader transition inputs are incomplete"
+        )
     frame = pd.read_sql_query(
         """
         SELECT daily.trade_date AS date, daily.ts_code, daily.open, daily.high,
@@ -317,6 +368,20 @@ def _load_industry_feature_bars(
         raise AuditedPITDevelopmentReplayError(
             "industry feature bars contain duplicate symbol dates"
         )
+    transition_application_receipt: dict[str, Any] | None = None
+    if security_code_transition_contract is not None:
+        try:
+            frame, transition_application_receipt = (
+                apply_security_code_transition_contract(
+                    frame,
+                    sessions=list(sessions or []),
+                    contract=security_code_transition_contract,
+                )
+            )
+        except SecurityCodeTransitionEvidenceError as exc:
+            raise AuditedPITDevelopmentReplayError(
+                "security-code transition application failed"
+            ) from exc
     exact_membership = (
         frame["membership_receipt_dataset"].eq("bak_basic")
         & frame["membership_receipt_partition"].astype(str).eq(frame["date"])
@@ -342,6 +407,12 @@ def _load_industry_feature_bars(
         (
             str(row.date),
             str(row.ts_code),
+            str(row.source_ts_code)
+            if hasattr(row, "source_ts_code")
+            else str(row.ts_code),
+            str(row.security_id)
+            if hasattr(row, "security_id")
+            else f"cn-a-share:{row.ts_code}",
             str(row.membership_industry)
             if not pd.isna(row.membership_industry)
             else "",
@@ -355,7 +426,7 @@ def _load_industry_feature_bars(
         for row in frame.itertuples(index=False)
     ]
     receipt = {
-        "schema_version": "industry-feature-bar-loader-receipt/v1",
+        "schema_version": "industry-feature-bar-loader-receipt/v2",
         "range": {"start_date": start_date, "end_date": end_date},
         "source_row_count": source_row_count,
         "eligible_market_row_count": len(frame),
@@ -367,6 +438,14 @@ def _load_industry_feature_bars(
         ],
         "membership_receipt_refs_sha256": _sha256(membership_refs),
         "row_keys_sha256": _sha256(row_keys),
+        "security_code_transition_application": (
+            transition_application_receipt
+        ),
+        "security_code_transition_application_receipt_sha256": (
+            transition_application_receipt["receipt_sha256"]
+            if transition_application_receipt is not None
+            else None
+        ),
     }
     receipt["receipt_sha256"] = _sha256(receipt)
     return frame.reset_index(drop=True), receipt
@@ -393,6 +472,16 @@ def _build_symbol_return_features(
     values = bars.copy()
     values["date"] = values["date"].astype(str)
     values["ts_code"] = values["ts_code"].astype(str)
+    if "source_ts_code" not in values:
+        values["source_ts_code"] = values["ts_code"]
+    if "security_id" not in values:
+        values["security_id"] = values["ts_code"].map(
+            lambda value: f"cn-a-share:{value}"
+        )
+    if "security_code_transition_id" not in values:
+        values["security_code_transition_id"] = None
+    if "security_code_transition_contract_sha256" not in values:
+        values["security_code_transition_contract_sha256"] = None
     if values.duplicated(["ts_code", "date"]).any():
         raise ValueError("industry residual bars contain duplicate symbol dates")
     values["session_position"] = values["date"].map(session_positions)
@@ -500,6 +589,10 @@ def _build_symbol_return_features(
     output_columns = [
         "date",
         "ts_code",
+        "source_ts_code",
+        "security_id",
+        "security_code_transition_id",
+        "security_code_transition_contract_sha256",
         "symbol",
         "name",
         "industry_key",
@@ -530,7 +623,10 @@ def _build_symbol_return_features(
         "status_counts": dict(sorted(status_counts.items())),
         "feature_keys_sha256": _sha256(
             [
-                f"{row.date}|{row.ts_code}"
+                (
+                    f"{row.date}|{row.ts_code}|{row.source_ts_code}|"
+                    f"{row.security_id}"
+                )
                 for row in features.itertuples(index=False)
             ]
         ),
@@ -561,6 +657,16 @@ def _deterministic_industry_record(
             {
                 "symbol": symbol,
                 "ts_code": ts_code,
+                "source_ts_code": str(
+                    member.get("source_ts_code") or ts_code
+                ),
+                "security_id": str(
+                    member.get("security_id")
+                    or f"cn-a-share:{ts_code}"
+                ),
+                "security_code_transition_id": member.get(
+                    "security_code_transition_id"
+                ),
                 "r1": r1,
                 "r5": r5,
                 "membership_receipt_dataset": str(
@@ -571,18 +677,28 @@ def _deterministic_industry_record(
                 ),
             }
         )
-    if len({item["ts_code"] for item in normalized}) != len(normalized):
+    if len({item["security_id"] for item in normalized}) != len(normalized):
         raise ValueError("industry median members contain duplicates")
     r1_inputs = sorted(
         (
-            {"symbol": item["symbol"], "ts_code": item["ts_code"], "value": item["r1"]}
+            {
+                "symbol": item["symbol"],
+                "ts_code": item["ts_code"],
+                "security_id": item["security_id"],
+                "value": item["r1"],
+            }
             for item in normalized
         ),
         key=lambda item: (item["value"], item["ts_code"]),
     )
     r5_inputs = sorted(
         (
-            {"symbol": item["symbol"], "ts_code": item["ts_code"], "value": item["r5"]}
+            {
+                "symbol": item["symbol"],
+                "ts_code": item["ts_code"],
+                "security_id": item["security_id"],
+                "value": item["r5"],
+            }
             for item in normalized
         ),
         key=lambda item: (item["value"], item["ts_code"]),
@@ -600,7 +716,7 @@ def _deterministic_industry_record(
             + float(inputs[middle]["value"])
         ) / 2.0
 
-    member_keys = sorted(item["ts_code"] for item in normalized)
+    member_keys = sorted(item["security_id"] for item in normalized)
     membership_receipt_refs = sorted(
         {
             (
@@ -619,6 +735,11 @@ def _deterministic_industry_record(
         (
             {
                 "ts_code": item["ts_code"],
+                "source_ts_code": item["source_ts_code"],
+                "security_id": item["security_id"],
+                "security_code_transition_id": item[
+                    "security_code_transition_id"
+                ],
                 "membership_receipt_dataset": item[
                     "membership_receipt_dataset"
                 ],
@@ -673,9 +794,24 @@ def _is_residual_candidate(
 def _build_industry_features(
     symbol_features: pd.DataFrame,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
+    values = symbol_features.copy()
+    if "source_ts_code" not in values:
+        values["source_ts_code"] = values["ts_code"]
+    if "security_id" not in values:
+        values["security_id"] = values["ts_code"].map(
+            lambda value: f"cn-a-share:{value}"
+        )
+    if "security_code_transition_id" not in values:
+        values["security_code_transition_id"] = None
+    if "security_code_transition_contract_sha256" not in values:
+        values["security_code_transition_contract_sha256"] = None
     required = {
         "date",
         "ts_code",
+        "source_ts_code",
+        "security_id",
+        "security_code_transition_id",
+        "security_code_transition_contract_sha256",
         "symbol",
         "industry_key",
         "r1",
@@ -684,7 +820,7 @@ def _build_industry_features(
         "membership_receipt_dataset",
         "membership_receipt_partition",
     }
-    if not required.issubset(symbol_features.columns):
+    if not required.issubset(values.columns):
         raise ValueError("industry feature rows are missing required columns")
     status_counts: Counter[str] = Counter()
     groups: list[dict[str, Any]] = []
@@ -692,7 +828,7 @@ def _build_industry_features(
     minimum = int(
         INDUSTRY_RESIDUAL_SPEC["industry"]["minimum_complete_members"]
     )
-    for (signal_date, industry_key), raw_group in symbol_features.groupby(
+    for (signal_date, industry_key), raw_group in values.groupby(
         ["date", "industry_key"],
         sort=True,
     ):
@@ -742,7 +878,7 @@ def _build_industry_features(
     complete = (
         pd.concat(enriched, ignore_index=True)
         if enriched
-        else symbol_features.iloc[0:0].copy()
+        else values.iloc[0:0].copy()
     )
     complete = complete.sort_values(
         ["date", "industry_key", "ts_code"],
@@ -787,6 +923,10 @@ def _build_residual_raw_candidates(
     required = {
         "date",
         "ts_code",
+        "source_ts_code",
+        "security_id",
+        "security_code_transition_id",
+        "security_code_transition_contract_sha256",
         "symbol",
         "name",
         "industry_key",
@@ -841,6 +981,22 @@ def _build_residual_raw_candidates(
             "signal_date": signal_date,
             "symbol": symbol,
             "ts_code": str(row.ts_code),
+            "signal_ts_code": str(row.source_ts_code),
+            "security_id": str(row.security_id),
+            "security_code_transition_id": (
+                None
+                if pd.isna(row.security_code_transition_id)
+                else str(row.security_code_transition_id)
+            ),
+            "security_code_transition_contract_sha256": (
+                None
+                if pd.isna(
+                    row.security_code_transition_contract_sha256
+                )
+                else str(
+                    row.security_code_transition_contract_sha256
+                )
+            ),
             "signal_industry": str(row.industry_key),
             "stock_r1": numeric_values[0],
             "stock_r5": numeric_values[1],
@@ -1513,6 +1669,11 @@ def _preflight_strict_entries(
             continue
         if entry_index is None:
             raise ValueError("fillable entry has no matching market bar")
+        _assert_execution_resolution_matches_frame(
+            frame=frame,
+            row_index=entry_index,
+            verdict=buy,
+        )
         signal_row = frame.iloc[signal_index]
         entry_row = frame.iloc[entry_index]
         raw_open = float(entry_row["open"])
@@ -1905,6 +2066,8 @@ def run_audited_pit_industry_residual_reversal(
     expected_artifact_root_sha256: str,
     temporal_contract_path: str | Path,
     expected_temporal_contract_sha256: str,
+    security_code_transition_evidence_root: str | Path,
+    expected_security_code_transition_contract_sha256: str,
     start_date: str,
     end_date: str,
     output_dir: str | Path,
@@ -1926,6 +2089,23 @@ def run_audited_pit_industry_residual_reversal(
         end_date,
         "backtest",
     )
+    try:
+        transition_evidence = load_security_code_transition_evidence(
+            security_code_transition_evidence_root,
+            expected_contract_sha256=(
+                expected_security_code_transition_contract_sha256
+            ),
+        )
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+        SecurityCodeTransitionEvidenceError,
+    ) as exc:
+        raise AuditedPITDevelopmentReplayError(
+            "security-code transition evidence verification failed"
+        ) from exc
+    transition_contract = transition_evidence["contract"]
     try:
         universe = AuditedPointInTimeUniverse.from_file(
             str(audited_pit_universe_path),
@@ -1958,6 +2138,8 @@ def run_audited_pit_industry_residual_reversal(
             connection,
             start_date=start_date,
             end_date=end_date,
+            sessions=sessions,
+            security_code_transition_contract=transition_contract,
         )
         frames = _frames_by_symbol(bars)
         symbol_features, symbol_feature_receipt = (
@@ -2009,23 +2191,49 @@ def run_audited_pit_industry_residual_reversal(
             legacy_tail[family] = kept
             legacy_tail_receipts[family] = receipt
 
-        suspension_evidence = _load_suspension_evidence(
+        raw_suspension_evidence = _load_suspension_evidence(
             connection,
             start_date=start_date,
             end_date=end_date,
         )
-        terminal_listing_evidence = _load_terminal_listing_evidence(
+        raw_terminal_listing_evidence = _load_terminal_listing_evidence(
             connection,
             start_date=start_date,
             end_date=end_date,
         )
-        adapter = ArtifactNativeReplayAdapter(
+        try:
+            suspension_evidence = (
+                remap_security_code_transition_suspension_evidence(
+                    raw_suspension_evidence,
+                    contract=transition_contract,
+                )
+            )
+            terminal_listing_evidence = (
+                remap_security_code_transition_terminal_evidence(
+                    raw_terminal_listing_evidence,
+                    contract=transition_contract,
+                )
+            )
+        except SecurityCodeTransitionEvidenceError as exc:
+            raise AuditedPITDevelopmentReplayError(
+                "security-code transition outcome evidence remap failed"
+            ) from exc
+        base_adapter = ArtifactNativeReplayAdapter(
             universe,
             expected_temporal_contract_sha256=(
                 expected_temporal_contract_sha256
             ),
             expected_temporal_role="development",
         )
+        try:
+            adapter = SecurityCodeTransitionReplayAdapter(
+                base_adapter,
+                contract=transition_contract,
+            )
+        except SecurityCodeTransitionEvidenceError as exc:
+            raise AuditedPITDevelopmentReplayError(
+                "security-code transition replay adapter failed"
+            ) from exc
         verdict_cache: dict[
             tuple[str, str, str], dict[str, Any]
         ] = {}
@@ -2092,6 +2300,20 @@ def run_audited_pit_industry_residual_reversal(
             "market_scope": market_scope_contract(),
             "artifact_native_replay_contract_sha256": (
                 adapter.contract_sha256
+            ),
+            "base_artifact_native_replay_contract_sha256": (
+                base_adapter.contract_sha256
+            ),
+            "security_code_transition_contract_sha256": (
+                transition_evidence["contract_sha256"]
+            ),
+            "security_code_transition_evidence_receipt_sha256": (
+                transition_evidence["receipt_sha256"]
+            ),
+            "security_code_transition_application_receipt_sha256": (
+                bar_loader_receipt[
+                    "security_code_transition_application_receipt_sha256"
+                ]
             ),
             "bar_loader_receipt_sha256": bar_loader_receipt[
                 "receipt_sha256"
@@ -2177,16 +2399,21 @@ def run_audited_pit_industry_residual_reversal(
             "market_session_count",
             "exact_membership_session_count",
             "artifact_native_replay_contract_sha256",
+            "base_artifact_native_replay_contract_sha256",
+            "security_code_transition_contract_sha256",
+            "security_code_transition_evidence_receipt_sha256",
+            "security_code_transition_application_receipt_sha256",
             "full_session_suspension_evidence_sha256",
             "terminal_listing_evidence_sha256",
             "producer_code",
         )
     }
     industry_sidecar_payload = {
-        "schema_version": "audited-pit-industry-feature-sidecar/v1",
+        "schema_version": "audited-pit-industry-feature-sidecar/v2",
         "strategy_sha256": strategy_sha256,
         "source": source_anchors,
         "bar_loader_receipt": bar_loader_receipt,
+        "security_code_transition_evidence": transition_evidence,
         "symbol_feature_receipt": symbol_feature_receipt,
         "industry_feature_receipt": industry_feature_receipt,
         "raw_candidate_receipt": raw_residual_receipt,
@@ -2197,7 +2424,7 @@ def run_audited_pit_industry_residual_reversal(
         industry_sidecar_payload,
     )
     execution_sidecar_payload = {
-        "schema_version": "audited-pit-industry-residual-execution-sidecar/v1",
+        "schema_version": "audited-pit-industry-residual-execution-sidecar/v2",
         "strategy_sha256": strategy_sha256,
         "source": source_anchors,
         "tail_cutoff_receipts": {
@@ -2224,7 +2451,7 @@ def run_audited_pit_industry_residual_reversal(
         execution_sidecar_payload,
     )
     payload = {
-        "schema_version": "audited-pit-industry-residual-result/v1",
+        "schema_version": "audited-pit-industry-residual-result/v2",
         "strategy": {
             **INDUSTRY_RESIDUAL_SPEC,
             "strategy_sha256": strategy_sha256,
