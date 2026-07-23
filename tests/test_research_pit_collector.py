@@ -2101,6 +2101,30 @@ def test_official_collect_rejects_a_store_without_generation_capabilities():
         collector.collect(start_date="2024-01-01", end_date="2024-01-02")
 
 
+def test_calendar_exchange_scope_follows_source_profile():
+    api = _api()
+    store = object()
+    clock = FakeTrustedClock()
+
+    official = _collector(
+        api,
+        ScriptedTransport([]),
+        store,
+        clock,
+        source_profile="official",
+    )
+    jiaoch = _collector(
+        api,
+        ScriptedTransport([]),
+        store,
+        clock,
+        source_profile="jiaoch",
+    )
+
+    assert official._calendar_exchanges() == ("SSE", "SZSE")
+    assert jiaoch._calendar_exchanges() == ("SSE",)
+
+
 def test_controlled_collect_end_to_end_passes_coverage_and_then_resumes_without_network(
     tmp_path, monkeypatch
 ):

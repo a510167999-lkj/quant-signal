@@ -733,6 +733,9 @@ class ControlledTushareCollector:
     def workers(self) -> int:
         return self._workers
 
+    def _calendar_exchanges(self) -> tuple[str, ...]:
+        return ("SSE",) if self.source_profile == "jiaoch" else ("SSE", "SZSE")
+
     @property
     def api_url(self) -> str:
         return self._source_authority.api_url
@@ -2036,9 +2039,8 @@ class ControlledTushareCollector:
                 raise PITCollectionError(
                     "market-only collection requires verified common-open calendar sessions"
                 )
-            calendar_exchanges = ("SSE",) if self.source_profile == "jiaoch" else ("SSE", "SZSE")
             raw_sessions = self.store.common_open_sessions(
-                start_date=start, end_date=end, exchanges=calendar_exchanges
+                start_date=start, end_date=end, exchanges=self._calendar_exchanges()
             )
             sessions = [_iso_date(session) for session in raw_sessions]
             if sessions != sorted(set(sessions)):
@@ -2171,8 +2173,11 @@ class ControlledTushareCollector:
 
         # jiaoch trade_cal 只维护 SSE(SZSE/CFFEX/SHFE/DCE 全空,A 股两市日历同步);
         # 官方 tushare 等其他 source 仍要求两市完整 controlled receipt。
-        calendar_exchanges = ("SSE",) if self.source_profile == "jiaoch" else ("SSE", "SZSE")
-        specs = build_trade_cal_specs(start_date=start, end_date=end, exchanges=calendar_exchanges)
+        specs = build_trade_cal_specs(
+            start_date=start,
+            end_date=end,
+            exchanges=self._calendar_exchanges(),
+        )
         results = self._run_phase(
             [
                 (
@@ -2272,7 +2277,11 @@ class ControlledTushareCollector:
             raise PITCollectionError(str(exc)) from exc
         results: list[dict[str, Any]] = []
         membership_results: list[dict[str, Any]] = []
-        calendar_specs = build_trade_cal_specs(start_date=start, end_date=end)
+        calendar_specs = build_trade_cal_specs(
+            start_date=start,
+            end_date=end,
+            exchanges=self._calendar_exchanges(),
+        )
         generation_methods = (
             "begin_or_resume_stock_basic_generation",
             "stage_stock_basic_attempt",
