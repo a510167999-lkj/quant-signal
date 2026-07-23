@@ -117,8 +117,73 @@ def test_simple_replay_does_not_create_breakout_from_reverse_split():
     )
 
     assert trades == []
-    assert SIMPLE_BREAKOUT_SPEC["schema_version"] == "development-simple-breakout/v3"
+    assert SIMPLE_BREAKOUT_SPEC["schema_version"] == "development-simple-breakout/v4"
     assert SIMPLE_BREAKOUT_SPEC["signal_price_basis"] == "raw_ohlc_times_session_adj_factor"
+
+
+def test_exact_membership_is_applied_only_on_signal_date():
+    rows = []
+    for index in range(27):
+        close = 10.0 if index < 20 else 11.0
+        rows.append(
+            {
+                "date": f"2025-01-{index + 1:02d}",
+                "ts_code": "000001.SZ",
+                "open": close,
+                "high": 11.0 if index >= 20 else 10.0,
+                "low": close,
+                "close": close,
+                "pre_close": 10.0,
+                "amount": 100_000_000.0,
+                "adj_factor": 1.0,
+                "suspended": False,
+                "membership_name": "历史名称" if index == 20 else None,
+            }
+        )
+
+    trades = _candidate_trades_from_bars(
+        pd.DataFrame(rows),
+        {},
+        Settings(),
+        membership_name_column="membership_name",
+        current_universe_bias=False,
+    )
+
+    assert trades
+    assert trades[0]["signal_date"] == "2025-01-21"
+    assert trades[0]["name"] == "历史名称"
+    assert SIMPLE_BREAKOUT_SPEC["membership_application"] == "signal_date_only"
+
+
+def test_exact_membership_rejects_st_name_on_signal_date():
+    rows = []
+    for index in range(27):
+        close = 10.0 if index < 20 else 11.0
+        rows.append(
+            {
+                "date": f"2025-01-{index + 1:02d}",
+                "ts_code": "000001.SZ",
+                "open": close,
+                "high": 11.0 if index >= 20 else 10.0,
+                "low": close,
+                "close": close,
+                "pre_close": 10.0,
+                "amount": 100_000_000.0,
+                "adj_factor": 1.0,
+                "suspended": False,
+                "membership_name": "*ST历史股" if index == 20 else None,
+            }
+        )
+
+    trades = _candidate_trades_from_bars(
+        pd.DataFrame(rows),
+        {},
+        Settings(),
+        membership_name_column="membership_name",
+        current_universe_bias=False,
+    )
+
+    assert trades == []
 
 
 class _MembershipUniverse:

@@ -136,7 +136,7 @@ def test_audited_replay_end_to_end_binds_exact_membership(monkeypatch, tmp_path)
     assert result["sweep"]["settings"]["fixed_spec"] is True
 
 
-def test_exact_membership_bar_query_filters_scope_and_historical_name():
+def test_exact_membership_bar_query_keeps_post_signal_market_path():
     connection = sqlite3.connect(":memory:")
     connection.executescript(
         """
@@ -162,10 +162,12 @@ def test_exact_membership_bar_query_filters_scope_and_historical_name():
         INSERT INTO market_session_generation_rows_daily VALUES
             ('g1', '2025-01-02', '000001.SZ', 10, 11, 9, 10.5, 10, 100),
             ('g1', '2025-01-02', '000002.SZ', 10, 11, 9, 10.5, 10, 100),
+            ('g1', '2025-01-02', '000003.SZ', 10, 11, 9, 10.5, 10, 100),
             ('g1', '2025-01-02', '688001.SH', 10, 11, 9, 10.5, 10, 100);
         INSERT INTO market_session_generation_rows_adj_factor VALUES
             ('g1', '2025-01-02', '000001.SZ', 1),
             ('g1', '2025-01-02', '000002.SZ', 1),
+            ('g1', '2025-01-02', '000003.SZ', 1),
             ('g1', '2025-01-02', '688001.SH', 1);
         INSERT INTO daily_universe VALUES
             ('2025-01-02', '000001.SZ', '历史正常股'),
@@ -180,6 +182,7 @@ def test_exact_membership_bar_query_filters_scope_and_historical_name():
         end_date="2025-01-02",
     )
 
-    assert bars[["ts_code", "membership_name"]].to_dict("records") == [
-        {"ts_code": "000001.SZ", "membership_name": "历史正常股"}
-    ]
+    assert bars["ts_code"].tolist() == ["000001.SZ", "000002.SZ", "000003.SZ"]
+    assert bars.loc[bars["ts_code"] == "000001.SZ", "membership_name"].notna().all()
+    assert bars.loc[bars["ts_code"] == "000002.SZ", "membership_name"].notna().all()
+    assert bars.loc[bars["ts_code"] == "000003.SZ", "membership_name"].isna().all()

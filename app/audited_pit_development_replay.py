@@ -6,7 +6,6 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
-from app.a_share_universe import _is_excluded_name
 from app.config import Settings
 from app.current_pool_development_replay import (
     SIMPLE_BREAKOUT_SPEC,
@@ -135,7 +134,7 @@ def _load_exact_membership_bars(
           ON adjustment.generation_id = daily.generation_id
          AND adjustment.trade_date = daily.trade_date
          AND adjustment.ts_code = daily.ts_code
-        JOIN daily_universe AS membership
+        LEFT JOIN daily_universe AS membership
           ON membership.trade_date = daily.trade_date
          AND membership.ts_code = daily.ts_code
         WHERE daily.trade_date BETWEEN ? AND ?
@@ -148,15 +147,12 @@ def _load_exact_membership_bars(
         raise AuditedPITDevelopmentReplayError(
             "audited PIT artifact has no exact-membership market bars"
         )
-    frame = frame[
-        frame["ts_code"].map(is_mainboard_chinext_symbol)
-        & ~frame["membership_name"].map(lambda value: _is_excluded_name(str(value or "")))
-    ].copy()
+    frame = frame[frame["ts_code"].map(is_mainboard_chinext_symbol)].copy()
     numeric = ["open", "high", "low", "close", "pre_close", "amount", "adj_factor"]
     for column in numeric:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame = frame.dropna(
-        subset=["open", "high", "low", "close", "adj_factor", "membership_name"]
+        subset=["open", "high", "low", "close", "adj_factor"]
     )
     frame = frame[
         (frame["open"] > 0)

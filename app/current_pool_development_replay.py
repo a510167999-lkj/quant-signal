@@ -17,6 +17,7 @@ from typing import Any
 
 import pandas as pd
 
+from app.a_share_universe import _is_excluded_name
 from app.config import Settings
 from app.current_pool_gate import verify_current_pool_audit
 from app.current_pool_history_source import verify_current_pool_history_descriptor
@@ -32,10 +33,11 @@ class CurrentPoolDevelopmentReplayError(ValueError):
 
 
 SIMPLE_BREAKOUT_SPEC = {
-    "schema_version": "development-simple-breakout/v3",
+    "schema_version": "development-simple-breakout/v4",
     "signal_tag": "breakout_20d",
     "signal_price_basis": "raw_ohlc_times_session_adj_factor",
     "adjustment_method": "causal_bar_factor_common_as_of_denominator_cancels",
+    "membership_application": "signal_date_only",
     "lookback_sessions": 20,
     "hold_days": 5,
     "stop_loss_pct": 5.0,
@@ -244,14 +246,19 @@ def _candidate_trades_from_bars(
             symbol = str(ts_code)[:6]
             if membership_by_date is not None:
                 name = membership_by_date.get(signal_date, {}).get(symbol)
-                if name is None:
+                if name is None or _is_excluded_name(str(name)):
                     continue
             elif membership_name_column is not None:
-                name = str(frame.at[index, membership_name_column] or "").strip()
-                if not name:
+                raw_name = frame.at[index, membership_name_column]
+                if pd.isna(raw_name):
+                    continue
+                name = str(raw_name or "").strip()
+                if not name or _is_excluded_name(name):
                     continue
             else:
                 name = names_by_symbol.get(symbol, "")
+                if not name or _is_excluded_name(str(name)):
+                    continue
             entry_index = index + 1
             exit_index = entry_index + SIMPLE_BREAKOUT_SPEC["hold_days"]
             if exit_index >= len(frame) or bool(frame.at[entry_index, "suspended"]):
