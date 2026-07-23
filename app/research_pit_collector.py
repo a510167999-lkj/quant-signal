@@ -2336,24 +2336,30 @@ class ControlledTushareCollector:
                 reuse_published=reuse_published,
             )
         else:
-            stock_workers = max(1, effective_workers - 2)
+            stock_workers = max(1, effective_workers - len(calendar_specs))
+            stock_task_index = len(calendar_specs)
             phase_a = self._run_phase(
                 [
-                    (0, lambda: self.fetch_partition(calendar_specs[0], resume=resume)),
                     (
-                        1,
+                        index,
+                        lambda spec=spec: self.fetch_partition(spec, resume=resume),
+                    )
+                    for index, spec in enumerate(calendar_specs)
+                ]
+                + [
+                    (
+                        stock_task_index,
                         lambda: self.collect_stock_basic_generation(
                             resume=resume,
                             reuse_published=resume,
                             workers=stock_workers,
                         ),
                     ),
-                    (2, lambda: self.fetch_partition(calendar_specs[1], resume=resume)),
                 ],
-                workers=min(3, effective_workers),
+                workers=min(len(calendar_specs) + 1, effective_workers),
             )
-            results.extend((phase_a[0], phase_a[2]))
-            generation = phase_a[1]
+            results.extend(phase_a[:stock_task_index])
+            generation = phase_a[stock_task_index]
             self._check_cancelled()
             sessions = self.store.common_open_sessions(start_date=start, end_date=end)
             daily_specs = build_bak_basic_specs(sessions)

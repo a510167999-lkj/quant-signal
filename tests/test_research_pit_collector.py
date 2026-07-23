@@ -2125,6 +2125,65 @@ def test_calendar_exchange_scope_follows_source_profile():
     assert jiaoch._calendar_exchanges() == ("SSE",)
 
 
+def test_jiaoch_parallel_collect_supports_single_calendar_source():
+    api = _api()
+
+    class Store:
+        begin_or_resume_stock_basic_generation = object()
+        stage_stock_basic_attempt = object()
+        publish_stock_basic_generation = object()
+        active_stock_basic_generation = object()
+
+        def common_open_sessions(self, *, start_date, end_date, exchanges=("SSE",)):
+            assert exchanges == ("SSE",)
+            return []
+
+        def verify_stock_basic_generation(self, generation_id):
+            assert generation_id == "stock-generation"
+            return {
+                "manifest": {},
+                "manifest_sha256": "a" * 64,
+                "rows_sha256": "b" * 64,
+                "audit_identity_sha256": "c" * 64,
+            }
+
+    collector = _collector(
+        api,
+        ScriptedTransport([]),
+        Store(),
+        FakeTrustedClock(),
+        source_profile="jiaoch",
+        workers=2,
+    )
+    calendar_partitions = []
+
+    def fetch_partition(spec, *, resume=False):
+        calendar_partitions.append(spec.partition_key)
+        return {
+            "status": "stored",
+            "attempts": [{}],
+            "receipt": {"status": "stored"},
+        }
+
+    collector.fetch_partition = fetch_partition
+    collector.collect_stock_basic_generation = lambda **kwargs: {
+        "generation_id": "stock-generation",
+        "fetched_partition_count": 8,
+        "attempt_count": 8,
+    }
+
+    report = collector.collect(
+        start_date="2024-01-01",
+        end_date="2024-01-01",
+        workers=2,
+    )
+
+    assert calendar_partitions == ["SSE:2024-01-01:2024-01-01"]
+    assert report["open_session_count"] == 0
+    assert report["planned_receipt_count"] == 9
+    assert report["generation_id"] == "stock-generation"
+
+
 def test_controlled_collect_end_to_end_passes_coverage_and_then_resumes_without_network(
     tmp_path, monkeypatch
 ):
