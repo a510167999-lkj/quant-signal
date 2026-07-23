@@ -62,6 +62,9 @@ TREND_PULLBACK_SPEC = {
     "coverage_end_policy": (
         "uniform_signal_cutoff_requires_covered_planned_exit"
     ),
+    "terminal_listing_policy": (
+        "right_censor_without_settlement_return_and_block_if_selected"
+    ),
     "intraday_stop_fill_assumed": False,
     "exposure_multiplier": 1.0,
     "top_n": 3,
@@ -259,6 +262,66 @@ def _load_suspension_evidence(
     return dict(evidence)
 
 
+def _load_terminal_listing_evidence(
+    connection: Any,
+    *,
+    start_date: str,
+    end_date: str,
+) -> dict[str, dict[str, Any]]:
+    evidence: dict[str, dict[str, Any]] = {}
+    rows = connection.execute(
+        """
+        SELECT master.ts_code, master.symbol, master.name,
+               master.list_status, master.delist_date,
+               master.generation_id, master.logical_partition_key,
+               head.manifest_sha256, head.published_at,
+               shard.attempt_id, shard.request_semantics_sha256,
+               shard.retrieved_at, shard.raw_sha256,
+               shard.normalized_sha256
+        FROM stock_basic_generation_rows AS master
+        JOIN stock_basic_generation_head AS head
+          ON head.generation_id = master.generation_id
+        JOIN stock_basic_generation_shards AS shard
+          ON shard.generation_id = master.generation_id
+         AND shard.logical_partition_key = master.logical_partition_key
+        WHERE upper(trim(master.list_status)) = 'D'
+          AND master.delist_date BETWEEN ? AND ?
+        ORDER BY master.ts_code
+        """,
+        (start_date, end_date),
+    )
+    for row in rows:
+        symbol = str(row["symbol"] or str(row["ts_code"])[:6])
+        proof = {
+            "symbol": symbol,
+            "ts_code": str(row["ts_code"]),
+            "name": str(row["name"]),
+            "list_status": str(row["list_status"]),
+            "delist_date": str(row["delist_date"]),
+            "generation_id": str(row["generation_id"]),
+            "manifest_sha256": str(row["manifest_sha256"]),
+            "published_at": str(row["published_at"]),
+            "logical_partition_key": str(row["logical_partition_key"]),
+            "attempt_id": str(row["attempt_id"]),
+            "request_semantics_sha256": str(
+                row["request_semantics_sha256"]
+            ),
+            "retrieved_at": str(row["retrieved_at"]),
+            "raw_sha256": str(row["raw_sha256"]),
+            "normalized_sha256": str(row["normalized_sha256"]),
+            "evidence_usage": (
+                "outcome_censor_only_not_signal_or_settlement_return"
+            ),
+        }
+        previous = evidence.get(symbol)
+        if previous is not None and previous != proof:
+            raise AuditedPITDevelopmentReplayError(
+                "terminal listing evidence conflicts for one symbol"
+            )
+        evidence[symbol] = proof
+    return evidence
+
+
 def _strategy_entry_filter(
     *,
     signal_adjusted_close: float,
@@ -290,6 +353,9 @@ def _strict_close_stop_trade(
     ] | None,
     hold_days: int,
     stop_loss_pct: float,
+    terminal_listing_evidence: Mapping[
+        str, Mapping[str, Any]
+    ] | None = None,
 ) -> tuple[
     dict[str, Any] | None,
     dict[str, Any] | None,
@@ -432,6 +498,7 @@ def _strict_close_stop_trade(
             buy=buy,
             exit_attempts=exit_attempts,
             suspension_evidence=suspension_evidence or {},
+            terminal_listing_evidence=terminal_listing_evidence or {},
         )
         censored["source_execution_requery_verification"] = (
             _verify_execution_evidence_against_adapter(
@@ -626,6 +693,7 @@ def _build_censored_position(
     suspension_evidence: Mapping[
         tuple[str, str], Sequence[Mapping[str, Any]]
     ],
+    terminal_listing_evidence: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
     if any(attempt.get("fillable") is not False for attempt in exit_attempts):
         raise AuditedPITDevelopmentReplayError(
@@ -648,8 +716,16 @@ def _build_censored_position(
     ]
     path: list[dict[str, Any]] = []
     suspension_proofs: list[dict[str, Any]] = []
+    terminal_listing_event: dict[str, Any] | None = None
+    unmarked_market_sessions: list[str] = []
     last_close_return_pct: float | None = None
-    for trade_date in held_market_sessions:
+    terminal_proof = terminal_listing_evidence.get(str(symbol))
+    terminal_date = (
+        str(terminal_proof.get("delist_date"))
+        if terminal_proof is not None
+        else None
+    )
+    for session_index, trade_date in enumerate(held_market_sessions):
         row_index = date_positions.get(trade_date)
         if row_index is not None:
             row = frame.iloc[row_index]
@@ -676,6 +752,18 @@ def _build_censored_position(
             }
             last_close_return_pct = float(mark["close_return_pct"])
         else:
+            if terminal_date is not None and trade_date >= terminal_date:
+                if (
+                    terminal_proof is None
+                    or str(terminal_proof.get("symbol")) != str(symbol)
+                    or str(terminal_proof.get("list_status")).upper() != "D"
+                ):
+                    raise AuditedPITDevelopmentReplayError(
+                        "terminal listing evidence is invalid"
+                    )
+                terminal_listing_event = dict(terminal_proof)
+                unmarked_market_sessions = held_market_sessions[session_index:]
+                break
             proofs = [
                 dict(proof)
                 for proof in suspension_evidence.get(
@@ -684,7 +772,9 @@ def _build_censored_position(
             ]
             if not proofs or last_close_return_pct is None:
                 raise AuditedPITDevelopmentReplayError(
-                    "right-censored position has an unexplained missing held bar"
+                    "right-censored position has an unexplained missing held "
+                    f"bar: symbol={symbol}, trade_date={trade_date}, "
+                    f"signal_date={signal_date}"
                 )
             suspension_proofs.append(
                 {"trade_date": trade_date, "proofs": proofs}
@@ -714,8 +804,20 @@ def _build_censored_position(
         "exit_attempts_sha256": _sha256(list(exit_attempts)),
         "mark_to_market_path_sha256": _sha256(path),
         "suspension_carry_forward_sha256": _sha256(suspension_proofs),
+        "terminal_listing_event_sha256": _sha256(
+            terminal_listing_event
+        ),
+        "unmarked_market_sessions_sha256": _sha256(
+            unmarked_market_sessions
+        ),
+        "valuation_complete": terminal_listing_event is None,
     }
     verification["receipt_sha256"] = _sha256(verification)
+    censor_reason = (
+        "terminal_listing_without_settlement_evidence"
+        if terminal_listing_event is not None
+        else "no_strict_sell_fill_through_coverage_end"
+    )
     return {
         "entry_date": entry_date,
         "exit_date": str(sessions[-1]),
@@ -730,7 +832,10 @@ def _build_censored_position(
         ),
         "right_censored": True,
         "outcome_complete": False,
-        "censor_reason": "no_strict_sell_fill_through_coverage_end",
+        "censor_reason": censor_reason,
+        "valuation_complete": terminal_listing_event is None,
+        "terminal_listing_event": terminal_listing_event,
+        "unmarked_market_sessions": unmarked_market_sessions,
         "entry_executability": {
             **dict(strategy_filter),
             "evidence_source": "audited_artifact_next_open",
@@ -1124,6 +1229,7 @@ def _build_strict_candidates(
     suspension_evidence: Mapping[
         tuple[str, str], Sequence[Mapping[str, Any]]
     ],
+    terminal_listing_evidence: Mapping[str, Mapping[str, Any]],
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -1193,6 +1299,7 @@ def _build_strict_candidates(
                     sessions=sessions,
                     session_positions=session_positions,
                     suspension_evidence=suspension_evidence,
+                    terminal_listing_evidence=terminal_listing_evidence,
                     hold_days=int(TREND_PULLBACK_SPEC["hold_days"]),
                     stop_loss_pct=float(
                         TREND_PULLBACK_SPEC["close_stop_loss_pct"]
@@ -1245,6 +1352,9 @@ def _build_strict_candidates(
             "entry_execution": TREND_PULLBACK_SPEC["entry_execution"],
             "blocked_sell_policy": TREND_PULLBACK_SPEC["blocked_sell_policy"],
             "coverage_end_policy": TREND_PULLBACK_SPEC["coverage_end_policy"],
+            "terminal_listing_policy": TREND_PULLBACK_SPEC[
+                "terminal_listing_policy"
+            ],
         },
         "signal_overlap_count": overlap_count,
         "strict_verdict_cache_count": len(verdict_cache),
@@ -1323,9 +1433,12 @@ def _evaluate(
         )
     evaluation_start_date = str(evaluation_session_dates[0])
     evaluation_end_date = str(evaluation_session_dates[-1])
+    allowed_censor_reasons = {
+        "no_strict_sell_fill_through_coverage_end",
+        "terminal_listing_without_settlement_evidence",
+    }
     if any(
-        trade.get("censor_reason")
-        != "no_strict_sell_fill_through_coverage_end"
+        trade.get("censor_reason") not in allowed_censor_reasons
         for trade in censored_positions
     ):
         raise AuditedPITDevelopmentReplayError(
@@ -1459,6 +1572,17 @@ def _single_fixed_spec_row(sweep: Mapping[str, Any]) -> Mapping[str, Any]:
     return top[0]
 
 
+def _advancement_gate_passes(
+    pullback_row: Mapping[str, Any],
+    baseline_row: Mapping[str, Any],
+) -> bool:
+    return bool(
+        pullback_row.get("target_all_pass")
+        and pullback_row.get("target_rolling_12m_stability_pass")
+        and baseline_row.get("evidence_complete")
+    )
+
+
 def run_audited_pit_trend_pullback(
     *,
     settings: Settings,
@@ -1512,6 +1636,11 @@ def run_audited_pit_trend_pullback(
             start_date=start_date,
             end_date=end_date,
         )
+        terminal_listing_evidence = _load_terminal_listing_evidence(
+            universe._require_open(),
+            start_date=start_date,
+            end_date=end_date,
+        )
         adapter = ArtifactNativeReplayAdapter(
             universe,
             expected_temporal_contract_sha256=expected_temporal_contract_sha256,
@@ -1528,6 +1657,7 @@ def run_audited_pit_trend_pullback(
             adapter=adapter,
             sessions=sessions,
             suspension_evidence=suspension_evidence,
+            terminal_listing_evidence=terminal_listing_evidence,
         )
         source = {
             "coverage_audit_sha256": universe.coverage_audit_sha256,
@@ -1551,6 +1681,18 @@ def run_audited_pit_trend_pullback(
                     for key, value in sorted(suspension_evidence.items())
                 ]
             ),
+            "terminal_listing_evidence_count": len(
+                terminal_listing_evidence
+            ),
+            "terminal_listing_evidence_sha256": _sha256(
+                [
+                    terminal_listing_evidence[symbol]
+                    for symbol in sorted(terminal_listing_evidence)
+                ]
+            ),
+            "terminal_listing_evidence_usage": (
+                "outcome_censor_only_not_signal_or_settlement_return"
+            ),
             "producer_code": _producer_binding(),
         }
     finally:
@@ -1570,9 +1712,9 @@ def run_audited_pit_trend_pullback(
     )
     pullback_row = _single_fixed_spec_row(pullback_sweep)
     baseline_row = _single_fixed_spec_row(baseline_sweep)
-    advancement_gate = bool(
-        pullback_row.get("target_all_pass")
-        and pullback_row.get("target_rolling_12m_stability_pass")
+    advancement_gate = _advancement_gate_passes(
+        pullback_row,
+        baseline_row,
     )
     pullback_sidecar_payload = {
         "schema_version": "audited-pit-strict-candidate-sidecar/v1",
@@ -1655,6 +1797,9 @@ def run_audited_pit_trend_pullback(
             "rolling_12m_stability_passed": bool(
                 pullback_row.get("target_rolling_12m_stability_pass")
             ),
+            "strict_baseline_evidence_complete": bool(
+                baseline_row.get("evidence_complete")
+            ),
             "all_required_gates_passed": advancement_gate,
             "embargo_consumed": False,
             "final_oos_consumed": False,
@@ -1665,6 +1810,9 @@ def run_audited_pit_trend_pullback(
             ),
             "baseline_selected_trade_count": baseline_row.get(
                 "selected_trade_count"
+            ),
+            "baseline_evidence_complete": bool(
+                baseline_row.get("evidence_complete")
             ),
             "same_execution_contract": True,
         },

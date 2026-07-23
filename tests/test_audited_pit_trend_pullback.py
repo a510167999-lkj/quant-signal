@@ -1,4 +1,5 @@
 from copy import deepcopy
+import sqlite3
 
 import pandas as pd
 import pytest
@@ -363,6 +364,106 @@ def test_unfilled_sell_through_coverage_preserves_open_position():
     assert event["planned_exit_date"] == sessions[6]
 
 
+def test_terminal_delisting_censor_never_fabricates_post_delist_marks():
+    full_frame = _execution_frame([100.0] * 8)
+    sessions = full_frame["date"].tolist()
+    frame = full_frame.iloc[:2].copy()
+    verdicts = {
+        (sessions[1], "buy"): _fillable(100.0),
+        (sessions[6], "sell"): _blocked("missing_raw_bar"),
+        (sessions[7], "sell"): _blocked("missing_raw_bar"),
+    }
+    suspension = {
+        ("000001", trade_date): [
+            {
+                "symbol": "000001",
+                "trade_date": trade_date,
+                "suspend_type": "S",
+                "generation_id": f"generation-{trade_date}",
+                "manifest_sha256": "a" * 64,
+            }
+        ]
+        for trade_date in sessions[2:6]
+    }
+    terminal_proof = {
+        "symbol": "000001",
+        "ts_code": "000001.SZ",
+        "name": "测试退",
+        "list_status": "D",
+        "delist_date": sessions[6],
+        "generation_id": "stock-master",
+        "manifest_sha256": "b" * 64,
+        "published_at": "2025-01-01T00:00:00+08:00",
+        "logical_partition_key": "SZSE:D",
+        "attempt_id": "attempt",
+        "raw_sha256": "c" * 64,
+        "normalized_sha256": "d" * 64,
+    }
+
+    trade, censored, event = pullback._strict_close_stop_trade(
+        adapter=_FakeAdapter(verdicts),
+        verdict_cache={},
+        frame=frame,
+        symbol="000001",
+        signal_index=0,
+        sessions=sessions,
+        session_positions={date: index for index, date in enumerate(sessions)},
+        suspension_evidence=suspension,
+        terminal_listing_evidence={"000001": terminal_proof},
+        hold_days=5,
+        stop_loss_pct=5.0,
+    )
+
+    assert trade is None
+    assert censored is not None
+    assert event["status"] == "entered_unresolved_exit"
+    assert censored["censor_reason"] == (
+        "terminal_listing_without_settlement_evidence"
+    )
+    assert censored["valuation_complete"] is False
+    assert censored["terminal_listing_event"] == terminal_proof
+    assert censored["unmarked_market_sessions"] == sessions[6:]
+    assert [mark["date"] for mark in censored["mark_to_market_path"]] == (
+        sessions[1:6]
+    )
+
+
+def test_missing_bar_before_terminal_listing_still_fails_closed():
+    full_frame = _execution_frame([100.0] * 8)
+    sessions = full_frame["date"].tolist()
+    frame = full_frame.iloc[:2].copy()
+    verdicts = {
+        (sessions[1], "buy"): _fillable(100.0),
+        (sessions[6], "sell"): _blocked("missing_raw_bar"),
+        (sessions[7], "sell"): _blocked("missing_raw_bar"),
+    }
+
+    with pytest.raises(
+        AuditedPITDevelopmentReplayError,
+        match=r"symbol=000001, trade_date=2025-01-04",
+    ):
+        pullback._strict_close_stop_trade(
+            adapter=_FakeAdapter(verdicts),
+            verdict_cache={},
+            frame=frame,
+            symbol="000001",
+            signal_index=0,
+            sessions=sessions,
+            session_positions={
+                date: index for index, date in enumerate(sessions)
+            },
+            suspension_evidence={},
+            terminal_listing_evidence={
+                "000001": {
+                    "symbol": "000001",
+                    "delist_date": sessions[6],
+                }
+            },
+            hold_days=5,
+            stop_loss_pct=5.0,
+        )
+
+
 def test_tail_signal_is_uniformly_cut_off_before_entry_or_outcome():
     frame = _execution_frame([100.0] * 4)
     sessions = frame["date"].tolist()
@@ -395,6 +496,89 @@ def test_signal_date_name_gate_rejects_st_and_missing_membership():
     assert pullback._eligible_signal_name(None) is None
 
 
+def test_terminal_listing_evidence_binds_stock_master_receipts():
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript(
+        """
+        CREATE TABLE stock_basic_generation_head (
+            scope_key TEXT PRIMARY KEY,
+            generation_id TEXT NOT NULL,
+            manifest_sha256 TEXT NOT NULL,
+            published_at TEXT NOT NULL
+        );
+        CREATE TABLE stock_basic_generation_rows (
+            generation_id TEXT NOT NULL,
+            logical_partition_key TEXT NOT NULL,
+            ts_code TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            name TEXT NOT NULL,
+            exchange TEXT NOT NULL,
+            market TEXT NOT NULL,
+            list_status TEXT NOT NULL,
+            list_date TEXT,
+            delist_date TEXT
+        );
+        CREATE TABLE stock_basic_generation_shards (
+            generation_id TEXT NOT NULL,
+            logical_partition_key TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            request_semantics_sha256 TEXT NOT NULL,
+            retrieved_at TEXT NOT NULL,
+            raw_sha256 TEXT NOT NULL,
+            raw_bytes INTEGER NOT NULL,
+            normalized_sha256 TEXT NOT NULL,
+            row_count INTEGER NOT NULL
+        );
+        """
+    )
+    connection.execute(
+        "INSERT INTO stock_basic_generation_head VALUES (?, ?, ?, ?)",
+        ("SSE:L,D,P,G", "stock-master", "a" * 64, "2026-01-01T00:00:00Z"),
+    )
+    connection.execute(
+        "INSERT INTO stock_basic_generation_rows VALUES "
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "stock-master",
+            "SSE:D",
+            "601989.SH",
+            "601989",
+            "中国重工(退)",
+            "SSE",
+            "主板",
+            "D",
+            "2009-12-16",
+            "2025-09-05",
+        ),
+    )
+    connection.execute(
+        "INSERT INTO stock_basic_generation_shards VALUES "
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "stock-master",
+            "SSE:D",
+            "attempt",
+            "b" * 64,
+            "2026-01-01T00:00:00Z",
+            "c" * 64,
+            1,
+            "d" * 64,
+            1,
+        ),
+    )
+
+    evidence = pullback._load_terminal_listing_evidence(
+        connection,
+        start_date="2024-07-05",
+        end_date="2026-07-03",
+    )
+
+    assert evidence["601989"]["delist_date"] == "2025-09-05"
+    assert evidence["601989"]["manifest_sha256"] == "a" * 64
+    assert evidence["601989"]["raw_sha256"] == "c" * 64
+
+
 def test_unresolved_censor_blocks_evidence_and_unknown_censor_fails_closed():
     base = {
         "symbol": "000001",
@@ -413,6 +597,10 @@ def test_unresolved_censor_blocks_evidence_and_unknown_censor_fails_closed():
         **base,
         "censor_reason": "planned_exit_beyond_coverage",
     }
+    terminal = {
+        **base,
+        "censor_reason": "terminal_listing_without_settlement_evidence",
+    }
 
     unresolved_sweep, _ = pullback._evaluate(
         [],
@@ -427,6 +615,21 @@ def test_unresolved_censor_blocks_evidence_and_unknown_censor_fails_closed():
     )
     assert unresolved_sweep["top"][0]["evidence_complete"] is False
     assert unresolved_sweep["top"][0][
+        "selected_right_censored_position_count"
+    ] == 1
+    terminal_sweep, _ = pullback._evaluate(
+        [],
+        [terminal],
+        ["trend_pullback_ma20_reclaim"],
+        evaluation_session_dates=[
+            "2026-06-30",
+            "2026-07-01",
+            "2026-07-02",
+            "2026-07-03",
+        ],
+    )
+    assert terminal_sweep["top"][0]["evidence_complete"] is False
+    assert terminal_sweep["top"][0][
         "selected_right_censored_position_count"
     ] == 1
     with pytest.raises(
@@ -472,6 +675,23 @@ def test_stable_sidecar_reference_does_not_bind_output_directory():
         "artifact_sha256": digest,
         "relative_path": f"sidecars/{digest}.json",
     }
+
+
+def test_incomplete_strict_baseline_blocks_advancement():
+    pullback_row = {
+        "target_all_pass": True,
+        "target_rolling_12m_stability_pass": True,
+        "evidence_complete": True,
+    }
+
+    assert pullback._advancement_gate_passes(
+        pullback_row,
+        {"evidence_complete": True},
+    )
+    assert not pullback._advancement_gate_passes(
+        pullback_row,
+        {"evidence_complete": False},
+    )
 
 
 def test_fixed_sweep_shape_fails_closed():
