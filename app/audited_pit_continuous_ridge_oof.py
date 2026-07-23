@@ -272,6 +272,84 @@ def _eligible_signal_name(value: Any) -> str | None:
     return name
 
 
+def _first_nonfinite_json_path(value: Any, path: str) -> str | None:
+    if isinstance(value, (float, np.floating)):
+        return path if not math.isfinite(float(value)) else None
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            found = _first_nonfinite_json_path(item, f"{path}.{key}")
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, Sequence) and not isinstance(
+        value,
+        (str, bytes, bytearray),
+    ):
+        for index, item in enumerate(value):
+            found = _first_nonfinite_json_path(item, f"{path}[{index}]")
+            if found is not None:
+                return found
+    return None
+
+
+def _audited_payload_sha256(value: Any, *, root_path: str) -> str:
+    try:
+        return _sha256(value)
+    except ValueError as exc:
+        nonfinite_path = _first_nonfinite_json_path(value, root_path)
+        if nonfinite_path is None:
+            raise
+        raise AuditedPITDevelopmentReplayError(
+            "audited payload contains a nonfinite float at "
+            f"{nonfinite_path}"
+        ) from exc
+
+
+def _normalize_security_transition_feature_metadata(
+    features: pd.DataFrame,
+) -> None:
+    fields = (
+        "security_code_transition_id",
+        "security_code_transition_contract_sha256",
+    )
+    if not set(fields).issubset(features.columns):
+        raise AuditedPITDevelopmentReplayError(
+            "continuous ridge transition metadata is missing"
+        )
+    for field in fields:
+        values = features[field].astype(object)
+        missing = pd.isna(values)
+        present = values.loc[~missing].tolist()
+        if field == "security_code_transition_id":
+            valid = all(
+                isinstance(value, str) and bool(value)
+                for value in present
+            )
+        else:
+            valid = all(
+                isinstance(value, str)
+                and len(value) == 64
+                and all(character in "0123456789abcdef" for character in value)
+                for value in present
+            )
+        if not valid:
+            raise AuditedPITDevelopmentReplayError(
+                f"continuous ridge {field} is invalid"
+            )
+        values.loc[missing] = None
+        features[field] = values
+    transition_rows = features["security_code_transition_id"].notna()
+    if bool(
+        features.loc[
+            transition_rows,
+            "security_code_transition_contract_sha256",
+        ].isna().any()
+    ):
+        raise AuditedPITDevelopmentReplayError(
+            "continuous ridge transition id has no contract hash"
+        )
+
+
 def _write_replay_progress(
     output_dir: str | Path,
     stage: str,
@@ -1111,6 +1189,7 @@ def _build_exact_cross_section_features(
         ["signal_date", "security_id", "source_ts_code"],
         kind="mergesort",
     ).reset_index(drop=True)
+    _normalize_security_transition_feature_metadata(features)
     if features["candidate_key"].duplicated().any():
         raise ValueError("continuous ridge feature keys are duplicated")
     matrix = features[list(FEATURE_NAMES)].to_numpy(dtype=float)
@@ -2220,9 +2299,15 @@ def _build_strict_outcomes(
         "execution_events": events,
         "execution_events_sha256": _sha256(events),
         "completed_candidate_count": len(completed),
-        "completed_candidates_sha256": _sha256(completed),
+        "completed_candidates_sha256": _audited_payload_sha256(
+            completed,
+            root_path="$.completed_candidates",
+        ),
         "right_censored_position_count": len(censored),
-        "right_censored_positions_sha256": _sha256(censored),
+        "right_censored_positions_sha256": _audited_payload_sha256(
+            censored,
+            root_path="$.right_censored_positions",
+        ),
         "verdict_cache_count": len(verdict_cache),
     }
     receipt["receipt_sha256"] = _sha256(receipt)

@@ -169,6 +169,63 @@ def test_exact_features_follow_frozen_math_and_exclude_star_and_beijing():
     assert receipt["feature_row_count"] == len(features)
 
 
+def test_exact_features_preserve_nullable_security_transition_metadata():
+    sessions = _sessions(61)
+    bars = _bars(
+        sessions,
+        ts_codes=("000001.SZ", "300001.SZ"),
+    )
+    bars["security_code_transition_contract_sha256"] = "d" * 64
+    bars.loc[
+        bars["ts_code"].eq("300001.SZ"),
+        "security_code_transition_id",
+    ] = "transition-1"
+
+    features, _ = ridge._build_exact_cross_section_features(
+        bars,
+        sessions,
+        minimum_cross_section_members=2,
+    )
+    records = features[
+        features["signal_date"].eq(sessions[-1])
+    ].to_dict("records")
+    by_symbol = {str(row["symbol"]): row for row in records}
+
+    assert by_symbol["000001"]["security_code_transition_id"] is None
+    assert (
+        by_symbol["300001"]["security_code_transition_id"]
+        == "transition-1"
+    )
+    assert {
+        row["security_code_transition_contract_sha256"]
+        for row in records
+    } == {"d" * 64}
+    ridge._sha256(records)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_audited_payload_hash_rejects_nonfinite_with_json_path(value):
+    payload = [{"nested": [{"return_pct": value}]}]
+
+    with pytest.raises(
+        ridge.AuditedPITDevelopmentReplayError,
+        match=r"\$\.completed_candidates\[0\]\.nested\[0\]\.return_pct",
+    ):
+        ridge._audited_payload_sha256(
+            payload,
+            root_path="$.completed_candidates",
+        )
+
+
+def test_audited_payload_hash_matches_canonical_hash_for_finite_values():
+    payload = [{"nested": [{"return_pct": 1.25}]}]
+
+    assert ridge._audited_payload_sha256(
+        payload,
+        root_path="$.completed_candidates",
+    ) == ridge._sha256(payload)
+
+
 def test_midrank_ties_share_rank_and_list_date_is_fail_closed():
     sessions = _sessions(61)
     bars = _bars(
@@ -1332,7 +1389,11 @@ def test_end_to_end_runner_stays_development_only(monkeypatch, tmp_path):
                     "ts_code": ts_code,
                     "source_ts_code": ts_code,
                     "security_id": f"cn-a-share:{ts_code}",
-                    "security_code_transition_id": None,
+                    "security_code_transition_id": (
+                        "transition-1"
+                        if ts_code == "000002.SZ"
+                        else None
+                    ),
                     "security_code_transition_contract_sha256": "d" * 64,
                     "open": close,
                     "high": close * 1.01,
