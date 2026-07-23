@@ -211,6 +211,19 @@ def _evaluate(trades: list[dict[str, Any]], required_tags: list[str]) -> dict[st
     )
 
 
+def _single_fixed_spec_row(sweep: Mapping[str, Any]) -> Mapping[str, Any]:
+    top = sweep.get("top")
+    if (
+        not isinstance(top, list)
+        or len(top) != 1
+        or not isinstance(top[0], Mapping)
+    ):
+        raise AuditedPITDevelopmentReplayError(
+            "fixed cooldown sweep must return exactly one result row"
+        )
+    return top[0]
+
+
 def run_audited_pit_loss_cluster_cooldown(
     *,
     settings: Settings,
@@ -293,10 +306,9 @@ def run_audited_pit_loss_cluster_cooldown(
         selected_for_evaluation,
         ["breakout_20d", "loss_cluster_cooldown"],
     )
+    cooldown_row = _single_fixed_spec_row(cooldown_sweep)
     if (
-        not cooldown_sweep.get("top")
-        or int(cooldown_sweep["top"].get("selected_trade_count") or 0)
-        != len(selected)
+        int(cooldown_row.get("selected_trade_count") or 0) != len(selected)
     ):
         raise AuditedPITDevelopmentReplayError(
             "cooldown-selected trades did not replay identically"

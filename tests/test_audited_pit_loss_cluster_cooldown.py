@@ -1,4 +1,5 @@
 from app import audited_pit_loss_cluster_cooldown as cooldown
+from app.audited_pit_development_replay import AuditedPITDevelopmentReplayError
 
 
 def _trade(symbol, signal_date, exit_date, exit_reason, rank_score=100.0):
@@ -82,3 +83,16 @@ def test_cooldown_keeps_selected_trade_exit_paths_unchanged_and_is_deterministic
     assert first == second == [before]
     assert first_receipt == second_receipt
     assert len(first_receipt["receipt_sha256"]) == 64
+
+
+def test_fixed_sweep_requires_exactly_one_top_row():
+    row = {"selected_trade_count": 4}
+
+    assert cooldown._single_fixed_spec_row({"top": [row]}) == row
+    for invalid in ({"top": row}, {"top": []}, {"top": [row, row]}):
+        try:
+            cooldown._single_fixed_spec_row(invalid)
+        except AuditedPITDevelopmentReplayError:
+            pass
+        else:
+            raise AssertionError("invalid fixed sweep shape must fail closed")
