@@ -277,6 +277,19 @@ CREATE TABLE IF NOT EXISTS market_session_generation_head (
 CREATE UNIQUE INDEX IF NOT EXISTS one_collecting_market_session_per_trade_date
     ON market_session_generations(trade_date)
     WHERE status = 'collecting';
+CREATE TABLE IF NOT EXISTS current_pool_market_collection_bindings (
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    temporal_contract_sha256 TEXT NOT NULL,
+    temporal_role TEXT NOT NULL CHECK (
+        temporal_role IN ('development', 'contaminated_diagnostic')
+    ),
+    source_profile TEXT NOT NULL,
+    market_generation_root_sha256 TEXT NOT NULL,
+    market_session_count INTEGER NOT NULL CHECK (market_session_count > 0),
+    binding_sha256 TEXT NOT NULL UNIQUE,
+    PRIMARY KEY (start_date, end_date)
+);
 """
 _OFFICIAL_SUSPENSION_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS official_notice_receipts (
@@ -7633,6 +7646,116 @@ class PITReceiptStore:
         if any(sessions != open_sets[0] for sessions in open_sets[1:]):
             raise PITReceiptError("exchange open-session calendars disagree")
         return sorted(open_sets[0])
+
+    def bind_current_pool_market_collection(
+        self,
+        *,
+        start_date: str,
+        end_date: str,
+        sessions: Sequence[str],
+        temporal_contract_sha256: str,
+        temporal_role: str,
+        source_profile: str,
+    ) -> Dict[str, Any]:
+        """Persist a verified temporal receipt after a complete market-only run."""
+
+        start = _iso_date(start_date, "start_date")
+        end = _iso_date(end_date, "end_date")
+        normalized_sessions = [_iso_date(value, "session") for value in sessions]
+        if (
+            end < start
+            or not normalized_sessions
+            or normalized_sessions != sorted(set(normalized_sessions))
+            or normalized_sessions[0] < start
+            or normalized_sessions[-1] > end
+            or temporal_role not in {"development", "contaminated_diagnostic"}
+            or not isinstance(source_profile, str)
+            or not source_profile.strip()
+        ):
+            raise PITReceiptError("current-pool market collection binding is invalid")
+        _require_sha256(temporal_contract_sha256, "temporal contract hash")
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            refs = []
+            for session in normalized_sessions:
+                head = connection.execute(
+                    """
+                    SELECT head.generation_id, head.manifest_sha256, generation.vintage
+                    FROM market_session_generation_head AS head
+                    JOIN market_session_generations AS generation
+                      ON generation.generation_id = head.generation_id
+                    WHERE head.trade_date = ?
+                    """,
+                    (session,),
+                ).fetchone()
+                if head is None:
+                    raise PITReceiptError("current-pool market binding is missing a session")
+                manifest = self._market_session_manifest_on_connection(
+                    connection, str(head["generation_id"])
+                )
+                refs.append(
+                    {
+                        "trade_date": session,
+                        "generation_id": str(head["generation_id"]),
+                        "manifest_sha256": str(head["manifest_sha256"]),
+                        "lineage_sha256": str(manifest["lineage_sha256"]),
+                        "vintage": str(head["vintage"]),
+                    }
+                )
+            unsigned = {
+                "schema_version": "current-pool-market-temporal-binding/v1",
+                "start_date": start,
+                "end_date": end,
+                "temporal_contract_sha256": temporal_contract_sha256,
+                "temporal_role": temporal_role,
+                "source_profile": source_profile.strip(),
+                "market_generation_root_sha256": _sha256(refs),
+                "market_session_count": len(refs),
+            }
+            binding_sha256 = _sha256(unsigned)
+            expected = {**unsigned, "binding_sha256": binding_sha256}
+            existing = connection.execute(
+                """
+                SELECT temporal_contract_sha256, temporal_role, source_profile,
+                       market_generation_root_sha256, market_session_count, binding_sha256
+                FROM current_pool_market_collection_bindings
+                WHERE start_date = ? AND end_date = ?
+                """,
+                (start, end),
+            ).fetchone()
+            stored = {
+                "temporal_contract_sha256": temporal_contract_sha256,
+                "temporal_role": temporal_role,
+                "source_profile": source_profile.strip(),
+                "market_generation_root_sha256": unsigned["market_generation_root_sha256"],
+                "market_session_count": len(refs),
+                "binding_sha256": binding_sha256,
+            }
+            if existing is not None:
+                if dict(existing) != stored:
+                    raise PITReceiptError("current-pool market binding conflicts with existing evidence")
+                return expected
+            connection.execute(
+                """
+                INSERT INTO current_pool_market_collection_bindings (
+                    start_date, end_date, temporal_contract_sha256, temporal_role,
+                    source_profile, market_generation_root_sha256,
+                    market_session_count, binding_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    start,
+                    end,
+                    temporal_contract_sha256,
+                    temporal_role,
+                    source_profile.strip(),
+                    unsigned["market_generation_root_sha256"],
+                    len(refs),
+                    binding_sha256,
+                ),
+            )
+            return expected
 
     def _verify_receipts_on_connection(self, connection: sqlite3.Connection) -> Dict[str, Any]:
         manifest_rows = []

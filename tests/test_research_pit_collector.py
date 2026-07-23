@@ -2761,6 +2761,11 @@ def test_current_pool_market_only_collects_calendars_and_market_generations_only
             events.append("common_open_sessions")
             return ["2024-01-02", "2024-01-03"]
 
+        def bind_current_pool_market_collection(self, **kwargs):
+            assert kwargs["sessions"] == ["2024-01-02", "2024-01-03"]
+            events.append("temporal_binding")
+            return {"binding_sha256": "a" * 64}
+
     collector = _collector(
         api,
         ScriptedTransport([]),
@@ -2814,7 +2819,11 @@ def test_current_pool_market_only_collects_calendars_and_market_generations_only
     )
 
     assert events[0:2] == ["trade_cal:SSE+SZSE", "common_open_sessions"]
-    assert set(events[2:]) == {"market:2024-01-02", "market:2024-01-03"}
+    assert set(events[2:]) == {
+        "market:2024-01-02",
+        "market:2024-01-03",
+        "temporal_binding",
+    }
     assert report == {
         "status": "complete",
         "mode": "current_pool_market_only",
@@ -2835,6 +2844,7 @@ def test_current_pool_market_only_collects_calendars_and_market_generations_only
         "reused_session_count": 0,
         "temporal_role": "contaminated_diagnostic",
         "temporal_contract_sha256": TEMPORAL_CONTRACT["contract_sha256"],
+        "temporal_binding_sha256": "a" * 64,
         "current_universe_bias": True,
         "development_only": True,
         "live_proof": False,
@@ -2847,6 +2857,10 @@ def test_current_pool_market_only_uses_published_generation_resume(tmp_path):
     class MarketPlanningStore:
         def common_open_sessions(self, *, start_date, end_date, exchanges=("SSE",)):
             return ["2024-01-02", "2024-01-03"]
+
+        def bind_current_pool_market_collection(self, **kwargs):
+            assert kwargs["sessions"] == ["2024-01-02", "2024-01-03"]
+            return {"binding_sha256": "b" * 64}
 
     collector = _collector(
         api,

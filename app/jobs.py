@@ -23,6 +23,7 @@ from app.current_pool_history_source import (
     build_current_pool_history_summary,
     verify_current_pool_history_descriptor,
 )
+from app.current_pool_development_replay import run_current_pool_development_replay
 from app.current_pool_source import (
     _strict_json_loads,
     fetch_jiaoch_current_pool_descriptor,
@@ -4062,6 +4063,15 @@ def main(argv=None) -> int:
     current_pool_history.add_argument("--as-of", required=True)
     current_pool_history.add_argument("--output-dir", required=True)
 
+    current_pool_development_replay = subparsers.add_parser(
+        "research-current-pool-development-replay"
+    )
+    current_pool_development_replay.add_argument("--store-dir", required=True)
+    current_pool_development_replay.add_argument("--universe-path", required=True)
+    current_pool_development_replay.add_argument("--history-summary-path", required=True)
+    current_pool_development_replay.add_argument("--temporal-contract-path", required=True)
+    current_pool_development_replay.add_argument("--output-dir", required=True)
+
     pit_publish = subparsers.add_parser("research-pit-publish-universe")
     pit_publish.add_argument("--store-dir", required=True)
     pit_publish.add_argument("--start-date", required=True)
@@ -4403,6 +4413,18 @@ def main(argv=None) -> int:
             history_start=args.start_date,
             history_end=args.end_date,
             as_of=args.as_of,
+            output_dir=args.output_dir,
+        )
+        _print_json(report)
+        return 0
+
+    if args.command == "research-current-pool-development-replay":
+        report = run_current_pool_development_replay(
+            settings=settings or get_settings(),
+            store_dir=args.store_dir,
+            universe_path=args.universe_path,
+            history_summary_path=args.history_summary_path,
+            temporal_contract_path=args.temporal_contract_path,
             output_dir=args.output_dir,
         )
         _print_json(report)

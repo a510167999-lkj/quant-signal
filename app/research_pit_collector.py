@@ -2101,6 +2101,19 @@ class ControlledTushareCollector:
             checkpoint("failed", phase="market")
             raise
 
+        if not hasattr(self.store, "bind_current_pool_market_collection"):
+            raise PITCollectionError(
+                "market-only collection requires durable temporal binding support"
+            )
+        temporal_binding = self.store.bind_current_pool_market_collection(
+            start_date=start,
+            end_date=end,
+            sessions=sessions,
+            temporal_contract_sha256=self._temporal_authority.contract_sha256,
+            temporal_role=self._temporal_authority.role,
+            source_profile=self.source_profile,
+        )
+
         return {
             "status": "complete",
             "mode": "current_pool_market_only",
@@ -2121,6 +2134,7 @@ class ControlledTushareCollector:
             "reused_session_count": reused_session_count,
             "temporal_role": self._temporal_authority.role,
             "temporal_contract_sha256": self._temporal_authority.contract_sha256,
+            "temporal_binding_sha256": temporal_binding["binding_sha256"],
             "current_universe_bias": True,
             "development_only": True,
             "live_proof": False,
