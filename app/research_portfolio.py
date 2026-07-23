@@ -98,6 +98,7 @@ def _select_with_portfolio_controls_receipt(
     top_n: int,
     symbol_cooldown_days: int = 0,
     max_active_positions: int = 0,
+    same_day_exit_before_signal_selection: bool = True,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     selected: List[Dict[str, Any]] = []
     active_positions: List[Dict[str, Any]] = []
@@ -113,7 +114,13 @@ def _select_with_portfolio_controls_receipt(
         all_candidate_keys.extend(ordered_keys)
         signal_day = _date_value(signal_date)
         active_positions = [
-            item for item in active_positions if _date_value(item["exit_date"]) >= signal_day
+            item
+            for item in active_positions
+            if (
+                _date_value(item["exit_date"]) > signal_day
+                if same_day_exit_before_signal_selection
+                else _date_value(item["exit_date"]) >= signal_day
+            )
         ]
         day_count = 0
         active_symbols = {item["symbol"] for item in active_positions}
@@ -170,11 +177,20 @@ def _select_with_portfolio_controls_receipt(
 
     selected_keys = [_selection_trade_key(trade) for trade in selected]
     payload = {
-        "schema_version": "portfolio_selection_receipt/v1",
+        "schema_version": (
+            "portfolio_selection_receipt/v2"
+            if same_day_exit_before_signal_selection
+            else "portfolio_selection_receipt/v1"
+        ),
         "parameters": {
             "top_n": int(top_n),
             "symbol_cooldown_days": int(symbol_cooldown_days),
             "max_active_positions": int(max_active_positions),
+            **(
+                {"same_day_exit_before_signal_selection": True}
+                if same_day_exit_before_signal_selection
+                else {}
+            ),
         },
         "candidate_count": len(all_candidate_keys),
         "selected_count": len(selected_keys),
@@ -191,10 +207,14 @@ def verify_portfolio_selection_receipt(
     by_signal_date: Dict[str, List[Dict[str, Any]]],
     receipt: Dict[str, Any],
 ) -> Dict[str, Any]:
-    if not isinstance(receipt, dict) or receipt.get("schema_version") != (
-        "portfolio_selection_receipt/v1"
-    ):
+    if not isinstance(receipt, dict) or receipt.get("schema_version") not in {
+        "portfolio_selection_receipt/v1",
+        "portfolio_selection_receipt/v2",
+    }:
         raise ValueError("portfolio selection receipt is invalid")
+    same_day_exit_before_signal_selection = (
+        receipt["schema_version"] == "portfolio_selection_receipt/v2"
+    )
     parameters = receipt.get("parameters") or {}
     try:
         _selected, expected = _select_with_portfolio_controls_receipt(
@@ -202,6 +222,9 @@ def verify_portfolio_selection_receipt(
             top_n=int(parameters["top_n"]),
             symbol_cooldown_days=int(parameters["symbol_cooldown_days"]),
             max_active_positions=int(parameters["max_active_positions"]),
+            same_day_exit_before_signal_selection=(
+                same_day_exit_before_signal_selection
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("portfolio selection receipt is invalid") from exc

@@ -3,7 +3,7 @@ from copy import deepcopy
 from datetime import timedelta
 from itertools import combinations
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Set
+from typing import Any, Dict, Iterable, List, Sequence, Set
 
 import pandas as pd
 
@@ -264,8 +264,11 @@ def _rolling_12m_window_stats(
     if not equity_points:
         return []
     windows = []
+    history_start = _date_value(equity_points[0]["signal_date"])
     for end_index, end in enumerate(equity_points):
         end_date = _date_value(end["signal_date"])
+        if (end_date - history_start).days < days:
+            continue
         start_cutoff = end_date - timedelta(days=days)
         start_index = 0
         for candidate_index in range(end_index, -1, -1):
@@ -278,7 +281,9 @@ def _rolling_12m_window_stats(
             continue
         windows.append(
             {
-                "start_date": segment[0]["signal_date"],
+                "start_date": max(start_cutoff, history_start).strftime(
+                    "%Y-%m-%d"
+                ),
                 "end_date": end["signal_date"],
                 "signal_days": len(segment),
                 "trade_count": sum(int(point.get("count") or 0) for point in segment),
@@ -287,6 +292,122 @@ def _rolling_12m_window_stats(
             }
         )
     return windows
+
+
+def _equity_points_on_evaluation_sessions(
+    equity_points: List[Dict[str, Any]],
+    *,
+    evaluation_start_date: str | None,
+    evaluation_end_date: str | None,
+    evaluation_session_dates: Sequence[str],
+) -> List[Dict[str, Any]]:
+    if isinstance(evaluation_session_dates, (str, bytes)):
+        raise ValueError("evaluation session dates must be a sequence")
+    sessions = [
+        _date_value(value).strftime("%Y-%m-%d")
+        for value in evaluation_session_dates
+    ]
+    if not sessions:
+        raise ValueError("evaluation session dates cannot be empty")
+    if len(sessions) != len(set(sessions)) or sessions != sorted(sessions):
+        raise ValueError(
+            "evaluation session dates must be unique and strictly increasing"
+        )
+    if not evaluation_start_date or not evaluation_end_date:
+        raise ValueError(
+            "evaluation session grid requires start and end dates"
+        )
+    evaluation_start = _date_value(evaluation_start_date).strftime("%Y-%m-%d")
+    evaluation_end = _date_value(evaluation_end_date).strftime("%Y-%m-%d")
+    if sessions[0] != evaluation_start or sessions[-1] != evaluation_end:
+        raise ValueError(
+            "evaluation session grid must exactly match start and end dates"
+        )
+
+    session_set = set(sessions)
+    points_by_date: Dict[str, Dict[str, Any]] = {}
+    for point in equity_points:
+        point_date = _date_value(point["signal_date"]).strftime("%Y-%m-%d")
+        if point_date not in session_set:
+            raise ValueError(
+                "equity event is outside the evaluation session grid"
+            )
+        if point_date in points_by_date:
+            raise ValueError(
+                "evaluation session grid received duplicate equity events"
+            )
+        points_by_date[point_date] = point
+
+    filled: List[Dict[str, Any]] = []
+    last_equity = 1.0
+    for session_date in sessions:
+        event = points_by_date.get(session_date)
+        if event is not None:
+            point = dict(event)
+            point["signal_date"] = session_date
+            point["event_date"] = session_date
+            point["evaluation_session"] = True
+            point["cash_session"] = False
+            last_equity = float(point["equity"])
+        else:
+            point = {
+                "signal_date": session_date,
+                "event_date": session_date,
+                "equity": last_equity,
+                "drawdown_equity": last_equity,
+                "return_pct": 0.0,
+                "net_period_return_pct": 0.0,
+                "count": 0,
+                "evaluation_session": True,
+                "cash_session": True,
+            }
+        filled.append(point)
+    return filled
+
+
+def _validate_slot_daily_paths_on_evaluation_sessions(
+    selected: Sequence[Dict[str, Any]],
+    evaluation_session_dates: Sequence[str],
+) -> None:
+    sessions = [
+        _date_value(value).strftime("%Y-%m-%d")
+        for value in evaluation_session_dates
+    ]
+    session_positions = {
+        session_date: index
+        for index, session_date in enumerate(sessions)
+    }
+    for trade in selected:
+        entry_date = _date_value(
+            trade.get("entry_date") or trade.get("signal_date")
+        ).strftime("%Y-%m-%d")
+        exit_date = _date_value(
+            trade.get("exit_date") or trade.get("signal_date")
+        ).strftime("%Y-%m-%d")
+        entry_position = session_positions.get(entry_date)
+        exit_position = session_positions.get(exit_date)
+        if (
+            entry_position is None
+            or exit_position is None
+            or entry_position > exit_position
+        ):
+            raise ValueError(
+                "slot-daily active interval is outside the evaluation session grid"
+            )
+        path = trade.get("mark_to_market_path")
+        if not isinstance(path, list):
+            raise ValueError(
+                "slot-daily active interval requires a complete mark path"
+            )
+        observed_dates = [
+            _date_value(mark.get("date")).strftime("%Y-%m-%d")
+            for mark in path
+        ]
+        expected_dates = sessions[entry_position : exit_position + 1]
+        if observed_dates != expected_dates:
+            raise ValueError(
+                "slot-daily active interval has a missing evaluation session mark"
+            )
 
 
 def _trade_metrics(
@@ -298,6 +419,9 @@ def _trade_metrics(
     roundtrip_cost_bps: float = 0.0,
     slippage_bps: float = 0.0,
     capital_model: str = "signal-day",
+    evaluation_start_date: str | None = None,
+    evaluation_end_date: str | None = None,
+    evaluation_session_dates: Sequence[str] | None = None,
 ) -> Dict[str, Any]:
     selected_by_signal_date: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for item in selected:
@@ -315,11 +439,26 @@ def _trade_metrics(
             )
     basket_returns.sort(key=lambda item: item["signal_date"])
 
-    returns = [item["return_pct"] for item in selected]
+    quality_cost_pct = max(
+        float(roundtrip_cost_bps) + float(slippage_bps) * 2,
+        0.0,
+    ) / 100.0
+    returns = [
+        float(item["return_pct"]) - quality_cost_pct
+        for item in selected
+    ]
     adverse = [item for item in selected if item.get("max_adverse_pct") is not None]
-    wins = [item for item in selected if item.get("return_pct", 0) > 0]
+    wins = [value for value in returns if value > 0]
     winning_returns = [value for value in returns if value > 0]
     losing_returns = [value for value in returns if value < 0]
+    if (
+        capital_model == "slot-daily"
+        and evaluation_session_dates is not None
+    ):
+        _validate_slot_daily_paths_on_evaluation_sessions(
+            selected,
+            evaluation_session_dates,
+        )
     if capital_model == "slot-daily":
         equity_points = _equity_points_from_slot_daily_returns(
             selected,
@@ -348,8 +487,67 @@ def _trade_metrics(
             roundtrip_cost_bps=roundtrip_cost_bps,
             slippage_bps=slippage_bps,
         )
-    latest_1y = _latest_window_portfolio_stats(equity_points, days=365)
-    rolling_1y_windows = _rolling_12m_window_stats(equity_points, days=365)
+    if evaluation_session_dates is None and evaluation_end_date is not None:
+        raise ValueError(
+            "evaluation session dates are required with evaluation end date"
+        )
+    evaluation_grid_included = evaluation_session_dates is not None
+    rolling_equity_points = (
+        _equity_points_on_evaluation_sessions(
+            equity_points,
+            evaluation_start_date=evaluation_start_date,
+            evaluation_end_date=evaluation_end_date,
+            evaluation_session_dates=evaluation_session_dates,
+        )
+        if evaluation_session_dates is not None
+        else list(equity_points)
+    )
+    evaluation_start = (
+        _date_value(evaluation_start_date)
+        if evaluation_start_date
+        else None
+    )
+    evaluation_end = (
+        _date_value(evaluation_end_date)
+        if evaluation_end_date
+        else None
+    )
+    cash_anchor_included = bool(
+        rolling_equity_points
+        and (
+            rolling_equity_points[0].get("cash_session") is True
+            if evaluation_grid_included
+            else (
+                evaluation_start is not None
+                and evaluation_start
+                < _date_value(rolling_equity_points[0]["signal_date"])
+            )
+        )
+    )
+    if cash_anchor_included and not evaluation_grid_included:
+        rolling_equity_points.insert(
+            0,
+            {
+                "signal_date": evaluation_start.strftime("%Y-%m-%d"),
+                "event_date": evaluation_start.strftime("%Y-%m-%d"),
+                "equity": 1.0,
+                "drawdown_equity": 1.0,
+                "return_pct": 0.0,
+                "net_period_return_pct": 0.0,
+                "count": 0,
+                "capital_model": capital_model,
+                "cash_anchor": True,
+            },
+        )
+    metric_equity_points = (
+        rolling_equity_points if evaluation_grid_included else equity_points
+    )
+    latest_1y = _latest_window_portfolio_stats(
+        rolling_equity_points, days=365
+    )
+    rolling_1y_windows = _rolling_12m_window_stats(
+        rolling_equity_points, days=365
+    )
 
     def window_quality(window: Dict[str, Any]) -> Dict[str, Any]:
         start_date = _date_value(window["start_date"])
@@ -357,9 +555,14 @@ def _trade_metrics(
         window_trades = [
             item
             for item in selected
-            if start_date <= _date_value(item.get("signal_date")) <= end_date
+            if start_date
+            <= _date_value(item.get("exit_date") or item.get("signal_date"))
+            <= end_date
         ]
-        returns = [float(item.get("return_pct") or 0.0) for item in window_trades]
+        returns = [
+            float(item.get("return_pct") or 0.0) - quality_cost_pct
+            for item in window_trades
+        ]
         wins = [value for value in returns if value > 0]
         losses = [value for value in returns if value < 0]
         average_win = sum(wins) / len(wins) if wins else None
@@ -389,10 +592,10 @@ def _trade_metrics(
         {**window, **window_quality(window)} for window in rolling_1y_windows
     ]
     rolling_full_window = bool(
-        equity_points
+        rolling_equity_points
         and (
-            _date_value(equity_points[-1]["signal_date"])
-            - _date_value(equity_points[0]["signal_date"])
+            _date_value(rolling_equity_points[-1]["signal_date"])
+            - _date_value(rolling_equity_points[0]["signal_date"])
         ).days
         >= 365
     )
@@ -420,7 +623,9 @@ def _trade_metrics(
     gross_loss = abs(sum(losing_returns))
     profit_factor = gross_profit / gross_loss if gross_loss else None
     max_drawdown = (
-        _max_drawdown_pct_from_points(equity_points) if equity_points else None
+        _max_drawdown_pct_from_points(metric_equity_points)
+        if metric_equity_points
+        else None
     )
     latest_return = latest_1y.get("return_pct")
     calmar = (
@@ -444,6 +649,8 @@ def _trade_metrics(
         "annual_financing_rate_pct": round(float(annual_financing_rate_pct), 2),
         "roundtrip_cost_bps": round(float(roundtrip_cost_bps), 2),
         "slippage_bps": round(float(slippage_bps), 2),
+        "trade_return_basis": "net_after_roundtrip_cost_and_slippage",
+        "quality_trade_cost_pct": round(quality_cost_pct, 4),
         "capital_model": capital_model,
         "trade_win_count": len(wins),
         "trade_nonwin_count": len(selected) - len(wins),
@@ -462,8 +669,11 @@ def _trade_metrics(
         )
         if adverse
         else None,
-        "portfolio_compounded_return_pct": round((equity_points[-1]["equity"] - 1) * 100, 2)
-        if equity_points
+        "portfolio_compounded_return_pct": round(
+            (metric_equity_points[-1]["equity"] - 1) * 100,
+            2,
+        )
+        if metric_equity_points
         else None,
         "portfolio_max_drawdown_pct": max_drawdown,
         "portfolio_calmar_latest_1y": round(calmar, 2) if calmar is not None else None,
@@ -478,6 +688,25 @@ def _trade_metrics(
         "rolling_1y_latest_full_window": rolling_full_window,
         "rolling_1y_latest_trade_count": rolling_trade_count,
         "rolling_1y_latest_active_position_days": rolling_position_days,
+        "rolling_1y_evaluation_start_date": (
+            evaluation_start.strftime("%Y-%m-%d")
+            if evaluation_start is not None
+            else None
+        ),
+        "rolling_1y_evaluation_end_date": (
+            evaluation_end.strftime("%Y-%m-%d")
+            if evaluation_end is not None
+            else None
+        ),
+        "rolling_1y_evaluation_session_count": (
+            len(rolling_equity_points)
+            if evaluation_grid_included
+            else None
+        ),
+        "rolling_1y_evaluation_session_grid_included": (
+            evaluation_grid_included
+        ),
+        "rolling_1y_cash_anchor_included": cash_anchor_included,
     }
 
 

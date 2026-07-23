@@ -1009,6 +1009,33 @@ def test_portfolio_controls_skip_overlapping_same_symbol():
     assert [item["symbol"] for item in selected] == ["600519", "000001"]
 
 
+def test_portfolio_controls_release_open_exit_before_same_day_signal():
+    selected = _select_with_portfolio_controls(
+        {
+            "2026-01-02": [
+                {
+                    "symbol": "600519",
+                    "signal_date": "2026-01-02",
+                    "exit_date": "2026-01-05",
+                    "rank_score": 10,
+                }
+            ],
+            "2026-01-05": [
+                {
+                    "symbol": "000001",
+                    "signal_date": "2026-01-05",
+                    "exit_date": "2026-01-12",
+                    "rank_score": 9,
+                }
+            ],
+        },
+        top_n=1,
+        max_active_positions=1,
+    )
+
+    assert [item["symbol"] for item in selected] == ["600519", "000001"]
+
+
 def test_portfolio_selection_receipt_replays_ordered_candidates_and_rejections():
     candidates = {
         "2026-01-02": [
@@ -1048,6 +1075,8 @@ def test_portfolio_selection_receipt_replays_ordered_candidates_and_rejections()
     assert [item["symbol"] for item in selected] == ["600519", "000001"]
     assert receipt["candidate_count"] == 3
     assert receipt["selected_count"] == 2
+    assert receipt["schema_version"] == "portfolio_selection_receipt/v2"
+    assert receipt["parameters"]["same_day_exit_before_signal_selection"] is True
     assert receipt["days"][1]["decisions"][0]["decision"] == "active_symbol"
     verified = verify_portfolio_selection_receipt(candidates, receipt)
     assert verified["verified"] is True
@@ -1055,3 +1084,38 @@ def test_portfolio_selection_receipt_replays_ordered_candidates_and_rejections()
     tampered["days"][1]["selected_trade_keys"] = []
     with pytest.raises(ValueError, match="portfolio selection receipt"):
         verify_portfolio_selection_receipt(candidates, tampered)
+
+
+def test_portfolio_selection_verifier_preserves_legacy_v1_semantics():
+    candidates = {
+        "2026-01-02": [
+            {
+                "symbol": "600519",
+                "signal_date": "2026-01-02",
+                "entry_date": "2026-01-03",
+                "exit_date": "2026-01-05",
+                "rank_score": 10,
+            }
+        ],
+        "2026-01-05": [
+            {
+                "symbol": "000001",
+                "signal_date": "2026-01-05",
+                "entry_date": "2026-01-06",
+                "exit_date": "2026-01-12",
+                "rank_score": 9,
+            }
+        ],
+    }
+    selected, receipt = _select_with_portfolio_controls_receipt(
+        candidates,
+        top_n=1,
+        max_active_positions=1,
+        same_day_exit_before_signal_selection=False,
+    )
+
+    assert receipt["schema_version"] == "portfolio_selection_receipt/v1"
+    assert [trade["symbol"] for trade in selected] == ["600519"]
+    assert verify_portfolio_selection_receipt(candidates, receipt)[
+        "verified"
+    ] is True

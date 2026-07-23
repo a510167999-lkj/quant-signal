@@ -2,6 +2,9 @@ import json
 from datetime import date, timedelta
 from pathlib import Path
 
+import pandas as pd
+import pytest
+
 import app.research_sweep as research_sweep
 from app.jobs import (
     _compact_hold_sweep_result,
@@ -52,6 +55,294 @@ def test_trade_metrics_exposes_full_rolling_12m_and_window_calmar():
     if latest["max_drawdown_pct"]:
         expected_calmar = latest["return_pct"] / abs(latest["max_drawdown_pct"])
         assert metrics["calmar_latest_12m"] == round(expected_calmar, 2)
+
+
+def test_trade_metrics_excludes_incomplete_rolling_12m_prefixes():
+    trades = [
+        {
+            "symbol": "600001",
+            "signal_date": "2024-01-02",
+            "entry_date": "2024-01-03",
+            "exit_date": "2024-01-04",
+            "return_pct": 2.0,
+            "max_adverse_pct": -1.0,
+        },
+        {
+            "symbol": "600002",
+            "signal_date": "2025-01-03",
+            "entry_date": "2025-01-06",
+            "exit_date": "2025-01-07",
+            "return_pct": 2.0,
+            "max_adverse_pct": -1.0,
+        },
+    ]
+
+    metrics = _trade_metrics(trades, hold_days=1)
+
+    assert len(metrics["rolling_1y_windows"]) == 1
+    assert metrics["rolling_1y_windows"][0]["end_date"] == "2025-01-03"
+
+
+def test_trade_metrics_includes_initial_cash_period_in_full_rolling_window():
+    trades = [
+        {
+            "symbol": "600001",
+            "signal_date": "2024-03-01",
+            "entry_date": "2024-03-04",
+            "exit_date": "2024-03-05",
+            "return_pct": 2.0,
+            "max_adverse_pct": -1.0,
+        },
+        {
+            "symbol": "600002",
+            "signal_date": "2025-01-02",
+            "entry_date": "2025-01-03",
+            "exit_date": "2025-01-06",
+            "return_pct": 2.0,
+            "max_adverse_pct": -1.0,
+        },
+    ]
+
+    metrics = _trade_metrics(
+        trades,
+        hold_days=1,
+        evaluation_start_date="2024-01-01",
+    )
+
+    assert metrics["rolling_1y_cash_anchor_included"] is True
+    assert metrics["rolling_1y_evaluation_start_date"] == "2024-01-01"
+    assert metrics["rolling_1y_windows"]
+    assert metrics["rolling_1y_windows"][0]["start_date"] == "2024-01-03"
+
+
+def test_trade_metrics_uses_full_evaluation_session_grid_through_end_date():
+    evaluation_sessions = (
+        pd.bdate_range("2024-01-02", "2025-06-30")
+        .strftime("%Y-%m-%d")
+        .tolist()
+    )
+    trades = [
+        {
+            "symbol": "600001",
+            "signal_date": "2024-02-01",
+            "entry_date": "2024-02-02",
+            "exit_date": "2024-02-05",
+            "return_pct": 10.0,
+            "max_adverse_pct": -1.0,
+            "mark_to_market_path": [
+                {
+                    "date": "2024-02-02",
+                    "close_return_pct": 4.0,
+                    "low_return_pct": -1.0,
+                },
+                {
+                    "date": "2024-02-05",
+                    "close_return_pct": 10.0,
+                    "low_return_pct": 3.0,
+                },
+            ],
+        }
+    ]
+
+    metrics = _trade_metrics(
+        trades,
+        hold_days=5,
+        max_active_positions=3,
+        capital_model="slot-daily",
+        evaluation_start_date=evaluation_sessions[0],
+        evaluation_end_date=evaluation_sessions[-1],
+        evaluation_session_dates=evaluation_sessions,
+    )
+
+    assert metrics["rolling_1y_evaluation_start_date"] == evaluation_sessions[0]
+    assert metrics["rolling_1y_evaluation_end_date"] == evaluation_sessions[-1]
+    assert metrics["rolling_1y_evaluation_session_count"] == len(
+        evaluation_sessions
+    )
+    assert metrics["rolling_1y_evaluation_session_grid_included"] is True
+    assert metrics["rolling_1y_windows"][-1]["end_date"] == evaluation_sessions[-1]
+    assert metrics["rolling_1y_latest_return_pct"] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("sessions", "start_date", "end_date"),
+    [
+        (
+            ["2024-01-02", "2024-01-02"],
+            "2024-01-02",
+            "2024-01-02",
+        ),
+        (
+            ["2024-01-03", "2024-01-02"],
+            "2024-01-03",
+            "2024-01-02",
+        ),
+        (
+            ["2024-01-03", "2024-01-04"],
+            "2024-01-02",
+            "2024-01-04",
+        ),
+    ],
+)
+def test_trade_metrics_rejects_invalid_evaluation_session_grid(
+    sessions,
+    start_date,
+    end_date,
+):
+    with pytest.raises(ValueError, match="evaluation session"):
+        _trade_metrics(
+            [],
+            hold_days=5,
+            evaluation_start_date=start_date,
+            evaluation_end_date=end_date,
+            evaluation_session_dates=sessions,
+        )
+
+
+def test_trade_metrics_rejects_missing_slot_daily_mark_inside_active_interval():
+    sessions = ["2024-01-02", "2024-01-03", "2024-01-04"]
+    trade = {
+        "symbol": "600001",
+        "signal_date": "2024-01-01",
+        "entry_date": sessions[0],
+        "exit_date": sessions[-1],
+        "return_pct": 2.0,
+        "max_adverse_pct": -1.0,
+        "mark_to_market_path": [
+            {
+                "date": sessions[0],
+                "close_return_pct": 1.0,
+                "low_return_pct": -1.0,
+            },
+            {
+                "date": sessions[-1],
+                "close_return_pct": 2.0,
+                "low_return_pct": 0.0,
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError, match="active interval"):
+        _trade_metrics(
+            [trade],
+            hold_days=5,
+            max_active_positions=3,
+            capital_model="slot-daily",
+            evaluation_start_date=sessions[0],
+            evaluation_end_date=sessions[-1],
+            evaluation_session_dates=sessions,
+        )
+
+
+def test_trade_quality_metrics_are_net_of_friction():
+    trades = [
+        {
+            "symbol": "600001",
+            "signal_date": "2024-01-02",
+            "entry_date": "2024-01-03",
+            "exit_date": "2024-01-04",
+            "return_pct": 0.4,
+            "max_adverse_pct": -1.0,
+        },
+        {
+            "symbol": "600002",
+            "signal_date": "2025-01-03",
+            "entry_date": "2025-01-06",
+            "exit_date": "2025-01-07",
+            "return_pct": 1.4,
+            "max_adverse_pct": -1.0,
+        },
+    ]
+
+    metrics = _trade_metrics(
+        trades,
+        hold_days=1,
+        roundtrip_cost_bps=25.0,
+        slippage_bps=10.0,
+    )
+
+    assert metrics["quality_trade_cost_pct"] == 0.45
+    assert metrics["trade_return_basis"] == "net_after_roundtrip_cost_and_slippage"
+    assert metrics["trade_win_count"] == 1
+    assert metrics["trade_nonwin_count"] == 1
+    assert metrics["trade_win_rate_pct"] == 50.0
+    assert metrics["trade_profit_factor"] == 19.0
+
+
+def test_rolling_trade_quality_uses_realized_exit_date_without_future_signal_return():
+    trades = [
+        {
+            "symbol": "600001",
+            "signal_date": "2024-01-01",
+            "entry_date": "2024-01-02",
+            "exit_date": "2024-01-02",
+            "return_pct": 1.0,
+            "max_adverse_pct": 0.0,
+            "mark_to_market_path": [
+                {
+                    "date": "2024-01-02",
+                    "close_return_pct": 1.0,
+                    "low_return_pct": 0.0,
+                }
+            ],
+        },
+        {
+            "symbol": "600002",
+            "signal_date": "2023-12-29",
+            "entry_date": "2025-01-02",
+            "exit_date": "2025-01-03",
+            "return_pct": 10.0,
+            "max_adverse_pct": 0.0,
+            "mark_to_market_path": [
+                {
+                    "date": "2025-01-02",
+                    "close_return_pct": 5.0,
+                    "low_return_pct": 0.0,
+                },
+                {
+                    "date": "2025-01-03",
+                    "close_return_pct": 10.0,
+                    "low_return_pct": 5.0,
+                },
+            ],
+        },
+        {
+            "symbol": "600003",
+            "signal_date": "2025-01-03",
+            "entry_date": "2025-01-06",
+            "exit_date": "2025-01-07",
+            "return_pct": -10.0,
+            "max_adverse_pct": -10.0,
+            "mark_to_market_path": [
+                {
+                    "date": "2025-01-06",
+                    "close_return_pct": -5.0,
+                    "low_return_pct": -5.0,
+                },
+                {
+                    "date": "2025-01-07",
+                    "close_return_pct": -10.0,
+                    "low_return_pct": -10.0,
+                },
+            ],
+        },
+    ]
+
+    metrics = _trade_metrics(
+        trades,
+        hold_days=1,
+        max_active_positions=3,
+        capital_model="slot-daily",
+    )
+    window = next(
+        item
+        for item in metrics["rolling_1y_windows"]
+        if item["end_date"] == "2025-01-03"
+    )
+
+    assert window["selected_trade_count"] == 1
+    assert window["win_count"] == 1
+    assert window["nonwin_count"] == 0
 
 
 def test_sweep_qualified_trades_ranks_target_passing_filters():

@@ -535,7 +535,7 @@ def test_development_gates_never_claim_completion_without_final_and_stress():
     trades = [
         _trade(
             start + timedelta(days=offset),
-            2.0 if offset % 20 < 11 else -1.0,
+            2.5 if offset % 20 < 11 else -1.0,
             symbol=f"{603000 + offset:06d}",
         )
         for offset in range(600)
