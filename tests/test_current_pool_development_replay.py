@@ -90,6 +90,37 @@ def test_simple_replay_uses_exact_signal_date_membership():
     assert present[0]["market_level"] == "audited_pit_development"
 
 
+def test_simple_replay_does_not_create_breakout_from_reverse_split():
+    rows = []
+    for index in range(27):
+        after_reverse_split = index >= 20
+        raw_price = 20.0 if after_reverse_split else 10.0
+        rows.append(
+            {
+                "date": f"2025-01-{index + 1:02d}",
+                "ts_code": "000001.SZ",
+                "open": raw_price,
+                "high": raw_price,
+                "low": raw_price,
+                "close": raw_price,
+                "pre_close": raw_price,
+                "amount": 100_000_000.0,
+                "adj_factor": 0.5 if after_reverse_split else 1.0,
+                "suspended": False,
+            }
+        )
+
+    trades = _candidate_trades_from_bars(
+        pd.DataFrame(rows),
+        {"000001": "测试股"},
+        Settings(),
+    )
+
+    assert trades == []
+    assert SIMPLE_BREAKOUT_SPEC["schema_version"] == "development-simple-breakout/v3"
+    assert SIMPLE_BREAKOUT_SPEC["signal_price_basis"] == "raw_ohlc_times_session_adj_factor"
+
+
 class _MembershipUniverse:
     def __init__(self, connection):
         self._connection = connection

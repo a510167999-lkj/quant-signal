@@ -32,8 +32,10 @@ class CurrentPoolDevelopmentReplayError(ValueError):
 
 
 SIMPLE_BREAKOUT_SPEC = {
-    "schema_version": "development-simple-breakout/v2",
+    "schema_version": "development-simple-breakout/v3",
     "signal_tag": "breakout_20d",
+    "signal_price_basis": "raw_ohlc_times_session_adj_factor",
+    "adjustment_method": "causal_bar_factor_common_as_of_denominator_cancels",
     "lookback_sessions": 20,
     "hold_days": 5,
     "stop_loss_pct": 5.0,
@@ -232,8 +234,8 @@ def _candidate_trades_from_bars(
     trades: list[dict[str, Any]] = []
     for ts_code, group in bars.groupby("ts_code", sort=True):
         frame = group.sort_values("date", kind="mergesort").reset_index(drop=True).copy()
-        adjusted_high = frame["high"] / frame["adj_factor"]
-        adjusted_close = frame["close"] / frame["adj_factor"]
+        adjusted_high = frame["high"] * frame["adj_factor"]
+        adjusted_close = frame["close"] * frame["adj_factor"]
         breakout = adjusted_close > adjusted_high.shift(1).rolling(
             SIMPLE_BREAKOUT_SPEC["lookback_sessions"], min_periods=SIMPLE_BREAKOUT_SPEC["lookback_sessions"]
         ).max()
