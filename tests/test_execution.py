@@ -54,6 +54,62 @@ def test_next_open_executability_ignores_later_session_high_and_low():
     assert calm["decision_cutoff"] == "next_open"
 
 
+def test_next_open_executability_allows_exact_gap_boundaries():
+    exact_gap_up = assess_entry_executability(
+        {"close": 100.0},
+        {"open": 106.0},
+        max_gap_up_pct=6.0,
+        decision_cutoff="next_open",
+    )
+    exact_gap_down = assess_entry_executability(
+        {"close": 100.0},
+        {"open": 93.0},
+        max_gap_down_pct=7.0,
+        decision_cutoff="next_open",
+    )
+
+    assert exact_gap_up["executable"] is True
+    assert exact_gap_down["executable"] is True
+
+
+def test_next_open_executability_rejects_gap_beyond_absolute_tolerance():
+    above_gap_up = assess_entry_executability(
+        {"close": 100.0},
+        {"open": 106.000000002},
+        max_gap_up_pct=6.0,
+        decision_cutoff="next_open",
+    )
+    below_gap_down = assess_entry_executability(
+        {"close": 100.0},
+        {"open": 92.999999998},
+        max_gap_down_pct=7.0,
+        decision_cutoff="next_open",
+    )
+
+    assert above_gap_up["executable"] is False
+    assert below_gap_down["executable"] is False
+
+
+def test_next_open_executability_treats_exact_locked_limit_as_locked():
+    exact_locked_limit = assess_entry_executability(
+        {"close": 100.0},
+        {"open": 109.3},
+        locked_limit_gap_pct=9.3,
+        max_gap_up_pct=10.0,
+        decision_cutoff="next_open",
+    )
+    below_locked_limit = assess_entry_executability(
+        {"close": 100.0},
+        {"open": 109.299999998},
+        locked_limit_gap_pct=9.3,
+        max_gap_up_pct=10.0,
+        decision_cutoff="next_open",
+    )
+
+    assert exact_locked_limit["executable"] is False
+    assert below_locked_limit["executable"] is True
+
+
 def test_next_open_executability_never_falls_back_to_close():
     result = assess_entry_executability(
         {"close": 10.0},

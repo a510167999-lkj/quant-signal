@@ -1,4 +1,8 @@
+import math
 from typing import Any, Dict
+
+
+_ABSOLUTE_COMPARISON_TOLERANCE = 1e-9
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -7,6 +11,33 @@ def _num(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
     return number
+
+
+def _strictly_above(value: float, boundary: float) -> bool:
+    return value > boundary and not math.isclose(
+        value,
+        boundary,
+        rel_tol=0.0,
+        abs_tol=_ABSOLUTE_COMPARISON_TOLERANCE,
+    )
+
+
+def _strictly_below(value: float, boundary: float) -> bool:
+    return value < boundary and not math.isclose(
+        value,
+        boundary,
+        rel_tol=0.0,
+        abs_tol=_ABSOLUTE_COMPARISON_TOLERANCE,
+    )
+
+
+def _at_or_above(value: float, boundary: float) -> bool:
+    return value > boundary or math.isclose(
+        value,
+        boundary,
+        rel_tol=0.0,
+        abs_tol=_ABSOLUTE_COMPARISON_TOLERANCE,
+    )
 
 
 def assess_entry_executability(
@@ -49,12 +80,12 @@ def assess_entry_executability(
         if entry_high is not None and entry_low is not None and entry_low > 0
         else None
     )
-    if gap_pct > max_gap_up_pct:
+    if _strictly_above(gap_pct, max_gap_up_pct):
         reasons.append("次日高开 %.2f%%，超过追价阈值 %.2f%%。" % (gap_pct, max_gap_up_pct))
-    if gap_pct < -abs(max_gap_down_pct):
+    if _strictly_below(gap_pct, -abs(max_gap_down_pct)):
         reasons.append("次日低开 %.2f%%，信号已明显受损。" % gap_pct)
 
-    locked_limit = gap_pct >= locked_limit_gap_pct and (
+    locked_limit = _at_or_above(gap_pct, locked_limit_gap_pct) and (
         decision_cutoff == "next_open"
         or (intraday_range_pct is not None and intraday_range_pct <= 0.35)
     )
