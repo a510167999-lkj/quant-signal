@@ -17,6 +17,9 @@ from app.audited_pit_development_replay import (
     run_audited_pit_moderate_amount_development_replay,
 )
 from app.audited_pit_loss_attribution import run_audited_pit_loss_attribution
+from app.audited_pit_loss_cluster_cooldown import (
+    run_audited_pit_loss_cluster_cooldown,
+)
 from app.audited_pit_walk_forward_rank import run_audited_pit_walk_forward_rank
 from app.artifact_native_evidence import (
     build_artifact_native_evidence,
@@ -4189,6 +4192,28 @@ def main(argv=None) -> int:
     audited_pit_walk_forward_rank.add_argument("--end-date", required=True)
     audited_pit_walk_forward_rank.add_argument("--output-dir", required=True)
 
+    audited_pit_loss_cluster_cooldown = subparsers.add_parser(
+        "research-audited-pit-loss-cluster-cooldown"
+    )
+    audited_pit_loss_cluster_cooldown.add_argument(
+        "--audited-pit-universe-path", required=True
+    )
+    audited_pit_loss_cluster_cooldown.add_argument(
+        "--expected-coverage-audit-sha256", required=True
+    )
+    audited_pit_loss_cluster_cooldown.add_argument(
+        "--expected-artifact-root-sha256", required=True
+    )
+    audited_pit_loss_cluster_cooldown.add_argument(
+        "--temporal-contract-path", required=True
+    )
+    audited_pit_loss_cluster_cooldown.add_argument(
+        "--expected-temporal-contract-sha256", required=True
+    )
+    audited_pit_loss_cluster_cooldown.add_argument("--start-date", required=True)
+    audited_pit_loss_cluster_cooldown.add_argument("--end-date", required=True)
+    audited_pit_loss_cluster_cooldown.add_argument("--output-dir", required=True)
+
     pit_publish = subparsers.add_parser("research-pit-publish-universe")
     pit_publish.add_argument("--store-dir", required=True)
     pit_publish.add_argument("--start-date", required=True)
@@ -4609,6 +4634,21 @@ def main(argv=None) -> int:
 
     if args.command == "research-audited-pit-walk-forward-rank":
         report = run_audited_pit_walk_forward_rank(
+            settings=settings or get_settings(),
+            audited_pit_universe_path=args.audited_pit_universe_path,
+            expected_coverage_audit_sha256=args.expected_coverage_audit_sha256,
+            expected_artifact_root_sha256=args.expected_artifact_root_sha256,
+            temporal_contract_path=args.temporal_contract_path,
+            expected_temporal_contract_sha256=args.expected_temporal_contract_sha256,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            output_dir=args.output_dir,
+        )
+        _print_json(report)
+        return 0
+
+    if args.command == "research-audited-pit-loss-cluster-cooldown":
+        report = run_audited_pit_loss_cluster_cooldown(
             settings=settings or get_settings(),
             audited_pit_universe_path=args.audited_pit_universe_path,
             expected_coverage_audit_sha256=args.expected_coverage_audit_sha256,
