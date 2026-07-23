@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,34 @@ from app.research_sweep import sweep_qualified_trades
 
 class AuditedPITDevelopmentReplayError(ValueError):
     """The audited PIT development replay inputs are incomplete or inconsistent."""
+
+
+def _producer_code_binding() -> dict[str, Any]:
+    module_names = (
+        "a_share_universe.py",
+        "audited_pit_development_replay.py",
+        "current_pool_development_replay.py",
+        "execution.py",
+        "research_equity.py",
+        "research_partitions.py",
+        "research_pit_store.py",
+        "research_portfolio.py",
+        "research_scope.py",
+        "research_sweep.py",
+    )
+    root = Path(__file__).resolve().parent
+    refs = [
+        {
+            "module": name,
+            "sha256": hashlib.sha256((root / name).read_bytes()).hexdigest(),
+        }
+        for name in module_names
+    ]
+    return {
+        "schema_version": "audited-pit-development-producer-code/v1",
+        "modules": refs,
+        "root_sha256": _sha256(refs),
+    }
 
 
 def _exact_membership_by_date(
@@ -139,6 +168,7 @@ def run_audited_pit_development_replay(
             "market_session_count": len(sessions),
             "exact_membership_session_count": len(sessions),
             "market_scope": market_scope_contract(),
+            "producer_code": _producer_code_binding(),
         }
     finally:
         universe.close()

@@ -6,6 +6,7 @@ import pytest
 from app.audited_pit_development_replay import (
     AuditedPITDevelopmentReplayError,
     _exact_membership_by_date,
+    _producer_code_binding,
 )
 from app.config import Settings
 from app.current_pool_development_replay import (
@@ -125,3 +126,23 @@ def test_exact_membership_rejects_derived_session():
             start_date="2025-01-02",
             end_date="2025-01-02",
         )
+
+
+def test_audited_replay_binds_all_producer_modules():
+    binding = _producer_code_binding()
+
+    assert binding["schema_version"] == "audited-pit-development-producer-code/v1"
+    assert len(binding["root_sha256"]) == 64
+    assert {item["module"] for item in binding["modules"]} == {
+        "a_share_universe.py",
+        "audited_pit_development_replay.py",
+        "current_pool_development_replay.py",
+        "execution.py",
+        "research_equity.py",
+        "research_partitions.py",
+        "research_pit_store.py",
+        "research_portfolio.py",
+        "research_scope.py",
+        "research_sweep.py",
+    }
+    assert all(len(item["sha256"]) == 64 for item in binding["modules"])
