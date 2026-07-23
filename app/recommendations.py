@@ -750,6 +750,15 @@ def _compact_analysis(
         risks.insert(0, "外部消息存在风险信号，需人工复核。")
     if fund_flow_context.get("level") in {"high_outflow", "outflow_risk"}:
         risks.insert(0, "近期主力资金流出，需降低仓位或等待确认。")
+    short_plan = ((result.get("trade_plans") or {}).get("short_term") or {})
+    holding_period = short_plan.get("horizon") or short_plan.get("holding_period")
+    trigger_conditions = list(
+        short_plan.get("conditions") or result.get("reasons") or []
+    )[:3]
+    invalidation_conditions = list(risks or result.get("risks") or [])[:3]
+    if not invalidation_conditions:
+        invalidation_conditions = ["价格跌破止损位或严格信号不再满足"]
+    take_profit = (result.get("levels") or {}).get("take_profit")
     compact = {
         "symbol": result["symbol"],
         "market": result["market"],
@@ -768,11 +777,17 @@ def _compact_analysis(
             "action": str(result.get("action") or "WATCH").lower(),
             "entry_zone": result.get("entry_zone") or {},
             "stop_loss": (result.get("levels") or {}).get("stop_loss"),
-            "take_profit": (result.get("levels") or {}).get("take_profit"),
-            "holding_period": ((result.get("trade_plans") or {}).get("short_term") or {}).get(
-                "horizon"
-            ),
-            "invalidation": (risks or [None])[0],
+            "take_profit": take_profit,
+            "holding_period": holding_period,
+            "invalidation": invalidation_conditions[0],
+            "trigger_conditions": trigger_conditions,
+            "take_profit_or_reduce": {
+                "condition": "price_gte_take_profit",
+                "trigger_price": take_profit,
+                "action": "reduce_or_take_profit",
+            },
+            "invalidation_conditions": invalidation_conditions,
+            "expected_holding_period": holding_period,
         },
         "auto_order": False,
         "reasons": result["reasons"],

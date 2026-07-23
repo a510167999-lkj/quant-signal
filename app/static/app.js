@@ -341,6 +341,14 @@ function recommendationAdviceLine(item) {
   if (advice.holding_period || plan.horizon || plan.holding_period) {
     parts.push(`周期 ${advice.holding_period || plan.horizon || plan.holding_period}`);
   }
+  const triggers = Array.isArray(advice.trigger_conditions) ? advice.trigger_conditions : [];
+  if (triggers.length) {
+    parts.push(`触发条件 ${triggers.join("；")}`);
+  }
+  const reduce = advice.take_profit_or_reduce || {};
+  if (reduce.trigger_price !== null && reduce.trigger_price !== undefined) {
+    parts.push(`止盈/减仓条件 价格达到 ${fmt(reduce.trigger_price, 2)}`);
+  }
   if (advice.invalidation) {
     parts.push(`失效 ${advice.invalidation}`);
   }

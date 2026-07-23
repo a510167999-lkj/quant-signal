@@ -805,6 +805,11 @@ def test_generate_daily_recommendations_from_a_share_universe(tmp_path):
     assert {"stop_loss", "take_profit"} <= set(development_items[0]["levels"])
     assert development_items[0]["entry_zone"]
     assert development_items[0]["trade_plans"]
+    advice = development_items[0]["operation_advice"]
+    assert advice["trigger_conditions"]
+    assert advice["take_profit_or_reduce"]["trigger_price"] == advice["take_profit"]
+    assert advice["invalidation_conditions"]
+    assert advice["expected_holding_period"] == advice["holding_period"]
     assert development_items[0]["industry"]["industry"] == "测试行业"
     assert development_items[0]["news_context"]["level"] == "neutral"
     assert development_items[0]["announcement_context"]["level"] == "neutral"

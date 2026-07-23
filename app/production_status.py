@@ -186,6 +186,11 @@ def _recommendations(settings: Settings, now: datetime, trade_dates: set[str]) -
                 and advice.get("take_profit") is not None
                 and (advice.get("holding_period") or plan.get("horizon") or plan.get("holding_period"))
                 and advice.get("invalidation")
+                and bool(advice.get("trigger_conditions"))
+                and (advice.get("take_profit_or_reduce") or {}).get("trigger_price")
+                == advice.get("take_profit")
+                and bool(advice.get("invalidation_conditions"))
+                and advice.get("expected_holding_period")
             )
             if not required or not operation_contract or not item.get("risks") or not (plan.get("horizon") or plan.get("holding_period")):
                 return _check("recommendations", "unhealthy", "推荐缺少完整操作建议。", symbol=item.get("symbol"))

@@ -21,6 +21,8 @@ def test_recommendation_panel_surfaces_profile_gate_and_operation_advice():
     assert "profile_gate" in script
     assert "strategy_profile" in script
     assert "operation_advice" in script
+    assert "trigger_conditions" in script
+    assert "take_profit_or_reduce" in script
     assert "blocked_profile_gate" in script
     assert "不自动下单" in script
 

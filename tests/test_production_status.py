@@ -27,6 +27,14 @@ def complete_item():
             "entry_zone": {"low": 100, "high": 102},
             "stop_loss": 95,
             "take_profit": 115,
+            "trigger_conditions": ["entry_zone_and_signal_confirmed"],
+            "take_profit_or_reduce": {
+                "condition": "price_gte_take_profit",
+                "trigger_price": 115,
+                "action": "reduce_or_take_profit",
+            },
+            "invalidation_conditions": ["price_lte_stop_loss"],
+            "expected_holding_period": "3-10 trading days",
             "holding_period": "3-10个交易日",
             "invalidation": "跌破止损位",
         },
@@ -391,6 +399,29 @@ def test_recommendations_health_requires_a_share_operation_contract(tmp_path):
 
     assert check["status"] == "unhealthy"
     assert "操作建议" in check["message"]
+
+
+def test_recommendations_health_requires_explicit_trigger_contract(tmp_path):
+    cfg = settings(tmp_path)
+    write_healthy_artifacts(cfg)
+    item = complete_item()
+    item["operation_advice"].pop("trigger_conditions")
+    write_json(
+        cfg.latest_recommendations_path,
+        {
+            "generated_at": NOW.isoformat(),
+            "trade_date": "2026-07-10",
+            "target_trade_date": "2026-07-10",
+            "run_slot": "pre_open",
+            "data_as_of": "2026-07-10",
+            "items": [item],
+            "summary": {"running": False, "data_as_of": "2026-07-10"},
+        },
+    )
+
+    check = find(build_production_status(cfg, NOW), "recommendations")
+
+    assert check["status"] == "unhealthy"
 
 
 def test_cli_exit_codes(monkeypatch, capsys):
