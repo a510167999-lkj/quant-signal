@@ -20,6 +20,9 @@ from app.audited_pit_loss_attribution import run_audited_pit_loss_attribution
 from app.audited_pit_loss_cluster_cooldown import (
     run_audited_pit_loss_cluster_cooldown,
 )
+from app.audited_pit_next_open_gap_confirmation import (
+    run_audited_pit_next_open_gap_confirmation,
+)
 from app.audited_pit_walk_forward_rank import run_audited_pit_walk_forward_rank
 from app.artifact_native_evidence import (
     build_artifact_native_evidence,
@@ -4214,6 +4217,30 @@ def main(argv=None) -> int:
     audited_pit_loss_cluster_cooldown.add_argument("--end-date", required=True)
     audited_pit_loss_cluster_cooldown.add_argument("--output-dir", required=True)
 
+    audited_pit_next_open_gap_confirmation = subparsers.add_parser(
+        "research-audited-pit-next-open-gap-confirmation"
+    )
+    audited_pit_next_open_gap_confirmation.add_argument(
+        "--audited-pit-universe-path", required=True
+    )
+    audited_pit_next_open_gap_confirmation.add_argument(
+        "--expected-coverage-audit-sha256", required=True
+    )
+    audited_pit_next_open_gap_confirmation.add_argument(
+        "--expected-artifact-root-sha256", required=True
+    )
+    audited_pit_next_open_gap_confirmation.add_argument(
+        "--temporal-contract-path", required=True
+    )
+    audited_pit_next_open_gap_confirmation.add_argument(
+        "--expected-temporal-contract-sha256", required=True
+    )
+    audited_pit_next_open_gap_confirmation.add_argument(
+        "--start-date", required=True
+    )
+    audited_pit_next_open_gap_confirmation.add_argument("--end-date", required=True)
+    audited_pit_next_open_gap_confirmation.add_argument("--output-dir", required=True)
+
     pit_publish = subparsers.add_parser("research-pit-publish-universe")
     pit_publish.add_argument("--store-dir", required=True)
     pit_publish.add_argument("--start-date", required=True)
@@ -4655,6 +4682,23 @@ def main(argv=None) -> int:
             expected_artifact_root_sha256=args.expected_artifact_root_sha256,
             temporal_contract_path=args.temporal_contract_path,
             expected_temporal_contract_sha256=args.expected_temporal_contract_sha256,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            output_dir=args.output_dir,
+        )
+        _print_json(report)
+        return 0
+
+    if args.command == "research-audited-pit-next-open-gap-confirmation":
+        report = run_audited_pit_next_open_gap_confirmation(
+            settings=settings or get_settings(),
+            audited_pit_universe_path=args.audited_pit_universe_path,
+            expected_coverage_audit_sha256=args.expected_coverage_audit_sha256,
+            expected_artifact_root_sha256=args.expected_artifact_root_sha256,
+            temporal_contract_path=args.temporal_contract_path,
+            expected_temporal_contract_sha256=(
+                args.expected_temporal_contract_sha256
+            ),
             start_date=args.start_date,
             end_date=args.end_date,
             output_dir=args.output_dir,
