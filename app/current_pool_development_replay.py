@@ -224,6 +224,7 @@ def _candidate_trades_from_bars(
     settings: Settings,
     *,
     membership_by_date: Mapping[str, Mapping[str, str]] | None = None,
+    membership_name_column: str | None = None,
     current_universe_bias: bool = True,
 ) -> list[dict[str, Any]]:
     """Build the one frozen simple-rule candidate set from verified raw bars."""
@@ -239,12 +240,16 @@ def _candidate_trades_from_bars(
         for index in breakout[breakout].index:
             signal_date = str(frame.at[index, "date"])
             symbol = str(ts_code)[:6]
-            if membership_by_date is None:
-                name = names_by_symbol.get(symbol, "")
-            else:
+            if membership_by_date is not None:
                 name = membership_by_date.get(signal_date, {}).get(symbol)
                 if name is None:
                     continue
+            elif membership_name_column is not None:
+                name = str(frame.at[index, membership_name_column] or "").strip()
+                if not name:
+                    continue
+            else:
+                name = names_by_symbol.get(symbol, "")
             entry_index = index + 1
             exit_index = entry_index + SIMPLE_BREAKOUT_SPEC["hold_days"]
             if exit_index >= len(frame) or bool(frame.at[entry_index, "suspended"]):

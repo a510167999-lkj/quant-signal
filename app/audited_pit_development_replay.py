@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 import hashlib
 from pathlib import Path
 from typing import Any
@@ -12,7 +11,6 @@ from app.config import Settings
 from app.current_pool_development_replay import (
     SIMPLE_BREAKOUT_SPEC,
     _candidate_trades_from_bars,
-    _load_bars,
     _sha256,
     _write_content_addressed,
 )
@@ -54,12 +52,12 @@ def _producer_code_binding() -> dict[str, Any]:
     }
 
 
-def _exact_membership_by_date(
+def _exact_membership_sessions(
     universe: AuditedPointInTimeUniverse,
     *,
     start_date: str,
     end_date: str,
-) -> tuple[dict[str, dict[str, str]], list[str]]:
+) -> list[str]:
     connection = universe._require_open()
     sessions = universe.open_sessions(start_date, end_date)
     exact = {
@@ -88,26 +86,90 @@ def _exact_membership_by_date(
             "derived or quarantined membership is forbidden for this replay"
         )
 
-    membership: dict[str, dict[str, str]] = defaultdict(dict)
-    for row in connection.execute(
-        """
-        SELECT trade_date, ts_code, name
-        FROM daily_universe
-        WHERE trade_date BETWEEN ? AND ?
-        ORDER BY trade_date, ts_code
-        """,
-        (start_date, end_date),
-    ):
-        ts_code = str(row["ts_code"])
-        name = str(row["name"] or "").strip()
-        if not is_mainboard_chinext_symbol(ts_code) or _is_excluded_name(name):
-            continue
-        membership[str(row["trade_date"])][ts_code[:6]] = name
-    if set(membership) != set(sessions) or any(not membership[session] for session in sessions):
-        raise AuditedPITDevelopmentReplayError(
-            "exact in-scope membership is incomplete for an open session"
+    counts = {
+        str(row["trade_date"]): int(row["row_count"])
+        for row in connection.execute(
+            """
+            SELECT trade_date, COUNT(*) AS row_count
+            FROM daily_universe
+            WHERE trade_date BETWEEN ? AND ?
+            GROUP BY trade_date
+            ORDER BY trade_date
+            """,
+            (start_date, end_date),
         )
-    return {session: membership[session] for session in sessions}, sessions
+    }
+    if set(counts) != set(sessions) or any(counts[session] <= 0 for session in sessions):
+        raise AuditedPITDevelopmentReplayError(
+            "exact membership rows are incomplete for an open session"
+        )
+    return sessions
+
+
+def _load_exact_membership_bars(
+    connection: Any,
+    *,
+    start_date: str,
+    end_date: str,
+) -> Any:
+    import pandas as pd
+
+    frame = pd.read_sql_query(
+        """
+        SELECT daily.trade_date AS date, daily.ts_code, daily.open, daily.high,
+               daily.low, daily.close, daily.pre_close, daily.amount,
+               adjustment.adj_factor, membership.name AS membership_name,
+               EXISTS(
+                   SELECT 1
+                   FROM market_session_generation_rows_suspend_d AS suspension
+                   WHERE suspension.generation_id = daily.generation_id
+                     AND suspension.ts_code = daily.ts_code
+                     AND suspension.trade_date = daily.trade_date
+                     AND suspension.suspend_type = 'S'
+               ) AS suspended
+        FROM market_session_generation_rows_daily AS daily
+        JOIN market_session_generation_head AS head
+          ON head.trade_date = daily.trade_date
+         AND head.generation_id = daily.generation_id
+        JOIN market_session_generation_rows_adj_factor AS adjustment
+          ON adjustment.generation_id = daily.generation_id
+         AND adjustment.trade_date = daily.trade_date
+         AND adjustment.ts_code = daily.ts_code
+        JOIN daily_universe AS membership
+          ON membership.trade_date = daily.trade_date
+         AND membership.ts_code = daily.ts_code
+        WHERE daily.trade_date BETWEEN ? AND ?
+        ORDER BY daily.ts_code, daily.trade_date
+        """,
+        connection,
+        params=(start_date, end_date),
+    )
+    if frame.empty:
+        raise AuditedPITDevelopmentReplayError(
+            "audited PIT artifact has no exact-membership market bars"
+        )
+    frame = frame[
+        frame["ts_code"].map(is_mainboard_chinext_symbol)
+        & ~frame["membership_name"].map(lambda value: _is_excluded_name(str(value or "")))
+    ].copy()
+    numeric = ["open", "high", "low", "close", "pre_close", "amount", "adj_factor"]
+    for column in numeric:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(
+        subset=["open", "high", "low", "close", "adj_factor", "membership_name"]
+    )
+    frame = frame[
+        (frame["open"] > 0)
+        & (frame["high"] > 0)
+        & (frame["low"] > 0)
+        & (frame["close"] > 0)
+        & (frame["adj_factor"] > 0)
+    ]
+    if frame.empty:
+        raise AuditedPITDevelopmentReplayError(
+            "audited PIT artifact has no eligible exact-membership bars"
+        )
+    return frame
 
 
 def run_audited_pit_development_replay(
@@ -142,22 +204,21 @@ def run_audited_pit_development_replay(
             raise AuditedPITDevelopmentReplayError(
                 "audited PIT artifact range differs from frozen development range"
             )
-        membership_by_date, sessions = _exact_membership_by_date(
+        sessions = _exact_membership_sessions(
             universe,
             start_date=start_date,
             end_date=end_date,
         )
-        symbols = {
-            symbol
-            for members in membership_by_date.values()
-            for symbol in members
-        }
-        bars = _load_bars(universe._require_open(), symbols, start_date, end_date)
+        bars = _load_exact_membership_bars(
+            universe._require_open(),
+            start_date=start_date,
+            end_date=end_date,
+        )
         trades = _candidate_trades_from_bars(
             bars,
             {},
             settings,
-            membership_by_date=membership_by_date,
+            membership_name_column="membership_name",
             current_universe_bias=False,
         )
         source = {

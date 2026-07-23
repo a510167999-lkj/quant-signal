@@ -83,7 +83,11 @@ def test_audited_replay_end_to_end_binds_exact_membership(monkeypatch, tmp_path)
         "from_file",
         open_universe,
     )
-    monkeypatch.setattr(replay, "_load_bars", lambda *_args, **_kwargs: _bars())
+    monkeypatch.setattr(
+        replay,
+        "_load_exact_membership_bars",
+        lambda *_args, **_kwargs: _bars().assign(membership_name="历史测试股"),
+    )
     monkeypatch.setattr(
         replay,
         "sweep_qualified_trades",
@@ -130,3 +134,52 @@ def test_audited_replay_end_to_end_binds_exact_membership(monkeypatch, tmp_path)
     assert result["source"]["exact_membership_session_count"] == 1
     assert result["source"]["producer_code"]["root_sha256"]
     assert result["sweep"]["settings"]["fixed_spec"] is True
+
+
+def test_exact_membership_bar_query_filters_scope_and_historical_name():
+    connection = sqlite3.connect(":memory:")
+    connection.executescript(
+        """
+        CREATE TABLE market_session_generation_head (
+            trade_date TEXT, generation_id TEXT
+        );
+        CREATE TABLE market_session_generation_rows_daily (
+            generation_id TEXT, trade_date TEXT, ts_code TEXT,
+            open REAL, high REAL, low REAL, close REAL, pre_close REAL,
+            amount REAL
+        );
+        CREATE TABLE market_session_generation_rows_adj_factor (
+            generation_id TEXT, trade_date TEXT, ts_code TEXT, adj_factor REAL
+        );
+        CREATE TABLE market_session_generation_rows_suspend_d (
+            generation_id TEXT, trade_date TEXT, ts_code TEXT,
+            suspend_type TEXT
+        );
+        CREATE TABLE daily_universe (
+            trade_date TEXT, ts_code TEXT, name TEXT
+        );
+        INSERT INTO market_session_generation_head VALUES ('2025-01-02', 'g1');
+        INSERT INTO market_session_generation_rows_daily VALUES
+            ('g1', '2025-01-02', '000001.SZ', 10, 11, 9, 10.5, 10, 100),
+            ('g1', '2025-01-02', '000002.SZ', 10, 11, 9, 10.5, 10, 100),
+            ('g1', '2025-01-02', '688001.SH', 10, 11, 9, 10.5, 10, 100);
+        INSERT INTO market_session_generation_rows_adj_factor VALUES
+            ('g1', '2025-01-02', '000001.SZ', 1),
+            ('g1', '2025-01-02', '000002.SZ', 1),
+            ('g1', '2025-01-02', '688001.SH', 1);
+        INSERT INTO daily_universe VALUES
+            ('2025-01-02', '000001.SZ', '历史正常股'),
+            ('2025-01-02', '000002.SZ', '*ST历史股'),
+            ('2025-01-02', '688001.SH', '科创样本');
+        """
+    )
+
+    bars = replay._load_exact_membership_bars(
+        connection,
+        start_date="2025-01-02",
+        end_date="2025-01-02",
+    )
+
+    assert bars[["ts_code", "membership_name"]].to_dict("records") == [
+        {"ts_code": "000001.SZ", "membership_name": "历史正常股"}
+    ]

@@ -5,7 +5,7 @@ import pytest
 
 from app.audited_pit_development_replay import (
     AuditedPITDevelopmentReplayError,
-    _exact_membership_by_date,
+    _exact_membership_sessions,
     _producer_code_binding,
 )
 from app.config import Settings
@@ -121,7 +121,7 @@ def test_exact_membership_rejects_derived_session():
         AuditedPITDevelopmentReplayError,
         match="derived or quarantined",
     ):
-        _exact_membership_by_date(
+        _exact_membership_sessions(
             _MembershipUniverse(connection),
             start_date="2025-01-02",
             end_date="2025-01-02",
