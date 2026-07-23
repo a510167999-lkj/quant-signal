@@ -32,7 +32,7 @@ class CurrentPoolDevelopmentReplayError(ValueError):
 
 
 SIMPLE_BREAKOUT_SPEC = {
-    "schema_version": "current-pool-development-simple-breakout/v1",
+    "schema_version": "development-simple-breakout/v2",
     "signal_tag": "breakout_20d",
     "lookback_sessions": 20,
     "hold_days": 5,
@@ -44,6 +44,13 @@ SIMPLE_BREAKOUT_SPEC = {
     "roundtrip_cost_bps": 25.0,
     "slippage_bps": 10.0,
     "annual_financing_rate_pct": 8.0,
+    "entry_execution": {
+        "decision_cutoff": "next_open",
+        "max_gap_up_pct": 6.0,
+        "max_gap_down_pct": 7.0,
+        "locked_limit_gap_pct": 9.3,
+        "max_intraday_range_pct": 8.0,
+    },
     "forbidden_overlays": [
         "correlation_budget",
         "proxy_filter",
@@ -215,6 +222,9 @@ def _candidate_trades_from_bars(
     bars: pd.DataFrame,
     names_by_symbol: Mapping[str, str],
     settings: Settings,
+    *,
+    membership_by_date: Mapping[str, Mapping[str, str]] | None = None,
+    current_universe_bias: bool = True,
 ) -> list[dict[str, Any]]:
     """Build the one frozen simple-rule candidate set from verified raw bars."""
 
@@ -227,18 +237,27 @@ def _candidate_trades_from_bars(
             SIMPLE_BREAKOUT_SPEC["lookback_sessions"], min_periods=SIMPLE_BREAKOUT_SPEC["lookback_sessions"]
         ).max()
         for index in breakout[breakout].index:
+            signal_date = str(frame.at[index, "date"])
+            symbol = str(ts_code)[:6]
+            if membership_by_date is None:
+                name = names_by_symbol.get(symbol, "")
+            else:
+                name = membership_by_date.get(signal_date, {}).get(symbol)
+                if name is None:
+                    continue
             entry_index = index + 1
             exit_index = entry_index + SIMPLE_BREAKOUT_SPEC["hold_days"]
             if exit_index >= len(frame) or bool(frame.at[entry_index, "suspended"]):
                 continue
+            execution = SIMPLE_BREAKOUT_SPEC["entry_execution"]
             executable = assess_entry_executability(
                 frame.iloc[index].to_dict(),
                 frame.iloc[entry_index].to_dict(),
-                max_gap_up_pct=settings.max_entry_gap_up_pct,
-                max_gap_down_pct=settings.max_entry_gap_down_pct,
-                locked_limit_gap_pct=settings.locked_limit_gap_pct,
-                max_intraday_range_pct=settings.max_entry_intraday_range_pct,
-                decision_cutoff="next_open",
+                max_gap_up_pct=execution["max_gap_up_pct"],
+                max_gap_down_pct=execution["max_gap_down_pct"],
+                locked_limit_gap_pct=execution["locked_limit_gap_pct"],
+                max_intraday_range_pct=execution["max_intraday_range_pct"],
+                decision_cutoff=execution["decision_cutoff"],
             )
             if not executable["executable"]:
                 continue
@@ -248,21 +267,24 @@ def _candidate_trades_from_bars(
                 exit_index,
                 stop_loss_pct=SIMPLE_BREAKOUT_SPEC["stop_loss_pct"],
             )
-            symbol = str(ts_code)[:6]
             trades.append(
                 {
                     **realized,
-                    "signal_date": str(frame.at[index, "date"]),
+                    "signal_date": signal_date,
                     "symbol": symbol,
-                    "name": names_by_symbol.get(symbol, ""),
+                    "name": name,
                     "action": "BUY",
                     "score": 1.0,
                     "rank_score": float(frame.at[index, "amount"] or 0.0),
                     "candidate_amount": float(frame.at[index, "amount"] or 0.0),
-                    "market_level": "current_pool_development_only",
+                    "market_level": (
+                        "current_pool_development_only"
+                        if current_universe_bias
+                        else "audited_pit_development"
+                    ),
                     "signal_tags": ["breakout_20d"],
                     "entry_executability": executable,
-                    "current_universe_bias": True,
+                    "current_universe_bias": current_universe_bias,
                 }
             )
     return sorted(trades, key=lambda item: (item["signal_date"], item["symbol"]))
