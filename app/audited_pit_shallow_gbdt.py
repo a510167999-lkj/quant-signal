@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import date
 import hashlib
 import json
@@ -12,7 +13,13 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from app.audited_pit_continuous_ridge_oof import FEATURE_NAMES
+from app.audited_pit_continuous_ridge_oof import (
+    FEATURE_NAMES,
+    ROLLING_CONTINUOUS_RIDGE_OOF_SPEC,
+)
+from app.audited_pit_score_contract import (
+    SHALLOW_GBDT_SCORE_CONTRACT,
+)
 
 
 NUM_BOOST_ROUND = 200
@@ -43,6 +50,73 @@ FROZEN_XGBOOST_PARAMS: Mapping[str, Any] = MappingProxyType(
 _XGBOOST_VERSION = "3.2.0"
 _FRICTION_PERCENTAGE_POINTS = 0.45
 _PROBABILITY_COLUMN = "predicted_positive_utility_probability"
+
+
+SHALLOW_GBDT_OOF_SPEC = deepcopy(ROLLING_CONTINUOUS_RIDGE_OOF_SPEC)
+SHALLOW_GBDT_OOF_SPEC.update(
+    {
+        "schema_version": (
+            "development-pit-cross-sectional-shallow-gbdt-"
+            "utility-logit-rolling-126-oof/v1"
+        ),
+        "signal_tag": (
+            "cross_sectional_shallow_gbdt_utility_logit_"
+            "rolling_126_oof"
+        ),
+        "label": {
+            "target": (
+                "gross_return_pct_minus_0.45_then_fold_p99_"
+                "symmetric_clip"
+            ),
+            "friction_percentage_points": 0.45,
+            "clipping": {
+                "method": (
+                    "absolute_p99_zero_based_nearest_rank_symmetric"
+                ),
+                "cutoff_index": "ceil(0.99*N)-1",
+                "scope": "mature_complete_training_rows_per_fold",
+            },
+            "class_label": "positive_clipped_net_return",
+            "sample_weight": (
+                "abs_clipped_return_over_same_signal_date_abs_sum"
+            ),
+            "utility": (
+                "clipped_net_return_over_same_signal_date_abs_sum"
+            ),
+            "zero_return_policy": "retain_row_with_zero_weight",
+        },
+        "model": {
+            "type": "weighted_binary_logistic_shallow_gbdt",
+            "parameters": dict(FROZEN_XGBOOST_PARAMS),
+            "num_boost_round": NUM_BOOST_ROUND,
+            "xgboost_version": _XGBOOST_VERSION,
+            "feature_input_dtype": "float64",
+            "feature_input_layout": "C_contiguous",
+            "feature_types": ["float"] * len(FEATURE_NAMES),
+            "hyperparameter_search": False,
+            "early_stopping": False,
+            "validation_metric_model_selection": False,
+            "feature_standardization": False,
+            "interactions": "tree_internal_only",
+        },
+        "selection": {
+            "score_contract": dict(SHALLOW_GBDT_SCORE_CONTRACT),
+            "comparison": "strictly_greater_unrounded_float64",
+            "top_n": 3,
+            "max_active_positions": 3,
+            "max_active_positions_per_industry": 1,
+            "main_rank": [
+                "predicted_positive_utility_probability_desc",
+                "signal_date_amount_desc",
+                "security_id_asc",
+            ],
+            "amount_baseline_rank": [
+                "signal_date_amount_desc",
+                "security_id_asc",
+            ],
+        },
+    }
+)
 
 
 def _float64_vector(

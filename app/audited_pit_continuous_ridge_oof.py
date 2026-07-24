@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import date
 import hashlib
 from importlib.metadata import version as package_version
@@ -226,6 +227,47 @@ ROLLING_CONTINUOUS_RIDGE_OOF_SPEC.update(
 _ROLLING_CONTINUOUS_RIDGE_OOF_SPEC_SHA256 = (
     "c5730311c3660cf4afa8fae5c442b80622c16cb4633bd26c5d5a889525fb3be4"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ModelOOFAdapter:
+    model_id: str
+    score_contract: Mapping[str, Any]
+    score_field: str
+    build_scores: Any
+    verify_receipt: Any
+
+
+def resolve_model_oof_adapter(
+    strategy_spec: Mapping[str, Any],
+) -> ModelOOFAdapter:
+    if (
+        dict(strategy_spec) == ROLLING_CONTINUOUS_RIDGE_OOF_SPEC
+        and _sha256(strategy_spec)
+        == _ROLLING_CONTINUOUS_RIDGE_OOF_SPEC_SHA256
+    ):
+        return ModelOOFAdapter(
+            model_id="continuous_ridge",
+            score_contract=RIDGE_SCORE_CONTRACT,
+            score_field="predicted_net_return_pct",
+            build_scores=_build_purged_oof_scores,
+            verify_receipt=verify_rolling_oof_receipt,
+        )
+    from app import audited_pit_shallow_gbdt as shallow_gbdt
+
+    if dict(strategy_spec) == shallow_gbdt.SHALLOW_GBDT_OOF_SPEC:
+        return ModelOOFAdapter(
+            model_id="shallow_gbdt_utility_logit",
+            score_contract=SHALLOW_GBDT_SCORE_CONTRACT,
+            score_field="predicted_positive_utility_probability",
+            build_scores=(
+                shallow_gbdt.build_shallow_gbdt_rolling_oof_scores
+            ),
+            verify_receipt=(
+                shallow_gbdt.verify_shallow_gbdt_rolling_oof_receipt
+            ),
+        )
+    raise ValueError("ranked-liquidity model OOF strategy is not frozen")
 
 
 _BAR_COLUMNS = (
