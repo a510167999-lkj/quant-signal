@@ -380,6 +380,11 @@ def _rolling_oof_inputs(
     ):
         raise ValueError("shallow GBDT rolling OOF features are incomplete")
     rows = features.copy(deep=True)
+    if (
+        rows["candidate_key"].isna().any()
+        or rows["signal_date"].isna().any()
+    ):
+        raise ValueError("shallow GBDT rolling OOF feature keys are invalid")
     rows["candidate_key"] = rows["candidate_key"].astype(str)
     rows["signal_date"] = rows["signal_date"].astype(str)
     if (
@@ -405,6 +410,10 @@ def _rolling_oof_inputs(
         ):
             raise ValueError(
                 "shallow GBDT rolling OOF outcomes have invalid keys"
+            )
+        if type(outcome.get("right_censored")) is not bool:
+            raise ValueError(
+                "shallow GBDT rolling OOF right_censored must be boolean"
             )
         if outcome.get("right_censored") is not True:
             exit_date = str(outcome.get("exit_date") or "")
@@ -439,6 +448,7 @@ def _rolling_fold_members(
     window_keys: list[str] = []
     right_censored_keys: list[str] = []
     incomplete_keys: list[str] = []
+    eligible_complete_keys: list[str] = []
     immature_keys: list[str] = []
     for row in rows.itertuples(index=False):
         signal_date = str(row.signal_date)
@@ -453,6 +463,7 @@ def _rolling_fold_members(
         if outcome.get("right_censored") is True:
             right_censored_keys.append(key)
             continue
+        eligible_complete_keys.append(key)
         exit_date = str(outcome["exit_date"])
         if exit_date >= validation_start:
             immature_keys.append(key)
@@ -478,6 +489,7 @@ def _rolling_fold_members(
         window_keys,
         right_censored_keys,
         incomplete_keys,
+        eligible_complete_keys,
         immature_keys,
     ):
         keys.sort()
@@ -490,6 +502,7 @@ def _rolling_fold_members(
         "window_keys": window_keys,
         "right_censored_keys": right_censored_keys,
         "incomplete_keys": incomplete_keys,
+        "eligible_complete_keys": eligible_complete_keys,
         "immature_keys": immature_keys,
     }
 
@@ -541,6 +554,12 @@ def _fold_receipt(
         "incomplete_window_candidate_keys_sha256": _canonical_sha256(
             members["incomplete_keys"]
         ),
+        "eligible_complete_window_candidate_count": len(
+            members["eligible_complete_keys"]
+        ),
+        "eligible_complete_window_candidate_keys_sha256": (
+            _canonical_sha256(members["eligible_complete_keys"])
+        ),
         "purged_immature_candidate_count": len(members["immature_keys"]),
         "purged_immature_candidate_keys_sha256": _canonical_sha256(
             members["immature_keys"]
@@ -582,11 +601,33 @@ def _fold_receipt(
         "validation_signal_date_count": int(
             validation["signal_date"].nunique()
         ),
+        "validation_signal_sessions": sorted(
+            validation["signal_date"].astype(str).unique().tolist()
+        ),
+        "validation_signal_sessions_sha256": _canonical_sha256(
+            sorted(validation["signal_date"].astype(str).unique().tolist())
+        ),
         "validation_candidate_keys_sha256": _canonical_sha256(
             validation_keys
         ),
         "score_rows_sha256": _canonical_sha256(list(score_rows)),
     }
+    positive_rows = [
+        dict(row)
+        for row in score_rows
+        if float(row[_PROBABILITY_COLUMN]) > 0.5
+    ]
+    receipt.update(
+        {
+            "positive_utility_candidate_count": len(positive_rows),
+            "positive_utility_candidate_keys_sha256": _canonical_sha256(
+                [row["candidate_key"] for row in positive_rows]
+            ),
+            "positive_utility_rows_sha256": _canonical_sha256(
+                positive_rows
+            ),
+        }
+    )
     receipt["receipt_sha256"] = _canonical_sha256(receipt)
     return receipt
 
@@ -733,6 +774,11 @@ def _compute_shallow_gbdt_rolling_oof(
         }
         for row in scored_oof.itertuples(index=False)
     ]
+    positive_payload = [
+        row
+        for row in score_payload
+        if float(row[_PROBABILITY_COLUMN]) > 0.5
+    ]
     receipt = {
         "schema_version": (
             "audited-pit-shallow-gbdt-rolling-oof-receipt/v1"
@@ -752,6 +798,13 @@ def _compute_shallow_gbdt_rolling_oof(
             scored_oof["candidate_key"].astype(str).tolist()
         ),
         "oof_scores_sha256": _canonical_sha256(score_payload),
+        "positive_utility_candidate_count": len(positive_payload),
+        "positive_utility_candidate_keys_sha256": _canonical_sha256(
+            [row["candidate_key"] for row in positive_payload]
+        ),
+        "positive_utility_rows_sha256": _canonical_sha256(
+            positive_payload
+        ),
         "frozen_signal_sessions": session_dates,
         "frozen_signal_sessions_sha256": _canonical_sha256(
             session_dates
@@ -780,6 +833,393 @@ def build_shallow_gbdt_rolling_oof_scores(
     )
 
 
+def _independent_shallow_gbdt_rolling_oof_replay(
+    features: pd.DataFrame,
+    outcomes: Sequence[Mapping[str, Any]],
+    sessions: Sequence[str],
+    *,
+    minimum_training_sessions: int,
+    training_window_sessions: int,
+    validation_sessions: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    session_dates = _ordered_signal_sessions(sessions)
+    if (
+        minimum_training_sessions <= 0
+        or training_window_sessions <= 0
+        or training_window_sessions > minimum_training_sessions
+        or validation_sessions <= 0
+        or len(session_dates) <= minimum_training_sessions
+    ):
+        raise ValueError
+    required = {"candidate_key", "signal_date", *FEATURE_NAMES}
+    if not isinstance(features, pd.DataFrame) or not required.issubset(
+        features.columns
+    ):
+        raise ValueError
+    if (
+        features["candidate_key"].isna().any()
+        or features["signal_date"].isna().any()
+    ):
+        raise ValueError
+    rows = features.copy(deep=True)
+    rows["candidate_key"] = rows["candidate_key"].astype(str)
+    rows["signal_date"] = rows["signal_date"].astype(str)
+    if (
+        rows.empty
+        or rows["candidate_key"].eq("").any()
+        or rows["candidate_key"].duplicated().any()
+        or not rows["signal_date"].isin(session_dates).all()
+    ):
+        raise ValueError
+    feature_matrix = np.ascontiguousarray(
+        rows.loc[:, list(FEATURE_NAMES)].to_numpy(dtype=np.float64)
+    )
+    if (
+        feature_matrix.shape != (len(rows), len(FEATURE_NAMES))
+        or not np.isfinite(feature_matrix).all()
+    ):
+        raise ValueError
+    feature_dates = dict(zip(rows["candidate_key"], rows["signal_date"]))
+    session_set = set(session_dates)
+    outcome_lookup: dict[str, dict[str, Any]] = {}
+    for raw_outcome in outcomes:
+        outcome = dict(raw_outcome)
+        key = str(outcome.get("candidate_key") or "")
+        if (
+            not key
+            or key in outcome_lookup
+            or key not in feature_dates
+            or type(outcome.get("right_censored")) is not bool
+        ):
+            raise ValueError
+        if outcome["right_censored"] is False:
+            exit_date = str(outcome.get("exit_date") or "")
+            gross_return = float(outcome.get("return_pct"))
+            if (
+                exit_date not in session_set
+                or exit_date <= feature_dates[key]
+                or not np.isfinite(gross_return)
+            ):
+                raise ValueError
+            outcome["exit_date"] = exit_date
+            outcome["return_pct"] = gross_return
+        outcome_lookup[key] = outcome
+
+    fold_receipts: list[dict[str, Any]] = []
+    score_payload: list[dict[str, Any]] = []
+    for fold_index, start_position in enumerate(
+        range(
+            minimum_training_sessions,
+            len(session_dates),
+            validation_sessions,
+        ),
+        start=1,
+    ):
+        validation_start = session_dates[start_position]
+        validation_end = session_dates[
+            min(
+                start_position + validation_sessions - 1,
+                len(session_dates) - 1,
+            )
+        ]
+        validation = rows[
+            rows["signal_date"].between(
+                validation_start,
+                validation_end,
+                inclusive="both",
+            )
+        ].sort_values(["signal_date", "candidate_key"], kind="mergesort")
+        if validation.empty:
+            raise ValueError
+        training_window = session_dates[
+            start_position - training_window_sessions : start_position
+        ]
+        if len(training_window) != training_window_sessions:
+            raise ValueError
+        training_window_set = set(training_window)
+        window_keys: list[str] = []
+        right_censored_keys: list[str] = []
+        incomplete_keys: list[str] = []
+        eligible_complete_keys: list[str] = []
+        immature_keys: list[str] = []
+        training_records: list[dict[str, Any]] = []
+        for row in rows.itertuples(index=False):
+            signal_date = str(row.signal_date)
+            if signal_date not in training_window_set:
+                continue
+            key = str(row.candidate_key)
+            window_keys.append(key)
+            outcome = outcome_lookup.get(key)
+            if outcome is None:
+                incomplete_keys.append(key)
+                continue
+            if outcome["right_censored"] is True:
+                right_censored_keys.append(key)
+                continue
+            eligible_complete_keys.append(key)
+            exit_date = str(outcome["exit_date"])
+            if exit_date >= validation_start:
+                immature_keys.append(key)
+                continue
+            training_records.append(
+                {
+                    "candidate_key": key,
+                    "signal_date": signal_date,
+                    "exit_date": exit_date,
+                    "net_return": (
+                        float(outcome["return_pct"])
+                        - _FRICTION_PERCENTAGE_POINTS
+                    ),
+                    "features": [
+                        float(getattr(row, name))
+                        for name in FEATURE_NAMES
+                    ],
+                }
+            )
+        training_records.sort(
+            key=lambda item: (
+                item["signal_date"],
+                item["candidate_key"],
+            )
+        )
+        for keys in (
+            window_keys,
+            right_censored_keys,
+            incomplete_keys,
+            eligible_complete_keys,
+            immature_keys,
+        ):
+            keys.sort()
+        if not training_records:
+            raise ValueError
+
+        x_train = np.ascontiguousarray(
+            [item["features"] for item in training_records],
+            dtype=np.float64,
+        )
+        raw_returns = np.ascontiguousarray(
+            [item["net_return"] for item in training_records],
+            dtype=np.float64,
+        )
+        cutoff_index = ceil(0.99 * len(raw_returns)) - 1
+        cutoff = float(np.sort(np.abs(raw_returns))[cutoff_index])
+        clipped = np.ascontiguousarray(
+            np.clip(raw_returns, -cutoff, cutoff)
+        )
+        training_dates = [
+            item["signal_date"] for item in training_records
+        ]
+        daily_sums_lookup: dict[str, float] = {}
+        for signal_date, absolute_return in zip(
+            training_dates,
+            np.abs(clipped),
+            strict=True,
+        ):
+            daily_sums_lookup[signal_date] = (
+                daily_sums_lookup.get(signal_date, 0.0)
+                + float(absolute_return)
+            )
+        if any(
+            not np.isfinite(value) or value <= 0.0
+            for value in daily_sums_lookup.values()
+        ):
+            raise ValueError
+        daily_abs_sums = np.ascontiguousarray(
+            [daily_sums_lookup[value] for value in training_dates],
+            dtype=np.float64,
+        )
+        labels = np.ascontiguousarray(
+            (clipped > 0.0).astype(np.float64)
+        )
+        weights = np.ascontiguousarray(
+            np.abs(clipped) / daily_abs_sums
+        )
+        booster, fit_receipt = fit_shallow_gbdt_fold(
+            x_train,
+            labels,
+            weights,
+        )
+        validation_matrix = np.ascontiguousarray(
+            validation.loc[:, list(FEATURE_NAMES)].to_numpy(
+                dtype=np.float64
+            )
+        )
+        probabilities, predict_receipt = predict_shallow_gbdt_fold(
+            booster,
+            validation_matrix,
+        )
+        fold_score_rows = [
+            {
+                "candidate_key": str(row.candidate_key),
+                "signal_date": str(row.signal_date),
+                _PROBABILITY_COLUMN: float(probability),
+            }
+            for row, probability in zip(
+                validation.itertuples(index=False),
+                probabilities,
+                strict=True,
+            )
+        ]
+        score_payload.extend(fold_score_rows)
+        validation_keys = validation["candidate_key"].astype(str).tolist()
+        validation_signal_sessions = sorted(
+            validation["signal_date"].astype(str).unique().tolist()
+        )
+        positive_rows = [
+            row
+            for row in fold_score_rows
+            if float(row[_PROBABILITY_COLUMN]) > 0.5
+        ]
+        fold_receipt = {
+            "fold": fold_index,
+            "validation_start": validation_start,
+            "validation_end": validation_end,
+            "training_window_type": (
+                "trailing_frozen_signal_sessions"
+            ),
+            "training_window_session_count": len(training_window),
+            "training_window_start": training_window[0],
+            "training_window_end": training_window[-1],
+            "training_window_sessions_sha256": _canonical_sha256(
+                training_window
+            ),
+            "window_candidate_count": len(window_keys),
+            "window_candidate_keys_sha256": _canonical_sha256(
+                window_keys
+            ),
+            "right_censored_window_candidate_count": len(
+                right_censored_keys
+            ),
+            "right_censored_window_candidate_keys_sha256": (
+                _canonical_sha256(right_censored_keys)
+            ),
+            "incomplete_window_candidate_count": len(incomplete_keys),
+            "incomplete_window_candidate_keys_sha256": (
+                _canonical_sha256(incomplete_keys)
+            ),
+            "eligible_complete_window_candidate_count": len(
+                eligible_complete_keys
+            ),
+            "eligible_complete_window_candidate_keys_sha256": (
+                _canonical_sha256(eligible_complete_keys)
+            ),
+            "purged_immature_candidate_count": len(immature_keys),
+            "purged_immature_candidate_keys_sha256": _canonical_sha256(
+                immature_keys
+            ),
+            "training_candidate_count": len(training_records),
+            "training_signal_date_count": len(set(training_dates)),
+            "training_last_exit_date": max(
+                item["exit_date"] for item in training_records
+            ),
+            "training_candidate_keys_sha256": _canonical_sha256(
+                [
+                    item["candidate_key"]
+                    for item in training_records
+                ]
+            ),
+            "training_rows_sha256": _canonical_sha256(
+                training_records
+            ),
+            "training_label": (
+                "gross_return_pct_minus_0.45_then_fold_p99_"
+                "symmetric_clip"
+            ),
+            "clip": {
+                "method": (
+                    "absolute_p99_zero_based_nearest_rank_symmetric"
+                ),
+                "cutoff": cutoff,
+                "cutoff_index": cutoff_index,
+                "clipped_net_returns_sha256": _array_sha256(clipped),
+            },
+            "targets": {
+                "label": "positive_clipped_net_return",
+                "weight": (
+                    "abs_clipped_return_over_same_signal_date_abs_sum"
+                ),
+                "labels_sha256": _array_sha256(labels),
+                "weights_sha256": _array_sha256(weights),
+                "daily_abs_sums_sha256": _array_sha256(
+                    daily_abs_sums
+                ),
+            },
+            "fit_receipt": dict(fit_receipt),
+            "predict_receipt": dict(predict_receipt),
+            "validation_candidate_count": len(validation),
+            "validation_signal_date_count": int(
+                validation["signal_date"].nunique()
+            ),
+            "validation_signal_sessions": validation_signal_sessions,
+            "validation_signal_sessions_sha256": _canonical_sha256(
+                validation_signal_sessions
+            ),
+            "validation_candidate_keys_sha256": _canonical_sha256(
+                validation_keys
+            ),
+            "score_rows_sha256": _canonical_sha256(fold_score_rows),
+            "positive_utility_candidate_count": len(positive_rows),
+            "positive_utility_candidate_keys_sha256": (
+                _canonical_sha256(
+                    [row["candidate_key"] for row in positive_rows]
+                )
+            ),
+            "positive_utility_rows_sha256": _canonical_sha256(
+                positive_rows
+            ),
+        }
+        fold_receipt["receipt_sha256"] = _canonical_sha256(
+            fold_receipt
+        )
+        fold_receipts.append(fold_receipt)
+
+    score_payload.sort(
+        key=lambda item: (item["signal_date"], item["candidate_key"])
+    )
+    if len({row["candidate_key"] for row in score_payload}) != len(
+        score_payload
+    ):
+        raise ValueError
+    positive_payload = [
+        row
+        for row in score_payload
+        if float(row[_PROBABILITY_COLUMN]) > 0.5
+    ]
+    receipt = {
+        "schema_version": (
+            "audited-pit-shallow-gbdt-rolling-oof-receipt/v1"
+        ),
+        "minimum_training_sessions": minimum_training_sessions,
+        "training_window_sessions": training_window_sessions,
+        "validation_sessions": validation_sessions,
+        "friction_percentage_points": _FRICTION_PERCENTAGE_POINTS,
+        "purge": "complete_exit_date_strictly_before_validation_start",
+        "probability_column": _PROBABILITY_COLUMN,
+        "probability_gate": "strictly_greater_than_0.5",
+        "fold_count": len(fold_receipts),
+        "folds": fold_receipts,
+        "folds_sha256": _canonical_sha256(fold_receipts),
+        "oof_candidate_count": len(score_payload),
+        "oof_candidate_keys_sha256": _canonical_sha256(
+            [row["candidate_key"] for row in score_payload]
+        ),
+        "oof_scores_sha256": _canonical_sha256(score_payload),
+        "positive_utility_candidate_count": len(positive_payload),
+        "positive_utility_candidate_keys_sha256": _canonical_sha256(
+            [row["candidate_key"] for row in positive_payload]
+        ),
+        "positive_utility_rows_sha256": _canonical_sha256(
+            positive_payload
+        ),
+        "frozen_signal_sessions": session_dates,
+        "frozen_signal_sessions_sha256": _canonical_sha256(
+            session_dates
+        ),
+    }
+    receipt["receipt_sha256"] = _canonical_sha256(receipt)
+    return score_payload, receipt
+
+
 def verify_shallow_gbdt_rolling_oof_receipt(
     features: pd.DataFrame,
     outcomes: Sequence[Mapping[str, Any]],
@@ -792,8 +1232,8 @@ def verify_shallow_gbdt_rolling_oof_receipt(
     validation_sessions: int = 63,
 ) -> dict[str, Any]:
     try:
-        expected_scores, expected_receipt = (
-            _compute_shallow_gbdt_rolling_oof(
+        expected_payload, expected_receipt = (
+            _independent_shallow_gbdt_rolling_oof_replay(
                 features,
                 outcomes,
                 sessions,
@@ -812,7 +1252,7 @@ def verify_shallow_gbdt_rolling_oof_receipt(
         if (
             not isinstance(scored_oof, pd.DataFrame)
             or not required.issubset(scored_oof.columns)
-            or len(scored_oof) != len(expected_scores)
+            or len(scored_oof) != len(expected_payload)
         ):
             raise ValueError
         actual_payload = [
@@ -824,16 +1264,6 @@ def verify_shallow_gbdt_rolling_oof_receipt(
                 ),
             }
             for row in scored_oof.itertuples(index=False)
-        ]
-        expected_payload = [
-            {
-                "candidate_key": str(row.candidate_key),
-                "signal_date": str(row.signal_date),
-                _PROBABILITY_COLUMN: float(
-                    getattr(row, _PROBABILITY_COLUMN)
-                ),
-            }
-            for row in expected_scores.itertuples(index=False)
         ]
         if (
             actual_payload != expected_payload
