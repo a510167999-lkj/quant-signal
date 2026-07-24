@@ -400,6 +400,10 @@ def test_rolling_oof_freezes_purge_utility_targets_and_receipts(
     assert first_fold["validation_signal_sessions_sha256"] == (
         _canonical_sha256(sessions[4:6])
     )
+    assert first_fold["observed_validation_signal_sessions"] == sessions[4:6]
+    assert first_fold[
+        "observed_validation_signal_sessions_sha256"
+    ] == _canonical_sha256(sessions[4:6])
     assert first_fold["validation_candidate_keys_sha256"] == (
         _canonical_sha256(validation_keys)
     )
@@ -503,6 +507,8 @@ def test_independent_verifier_replays_and_rejects_tampering(
         "_fold_receipt",
         "clip_training_net_returns",
         "build_daily_utility_targets",
+        "fit_shallow_gbdt_fold",
+        "predict_shallow_gbdt_fold",
     ):
         monkeypatch.setattr(
             gbdt,
@@ -612,6 +618,44 @@ def test_second_fold_drops_old_sessions_and_validation_outcomes_do_not_leak(
         ].reset_index(drop=True),
     )
     assert receipt["folds"][0] == changed_receipt["folds"][0]
+
+
+def test_validation_session_root_binds_frozen_slice_not_observed_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, features, outcomes = _fixture()
+    _install_fake_fold_model(monkeypatch)
+    missing_session = sessions[5]
+    reduced_features = features[
+        features["signal_date"] != missing_session
+    ].reset_index(drop=True)
+    reduced_keys = set(reduced_features["candidate_key"].astype(str))
+    reduced_outcomes = [
+        outcome
+        for outcome in outcomes
+        if str(outcome["candidate_key"]) in reduced_keys
+    ]
+
+    _, receipt = build_shallow_gbdt_rolling_oof_scores(
+        reduced_features,
+        reduced_outcomes,
+        sessions,
+        minimum_training_sessions=4,
+        training_window_sessions=4,
+        validation_sessions=2,
+    )
+
+    first_fold = receipt["folds"][0]
+    assert first_fold["validation_signal_sessions"] == sessions[4:6]
+    assert first_fold["validation_signal_sessions_sha256"] == (
+        _canonical_sha256(sessions[4:6])
+    )
+    assert first_fold["observed_validation_signal_sessions"] == [
+        sessions[4]
+    ]
+    assert first_fold[
+        "observed_validation_signal_sessions_sha256"
+    ] == _canonical_sha256([sessions[4]])
 
 
 def test_rolling_oof_rejects_nan_keys_and_non_boolean_censor_flag(
