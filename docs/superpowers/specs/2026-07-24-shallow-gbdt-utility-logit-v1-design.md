@@ -181,6 +181,8 @@ p_{it}=\sigma(F_f(x_{it})).
 
 成交额基线只在完全相同的 `p > 0.5` 候选池内按成交额排序；其绩效不是晋级门，evidence 完整性是晋级门。
 
+共享 producer 的实现必须使用显式 score contract：真实字段固定为 `predicted_positive_utility_probability`，单位为 probability，定义域为 `[0, 1]`，门槛为精确 `strict_gt 0.5`，主排序模式为 probability descending。通用组合状态机中的 `score` 与 `rank_score` 可以等值保存 `p`，但 GBDT artifact、sidecar、candidate table、selected evidence 和 verifier 中不得出现 `predicted_net_return_pct`，也不得以 `p - 0.5` 冒充收益百分点。既有 Ridge v2/v3 继续使用原 legacy score contract，历史 schema 与 receipt 内容不得漂移。
+
 ## 7. 审计证据与 verifier
 
 每折至少落盘并内容寻址：
