@@ -29,6 +29,13 @@ from app.audited_pit_industry_residual_reversal import (
     _frames_by_symbol as _residual_frames_by_symbol,
     _preflight_strict_entries as _residual_preflight_strict_entries,
 )
+from app.audited_pit_score_contract import (
+    RIDGE_SCORE_CONTRACT,
+    SHALLOW_GBDT_SCORE_CONTRACT,
+    candidate_passes_gate,
+    candidate_score,
+    selection_rank_key as _contract_selection_rank_key,
+)
 from app.audited_pit_trend_pullback import (
     TREND_PULLBACK_SPEC,
     _load_suspension_evidence,
@@ -2306,12 +2313,50 @@ SCORED_EXECUTION_EVIDENCE_COLUMNS = (
 )
 
 
+def _score_contract_metadata(
+    score_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload = dict(score_contract)
+    if payload == dict(RIDGE_SCORE_CONTRACT):
+        return {
+            "field": "predicted_net_return_pct",
+            "evidence_schema": "ranked-liquidity-score-evidence/v3",
+            "pool_schema": "continuous-ridge-positive-score-pool/v1",
+            "comparison": (
+                "predicted_net_return_pct_strictly_greater_than_zero"
+            ),
+            "selection_schema": (
+                "continuous-ridge-industry-selection-receipt/v1"
+            ),
+        }
+    if payload == dict(SHALLOW_GBDT_SCORE_CONTRACT):
+        return {
+            "field": "predicted_positive_utility_probability",
+            "evidence_schema": (
+                "ranked-liquidity-shallow-gbdt-score-evidence/v1"
+            ),
+            "pool_schema": "shallow-gbdt-positive-utility-pool/v1",
+            "comparison": (
+                "predicted_positive_utility_probability_"
+                "strictly_greater_than_0.5"
+            ),
+            "selection_schema": (
+                "shallow-gbdt-industry-selection-receipt/v1"
+            ),
+        }
+    raise ValueError("score contract must match a frozen contract")
+
+
 def _outcome_payload_from_scored_candidate(
     candidate: Mapping[str, Any],
+    *,
+    score_contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> dict[str, Any]:
+    metadata = _score_contract_metadata(score_contract)
+    candidate_score(candidate, contract=score_contract)
     payload = dict(candidate)
     for field in (
-        "predicted_net_return_pct",
+        metadata["field"],
         "score",
         "rank_score",
     ):
@@ -2412,7 +2457,16 @@ def _compact_outcome_membership_evidence(
 
 def _compact_scored_execution_evidence(
     candidates: Sequence[Mapping[str, Any]],
+    *,
+    score_contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> dict[str, Any]:
+    metadata = _score_contract_metadata(score_contract)
+    score_field = str(metadata["field"])
+    columns = (
+        *SCORED_EXECUTION_EVIDENCE_COLUMNS[:5],
+        score_field,
+        *SCORED_EXECUTION_EVIDENCE_COLUMNS[6:],
+    )
     ordered = sorted(
         (dict(candidate) for candidate in candidates),
         key=lambda item: (
@@ -2432,7 +2486,7 @@ def _compact_scored_execution_evidence(
         trade_key = _selection_trade_key(candidate)
         security_id = str(candidate.get("security_id") or "")
         industry = str(candidate.get("signal_industry") or "").strip()
-        score = float(candidate.get("predicted_net_return_pct"))
+        score = candidate_score(candidate, contract=score_contract)
         amount = float(candidate.get("candidate_amount"))
         if (
             not candidate_key
@@ -2445,12 +2499,15 @@ def _compact_scored_execution_evidence(
             raise ValueError("scored execution evidence row is invalid")
         payload_sha256 = _sha256(candidate)
         outcome_payload_sha256 = _sha256(
-            _outcome_payload_from_scored_candidate(candidate)
+            _outcome_payload_from_scored_candidate(
+                candidate,
+                score_contract=score_contract,
+            )
         )
         candidate_keys.append(candidate_key)
         trade_keys.append(trade_key)
         payload_hashes.append(payload_sha256)
-        if score > 0.0:
+        if candidate_passes_gate(candidate, contract=score_contract):
             positive_payload_hashes.append(payload_sha256)
         rows.append(
             [
@@ -2472,8 +2529,8 @@ def _compact_scored_execution_evidence(
     ):
         raise ValueError("scored execution evidence keys are duplicated")
     evidence = {
-        "schema_version": "ranked-liquidity-score-evidence/v3",
-        "columns": list(SCORED_EXECUTION_EVIDENCE_COLUMNS),
+        "schema_version": metadata["evidence_schema"],
+        "columns": list(columns),
         "row_count": len(rows),
         "rows": rows,
         "rows_sha256": _sha256(rows),
@@ -2488,7 +2545,10 @@ def _compact_scored_execution_evidence(
 
 def _positive_score_pool(
     candidates: Sequence[Mapping[str, Any]],
+    *,
+    score_contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    metadata = _score_contract_metadata(score_contract)
     ordered = sorted(
         (dict(candidate) for candidate in candidates),
         key=lambda item: (
@@ -2504,18 +2564,23 @@ def _positive_score_pool(
         key = str(candidate.get("candidate_key") or "")
         if not key:
             raise ValueError("continuous ridge score candidate key is missing")
-        score = float(candidate.get("predicted_net_return_pct"))
-        if not math.isfinite(score):
-            raise ValueError("continuous ridge prediction is nonfinite")
+        try:
+            candidate_score(candidate, contract=score_contract)
+        except ValueError as exc:
+            if metadata["field"] == "predicted_net_return_pct":
+                raise ValueError(
+                    "continuous ridge prediction is nonfinite"
+                ) from exc
+            raise
         input_keys.append(key)
-        if score > 0.0:
+        if candidate_passes_gate(candidate, contract=score_contract):
             positive.append(candidate)
             positive_keys.append(key)
     if len(input_keys) != len(set(input_keys)):
         raise ValueError("continuous ridge score pool keys are duplicated")
     receipt = {
-        "schema_version": "continuous-ridge-positive-score-pool/v1",
-        "comparison": "predicted_net_return_pct_strictly_greater_than_zero",
+        "schema_version": metadata["pool_schema"],
+        "comparison": metadata["comparison"],
         "input_candidate_count": len(ordered),
         "input_candidate_keys_sha256": _sha256(input_keys),
         "positive_candidate_count": len(positive),
@@ -2527,17 +2592,24 @@ def _positive_score_pool(
 
 def _selection_candidate_table(
     candidates: Sequence[Mapping[str, Any]],
+    *,
+    score_contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> list[dict[str, Any]]:
+    metadata = _score_contract_metadata(score_contract)
+    score_field = str(metadata["field"])
     rows = []
     for candidate in candidates:
         trade = dict(candidate)
-        score = float(trade.get("predicted_net_return_pct"))
+        score = candidate_score(trade, contract=score_contract)
         amount = float(trade.get("candidate_amount"))
         industry = str(trade.get("signal_industry") or "").strip()
         security_id = str(trade.get("security_id") or "")
         if (
             not math.isfinite(score)
-            or score <= 0.0
+            or not candidate_passes_gate(
+                trade,
+                contract=score_contract,
+            )
             or not math.isfinite(amount)
             or not industry
             or not security_id
@@ -2549,7 +2621,7 @@ def _selection_candidate_table(
                 "candidate_key": str(trade.get("candidate_key") or ""),
                 "security_id": security_id,
                 "signal_industry": industry,
-                "predicted_net_return_pct": score,
+                score_field: score,
                 "candidate_amount": amount,
                 "right_censored": trade.get("right_censored") is True,
             }
@@ -2564,19 +2636,14 @@ def _selection_rank_key(
     trade: Mapping[str, Any],
     *,
     rank_mode: str,
+    score_contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> tuple[Any, ...]:
-    security_id = str(trade.get("security_id") or "")
-    amount = float(trade.get("candidate_amount"))
-    if not security_id or not math.isfinite(amount):
-        raise ValueError("continuous ridge selection rank inputs are invalid")
-    if rank_mode == "predicted_net_return":
-        score = float(trade.get("predicted_net_return_pct"))
-        if not math.isfinite(score):
-            raise ValueError("continuous ridge model score is invalid")
-        return (-score, -amount, security_id)
-    if rank_mode == "signal_date_amount":
-        return (-amount, security_id)
-    raise ValueError("continuous ridge selection rank mode is invalid")
+    _score_contract_metadata(score_contract)
+    return _contract_selection_rank_key(
+        trade,
+        rank_mode=rank_mode,
+        contract=score_contract,
+    )
 
 
 def _select_with_industry_cap_receipt(
@@ -2585,10 +2652,15 @@ def _select_with_industry_cap_receipt(
     rank_mode: str,
     top_n: int,
     max_active_positions: int,
+    score_contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    metadata = _score_contract_metadata(score_contract)
     if top_n <= 0 or max_active_positions <= 0:
         raise ValueError("continuous ridge selection capacities are invalid")
-    candidate_table = _selection_candidate_table(candidates)
+    candidate_table = _selection_candidate_table(
+        candidates,
+        score_contract=score_contract,
+    )
     by_signal_date: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for raw_candidate in candidates:
         candidate = dict(raw_candidate)
@@ -2613,6 +2685,7 @@ def _select_with_industry_cap_receipt(
             key=lambda trade: _selection_rank_key(
                 trade,
                 rank_mode=rank_mode,
+                score_contract=score_contract,
             ),
         )
         ordered_keys = [_selection_trade_key(trade) for trade in trades]
@@ -2684,7 +2757,7 @@ def _select_with_industry_cap_receipt(
 
     selected_keys = [_selection_trade_key(trade) for trade in selected]
     receipt = {
-        "schema_version": "continuous-ridge-industry-selection-receipt/v1",
+        "schema_version": metadata["selection_schema"],
         "parameters": {
             "rank_mode": rank_mode,
             "top_n": int(top_n),
