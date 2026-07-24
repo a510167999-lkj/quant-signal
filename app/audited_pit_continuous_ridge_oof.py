@@ -5994,7 +5994,6 @@ def _scored_execution_candidates_from_oof(
         if (
             not candidate_key
             or candidate_key in score_lookup
-            or candidate_key not in outcome_by_key
         ):
             raise AuditedPITDevelopmentReplayError(
                 "ranked-liquidity OOF score keys are invalid"
@@ -6004,8 +6003,10 @@ def _scored_execution_candidates_from_oof(
             signal_date_lookup[candidate_key] = str(row.signal_date)
 
     scored_candidates: list[dict[str, Any]] = []
-    for candidate_key, score in score_lookup.items():
-        candidate = outcome_by_key[candidate_key]
+    for candidate_key, candidate in outcome_by_key.items():
+        if candidate_key not in score_lookup:
+            continue
+        score = score_lookup[candidate_key]
         if (
             candidate_key in signal_date_lookup
             and signal_date_lookup[candidate_key]
