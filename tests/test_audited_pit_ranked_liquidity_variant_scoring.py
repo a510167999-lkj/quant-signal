@@ -193,6 +193,74 @@ def test_variant_scoring_keeps_gbdt_probability_contract_and_double_ranking(
     assert "predicted_net_return_pct" not in json.dumps(result)
 
 
+def test_variant_scoring_ignores_score_only_rows_rejected_before_execution(
+    monkeypatch,
+):
+    sessions = _sessions()
+    features, outcomes = _variant_inputs(sessions=sessions)
+    captured: dict = {}
+    adapter = _fake_adapter(
+        model_id="shallow_gbdt_utility_logit",
+        score_contract=dict(ridge.SHALLOW_GBDT_SCORE_CONTRACT),
+        score_field="predicted_positive_utility_probability",
+        scores=[0.9, 0.8, 0.7],
+        captured=captured,
+    )
+    monkeypatch.setattr(
+        ridge,
+        "resolve_model_oof_adapter",
+        lambda strategy_spec: adapter,
+    )
+    monkeypatch.setattr(ridge, "_trade_metrics", _passing_metrics)
+
+    result = ridge._score_and_evaluate_oof_variant(
+        tail_features=features,
+        outcome_candidates=outcomes[:2],
+        sessions=sessions,
+        strategy_spec=shallow_gbdt.SHALLOW_GBDT_OOF_SPEC,
+    )
+
+    expected_keys = [row["candidate_key"] for row in outcomes[:2]]
+    assert [
+        row["candidate_key"]
+        for row in result["scored_execution_candidates"]
+    ] == expected_keys
+    assert [
+        row["candidate_key"] for row in result["positive_candidates"]
+    ] == expected_keys
+
+
+@pytest.mark.parametrize(
+    "candidate_keys",
+    [
+        ["entity-a|2024-05-07", "entity-a|2024-05-07"],
+        ["entity-a|2024-05-07", ""],
+    ],
+    ids=["duplicate", "empty"],
+)
+def test_scored_execution_candidates_reject_invalid_score_keys(
+    candidate_keys,
+):
+    sessions = _sessions()
+    _, outcomes = _variant_inputs(sessions=sessions)
+    scored_oof = pd.DataFrame(
+        {
+            "candidate_key": candidate_keys,
+            "predicted_positive_utility_probability": [0.9, 0.8],
+        }
+    )
+
+    with pytest.raises(
+        ridge.AuditedPITDevelopmentReplayError,
+        match="OOF score keys are invalid",
+    ):
+        ridge._scored_execution_candidates_from_oof(
+            outcomes,
+            scored_oof,
+            score_contract=shallow_gbdt.SHALLOW_GBDT_SCORE_CONTRACT,
+        )
+
+
 def test_variant_scoring_preserves_ridge_score_field_and_rank_mode(
     monkeypatch,
 ):
