@@ -482,7 +482,6 @@ def test_independent_verifier_replays_and_rejects_tampering(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sessions, features, outcomes = _fixture()
-    _install_fake_fold_model(monkeypatch)
     scored, receipt = build_shallow_gbdt_rolling_oof_scores(
         features,
         outcomes,
