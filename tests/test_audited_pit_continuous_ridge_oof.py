@@ -4,6 +4,7 @@ from copy import deepcopy
 from datetime import date, timedelta
 import json
 import math
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -104,6 +105,66 @@ def test_frozen_spec_is_ranked_liquidity_oof_and_mainboard_chinext_only():
         "science_technology",
         "beijing",
     ]
+
+
+def test_rolling_v3_spec_changes_only_training_memory_and_identity():
+    v2 = deepcopy(ridge.CONTINUOUS_RIDGE_OOF_SPEC)
+    v3 = deepcopy(ridge.ROLLING_CONTINUOUS_RIDGE_OOF_SPEC)
+
+    assert v3["schema_version"] == (
+        "development-pit-cross-sectional-ranked-liquidity-"
+        "ridge-rolling-oof/v3"
+    )
+    assert v3["signal_tag"] == (
+        "cross_sectional_ranked_liquidity_ridge_rolling_126_oof"
+    )
+    assert v3["walk_forward"] == {
+        "minimum_training_sessions": 126,
+        "training_window_type": "trailing_frozen_signal_sessions",
+        "training_window_sessions": 126,
+        "validation_sessions": 63,
+        "purge": "complete_exit_date_strictly_before_validation_start",
+        "folds": "continuous_non_overlapping_validation_windows",
+    }
+    assert ridge._sha256(v3) == (
+        "c5730311c3660cf4afa8fae5c442b80622c16cb4633bd26c5d5a889525fb3be4"
+    )
+
+    for spec in (v2, v3):
+        spec.pop("schema_version")
+        spec.pop("signal_tag")
+        spec.pop("walk_forward")
+    assert v3 == v2
+
+
+def test_rolling_public_runner_rejects_any_strategy_drift(
+    monkeypatch,
+    tmp_path,
+):
+    from app.config import Settings
+
+    monkeypatch.setitem(
+        ridge.ROLLING_CONTINUOUS_RIDGE_OOF_SPEC["selection"],
+        "top_n",
+        4,
+    )
+    with pytest.raises(
+        ridge.AuditedPITDevelopmentReplayError,
+        match="canonical hash",
+    ):
+        ridge.run_audited_pit_ranked_liquidity_ridge_rolling_oof(
+            settings=Settings(),
+            audited_pit_universe_path=tmp_path / "universe.sqlite3",
+            expected_coverage_audit_sha256="a" * 64,
+            expected_artifact_root_sha256="b" * 64,
+            temporal_contract_path=tmp_path / "temporal.json",
+            expected_temporal_contract_sha256="c" * 64,
+            security_code_transition_evidence_root=tmp_path / "transition",
+            expected_security_code_transition_contract_sha256="d" * 64,
+            start_date="2024-07-05",
+            end_date="2026-07-03",
+            output_dir=tmp_path / "output",
+        )
 
 
 def test_exact_features_follow_frozen_math_and_exclude_star_and_beijing():
@@ -545,6 +606,154 @@ def test_purged_oof_uses_only_mature_complete_training_outcomes():
     assert fold["training_last_exit_date"] == sessions[3]
     assert fold["validation_candidate_count"] == 2
     assert fold["training_label"] == "gross_return_pct_minus_0.45"
+
+
+def test_rolling_oof_uses_exact_trailing_sessions_and_purges_immature():
+    sessions = _sessions(10)
+    features = pd.DataFrame(
+        [
+            _feature_row(
+                f"{index:06d}|row",
+                signal_date,
+                float(index),
+            )
+            for index, signal_date in enumerate(sessions)
+        ]
+    )
+    outcomes = [
+        {
+            "candidate_key": f"{index:06d}|row",
+            "exit_date": sessions[index + 1],
+            "return_pct": float(index - 2),
+            "right_censored": False,
+        }
+        for index in range(len(sessions) - 1)
+    ]
+
+    scored, receipt = ridge._build_purged_oof_scores(
+        features,
+        outcomes,
+        sessions,
+        minimum_training_sessions=4,
+        training_window_sessions=4,
+        validation_sessions=2,
+        receipt_schema_version=(
+            "ranked-liquidity-ridge-purged-oof-receipt/v3"
+        ),
+    )
+
+    second_fold = receipt["folds"][1]
+    assert second_fold["validation_start"] == sessions[6]
+    assert second_fold["training_window_type"] == (
+        "trailing_frozen_signal_sessions"
+    )
+    assert second_fold["training_window_session_count"] == 4
+    assert second_fold["training_window_start"] == sessions[2]
+    assert second_fold["training_window_end"] == sessions[5]
+    assert second_fold["training_window_sessions_sha256"] == ridge._sha256(
+        sessions[2:6]
+    )
+    assert second_fold["eligible_window_training_candidate_count"] == 4
+    assert second_fold["purged_immature_candidate_count"] == 1
+    assert second_fold["training_candidate_count"] == 3
+    assert second_fold["training_signal_date_count"] == 3
+
+    outside_mutated = [
+        {
+            **outcome,
+            "return_pct": (
+                float(outcome["return_pct"]) + 10_000.0
+                if outcome["candidate_key"] in {
+                    "000000|row",
+                    "000001|row",
+                }
+                else outcome["return_pct"]
+            ),
+        }
+        for outcome in outcomes
+    ]
+    rescored_outside, _ = ridge._build_purged_oof_scores(
+        features,
+        outside_mutated,
+        sessions,
+        minimum_training_sessions=4,
+        training_window_sessions=4,
+        validation_sessions=2,
+        receipt_schema_version=(
+            "ranked-liquidity-ridge-purged-oof-receipt/v3"
+        ),
+    )
+    fold_two_keys = {"000006|row", "000007|row"}
+    original_fold_two = scored[
+        scored["candidate_key"].isin(fold_two_keys)
+    ]["predicted_net_return_pct"].tolist()
+    outside_fold_two = rescored_outside[
+        rescored_outside["candidate_key"].isin(fold_two_keys)
+    ]["predicted_net_return_pct"].tolist()
+    assert outside_fold_two == pytest.approx(original_fold_two)
+
+    inside_mutated = [
+        {
+            **outcome,
+            "return_pct": (
+                float(outcome["return_pct"]) + 10_000.0
+                if outcome["candidate_key"] == "000002|row"
+                else outcome["return_pct"]
+            ),
+        }
+        for outcome in outcomes
+    ]
+    rescored_inside, _ = ridge._build_purged_oof_scores(
+        features,
+        inside_mutated,
+        sessions,
+        minimum_training_sessions=4,
+        training_window_sessions=4,
+        validation_sessions=2,
+        receipt_schema_version=(
+            "ranked-liquidity-ridge-purged-oof-receipt/v3"
+        ),
+    )
+    inside_fold_two = rescored_inside[
+        rescored_inside["candidate_key"].isin(fold_two_keys)
+    ]["predicted_net_return_pct"].tolist()
+    assert inside_fold_two != pytest.approx(original_fold_two)
+
+    assert ridge.verify_rolling_oof_receipt(
+        features,
+        outcomes,
+        sessions,
+        scored,
+        receipt,
+        minimum_training_sessions=4,
+        training_window_sessions=4,
+        validation_sessions=2,
+    ) == {
+        "verified": True,
+        "receipt_sha256": receipt["receipt_sha256"],
+        "fold_count": 3,
+        "oof_candidate_count": len(scored),
+    }
+    tampered = deepcopy(receipt)
+    tampered["folds"][1]["training_window_start"] = sessions[1]
+    tampered["folds_sha256"] = ridge._sha256(tampered["folds"])
+    tampered_without_self = {
+        key: value
+        for key, value in tampered.items()
+        if key != "receipt_sha256"
+    }
+    tampered["receipt_sha256"] = ridge._sha256(tampered_without_self)
+    with pytest.raises(ValueError, match="rolling OOF receipt"):
+        ridge.verify_rolling_oof_receipt(
+            features,
+            outcomes,
+            sessions,
+            scored,
+            tampered,
+            minimum_training_sessions=4,
+            training_window_sessions=4,
+            validation_sessions=2,
+        )
 
 
 def _outcome_candidate(
@@ -1291,8 +1500,12 @@ def test_compact_receipt_summary_replaces_full_self_hash_and_is_verifiable():
 
 def test_producer_binding_includes_pdf_parser_version():
     producer = ridge._producer_binding()
+    rolling_producer = ridge._producer_binding(artifact_version=3)
 
     assert producer["pypdf_version"]
+    assert producer["schema_version"].endswith("/v2")
+    assert rolling_producer["schema_version"].endswith("/v3")
+    assert producer["root_sha256"] != rolling_producer["root_sha256"]
 
 
 def test_result_bundle_is_content_addressed_path_stable_and_drift_closed(
@@ -1526,6 +1739,21 @@ def test_end_to_end_runner_stays_development_only(monkeypatch, tmp_path):
         "required_oof_fold_count",
         2,
     )
+    monkeypatch.setitem(
+        ridge.ROLLING_CONTINUOUS_RIDGE_OOF_SPEC,
+        "minimum_cross_section_members",
+        4,
+    )
+    monkeypatch.setitem(
+        ridge.ROLLING_CONTINUOUS_RIDGE_OOF_SPEC,
+        "required_market_session_count",
+        len(sessions),
+    )
+    monkeypatch.setitem(
+        ridge.ROLLING_CONTINUOUS_RIDGE_OOF_SPEC,
+        "required_oof_fold_count",
+        2,
+    )
     monkeypatch.setattr(
         ridge,
         "load_temporal_partition_contract",
@@ -1631,6 +1859,12 @@ def test_end_to_end_runner_stays_development_only(monkeypatch, tmp_path):
         "models",
         "selection",
     ]
+    v2_model_sidecar = json.loads(
+        Path(result["runtime_sidecars"]["models"]["path"]).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "oof_replay_verification" not in v2_model_sidecar
     progress = json.loads(
         (
             tmp_path
@@ -1643,6 +1877,510 @@ def test_end_to_end_runner_stays_development_only(monkeypatch, tmp_path):
         progress["artifact_sha256"]
         == result["artifact"]["artifact_sha256"]
     )
+    v2_progress_path = (
+        tmp_path / "output" / ".ranked_liquidity_v2_progress.json"
+    )
+    v2_progress_bytes = v2_progress_path.read_bytes()
+
+    outcome_query_order.clear()
+    oof_feature_signal_dates.clear()
+    rolling_result = (
+        ridge._run_audited_pit_ranked_liquidity_ridge_oof(
+            settings=Settings(),
+            audited_pit_universe_path=tmp_path / "universe.sqlite3",
+            expected_coverage_audit_sha256=coverage_sha,
+            expected_artifact_root_sha256=artifact_root_sha,
+            temporal_contract_path=tmp_path / "temporal.json",
+            expected_temporal_contract_sha256=temporal_sha,
+            security_code_transition_evidence_root=(
+                tmp_path / "transition"
+            ),
+            expected_security_code_transition_contract_sha256="d" * 64,
+            start_date=sessions[0],
+            end_date=sessions[-1],
+            output_dir=tmp_path / "rolling-output",
+            strategy_spec=ridge.ROLLING_CONTINUOUS_RIDGE_OOF_SPEC,
+            artifact_version=3,
+            training_window_sessions=126,
+        )
+    )
+
+    assert rolling_result["schema_version"] == (
+        "ranked-liquidity-ridge-result/v3"
+    )
+    assert rolling_result["strategy"]["schema_version"] == (
+        "development-pit-cross-sectional-ranked-liquidity-"
+        "ridge-rolling-oof/v3"
+    )
+    assert rolling_result["strategy"]["signal_tag"] == (
+        "cross_sectional_ranked_liquidity_ridge_rolling_126_oof"
+    )
+    assert rolling_result["producer_code"]["schema_version"] == (
+        "audited-pit-ranked-liquidity-producer/v3"
+    )
+    assert rolling_result["scope"]["development_only"] is True
+    assert rolling_result["scope"]["embargo_consumed"] is False
+    assert rolling_result["scope"]["final_oos_consumed"] is False
+    assert (
+        rolling_result["scope"]["eligible_for_profile_registration"]
+        is False
+    )
+    assert outcome_query_order == [
+        "tail_cutoff",
+        "suspension_evidence",
+        "terminal_listing_evidence",
+        "bulk_next_open_evidence",
+    ]
+    assert max(oof_feature_signal_dates) == sessions[-7]
+    assert v2_progress_path.read_bytes() == v2_progress_bytes
+    rolling_progress = json.loads(
+        (
+            tmp_path
+            / "rolling-output"
+            / ".ranked_liquidity_v3_progress.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert rolling_progress["stage"] == "completed"
+    assert rolling_progress["schema_version"].endswith("/v3")
+
+    sidecars = {
+        name: json.loads(
+            Path(payload["path"]).read_text(encoding="utf-8")
+        )
+        for name, payload in rolling_result["runtime_sidecars"].items()
+    }
+    assert {
+        name: sidecar["schema_version"]
+        for name, sidecar in sidecars.items()
+    } == {
+        "execution": "ranked-liquidity-execution-sidecar/v3",
+        "features": "ranked-liquidity-feature-sidecar/v3",
+        "models": "ranked-liquidity-model-sidecar/v3",
+        "selection": "ranked-liquidity-selection-sidecar/v3",
+    }
+    rolling_oof = sidecars["models"]["oof_receipt"]
+    assert rolling_oof["schema_version"].endswith("/v3")
+    assert rolling_oof["training_window_sessions"] == 126
+    assert rolling_oof["ridge_lambda"] == 1.0
+    assert len(rolling_oof["folds"]) == 2
+    assert all(
+        fold["training_window_type"]
+        == "trailing_frozen_signal_sessions"
+        and fold["training_window_session_count"] == 126
+        for fold in rolling_oof["folds"]
+    )
+    assert (
+        sidecars["models"]["oof_replay_verification"]["verified"]
+        is True
+    )
+    assert sidecars["execution"]["outcome_receipt"][
+        "schema_version"
+    ].endswith("/v3")
+    main_sweep = sidecars["selection"]["main_sweep"]
+    baseline_sweep = sidecars["selection"]["amount_baseline_sweep"]
+    assert main_sweep["schema_version"].endswith("/v3")
+    assert baseline_sweep["schema_version"].endswith("/v3")
+    score_evidence = sidecars["selection"][
+        "scored_execution_candidate_evidence"
+    ]
+    assert score_evidence["schema_version"] == (
+        "ranked-liquidity-score-evidence/v3"
+    )
+    assert score_evidence["columns"] == list(
+        ridge.SCORED_EXECUTION_EVIDENCE_COLUMNS
+    )
+    assert score_evidence["row_count"] == len(score_evidence["rows"])
+    assert all(
+        isinstance(row, list)
+        and len(row) == len(ridge.SCORED_EXECUTION_EVIDENCE_COLUMNS)
+        for row in score_evidence["rows"]
+    )
+    assert main_sweep["top"][0]["required_signal_tags"] == [
+        "cross_sectional_ranked_liquidity_ridge_rolling_126_oof"
+    ]
+    assert sidecars["selection"]["main_selection_receipt"][
+        "candidate_table_sha256"
+    ] == sidecars["selection"]["amount_baseline_selection_receipt"][
+        "candidate_table_sha256"
+    ]
+    assert len(rolling_result["artifact"]["artifact_sha256"]) == 64
+    assert rolling_result["verification"]["verified"] is True
+    assert rolling_result["verification"]["checks"] == {
+        "independent_rolling_oof_replay": True,
+        "exact_trailing_126_session_windows": True,
+        "window_external_labels_excluded": True,
+        "window_internal_mature_labels_bound": True,
+        "immature_labels_purged": True,
+        "six_fold_geometry_matches_v2": True,
+        "content_addressing_verified": True,
+        "shared_positive_candidate_pool_verified": True,
+        "selected_board_scope_verified": True,
+    }
+    assert len(
+        rolling_result["runtime_verification"]["artifact_sha256"]
+    ) == 64
+    assert all(
+        len(payload["artifact_sha256"]) == 64
+        for payload in rolling_result["runtime_sidecars"].values()
+    )
+    assert sidecars["selection"]["selected_evidence"]
+
+    tamper_index = 0
+
+    def tampered_bundle(
+        *,
+        mutate_main=None,
+        mutate_models=None,
+        mutate_selection=None,
+    ):
+        nonlocal tamper_index
+        tamper_index += 1
+        bundle = deepcopy(rolling_result)
+        main_document = json.loads(
+            Path(bundle["artifact"]["path"]).read_text(encoding="utf-8")
+        )
+        main_document.pop("artifact_sha256")
+        tamper_root = tmp_path / f"tamper-{tamper_index}"
+        for sidecar_name, mutate_sidecar in (
+            ("models", mutate_models),
+            ("selection", mutate_selection),
+        ):
+            if mutate_sidecar is None:
+                continue
+            sidecar_document = json.loads(
+                Path(
+                    bundle["runtime_sidecars"][sidecar_name]["path"]
+                ).read_text(encoding="utf-8")
+            )
+            sidecar_document.pop("artifact_sha256")
+            mutate_sidecar(sidecar_document)
+            sidecar_runtime = ridge._write_content_addressed(
+                tamper_root / "sidecars",
+                sidecar_document,
+            )
+            bundle["runtime_sidecars"][sidecar_name] = sidecar_runtime
+            main_document["sidecars"][sidecar_name] = (
+                ridge._stable_sidecar_reference(sidecar_runtime)
+            )
+        if mutate_main is not None:
+            mutate_main(main_document)
+        bundle["artifact"] = ridge._write_content_addressed(
+            tamper_root,
+            main_document,
+        )
+        return bundle
+
+    def tamper_scope(main_document):
+        main_document["scope"]["production_recommendation_eligible"] = True
+
+    def tamper_relative_path(main_document):
+        main_document["sidecars"]["selection"]["relative_path"] = (
+            "sidecars/not-the-selection-sidecar.json"
+        )
+
+    def tamper_strict_outcome_count(main_document):
+        main_document["strict_outcome_candidate_count"] += 1
+
+    def tamper_sidecar_schema(selection_document):
+        selection_document["schema_version"] = (
+            "ranked-liquidity-selection-sidecar/v2"
+        )
+
+    def tamper_oof_window(models_document):
+        receipt = models_document["oof_receipt"]
+        fold = receipt["folds"][0]
+        fold["training_window_session_count"] -= 1
+        fold_unsigned = {
+            key: value
+            for key, value in fold.items()
+            if key != "receipt_sha256"
+        }
+        fold["receipt_sha256"] = ridge._sha256(fold_unsigned)
+        receipt["folds_sha256"] = ridge._sha256(receipt["folds"])
+        receipt_unsigned = {
+            key: value
+            for key, value in receipt.items()
+            if key != "receipt_sha256"
+        }
+        receipt["receipt_sha256"] = ridge._sha256(receipt_unsigned)
+        models_document["oof_replay_verification"][
+            "receipt_sha256"
+        ] = receipt["receipt_sha256"]
+
+    def tamper_selection_parameters(selection_document):
+        receipt = selection_document["main_selection_receipt"]
+        receipt["parameters"]["top_n"] += 1
+        summary_unsigned = {
+            key: value
+            for key, value in receipt.items()
+            if key != "summary_receipt_sha256"
+        }
+        receipt["summary_receipt_sha256"] = ridge._sha256(
+            summary_unsigned
+        )
+
+    def tamper_positive_pool(selection_document):
+        receipt = selection_document["positive_pool_receipt"]
+        receipt["positive_candidate_count"] += 1
+        unsigned = {
+            key: value
+            for key, value in receipt.items()
+            if key != "receipt_sha256"
+        }
+        receipt["receipt_sha256"] = ridge._sha256(unsigned)
+        tampered_positive_receipt_sha["value"] = receipt["receipt_sha256"]
+
+    def bind_tampered_positive_pool(main_document):
+        main_document["positive_pool_receipt_sha256"] = (
+            tampered_positive_receipt_sha["value"]
+        )
+
+    def tamper_selected_evidence(selection_document):
+        selection_document["selected_evidence"].pop()
+        selection_document["selected_evidence_sha256"] = ridge._sha256(
+            selection_document["selected_evidence"]
+        )
+
+    def tamper_selected_content(selection_document):
+        evidence = selection_document["selected_evidence"]
+        evidence[0]["predicted_net_return_pct"] += 1.0
+        selection_document["selected_evidence_sha256"] = ridge._sha256(
+            evidence
+        )
+
+    tampered_gate = not sidecars["selection"]["advancement_gate_passed"]
+
+    def tamper_advancement_selection(selection_document):
+        selection_document["advancement_gate_passed"] = tampered_gate
+
+    def tamper_advancement_main(main_document):
+        main_document["scope"]["advancement_gate_passed"] = tampered_gate
+        main_document["advancement_gate"][
+            "all_required_gates_passed"
+        ] = tampered_gate
+
+    def tamper_positive_hash_selection(selection_document):
+        selection_document[
+            "positive_candidate_payload_hashes_sha256"
+        ] = "0" * 64
+
+    def tamper_positive_hash_main(main_document):
+        main_document[
+            "positive_candidate_payload_hashes_sha256"
+        ] = "0" * 64
+
+    assert (
+        sidecars["selection"]["main_sweep"]["top"][0]["target_all_pass"]
+        is False
+    )
+    tampered_sweep_holder = {}
+
+    def tamper_sweep_selection(selection_document):
+        sweep = selection_document["main_sweep"]
+        row = sweep["top"][0]
+        row["target_full_development_quality_pass"] = True
+        row["target_latest_12m_pass"] = True
+        row["target_rolling_12m_stability_pass"] = True
+        row["target_all_pass"] = True
+        sweep["target_all_pass_count"] = 1
+        sweep["target_rolling_12m_stability_pass_count"] = 1
+        selection_document["advancement_gate_passed"] = True
+        tampered_sweep_holder["value"] = deepcopy(sweep)
+
+    def bind_tampered_sweep(main_document):
+        main_document["main_sweep"] = tampered_sweep_holder["value"]
+        main_document["scope"]["advancement_gate_passed"] = True
+        main_document["advancement_gate"][
+            "all_required_gates_passed"
+        ] = True
+
+    tampered_raw_metric_holder = {}
+
+    def tamper_raw_metric_selection(selection_document):
+        sweep = selection_document["main_sweep"]
+        row = sweep["top"][0]
+        row["trade_win_rate_pct_raw"] = (
+            float(row["trade_win_rate_pct_raw"]) + 0.01
+        )
+        tampered_raw_metric_holder["value"] = deepcopy(sweep)
+
+    def bind_tampered_raw_metric(main_document):
+        main_document["main_sweep"] = (
+            tampered_raw_metric_holder["value"]
+        )
+
+    tampered_projection_holder = {}
+
+    def tamper_selected_projection(selection_document):
+        selected_item = selection_document["selected_evidence"][0]
+        selected_item["right_censored"] = (
+            selected_item.get("right_censored") is not True
+        )
+        selection_document["selected_evidence_sha256"] = ridge._sha256(
+            selection_document["selected_evidence"]
+        )
+        trade_key = ridge._selection_trade_key(selected_item)
+        evidence = selection_document[
+            "scored_execution_candidate_evidence"
+        ]
+        evidence_row = next(
+            row for row in evidence["rows"] if row[2] == trade_key
+        )
+        evidence_row[9] = ridge._sha256(selected_item)
+        evidence["rows_sha256"] = ridge._sha256(evidence["rows"])
+        evidence["candidate_payload_hashes_sha256"] = ridge._sha256(
+            [row[9] for row in evidence["rows"]]
+        )
+        evidence["positive_candidate_payload_hashes_sha256"] = (
+            ridge._sha256(
+                [row[9] for row in evidence["rows"] if float(row[5]) > 0.0]
+            )
+        )
+        evidence_unsigned = {
+            key: value
+            for key, value in evidence.items()
+            if key != "receipt_sha256"
+        }
+        evidence["receipt_sha256"] = ridge._sha256(evidence_unsigned)
+        selection_document[
+            "positive_candidate_payload_hashes_sha256"
+        ] = evidence["positive_candidate_payload_hashes_sha256"]
+        tampered_projection_holder.update(
+            {
+                "rows": evidence["rows_sha256"],
+                "payloads": evidence[
+                    "candidate_payload_hashes_sha256"
+                ],
+                "positive_payloads": evidence[
+                    "positive_candidate_payload_hashes_sha256"
+                ],
+            }
+        )
+
+    def bind_tampered_projection(main_document):
+        main_document[
+            "scored_execution_candidate_evidence_rows_sha256"
+        ] = tampered_projection_holder["rows"]
+        main_document[
+            "scored_execution_candidate_payload_hashes_sha256"
+        ] = tampered_projection_holder["payloads"]
+        main_document[
+            "positive_candidate_payload_hashes_sha256"
+        ] = tampered_projection_holder["positive_payloads"]
+
+    tampered_outcome_holder = {}
+
+    def tamper_selected_outcome(selection_document):
+        selected_item = next(
+            item
+            for item in selection_document["selected_evidence"]
+            if item.get("right_censored") is not True
+            and item.get("return_pct") is not None
+        )
+        selected_item["return_pct"] = (
+            float(selected_item["return_pct"]) + 0.01
+        )
+        selection_document["selected_evidence_sha256"] = ridge._sha256(
+            selection_document["selected_evidence"]
+        )
+        trade_key = ridge._selection_trade_key(selected_item)
+        evidence = selection_document[
+            "scored_execution_candidate_evidence"
+        ]
+        evidence_row = next(
+            row for row in evidence["rows"] if row[2] == trade_key
+        )
+        evidence_row[8] = ridge._sha256(
+            ridge._outcome_payload_from_scored_candidate(selected_item)
+        )
+        evidence_row[9] = ridge._sha256(selected_item)
+        evidence["rows_sha256"] = ridge._sha256(evidence["rows"])
+        evidence["candidate_payload_hashes_sha256"] = ridge._sha256(
+            [row[9] for row in evidence["rows"]]
+        )
+        evidence["positive_candidate_payload_hashes_sha256"] = (
+            ridge._sha256(
+                [row[9] for row in evidence["rows"] if float(row[5]) > 0.0]
+            )
+        )
+        evidence_unsigned = {
+            key: value
+            for key, value in evidence.items()
+            if key != "receipt_sha256"
+        }
+        evidence["receipt_sha256"] = ridge._sha256(evidence_unsigned)
+        selection_document[
+            "positive_candidate_payload_hashes_sha256"
+        ] = evidence["positive_candidate_payload_hashes_sha256"]
+        tampered_outcome_holder.update(
+            {
+                "rows": evidence["rows_sha256"],
+                "payloads": evidence[
+                    "candidate_payload_hashes_sha256"
+                ],
+                "positive_payloads": evidence[
+                    "positive_candidate_payload_hashes_sha256"
+                ],
+            }
+        )
+
+    def bind_tampered_outcome(main_document):
+        main_document[
+            "scored_execution_candidate_evidence_rows_sha256"
+        ] = tampered_outcome_holder["rows"]
+        main_document[
+            "scored_execution_candidate_payload_hashes_sha256"
+        ] = tampered_outcome_holder["payloads"]
+        main_document[
+            "positive_candidate_payload_hashes_sha256"
+        ] = tampered_outcome_holder["positive_payloads"]
+
+    tampered_positive_receipt_sha = {}
+    for bundle in (
+        tampered_bundle(mutate_main=tamper_scope),
+        tampered_bundle(mutate_main=tamper_relative_path),
+        tampered_bundle(mutate_main=tamper_strict_outcome_count),
+        tampered_bundle(mutate_selection=tamper_sidecar_schema),
+        tampered_bundle(mutate_models=tamper_oof_window),
+        tampered_bundle(
+            mutate_selection=tamper_selection_parameters
+        ),
+        tampered_bundle(
+            mutate_main=bind_tampered_positive_pool,
+            mutate_selection=tamper_positive_pool,
+        ),
+        tampered_bundle(
+            mutate_main=tamper_positive_hash_main,
+            mutate_selection=tamper_positive_hash_selection,
+        ),
+        tampered_bundle(mutate_selection=tamper_selected_evidence),
+        tampered_bundle(mutate_selection=tamper_selected_content),
+        tampered_bundle(
+            mutate_main=tamper_advancement_main,
+            mutate_selection=tamper_advancement_selection,
+        ),
+        tampered_bundle(
+            mutate_main=bind_tampered_sweep,
+            mutate_selection=tamper_sweep_selection,
+        ),
+        tampered_bundle(
+            mutate_main=bind_tampered_raw_metric,
+            mutate_selection=tamper_raw_metric_selection,
+        ),
+        tampered_bundle(
+            mutate_main=bind_tampered_projection,
+            mutate_selection=tamper_selected_projection,
+        ),
+        tampered_bundle(
+            mutate_main=bind_tampered_outcome,
+            mutate_selection=tamper_selected_outcome,
+        ),
+    ):
+        with pytest.raises(
+            ValueError,
+            match="rolling result bundle verification failed",
+        ):
+            ridge.verify_rolling_result_bundle(bundle)
 
 
 def test_jobs_cli_dispatches_ranked_liquidity_ridge_oof(
@@ -1667,6 +2405,62 @@ def test_jobs_cli_dispatches_ranked_liquidity_ridge_oof(
     result = jobs.main(
         [
             "research-audited-pit-ranked-liquidity-ridge-oof",
+            "--audited-pit-universe-path",
+            str(tmp_path / "universe.sqlite3"),
+            "--expected-coverage-audit-sha256",
+            "a" * 64,
+            "--expected-artifact-root-sha256",
+            "b" * 64,
+            "--temporal-contract-path",
+            str(tmp_path / "temporal.json"),
+            "--expected-temporal-contract-sha256",
+            "c" * 64,
+            "--security-code-transition-evidence-root",
+            str(tmp_path / "transition"),
+            "--expected-security-code-transition-contract-sha256",
+            "d" * 64,
+            "--start-date",
+            "2024-07-05",
+            "--end-date",
+            "2026-07-03",
+            "--output-dir",
+            str(tmp_path / "output"),
+        ]
+    )
+
+    assert result == 0
+    assert captured["settings"] == "settings"
+    assert captured["start_date"] == "2024-07-05"
+    assert captured["end_date"] == "2026-07-03"
+    assert captured["security_code_transition_evidence_root"] == str(
+        tmp_path / "transition"
+    )
+
+
+def test_jobs_cli_dispatches_ranked_liquidity_rolling_ridge_oof(
+    monkeypatch,
+    tmp_path,
+):
+    from app import jobs
+
+    captured = {}
+
+    def fake_runner(**kwargs):
+        captured.update(kwargs)
+        return {
+            "schema_version": "test-ranked-liquidity-ridge-result/v3"
+        }
+
+    monkeypatch.setattr(
+        jobs,
+        "run_audited_pit_ranked_liquidity_ridge_rolling_oof",
+        fake_runner,
+        raising=False,
+    )
+    monkeypatch.setattr(jobs, "get_settings", lambda: "settings")
+    result = jobs.main(
+        [
+            "research-audited-pit-ranked-liquidity-ridge-rolling-oof",
             "--audited-pit-universe-path",
             str(tmp_path / "universe.sqlite3"),
             "--expected-coverage-audit-sha256",

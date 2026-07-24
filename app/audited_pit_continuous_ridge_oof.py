@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from datetime import date
 import hashlib
 from importlib.metadata import version as package_version
+import json
 import math
 from pathlib import Path
 import sys
@@ -190,6 +192,32 @@ CONTINUOUS_RIDGE_OOF_SPEC = {
     },
 }
 
+ROLLING_CONTINUOUS_RIDGE_OOF_SPEC = deepcopy(CONTINUOUS_RIDGE_OOF_SPEC)
+ROLLING_CONTINUOUS_RIDGE_OOF_SPEC.update(
+    {
+        "schema_version": (
+            "development-pit-cross-sectional-ranked-liquidity-"
+            "ridge-rolling-oof/v3"
+        ),
+        "signal_tag": (
+            "cross_sectional_ranked_liquidity_ridge_rolling_126_oof"
+        ),
+        "walk_forward": {
+            "minimum_training_sessions": 126,
+            "training_window_type": "trailing_frozen_signal_sessions",
+            "training_window_sessions": 126,
+            "validation_sessions": 63,
+            "purge": (
+                "complete_exit_date_strictly_before_validation_start"
+            ),
+            "folds": "continuous_non_overlapping_validation_windows",
+        },
+    }
+)
+_ROLLING_CONTINUOUS_RIDGE_OOF_SPEC_SHA256 = (
+    "c5730311c3660cf4afa8fae5c442b80622c16cb4633bd26c5d5a889525fb3be4"
+)
+
 
 _BAR_COLUMNS = (
     "date",
@@ -353,12 +381,21 @@ def _normalize_security_transition_feature_metadata(
 def _write_replay_progress(
     output_dir: str | Path,
     stage: str,
+    *,
+    artifact_version: int = 2,
     **details: Any,
 ) -> None:
+    if artifact_version not in {2, 3}:
+        raise ValueError("ranked-liquidity artifact version is invalid")
     write_json(
-        str(Path(output_dir) / ".ranked_liquidity_v2_progress.json"),
+        str(
+            Path(output_dir)
+            / f".ranked_liquidity_v{artifact_version}_progress.json"
+        ),
         {
-            "schema_version": "ranked-liquidity-replay-progress/v2",
+            "schema_version": (
+                f"ranked-liquidity-replay-progress/v{artifact_version}"
+            ),
             "stage": str(stage),
             **details,
         },
@@ -1442,14 +1479,15 @@ def _signal_date_weights(signal_dates: Sequence[str]) -> np.ndarray:
     )
 
 
-def _continuous_net_label(gross_return_pct: float) -> float:
+def _continuous_net_label(
+    gross_return_pct: float,
+    strategy_spec: Mapping[str, Any] = CONTINUOUS_RIDGE_OOF_SPEC,
+) -> float:
     value = float(gross_return_pct)
     if not math.isfinite(value):
         raise ValueError("continuous ridge gross return is nonfinite")
     return value - float(
-        CONTINUOUS_RIDGE_OOF_SPEC["label"][
-            "friction_percentage_points"
-        ]
+        strategy_spec["label"]["friction_percentage_points"]
     )
 
 
@@ -1567,10 +1605,43 @@ def _build_purged_oof_scores(
     sessions: Sequence[str],
     *,
     minimum_training_sessions: int = 126,
+    training_window_sessions: int | None = None,
     validation_sessions: int = 63,
     require_nonempty_validation_folds: bool = False,
+    receipt_schema_version: str = (
+        "ranked-liquidity-ridge-purged-oof-receipt/v2"
+    ),
+    ridge_lambda: float | None = None,
+    strategy_spec: Mapping[str, Any] = CONTINUOUS_RIDGE_OOF_SPEC,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     session_dates = _ordered_sessions(sessions)
+    if training_window_sessions is not None and (
+        training_window_sessions <= 0
+        or training_window_sessions > minimum_training_sessions
+    ):
+        raise ValueError(
+            "continuous ridge rolling training window is invalid"
+        )
+    expected_receipt_schema = (
+        "ranked-liquidity-ridge-purged-oof-receipt/v3"
+        if training_window_sessions is not None
+        else "ranked-liquidity-ridge-purged-oof-receipt/v2"
+    )
+    if receipt_schema_version != expected_receipt_schema:
+        raise ValueError("continuous ridge OOF receipt schema is invalid")
+    frozen_ridge_lambda = float(strategy_spec["model"]["ridge_lambda"])
+    resolved_ridge_lambda = (
+        frozen_ridge_lambda
+        if ridge_lambda is None
+        else float(ridge_lambda)
+    )
+    if not math.isclose(
+        resolved_ridge_lambda,
+        frozen_ridge_lambda,
+        rel_tol=0.0,
+        abs_tol=0.0,
+    ):
+        raise ValueError("continuous ridge lambda differs from frozen spec")
     required = {"candidate_key", "signal_date", *FEATURE_NAMES}
     if not required.issubset(features.columns):
         raise ValueError("continuous ridge OOF features are incomplete")
@@ -1629,7 +1700,10 @@ def _build_purged_oof_scores(
             raise ValueError("continuous ridge outcome boundary is invalid")
         completed[key] = {
             "exit_date": exit_date,
-            "net_label": _continuous_net_label(gross_return),
+            "net_label": _continuous_net_label(
+                gross_return,
+                strategy_spec,
+            ),
         }
 
     folds = _fold_ranges(
@@ -1643,6 +1717,19 @@ def _build_purged_oof_scores(
         folds,
         start=1,
     ):
+        validation_start_position = session_dates.index(validation_start)
+        if training_window_sessions is None:
+            training_window = session_dates[:validation_start_position]
+        else:
+            training_window = session_dates[
+                validation_start_position - training_window_sessions :
+                validation_start_position
+            ]
+            if len(training_window) != training_window_sessions:
+                raise ValueError(
+                    "continuous ridge rolling training window is incomplete"
+                )
+        training_window_set = set(training_window)
         validation = rows[
             rows["signal_date"].between(
                 validation_start,
@@ -1660,13 +1747,22 @@ def _build_purged_oof_scores(
                 )
             continue
         training_records = []
+        window_candidate_keys: list[str] = []
+        eligible_window_training_candidate_keys: list[str] = []
+        purged_immature_candidate_keys: list[str] = []
+        noncomplete_window_candidate_keys: list[str] = []
         for row in rows.itertuples(index=False):
             key = str(row.candidate_key)
+            if str(row.signal_date) not in training_window_set:
+                continue
+            window_candidate_keys.append(key)
             outcome = completed.get(key)
-            if (
-                outcome is None
-                or str(outcome["exit_date"]) >= validation_start
-            ):
+            if outcome is None:
+                noncomplete_window_candidate_keys.append(key)
+                continue
+            eligible_window_training_candidate_keys.append(key)
+            if str(outcome["exit_date"]) >= validation_start:
+                purged_immature_candidate_keys.append(key)
                 continue
             training_records.append(
                 {
@@ -1685,6 +1781,10 @@ def _build_purged_oof_scores(
                 item["candidate_key"],
             )
         )
+        window_candidate_keys.sort()
+        eligible_window_training_candidate_keys.sort()
+        purged_immature_candidate_keys.sort()
+        noncomplete_window_candidate_keys.sort()
         if not training_records:
             raise ValueError(
                 "continuous ridge fold has no mature complete training rows"
@@ -1701,9 +1801,7 @@ def _build_purged_oof_scores(
             x_train,
             y_train,
             [item["signal_date"] for item in training_records],
-            ridge_lambda=float(
-                CONTINUOUS_RIDGE_OOF_SPEC["model"]["ridge_lambda"]
-            ),
+            ridge_lambda=resolved_ridge_lambda,
         )
         scores = _predict_continuous_ridge(
             model,
@@ -1748,6 +1846,44 @@ def _build_purged_oof_scores(
             ),
             "score_rows_sha256": _sha256(score_rows),
         }
+        if training_window_sessions is not None:
+            fold_receipt.update(
+                {
+                    "training_window_type": (
+                        "trailing_frozen_signal_sessions"
+                    ),
+                    "training_window_session_count": len(training_window),
+                    "training_window_start": training_window[0],
+                    "training_window_end": training_window[-1],
+                    "training_window_sessions_sha256": _sha256(
+                        training_window
+                    ),
+                    "window_candidate_count": len(
+                        window_candidate_keys
+                    ),
+                    "window_candidate_keys_sha256": _sha256(
+                        window_candidate_keys
+                    ),
+                    "eligible_window_training_candidate_count": len(
+                        eligible_window_training_candidate_keys
+                    ),
+                    "eligible_window_training_candidate_keys_sha256": (
+                        _sha256(eligible_window_training_candidate_keys)
+                    ),
+                    "purged_immature_candidate_count": len(
+                        purged_immature_candidate_keys
+                    ),
+                    "purged_immature_candidate_keys_sha256": _sha256(
+                        purged_immature_candidate_keys
+                    ),
+                    "noncomplete_window_candidate_count": len(
+                        noncomplete_window_candidate_keys
+                    ),
+                    "noncomplete_window_candidate_keys_sha256": _sha256(
+                        noncomplete_window_candidate_keys
+                    ),
+                }
+            )
         fold_receipt["receipt_sha256"] = _sha256(fold_receipt)
         fold_receipts.append(fold_receipt)
 
@@ -1770,7 +1906,7 @@ def _build_purged_oof_scores(
         for row in scored_oof.itertuples(index=False)
     ]
     receipt = {
-        "schema_version": "ranked-liquidity-ridge-purged-oof-receipt/v2",
+        "schema_version": receipt_schema_version,
         "minimum_training_sessions": int(minimum_training_sessions),
         "validation_sessions": int(validation_sessions),
         "purge": "complete_exit_date_strictly_before_validation_start",
@@ -1780,8 +1916,368 @@ def _build_purged_oof_scores(
         "oof_candidate_count": len(scored_oof),
         "oof_scores_sha256": _sha256(score_payload),
     }
+    if training_window_sessions is not None:
+        receipt.update(
+            {
+                "training_window_type": (
+                    "trailing_frozen_signal_sessions"
+                ),
+                "training_window_sessions": int(training_window_sessions),
+                "ridge_lambda": resolved_ridge_lambda,
+                "frozen_signal_sessions": session_dates,
+                "frozen_signal_sessions_sha256": _sha256(
+                    session_dates
+                ),
+            }
+        )
     receipt["receipt_sha256"] = _sha256(receipt)
     return scored_oof, receipt
+
+
+def verify_rolling_oof_receipt(
+    features: pd.DataFrame,
+    outcomes: Sequence[Mapping[str, Any]],
+    sessions: Sequence[str],
+    scored_oof: pd.DataFrame,
+    receipt: Mapping[str, Any],
+    *,
+    minimum_training_sessions: int,
+    training_window_sessions: int,
+    validation_sessions: int,
+) -> dict[str, Any]:
+    try:
+        session_dates = _ordered_sessions(sessions)
+        required = {"candidate_key", "signal_date", *FEATURE_NAMES}
+        if (
+            training_window_sessions <= 0
+            or training_window_sessions > minimum_training_sessions
+            or not required.issubset(features.columns)
+        ):
+            raise ValueError
+        rows = features.copy()
+        rows["candidate_key"] = rows["candidate_key"].astype(str)
+        rows["signal_date"] = rows["signal_date"].astype(str)
+        session_set = set(session_dates)
+        if (
+            rows["candidate_key"].duplicated().any()
+            or rows["candidate_key"].eq("").any()
+            or not rows["signal_date"].isin(session_set).all()
+            or not np.isfinite(
+                rows[list(FEATURE_NAMES)].to_numpy(dtype=float)
+            ).all()
+        ):
+            raise ValueError
+        feature_signal_dates = dict(
+            zip(rows["candidate_key"], rows["signal_date"])
+        )
+        outcome_lookup: dict[str, dict[str, Any]] = {}
+        for raw_outcome in outcomes:
+            outcome = dict(raw_outcome)
+            key = str(outcome.get("candidate_key") or "")
+            if (
+                not key
+                or key in outcome_lookup
+                or key not in feature_signal_dates
+            ):
+                raise ValueError
+            outcome_lookup[key] = outcome
+        friction = float(
+            ROLLING_CONTINUOUS_RIDGE_OOF_SPEC["label"][
+                "friction_percentage_points"
+            ]
+        )
+        ridge_lambda = float(
+            ROLLING_CONTINUOUS_RIDGE_OOF_SPEC["model"]["ridge_lambda"]
+        )
+        completed: dict[str, dict[str, Any]] = {}
+        for key, outcome in outcome_lookup.items():
+            if outcome.get("right_censored") is True:
+                continue
+            exit_date = outcome.get("exit_date")
+            gross_return = float(outcome.get("return_pct"))
+            if (
+                _strict_iso_date(exit_date) is None
+                or exit_date not in session_set
+                or exit_date <= feature_signal_dates[key]
+                or not math.isfinite(gross_return)
+            ):
+                raise ValueError
+            completed[key] = {
+                "exit_date": str(exit_date),
+                "net_label": gross_return - friction,
+            }
+
+        fold_receipts: list[dict[str, Any]] = []
+        expected_score_payload: list[dict[str, Any]] = []
+        for fold_index, start_position in enumerate(
+            range(
+                minimum_training_sessions,
+                len(session_dates),
+                validation_sessions,
+            ),
+            start=1,
+        ):
+            validation_start = session_dates[start_position]
+            validation_end = session_dates[
+                min(
+                    start_position + validation_sessions - 1,
+                    len(session_dates) - 1,
+                )
+            ]
+            validation = rows[
+                rows["signal_date"].between(
+                    validation_start,
+                    validation_end,
+                    inclusive="both",
+                )
+            ].sort_values(
+                ["signal_date", "candidate_key"],
+                kind="mergesort",
+            )
+            if validation.empty:
+                raise ValueError
+            training_window = session_dates[
+                start_position - training_window_sessions : start_position
+            ]
+            if len(training_window) != training_window_sessions:
+                raise ValueError
+            training_window_set = set(training_window)
+            window_candidate_keys: list[str] = []
+            eligible_candidate_keys: list[str] = []
+            immature_candidate_keys: list[str] = []
+            noncomplete_candidate_keys: list[str] = []
+            training_records: list[dict[str, Any]] = []
+            for row in rows.itertuples(index=False):
+                key = str(row.candidate_key)
+                signal_date = str(row.signal_date)
+                if signal_date not in training_window_set:
+                    continue
+                window_candidate_keys.append(key)
+                outcome = completed.get(key)
+                if outcome is None:
+                    noncomplete_candidate_keys.append(key)
+                    continue
+                eligible_candidate_keys.append(key)
+                if outcome["exit_date"] >= validation_start:
+                    immature_candidate_keys.append(key)
+                    continue
+                training_records.append(
+                    {
+                        "candidate_key": key,
+                        "signal_date": signal_date,
+                        "exit_date": outcome["exit_date"],
+                        "net_label": float(outcome["net_label"]),
+                        "features": [
+                            float(getattr(row, name))
+                            for name in FEATURE_NAMES
+                        ],
+                    }
+                )
+            training_records.sort(
+                key=lambda item: (
+                    item["signal_date"],
+                    item["candidate_key"],
+                )
+            )
+            window_candidate_keys.sort()
+            eligible_candidate_keys.sort()
+            immature_candidate_keys.sort()
+            noncomplete_candidate_keys.sort()
+            if not training_records:
+                raise ValueError
+
+            x_train = np.asarray(
+                [item["features"] for item in training_records],
+                dtype=float,
+            )
+            y_train = np.asarray(
+                [item["net_label"] for item in training_records],
+                dtype=float,
+            )
+            training_dates = [
+                item["signal_date"] for item in training_records
+            ]
+            date_counts = Counter(training_dates)
+            weights = np.asarray(
+                [1.0 / date_counts[value] for value in training_dates],
+                dtype=float,
+            )
+            total_weight = float(weights.sum())
+            mean = (
+                x_train * weights[:, None]
+            ).sum(axis=0) / total_weight
+            centered = x_train - mean
+            variance = (
+                (centered**2 * weights[:, None]).sum(axis=0)
+                / total_weight
+            )
+            scale = np.sqrt(variance)
+            scale = np.where(scale > 1e-12, scale, 1.0)
+            standardized = centered / scale
+            design = np.column_stack(
+                [
+                    np.ones(len(standardized), dtype=float),
+                    standardized,
+                ]
+            )
+            sqrt_weights = np.sqrt(weights)
+            weighted_design = design * sqrt_weights[:, None]
+            weighted_target = y_train * sqrt_weights
+            penalty = (
+                np.eye(design.shape[1], dtype=float) * ridge_lambda
+            )
+            penalty[0, 0] = 0.0
+            coefficients = np.linalg.solve(
+                weighted_design.T @ weighted_design + penalty,
+                weighted_design.T @ weighted_target,
+            )
+            validation_values = validation[
+                list(FEATURE_NAMES)
+            ].to_numpy(dtype=float)
+            validation_design = np.column_stack(
+                [
+                    np.ones(len(validation_values), dtype=float),
+                    (validation_values - mean) / scale,
+                ]
+            )
+            scores = validation_design @ coefficients
+            if not np.isfinite(scores).all():
+                raise ValueError
+            score_rows = [
+                {
+                    "candidate_key": str(row.candidate_key),
+                    "signal_date": str(row.signal_date),
+                    "predicted_net_return_pct": float(score),
+                }
+                for row, score in zip(
+                    validation.itertuples(index=False),
+                    scores,
+                )
+            ]
+            expected_score_payload.extend(score_rows)
+            model_payload = {
+                "mean": [float(value) for value in mean],
+                "scale": [float(value) for value in scale],
+                "coefficients": [
+                    float(value) for value in coefficients
+                ],
+            }
+            fold_receipt = {
+                "fold": fold_index,
+                "validation_start": validation_start,
+                "validation_end": validation_end,
+                "training_candidate_count": len(training_records),
+                "training_signal_date_count": len(set(training_dates)),
+                "training_last_exit_date": max(
+                    item["exit_date"] for item in training_records
+                ),
+                "training_candidate_keys_sha256": _sha256(
+                    [item["candidate_key"] for item in training_records]
+                ),
+                "training_rows_sha256": _sha256(training_records),
+                "training_label": "gross_return_pct_minus_0.45",
+                "model": model_payload,
+                "model_sha256": _sha256(model_payload),
+                "validation_candidate_count": len(validation),
+                "validation_signal_date_count": int(
+                    validation["signal_date"].nunique()
+                ),
+                "score_rows_sha256": _sha256(score_rows),
+                "training_window_type": (
+                    "trailing_frozen_signal_sessions"
+                ),
+                "training_window_session_count": len(training_window),
+                "training_window_start": training_window[0],
+                "training_window_end": training_window[-1],
+                "training_window_sessions_sha256": _sha256(
+                    training_window
+                ),
+                "window_candidate_count": len(window_candidate_keys),
+                "window_candidate_keys_sha256": _sha256(
+                    window_candidate_keys
+                ),
+                "eligible_window_training_candidate_count": len(
+                    eligible_candidate_keys
+                ),
+                "eligible_window_training_candidate_keys_sha256": (
+                    _sha256(eligible_candidate_keys)
+                ),
+                "purged_immature_candidate_count": len(
+                    immature_candidate_keys
+                ),
+                "purged_immature_candidate_keys_sha256": _sha256(
+                    immature_candidate_keys
+                ),
+                "noncomplete_window_candidate_count": len(
+                    noncomplete_candidate_keys
+                ),
+                "noncomplete_window_candidate_keys_sha256": _sha256(
+                    noncomplete_candidate_keys
+                ),
+            }
+            fold_receipt["receipt_sha256"] = _sha256(fold_receipt)
+            fold_receipts.append(fold_receipt)
+
+        expected_score_payload.sort(
+            key=lambda item: (
+                item["signal_date"],
+                item["candidate_key"],
+            )
+        )
+        expected_receipt = {
+            "schema_version": (
+                "ranked-liquidity-ridge-purged-oof-receipt/v3"
+            ),
+            "minimum_training_sessions": int(
+                minimum_training_sessions
+            ),
+            "validation_sessions": int(validation_sessions),
+            "purge": (
+                "complete_exit_date_strictly_before_validation_start"
+            ),
+            "fold_count": len(fold_receipts),
+            "folds": fold_receipts,
+            "folds_sha256": _sha256(fold_receipts),
+            "oof_candidate_count": len(expected_score_payload),
+            "oof_scores_sha256": _sha256(expected_score_payload),
+            "training_window_type": (
+                "trailing_frozen_signal_sessions"
+            ),
+            "training_window_sessions": int(training_window_sessions),
+            "ridge_lambda": ridge_lambda,
+            "frozen_signal_sessions": session_dates,
+            "frozen_signal_sessions_sha256": _sha256(session_dates),
+        }
+        expected_receipt["receipt_sha256"] = _sha256(expected_receipt)
+        observed_scores = scored_oof.sort_values(
+            ["signal_date", "candidate_key"],
+            kind="mergesort",
+        ).reset_index(drop=True)
+        observed_payload = [
+            {
+                "candidate_key": str(row.candidate_key),
+                "signal_date": str(row.signal_date),
+                "predicted_net_return_pct": float(
+                    row.predicted_net_return_pct
+                ),
+            }
+            for row in observed_scores.itertuples(index=False)
+        ]
+        if (
+            dict(receipt) != expected_receipt
+            or observed_payload != expected_score_payload
+        ):
+            raise ValueError
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "rolling OOF receipt verification failed"
+        ) from exc
+    return {
+        "verified": True,
+        "receipt_sha256": expected_receipt["receipt_sha256"],
+        "fold_count": expected_receipt["fold_count"],
+        "oof_candidate_count": expected_receipt["oof_candidate_count"],
+    }
 
 
 def _selection_trade_key(trade: Mapping[str, Any]) -> str:
@@ -1794,6 +2290,200 @@ def _selection_trade_key(trade: Mapping[str, Any]) -> str:
     if not all(values):
         raise ValueError("continuous ridge selection key is incomplete")
     return "|".join(values)
+
+
+SCORED_EXECUTION_EVIDENCE_COLUMNS = (
+    "candidate_key",
+    "signal_date",
+    "trade_key",
+    "security_id",
+    "signal_industry",
+    "predicted_net_return_pct",
+    "candidate_amount",
+    "right_censored",
+    "outcome_payload_sha256",
+    "candidate_payload_sha256",
+)
+
+
+def _outcome_payload_from_scored_candidate(
+    candidate: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload = dict(candidate)
+    for field in (
+        "predicted_net_return_pct",
+        "score",
+        "rank_score",
+    ):
+        payload.pop(field, None)
+    return payload
+
+
+def _compact_outcome_membership_evidence(
+    completed_candidates: Sequence[Mapping[str, Any]],
+    right_censored_positions: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    completed = sorted(
+        (dict(candidate) for candidate in completed_candidates),
+        key=lambda item: (
+            str(item.get("signal_date") or ""),
+            str(item.get("security_id") or ""),
+            str(item.get("candidate_key") or ""),
+        ),
+    )
+    censored = sorted(
+        (dict(candidate) for candidate in right_censored_positions),
+        key=lambda item: (
+            str(item.get("signal_date") or ""),
+            str(item.get("security_id") or ""),
+            str(item.get("candidate_key") or ""),
+        ),
+    )
+    completed_hashes = [_sha256(candidate) for candidate in completed]
+    censored_hashes = [_sha256(candidate) for candidate in censored]
+    rows = sorted(
+        [
+            [
+                str(candidate.get("candidate_key") or ""),
+                False,
+                payload_sha256,
+            ]
+            for candidate, payload_sha256 in zip(
+                completed,
+                completed_hashes,
+            )
+        ]
+        + [
+            [
+                str(candidate.get("candidate_key") or ""),
+                True,
+                payload_sha256,
+            ]
+            for candidate, payload_sha256 in zip(
+                censored,
+                censored_hashes,
+            )
+        ],
+        key=lambda row: row[0],
+    )
+    candidate_keys = [str(row[0]) for row in rows]
+    completed_row_hashes = [row[2] for row in rows if row[1] is False]
+    censored_row_hashes = [row[2] for row in rows if row[1] is True]
+    ordered_union = sorted(
+        [*completed, *censored],
+        key=lambda item: (
+            str(item.get("signal_date") or ""),
+            str(item.get("security_id") or ""),
+        ),
+    )
+    if (
+        not all(candidate_keys)
+        or len(candidate_keys) != len(set(candidate_keys))
+    ):
+        raise ValueError("outcome membership keys are invalid")
+    evidence = {
+        "schema_version": "ranked-liquidity-outcome-membership/v3",
+        "columns": [
+            "candidate_key",
+            "right_censored",
+            "outcome_payload_sha256",
+        ],
+        "row_count": len(rows),
+        "rows": rows,
+        "rows_sha256": _sha256(rows),
+        "completed_candidate_count": len(completed),
+        "completed_candidates_sha256": _sha256(completed),
+        "completed_candidate_payload_hashes_sha256": _sha256(
+            completed_row_hashes
+        ),
+        "right_censored_position_count": len(censored),
+        "right_censored_positions_sha256": _sha256(censored),
+        "right_censored_position_payload_hashes_sha256": _sha256(
+            censored_row_hashes
+        ),
+        "strict_outcome_candidate_payload_hashes_sha256": _sha256(
+            [*completed_row_hashes, *censored_row_hashes]
+        ),
+        "strict_outcome_candidates_sha256": _sha256(ordered_union),
+    }
+    evidence["receipt_sha256"] = _sha256(evidence)
+    return evidence
+
+
+def _compact_scored_execution_evidence(
+    candidates: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    ordered = sorted(
+        (dict(candidate) for candidate in candidates),
+        key=lambda item: (
+            str(item.get("signal_date") or ""),
+            str(item.get("security_id") or ""),
+            str(item.get("candidate_key") or ""),
+        ),
+    )
+    rows: list[list[Any]] = []
+    candidate_keys: list[str] = []
+    trade_keys: list[str] = []
+    payload_hashes: list[str] = []
+    positive_payload_hashes: list[str] = []
+    for candidate in ordered:
+        candidate_key = str(candidate.get("candidate_key") or "")
+        signal_date = str(candidate.get("signal_date") or "")
+        trade_key = _selection_trade_key(candidate)
+        security_id = str(candidate.get("security_id") or "")
+        industry = str(candidate.get("signal_industry") or "").strip()
+        score = float(candidate.get("predicted_net_return_pct"))
+        amount = float(candidate.get("candidate_amount"))
+        if (
+            not candidate_key
+            or not signal_date
+            or not security_id
+            or not industry
+            or not math.isfinite(score)
+            or not math.isfinite(amount)
+        ):
+            raise ValueError("scored execution evidence row is invalid")
+        payload_sha256 = _sha256(candidate)
+        outcome_payload_sha256 = _sha256(
+            _outcome_payload_from_scored_candidate(candidate)
+        )
+        candidate_keys.append(candidate_key)
+        trade_keys.append(trade_key)
+        payload_hashes.append(payload_sha256)
+        if score > 0.0:
+            positive_payload_hashes.append(payload_sha256)
+        rows.append(
+            [
+                candidate_key,
+                signal_date,
+                trade_key,
+                security_id,
+                industry,
+                score,
+                amount,
+                candidate.get("right_censored") is True,
+                outcome_payload_sha256,
+                payload_sha256,
+            ]
+        )
+    if (
+        len(candidate_keys) != len(set(candidate_keys))
+        or len(trade_keys) != len(set(trade_keys))
+    ):
+        raise ValueError("scored execution evidence keys are duplicated")
+    evidence = {
+        "schema_version": "ranked-liquidity-score-evidence/v3",
+        "columns": list(SCORED_EXECUTION_EVIDENCE_COLUMNS),
+        "row_count": len(rows),
+        "rows": rows,
+        "rows_sha256": _sha256(rows),
+        "candidate_payload_hashes_sha256": _sha256(payload_hashes),
+        "positive_candidate_payload_hashes_sha256": _sha256(
+            positive_payload_hashes
+        ),
+    }
+    evidence["receipt_sha256"] = _sha256(evidence)
+    return evidence
 
 
 def _positive_score_pool(
@@ -2020,10 +2710,12 @@ def _select_with_industry_cap_receipt(
     return selected, receipt
 
 
-def _assert_shared_strict_execution_contract() -> None:
+def _assert_shared_strict_execution_contract(
+    strategy_spec: Mapping[str, Any] = CONTINUOUS_RIDGE_OOF_SPEC,
+) -> None:
     comparisons = (
         (
-            CONTINUOUS_RIDGE_OOF_SPEC[
+            strategy_spec[
                 "planned_exit_signal_offset_sessions"
             ],
             INDUSTRY_RESIDUAL_SPEC[
@@ -2032,67 +2724,67 @@ def _assert_shared_strict_execution_contract() -> None:
             "planned exit offset",
         ),
         (
-            CONTINUOUS_RIDGE_OOF_SPEC["hold_days"],
+            strategy_spec["hold_days"],
             INDUSTRY_RESIDUAL_SPEC["hold_days"],
             "hold days",
         ),
         (
-            CONTINUOUS_RIDGE_OOF_SPEC["close_stop_loss_pct"],
+            strategy_spec["close_stop_loss_pct"],
             INDUSTRY_RESIDUAL_SPEC["close_stop_loss_pct"],
             "close stop",
         ),
         (
-            CONTINUOUS_RIDGE_OOF_SPEC["entry_execution"],
+            strategy_spec["entry_execution"],
             INDUSTRY_RESIDUAL_SPEC["entry_execution"],
             "entry execution",
         ),
         (
-            CONTINUOUS_RIDGE_OOF_SPEC["capital_model"],
+            strategy_spec["capital_model"],
             INDUSTRY_RESIDUAL_SPEC["capital_model"],
             "capital model",
         ),
         (
-            CONTINUOUS_RIDGE_OOF_SPEC["exposure_multiplier"],
+            strategy_spec["exposure_multiplier"],
             INDUSTRY_RESIDUAL_SPEC["exposure_multiplier"],
             "exposure multiplier",
         ),
         (
-            CONTINUOUS_RIDGE_OOF_SPEC["roundtrip_cost_bps"],
+            strategy_spec["roundtrip_cost_bps"],
             INDUSTRY_RESIDUAL_SPEC["roundtrip_cost_bps"],
             "roundtrip cost",
         ),
         (
-            CONTINUOUS_RIDGE_OOF_SPEC["slippage_bps"],
+            strategy_spec["slippage_bps"],
             INDUSTRY_RESIDUAL_SPEC["slippage_bps"],
             "slippage",
         ),
         (
-            CONTINUOUS_RIDGE_OOF_SPEC["annual_financing_rate_pct"],
+            strategy_spec["annual_financing_rate_pct"],
             INDUSTRY_RESIDUAL_SPEC["annual_financing_rate_pct"],
             "financing",
         ),
         (
-            CONTINUOUS_RIDGE_OOF_SPEC["blocked_sell_policy"],
+            strategy_spec["blocked_sell_policy"],
             INDUSTRY_RESIDUAL_SPEC["blocked_sell_policy"],
             "blocked sell",
         ),
         (
-            CONTINUOUS_RIDGE_OOF_SPEC["terminal_listing_policy"],
+            strategy_spec["terminal_listing_policy"],
             INDUSTRY_RESIDUAL_SPEC["terminal_listing_policy"],
             "terminal listing",
         ),
         (
-            CONTINUOUS_RIDGE_OOF_SPEC["entry_execution"],
+            strategy_spec["entry_execution"],
             TREND_PULLBACK_SPEC["entry_execution"],
             "strict trade core entry execution",
         ),
         (
-            CONTINUOUS_RIDGE_OOF_SPEC["hold_days"],
+            strategy_spec["hold_days"],
             TREND_PULLBACK_SPEC["hold_days"],
             "strict trade core hold days",
         ),
         (
-            CONTINUOUS_RIDGE_OOF_SPEC["close_stop_loss_pct"],
+            strategy_spec["close_stop_loss_pct"],
             TREND_PULLBACK_SPEC["close_stop_loss_pct"],
             "strict trade core close stop",
         ),
@@ -2103,11 +2795,11 @@ def _assert_shared_strict_execution_contract() -> None:
                 f"continuous ridge shared strict {label} contract drifted"
             )
     expected_label_friction = (
-        float(CONTINUOUS_RIDGE_OOF_SPEC["roundtrip_cost_bps"])
-        + 2.0 * float(CONTINUOUS_RIDGE_OOF_SPEC["slippage_bps"])
+        float(strategy_spec["roundtrip_cost_bps"])
+        + 2.0 * float(strategy_spec["slippage_bps"])
     ) / 100.0
     actual_label_friction = float(
-        CONTINUOUS_RIDGE_OOF_SPEC["label"][
+        strategy_spec["label"][
             "friction_percentage_points"
         ]
     )
@@ -2127,8 +2819,9 @@ def _apply_uniform_tail_cutoff(
     *,
     sessions: Sequence[str],
     family: str,
+    strategy_spec: Mapping[str, Any] = CONTINUOUS_RIDGE_OOF_SPEC,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    _assert_shared_strict_execution_contract()
+    _assert_shared_strict_execution_contract(strategy_spec)
     return _residual_apply_uniform_tail_cutoff(
         candidates,
         sessions=sessions,
@@ -2143,12 +2836,13 @@ def _preflight_strict_entries(
     sessions: Sequence[str],
     adapter: Any,
     verdict_cache: dict[tuple[str, str, str], dict[str, Any]] | None = None,
+    strategy_spec: Mapping[str, Any] = CONTINUOUS_RIDGE_OOF_SPEC,
 ) -> tuple[
     list[dict[str, Any]],
     dict[str, Any],
     dict[tuple[str, str, str], dict[str, Any]],
 ]:
-    _assert_shared_strict_execution_contract()
+    _assert_shared_strict_execution_contract(strategy_spec)
     return _residual_preflight_strict_entries(
         raw_candidates,
         frames_by_symbol=frames_by_symbol,
@@ -2169,8 +2863,12 @@ def _build_strict_outcomes(
         tuple[str, str], Sequence[Mapping[str, Any]]
     ],
     terminal_listing_evidence: Mapping[str, Mapping[str, Any]],
+    strategy_spec: Mapping[str, Any] = CONTINUOUS_RIDGE_OOF_SPEC,
+    receipt_schema_version: str = (
+        "ranked-liquidity-ridge-strict-outcome/v2"
+    ),
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    _assert_shared_strict_execution_contract()
+    _assert_shared_strict_execution_contract(strategy_spec)
     session_dates = _ordered_sessions(sessions)
     session_positions = {
         trade_date: position
@@ -2226,9 +2924,9 @@ def _build_strict_outcomes(
             session_positions=session_positions,
             suspension_evidence=suspension_evidence,
             terminal_listing_evidence=terminal_listing_evidence,
-            hold_days=int(CONTINUOUS_RIDGE_OOF_SPEC["hold_days"]),
+            hold_days=int(strategy_spec["hold_days"]),
             stop_loss_pct=float(
-                CONTINUOUS_RIDGE_OOF_SPEC["close_stop_loss_pct"]
+                strategy_spec["close_stop_loss_pct"]
             ),
             prevalidated_date_positions=date_positions_by_symbol[symbol],
         )
@@ -2255,7 +2953,7 @@ def _build_strict_outcomes(
             "name": str(candidate.get("name") or ""),
             "action": "BUY",
             "market_level": "audited_pit_development",
-            "signal_tags": [CONTINUOUS_RIDGE_OOF_SPEC["signal_tag"]],
+            "signal_tags": [strategy_spec["signal_tag"]],
             "current_universe_bias": False,
         }
         prediction = candidate.get("predicted_net_return_pct")
@@ -2291,7 +2989,7 @@ def _build_strict_outcomes(
         )
     )
     receipt = {
-        "schema_version": "ranked-liquidity-ridge-strict-outcome/v2",
+        "schema_version": receipt_schema_version,
         "input_executable_candidate_count": len(ordered),
         "input_candidate_keys_sha256": _sha256(candidate_keys),
         "status_counts": dict(sorted(status_counts.items())),
@@ -2310,6 +3008,43 @@ def _build_strict_outcomes(
         ),
         "verdict_cache_count": len(verdict_cache),
     }
+    if receipt_schema_version.endswith("/v3"):
+        completed_payload_hashes = [
+            _sha256(candidate)
+            for candidate in sorted(
+                completed,
+                key=lambda item: str(
+                    item.get("candidate_key") or ""
+                ),
+            )
+        ]
+        censored_payload_hashes = [
+            _sha256(candidate)
+            for candidate in sorted(
+                censored,
+                key=lambda item: str(
+                    item.get("candidate_key") or ""
+                ),
+            )
+        ]
+        receipt.update(
+            {
+                "completed_candidate_payload_hashes_sha256": _sha256(
+                    completed_payload_hashes
+                ),
+                "right_censored_position_payload_hashes_sha256": (
+                    _sha256(censored_payload_hashes)
+                ),
+                "strict_outcome_candidate_payload_hashes_sha256": (
+                    _sha256(
+                        [
+                            *completed_payload_hashes,
+                            *censored_payload_hashes,
+                        ]
+                    )
+                ),
+            }
+        )
     receipt["receipt_sha256"] = _sha256(receipt)
     return completed, censored, receipt
 
@@ -2324,11 +3059,20 @@ def _strict_execution_dataset(
         tuple[str, str], Sequence[Mapping[str, Any]]
     ],
     terminal_listing_evidence: Mapping[str, Mapping[str, Any]],
+    strategy_spec: Mapping[str, Any] = CONTINUOUS_RIDGE_OOF_SPEC,
+    outcome_receipt_schema_version: str = (
+        "ranked-liquidity-ridge-strict-outcome/v2"
+    ),
 ) -> dict[str, Any]:
+    tail_kwargs: dict[str, Any] = {
+        "sessions": sessions,
+        "family": str(strategy_spec["signal_tag"]),
+    }
+    if strategy_spec is not CONTINUOUS_RIDGE_OOF_SPEC:
+        tail_kwargs["strategy_spec"] = strategy_spec
     tail_candidates, tail_receipt = _apply_uniform_tail_cutoff(
         candidates,
-        sessions=sessions,
-        family=str(CONTINUOUS_RIDGE_OOF_SPEC["signal_tag"]),
+        **tail_kwargs,
     )
     executable, entry_receipt, verdict_cache = (
         _preflight_strict_entries(
@@ -2336,6 +3080,7 @@ def _strict_execution_dataset(
             frames_by_symbol=frames_by_symbol,
             sessions=sessions,
             adapter=adapter,
+            strategy_spec=strategy_spec,
         )
     )
     completed, censored, outcome_receipt = _build_strict_outcomes(
@@ -2346,6 +3091,8 @@ def _strict_execution_dataset(
         verdict_cache=verdict_cache,
         suspension_evidence=suspension_evidence,
         terminal_listing_evidence=terminal_listing_evidence,
+        strategy_spec=strategy_spec,
+        receipt_schema_version=outcome_receipt_schema_version,
     )
     return {
         "tail_candidates": tail_candidates,
@@ -2364,6 +3111,8 @@ def _evaluate_fixed_oof(
     *,
     rank_mode: str,
     evaluation_session_dates: Sequence[str],
+    strategy_spec: Mapping[str, Any] = CONTINUOUS_RIDGE_OOF_SPEC,
+    sweep_schema_version: str = "strict-ranked-liquidity-ridge-fixed-oof/v2",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     session_dates = _ordered_sessions(evaluation_session_dates)
     allowed_censor_reasons = {
@@ -2379,7 +3128,7 @@ def _evaluate_fixed_oof(
         raise AuditedPITDevelopmentReplayError(
             "continuous ridge evaluation received an unknown censor reason"
         )
-    selection = CONTINUOUS_RIDGE_OOF_SPEC["selection"]
+    selection = strategy_spec["selection"]
     selected, selection_receipt = _select_with_industry_cap_receipt(
         selection_candidates,
         rank_mode=rank_mode,
@@ -2394,24 +3143,24 @@ def _evaluate_fixed_oof(
     ]
     metrics = _trade_metrics(
         selected_complete,
-        hold_days=int(CONTINUOUS_RIDGE_OOF_SPEC["hold_days"]),
+        hold_days=int(strategy_spec["hold_days"]),
         max_active_positions=int(selection["max_active_positions"]),
         exposure_multiplier=float(
-            CONTINUOUS_RIDGE_OOF_SPEC["exposure_multiplier"]
+            strategy_spec["exposure_multiplier"]
         ),
         annual_financing_rate_pct=float(
-            CONTINUOUS_RIDGE_OOF_SPEC["annual_financing_rate_pct"]
+            strategy_spec["annual_financing_rate_pct"]
         ),
         roundtrip_cost_bps=float(
-            CONTINUOUS_RIDGE_OOF_SPEC["roundtrip_cost_bps"]
+            strategy_spec["roundtrip_cost_bps"]
         ),
-        slippage_bps=float(CONTINUOUS_RIDGE_OOF_SPEC["slippage_bps"]),
-        capital_model=str(CONTINUOUS_RIDGE_OOF_SPEC["capital_model"]),
+        slippage_bps=float(strategy_spec["slippage_bps"]),
+        capital_model=str(strategy_spec["capital_model"]),
         evaluation_start_date=session_dates[0],
         evaluation_end_date=session_dates[-1],
         evaluation_session_dates=session_dates,
     )
-    thresholds = CONTINUOUS_RIDGE_OOF_SPEC["advancement_thresholds"]
+    thresholds = strategy_spec["advancement_thresholds"]
     sample_pass = len(selected_complete) >= int(
         thresholds["minimum_complete_trades"]
     )
@@ -2483,11 +3232,11 @@ def _evaluate_fixed_oof(
     )
     row = {
         "label": (
-            f"{CONTINUOUS_RIDGE_OOF_SPEC['signal_tag']}|"
+            f"{strategy_spec['signal_tag']}|"
             f"{rank_mode}|all_market_levels"
         ),
         "required_signal_tags": [
-            CONTINUOUS_RIDGE_OOF_SPEC["signal_tag"]
+            strategy_spec["signal_tag"]
         ],
         "market_levels": [],
         **metrics,
@@ -2516,7 +3265,7 @@ def _evaluate_fixed_oof(
         ),
     }
     sweep = {
-        "schema_version": "strict-ranked-liquidity-ridge-fixed-oof/v2",
+        "schema_version": sweep_schema_version,
         "qualified_trade_count": len(selection_candidates)
         - sum(
             candidate.get("right_censored") is True
@@ -2548,6 +3297,411 @@ def _advancement_gate_passes(
         and main_row.get("evidence_complete")
         and amount_baseline_row.get("evidence_complete")
     )
+
+
+def _recompute_fixed_oof_gate(
+    sweep: Mapping[str, Any],
+    selection_receipt: Mapping[str, Any],
+    candidate_table: Sequence[Mapping[str, Any]],
+    *,
+    strategy_spec: Mapping[str, Any],
+    rank_mode: str,
+) -> dict[str, bool]:
+    top = sweep.get("top")
+    if not isinstance(top, list) or len(top) != 1:
+        raise ValueError("fixed OOF sweep must contain one result row")
+    row = dict(top[0])
+    selected_keys = list(selection_receipt["selected_trade_keys"])
+    candidate_by_trade_key = {
+        str(candidate["trade_key"]): dict(candidate)
+        for candidate in candidate_table
+    }
+    if (
+        len(candidate_by_trade_key) != len(candidate_table)
+        or any(key not in candidate_by_trade_key for key in selected_keys)
+    ):
+        raise ValueError("fixed OOF selection keys are invalid")
+    selected_censored_keys = [
+        key
+        for key in selected_keys
+        if candidate_by_trade_key[key]["right_censored"] is True
+    ]
+    selected_complete_count = len(selected_keys) - len(
+        selected_censored_keys
+    )
+    all_censored_count = sum(
+        candidate["right_censored"] is True
+        for candidate in candidate_table
+    )
+    evidence_complete = not selected_censored_keys
+    thresholds = strategy_spec["advancement_thresholds"]
+    raw_gate_metrics = (
+        row.get("gate_metric_basis") == "unrounded_float64"
+    )
+    win_rate = row.get("trade_win_rate_pct_raw")
+    full_drawdown = row.get("portfolio_max_drawdown_pct_raw")
+    full_profit_factor = row.get("trade_profit_factor_raw")
+    sample_pass = selected_complete_count >= int(
+        thresholds["minimum_complete_trades"]
+    )
+    full_quality_pass = bool(
+        raw_gate_metrics
+        and sample_pass
+        and win_rate is not None
+        and float(win_rate)
+        >= float(thresholds["minimum_full_win_rate_pct"])
+        and full_drawdown is not None
+        and abs(float(full_drawdown))
+        <= float(thresholds["maximum_full_drawdown_pct"])
+        and full_profit_factor is not None
+        and float(full_profit_factor)
+        >= float(thresholds["minimum_full_profit_factor"])
+    )
+    latest_return = row.get("rolling_1y_latest_return_pct_raw")
+    latest_calmar = row.get("calmar_latest_12m_raw")
+    latest_window_pass = bool(
+        raw_gate_metrics
+        and row.get("rolling_1y_latest_full_window") is True
+        and latest_return is not None
+        and float(latest_return)
+        >= float(thresholds["minimum_latest_365d_return_pct"])
+        and latest_calmar is not None
+        and float(latest_calmar)
+        >= float(thresholds["minimum_latest_365d_calmar"])
+    )
+    windows = row.get("rolling_1y_windows")
+    if not isinstance(windows, list):
+        raise ValueError("fixed OOF rolling windows are invalid")
+    rolling_stability_pass = bool(
+        windows
+        and raw_gate_metrics
+        and all(
+            window.get("return_pct_raw") is not None
+            and float(window["return_pct_raw"])
+            >= float(
+                thresholds[
+                    "all_complete_365d_minimum_return_pct"
+                ]
+            )
+            and window.get("max_drawdown_pct_raw") is not None
+            and abs(float(window["max_drawdown_pct_raw"]))
+            <= float(
+                thresholds[
+                    "all_complete_365d_maximum_drawdown_pct"
+                ]
+            )
+            and window.get("payoff_ratio_raw") is not None
+            and float(window["payoff_ratio_raw"])
+            >= float(
+                thresholds[
+                    "all_complete_365d_minimum_payoff_ratio"
+                ]
+            )
+            and window.get("profit_factor_raw") is not None
+            and float(window["profit_factor_raw"])
+            >= float(
+                thresholds[
+                    "all_complete_365d_minimum_profit_factor"
+                ]
+            )
+            and window.get("calmar_raw") is not None
+            and float(window["calmar_raw"])
+            >= float(
+                thresholds["all_complete_365d_minimum_calmar"]
+            )
+            for window in windows
+        )
+    )
+    target_all_pass = bool(
+        evidence_complete
+        and full_quality_pass
+        and latest_window_pass
+    )
+    target_gap = (
+        round(
+            float(thresholds["minimum_latest_365d_return_pct"])
+            - float(latest_return),
+            2,
+        )
+        if latest_return is not None
+        else None
+    )
+    expected_label = (
+        f"{strategy_spec['signal_tag']}|"
+        f"{rank_mode}|all_market_levels"
+    )
+    if (
+        sweep.get("schema_version")
+        != "strict-ranked-liquidity-ridge-fixed-oof/v3"
+        or sweep.get("selection_candidate_count")
+        != len(candidate_table)
+        or sweep.get("qualified_trade_count")
+        != len(candidate_table) - all_censored_count
+        or sweep.get("right_censored_position_count")
+        != all_censored_count
+        or sweep.get("spec_count") != 1
+        or sweep.get("evidence_complete") is not evidence_complete
+        or sweep.get("target_all_pass_count") != int(target_all_pass)
+        or sweep.get("target_rolling_12m_stability_pass_count")
+        != int(rolling_stability_pass)
+        or selection_receipt["selected_count"] != len(selected_keys)
+        or selection_receipt["parameters"]["rank_mode"] != rank_mode
+        or row.get("label") != expected_label
+        or row.get("required_signal_tags")
+        != [strategy_spec["signal_tag"]]
+        or row.get("market_levels") != []
+        or row.get("rank_mode") != rank_mode
+        or row.get("selection_candidate_count")
+        != len(candidate_table)
+        or row.get("selected_position_count") != len(selected_keys)
+        or row.get("selected_complete_trade_count")
+        != selected_complete_count
+        or row.get("selected_right_censored_position_count")
+        != len(selected_censored_keys)
+        or row.get("selected_right_censored_trade_keys")
+        != selected_censored_keys
+        or row.get("evidence_complete") is not evidence_complete
+        or row.get("target_minimum_sample_pass") is not sample_pass
+        or row.get("target_full_development_quality_pass")
+        is not full_quality_pass
+        or row.get("target_latest_12m_pass")
+        is not latest_window_pass
+        or row.get("target_rolling_12m_stability_pass")
+        is not rolling_stability_pass
+        or row.get("target_all_pass") is not target_all_pass
+        or row.get("target_gap_1y_return_pct") != target_gap
+    ):
+        raise ValueError("fixed OOF sweep gate verification failed")
+    return {
+        "target_all_pass": target_all_pass,
+        "rolling_stability_pass": rolling_stability_pass,
+        "evidence_complete": evidence_complete,
+    }
+
+
+def _verify_recomputed_trade_metrics(
+    sweep: Mapping[str, Any],
+    selected_trade_keys: Sequence[str],
+    selected_evidence_by_trade_key: Mapping[str, Mapping[str, Any]],
+    frozen_signal_sessions: Sequence[str],
+    *,
+    strategy_spec: Mapping[str, Any],
+) -> None:
+    selected_complete = [
+        dict(selected_evidence_by_trade_key[trade_key])
+        for trade_key in selected_trade_keys
+        if selected_evidence_by_trade_key[trade_key].get(
+            "right_censored"
+        )
+        is not True
+    ]
+    minimum_training_sessions = int(
+        strategy_spec["walk_forward"]["minimum_training_sessions"]
+    )
+    evaluation_sessions = list(
+        frozen_signal_sessions[minimum_training_sessions:]
+    )
+    if not evaluation_sessions:
+        raise ValueError("fixed OOF metric session grid is empty")
+    recomputed = _trade_metrics(
+        selected_complete,
+        hold_days=int(strategy_spec["hold_days"]),
+        max_active_positions=int(
+            strategy_spec["selection"]["max_active_positions"]
+        ),
+        exposure_multiplier=float(
+            strategy_spec["exposure_multiplier"]
+        ),
+        annual_financing_rate_pct=float(
+            strategy_spec["annual_financing_rate_pct"]
+        ),
+        roundtrip_cost_bps=float(
+            strategy_spec["roundtrip_cost_bps"]
+        ),
+        slippage_bps=float(strategy_spec["slippage_bps"]),
+        capital_model=str(strategy_spec["capital_model"]),
+        evaluation_start_date=evaluation_sessions[0],
+        evaluation_end_date=evaluation_sessions[-1],
+        evaluation_session_dates=evaluation_sessions,
+    )
+    row = sweep["top"][0]
+    if any(row.get(key) != value for key, value in recomputed.items()):
+        raise ValueError("fixed OOF trade metrics replay failed")
+
+
+def _replay_selection_summary(
+    receipt: Mapping[str, Any],
+    candidate_table: Sequence[Mapping[str, Any]],
+    *,
+    strategy_spec: Mapping[str, Any],
+    rank_mode: str,
+) -> list[str]:
+    summary = dict(receipt)
+    _verify_compact_receipt_summary(summary)
+    selection_spec = strategy_spec["selection"]
+    top_n = int(selection_spec["top_n"])
+    max_active_positions = int(
+        selection_spec["max_active_positions"]
+    )
+    expected_parameters = {
+        "rank_mode": rank_mode,
+        "top_n": top_n,
+        "max_active_positions": max_active_positions,
+        "max_active_positions_per_industry": 1,
+        "same_day_exit_before_signal_selection": True,
+        "industry_source": "signal_date_frozen",
+        "stable_identity": "security_id",
+    }
+    by_signal_date: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for compact_candidate in candidate_table:
+        candidate = dict(compact_candidate)
+        trade_key = str(candidate.get("trade_key") or "")
+        trade_key_parts = trade_key.split("|")
+        if (
+            len(trade_key_parts) != 4
+            or trade_key_parts[0] != candidate.get("security_id")
+        ):
+            raise ValueError("selection evidence trade key is invalid")
+        candidate["signal_date"] = trade_key_parts[1]
+        candidate["entry_date"] = trade_key_parts[2]
+        candidate["exit_date"] = trade_key_parts[3]
+        by_signal_date[trade_key_parts[1]].append(candidate)
+
+    selected_trade_keys: list[str] = []
+    active_positions: list[dict[str, Any]] = []
+    days: list[dict[str, Any]] = []
+    all_ordered_keys: list[str] = []
+    for signal_date in sorted(by_signal_date):
+        signal_day = date.fromisoformat(signal_date)
+        active_positions = [
+            trade
+            for trade in active_positions
+            if date.fromisoformat(str(trade["exit_date"])) > signal_day
+        ]
+        if rank_mode == "predicted_net_return":
+            trades = sorted(
+                by_signal_date[signal_date],
+                key=lambda trade: (
+                    -float(trade["predicted_net_return_pct"]),
+                    -float(trade["candidate_amount"]),
+                    str(trade["security_id"]),
+                ),
+            )
+        elif rank_mode == "signal_date_amount":
+            trades = sorted(
+                by_signal_date[signal_date],
+                key=lambda trade: (
+                    -float(trade["candidate_amount"]),
+                    str(trade["security_id"]),
+                ),
+            )
+        else:
+            raise ValueError("selection rank mode is invalid")
+        ordered_keys = [str(trade["trade_key"]) for trade in trades]
+        if len(ordered_keys) != len(set(ordered_keys)):
+            raise ValueError("daily selection keys are duplicated")
+        all_ordered_keys.extend(ordered_keys)
+        active_securities = {
+            str(trade["security_id"]) for trade in active_positions
+        }
+        active_industries = {
+            str(trade["signal_industry"]) for trade in active_positions
+        }
+        selected_today = 0
+        selected_today_keys: list[str] = []
+        decisions: list[dict[str, str]] = []
+        for index, trade in enumerate(trades):
+            trade_key = ordered_keys[index]
+            security_id = str(trade["security_id"])
+            industry = str(trade["signal_industry"])
+            if security_id in active_securities:
+                decisions.append(
+                    {
+                        "trade_key": trade_key,
+                        "decision": "active_security",
+                    }
+                )
+                continue
+            if industry in active_industries:
+                decisions.append(
+                    {
+                        "trade_key": trade_key,
+                        "decision": "active_industry",
+                    }
+                )
+                continue
+            if len(active_positions) >= max_active_positions:
+                decisions.extend(
+                    {
+                        "trade_key": ordered_keys[remaining],
+                        "decision": "max_active_positions_break",
+                    }
+                    for remaining in range(index, len(trades))
+                )
+                break
+            active_positions.append(trade)
+            active_securities.add(security_id)
+            active_industries.add(industry)
+            selected_trade_keys.append(trade_key)
+            selected_today_keys.append(trade_key)
+            selected_today += 1
+            decisions.append(
+                {"trade_key": trade_key, "decision": "selected"}
+            )
+            if selected_today >= top_n:
+                decisions.extend(
+                    {
+                        "trade_key": ordered_keys[remaining],
+                        "decision": "top_n_break",
+                    }
+                    for remaining in range(index + 1, len(trades))
+                )
+                break
+        days.append(
+            {
+                "signal_date": signal_date,
+                "ordered_candidate_trade_keys": ordered_keys,
+                "ordered_candidate_root_sha256": _sha256(
+                    ordered_keys
+                ),
+                "decisions": decisions,
+                "selected_trade_keys": selected_today_keys,
+            }
+        )
+
+    full_receipt_without_self_hash = {
+        key: value
+        for key, value in summary.items()
+        if key
+        not in {
+            "compact_summary_schema_version",
+            "full_receipt_sha256",
+            "omitted_fields",
+            "summary_receipt_sha256",
+        }
+    }
+    full_receipt_without_self_hash["days"] = days
+    if (
+        summary.get("schema_version")
+        != "continuous-ridge-industry-selection-receipt/v1"
+        or summary.get("parameters") != expected_parameters
+        or summary.get("candidate_count") != len(candidate_table)
+        or summary.get("candidate_table_sha256")
+        != _sha256(candidate_table)
+        or summary.get("ordered_candidate_trade_keys_sha256")
+        != _sha256(all_ordered_keys)
+        or summary.get("selected_count") != len(selected_trade_keys)
+        or summary.get("selected_trade_keys") != selected_trade_keys
+        or summary.get("selected_trade_keys_sha256")
+        != _sha256(selected_trade_keys)
+        or summary.get("signal_day_count") != len(days)
+        or summary["omitted_fields"].get("days")
+        != {"count": len(days), "sha256": _sha256(days)}
+        or summary.get("full_receipt_sha256")
+        != _sha256(full_receipt_without_self_hash)
+    ):
+        raise ValueError("selection summary replay failed")
+    return selected_trade_keys
 
 
 def _compact_receipt_summary(
@@ -2634,7 +3788,9 @@ def _verify_compact_receipt_summary(
             raise ValueError("compact receipt summary evidence is invalid")
 
 
-def _producer_binding() -> dict[str, Any]:
+def _producer_binding(*, artifact_version: int = 2) -> dict[str, Any]:
+    if artifact_version not in {2, 3}:
+        raise ValueError("ranked-liquidity producer version is invalid")
     base = _producer_code_binding()
     root = Path(__file__).resolve().parent
     module_names = (
@@ -2672,8 +3828,12 @@ def _producer_binding() -> dict[str, Any]:
         "pandas_version": pd.__version__,
         "pypdf_version": package_version("pypdf"),
     }
+    if artifact_version == 3:
+        identity["artifact_version"] = artifact_version
     return {
-        "schema_version": "audited-pit-ranked-liquidity-producer/v2",
+        "schema_version": (
+            f"audited-pit-ranked-liquidity-producer/v{artifact_version}"
+        ),
         **identity,
         "root_sha256": _sha256(identity),
     }
@@ -2682,7 +3842,12 @@ def _producer_binding() -> dict[str, Any]:
 def _assert_producer_binding_unchanged(
     expected: Mapping[str, Any],
 ) -> None:
-    if _producer_binding() != dict(expected):
+    schema_version = str(expected.get("schema_version") or "")
+    if schema_version == "audited-pit-ranked-liquidity-producer/v3":
+        actual = _producer_binding(artifact_version=3)
+    else:
+        actual = _producer_binding()
+    if actual != dict(expected):
         raise ValueError("continuous ridge producer code changed during replay")
 
 
@@ -2740,7 +3905,871 @@ def _write_result_bundle(
     }
 
 
-def run_audited_pit_ranked_liquidity_ridge_oof(
+def verify_rolling_result_bundle(
+    result: Mapping[str, Any],
+    *,
+    expected_strategy_spec: Mapping[str, Any] = (
+        ROLLING_CONTINUOUS_RIDGE_OOF_SPEC
+    ),
+) -> dict[str, Any]:
+    try:
+        runtime_result = dict(result)
+        artifact = dict(runtime_result["artifact"])
+        runtime_sidecars = dict(runtime_result["runtime_sidecars"])
+        main_path = Path(str(artifact["path"]))
+        main_file = json.loads(main_path.read_text(encoding="utf-8"))
+        main_digest = str(main_file.pop("artifact_sha256"))
+        if (
+            main_digest != artifact["artifact_sha256"]
+            or _sha256(main_file) != main_digest
+            or main_path.name != f"{main_digest}.json"
+        ):
+            raise ValueError
+        strategy = dict(main_file["strategy"])
+        strategy_digest = str(strategy.pop("strategy_sha256"))
+        expected_strategy = dict(expected_strategy_spec)
+        expected_strategy_sha256 = _sha256(expected_strategy)
+        if (
+            strategy != expected_strategy
+            or strategy_digest != expected_strategy_sha256
+            or main_file["strategy_sha256"] != strategy_digest
+        ):
+            raise ValueError
+        if (
+            main_file["schema_version"]
+            != "ranked-liquidity-ridge-result/v3"
+            or main_file["producer_code"]
+            != _producer_binding(artifact_version=3)
+            or main_file["scope"]["point_in_time"] is not True
+            or main_file["scope"]["development_only"] is not True
+            or main_file["scope"]["strict_artifact_native_execution"]
+            is not True
+            or main_file["scope"]["intraday_fill_claimed"] is not False
+            or main_file["scope"]["embargo_consumed"] is not False
+            or main_file["scope"]["final_oos_consumed"] is not False
+            or main_file["scope"]["eligible_for_profile_registration"]
+            is not False
+            or main_file["scope"]["production_recommendation_eligible"]
+            is not False
+        ):
+            raise ValueError
+
+        expected_sidecar_schemas = {
+            "features": "ranked-liquidity-feature-sidecar/v3",
+            "models": "ranked-liquidity-model-sidecar/v3",
+            "execution": "ranked-liquidity-execution-sidecar/v3",
+            "selection": "ranked-liquidity-selection-sidecar/v3",
+        }
+        expected_names = set(expected_sidecar_schemas)
+        if (
+            set(runtime_sidecars) != expected_names
+            or set(main_file["sidecars"]) != expected_names
+        ):
+            raise ValueError
+        sidecars: dict[str, dict[str, Any]] = {}
+        for name in sorted(expected_names):
+            runtime = dict(runtime_sidecars[name])
+            sidecar_path = Path(str(runtime["path"]))
+            sidecar_file = json.loads(
+                sidecar_path.read_text(encoding="utf-8")
+            )
+            sidecar_digest = str(sidecar_file.pop("artifact_sha256"))
+            if (
+                sidecar_digest != runtime["artifact_sha256"]
+                or _sha256(sidecar_file) != sidecar_digest
+                or sidecar_path.name != f"{sidecar_digest}.json"
+                or main_file["sidecars"][name]
+                != _stable_sidecar_reference(runtime)
+                or sidecar_file["schema_version"]
+                != expected_sidecar_schemas[name]
+                or sidecar_file["strategy_sha256"] != strategy_digest
+                or sidecar_file["source"] != main_file["source"]
+                or sidecar_file["producer_code"]
+                != main_file["producer_code"]
+            ):
+                raise ValueError
+            sidecars[name] = sidecar_file
+
+        oof_verification = sidecars["models"].get(
+            "oof_replay_verification"
+        )
+        oof_receipt_value = sidecars["models"].get("oof_receipt")
+        if (
+            not isinstance(oof_verification, Mapping)
+            or oof_verification.get("verified") is not True
+            or not isinstance(oof_receipt_value, Mapping)
+        ):
+            raise ValueError
+        oof_receipt = dict(oof_receipt_value)
+        oof_receipt_sha256 = str(
+            oof_receipt.pop("receipt_sha256")
+        )
+        folds = oof_receipt.get("folds")
+        frozen_signal_sessions = oof_receipt.get(
+            "frozen_signal_sessions"
+        )
+        if (
+            oof_receipt.get("schema_version")
+            != "ranked-liquidity-ridge-purged-oof-receipt/v3"
+            or not isinstance(folds, list)
+            or not isinstance(frozen_signal_sessions, list)
+            or frozen_signal_sessions
+            != sorted(set(frozen_signal_sessions))
+            or any(
+                date.fromisoformat(str(session)).isoformat()
+                != str(session)
+                for session in frozen_signal_sessions
+            )
+            or len(frozen_signal_sessions)
+            != int(expected_strategy["required_market_session_count"])
+            or oof_receipt.get("frozen_signal_sessions_sha256")
+            != _sha256(frozen_signal_sessions)
+            or sidecars["features"]["feature_receipt"].get(
+                "session_count"
+            )
+            != len(frozen_signal_sessions)
+            or sidecars["features"]["feature_receipt"].get(
+                "sessions_sha256"
+            )
+            != _sha256(frozen_signal_sessions)
+            or main_file["source"].get("market_session_count")
+            != len(frozen_signal_sessions)
+            or oof_receipt.get("fold_count") != len(folds)
+            or oof_receipt.get("folds_sha256") != _sha256(folds)
+            or oof_receipt_sha256 != _sha256(oof_receipt)
+            or len(folds)
+            != int(expected_strategy["required_oof_fold_count"])
+            or oof_verification.get("receipt_sha256")
+            != oof_receipt_sha256
+            or oof_verification.get("fold_count") != len(folds)
+            or oof_verification.get("oof_candidate_count")
+            != oof_receipt.get("oof_candidate_count")
+            or oof_receipt.get("minimum_training_sessions")
+            != expected_strategy["walk_forward"][
+                "minimum_training_sessions"
+            ]
+            or oof_receipt.get("validation_sessions")
+            != expected_strategy["walk_forward"]["validation_sessions"]
+            or oof_receipt.get("training_window_type")
+            != expected_strategy["walk_forward"][
+                "training_window_type"
+            ]
+            or oof_receipt.get("training_window_sessions")
+            != expected_strategy["walk_forward"][
+                "training_window_sessions"
+            ]
+            or oof_receipt.get("purge")
+            != expected_strategy["walk_forward"]["purge"]
+            or float(oof_receipt.get("ridge_lambda"))
+            != float(expected_strategy["model"]["ridge_lambda"])
+            or oof_receipt.get("oof_candidate_count")
+            != sum(
+                int(fold.get("validation_candidate_count", -1))
+                for fold in folds
+            )
+            or sidecars["models"].get("oof_candidate_count")
+            != oof_receipt.get("oof_candidate_count")
+            or main_file.get("oof_candidate_count")
+            != oof_receipt.get("oof_candidate_count")
+            or sidecars["models"].get("oof_scores_sha256")
+            != oof_receipt.get("oof_scores_sha256")
+            or main_file.get("oof_scores_sha256")
+            != oof_receipt.get("oof_scores_sha256")
+        ):
+            raise ValueError
+        prior_validation_end: str | None = None
+        for expected_fold_number, fold_value in enumerate(
+            folds,
+            start=1,
+        ):
+            if not isinstance(fold_value, Mapping):
+                raise ValueError
+            fold = dict(fold_value)
+            fold_receipt_sha256 = str(
+                fold.pop("receipt_sha256")
+            )
+            validation_start = str(
+                fold.get("validation_start") or ""
+            )
+            validation_end = str(fold.get("validation_end") or "")
+            start_position = int(
+                expected_strategy["walk_forward"][
+                    "minimum_training_sessions"
+                ]
+            ) + (
+                (expected_fold_number - 1)
+                * int(
+                    expected_strategy["walk_forward"][
+                        "validation_sessions"
+                    ]
+                )
+            )
+            expected_validation_start = frozen_signal_sessions[
+                start_position
+            ]
+            expected_validation_end = frozen_signal_sessions[
+                min(
+                    start_position
+                    + int(
+                        expected_strategy["walk_forward"][
+                            "validation_sessions"
+                        ]
+                    )
+                    - 1,
+                    len(frozen_signal_sessions) - 1,
+                )
+            ]
+            training_window_sessions = int(
+                expected_strategy["walk_forward"][
+                    "training_window_sessions"
+                ]
+            )
+            expected_training_window = frozen_signal_sessions[
+                start_position - training_window_sessions : start_position
+            ]
+            if (
+                fold_receipt_sha256 != _sha256(fold)
+                or fold.get("fold") != expected_fold_number
+                or fold.get("training_window_type")
+                != "trailing_frozen_signal_sessions"
+                or fold.get("training_window_session_count")
+                != training_window_sessions
+                or validation_start != expected_validation_start
+                or validation_end != expected_validation_end
+                or fold.get("training_window_start")
+                != expected_training_window[0]
+                or fold.get("training_window_end")
+                != expected_training_window[-1]
+                or fold.get("training_window_sessions_sha256")
+                != _sha256(expected_training_window)
+                or not validation_start
+                or validation_end < validation_start
+                or (
+                    prior_validation_end is not None
+                    and validation_start <= prior_validation_end
+                )
+                or str(fold.get("training_window_start") or "")
+                > str(fold.get("training_window_end") or "")
+                or str(fold.get("training_window_end") or "")
+                >= validation_start
+                or str(fold.get("training_last_exit_date") or "")
+                >= validation_start
+                or fold.get("model_sha256")
+                != _sha256(fold.get("model"))
+            ):
+                raise ValueError
+            prior_validation_end = validation_end
+        selection = sidecars["selection"]
+        main_selection = selection["main_selection_receipt"]
+        baseline_selection = selection[
+            "amount_baseline_selection_receipt"
+        ]
+        _verify_compact_receipt_summary(main_selection)
+        _verify_compact_receipt_summary(baseline_selection)
+        positive_pool_receipt = dict(selection["positive_pool_receipt"])
+        positive_pool_receipt_sha256 = str(
+            positive_pool_receipt.pop("receipt_sha256")
+        )
+        main_sweep = selection["main_sweep"]
+        baseline_sweep = selection["amount_baseline_sweep"]
+        outcome_membership = dict(
+            sidecars["execution"]["outcome_membership_evidence"]
+        )
+        outcome_membership_receipt_sha256 = str(
+            outcome_membership.pop("receipt_sha256")
+        )
+        outcome_membership_rows = outcome_membership["rows"]
+        if (
+            outcome_membership.get("schema_version")
+            != "ranked-liquidity-outcome-membership/v3"
+            or outcome_membership.get("columns")
+            != [
+                "candidate_key",
+                "right_censored",
+                "outcome_payload_sha256",
+            ]
+            or not isinstance(outcome_membership_rows, list)
+            or outcome_membership.get("row_count")
+            != len(outcome_membership_rows)
+            or outcome_membership_rows
+            != sorted(outcome_membership_rows, key=lambda row: row[0])
+            or outcome_membership.get("rows_sha256")
+            != _sha256(outcome_membership_rows)
+            or outcome_membership_receipt_sha256
+            != _sha256(outcome_membership)
+        ):
+            raise ValueError
+        outcome_membership_by_candidate_key: dict[
+            str, tuple[bool, str]
+        ] = {}
+        completed_outcome_payload_hashes: list[str] = []
+        censored_outcome_payload_hashes: list[str] = []
+        for row in outcome_membership_rows:
+            if (
+                not isinstance(row, list)
+                or len(row) != 3
+                or not str(row[0] or "")
+                or not isinstance(row[1], bool)
+                or len(str(row[2] or "")) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in str(row[2])
+                )
+                or str(row[0])
+                in outcome_membership_by_candidate_key
+            ):
+                raise ValueError
+            candidate_key = str(row[0])
+            right_censored = bool(row[1])
+            payload_sha256 = str(row[2])
+            outcome_membership_by_candidate_key[candidate_key] = (
+                right_censored,
+                payload_sha256,
+            )
+            if right_censored:
+                censored_outcome_payload_hashes.append(payload_sha256)
+            else:
+                completed_outcome_payload_hashes.append(payload_sha256)
+        if (
+            outcome_membership["completed_candidate_count"]
+            != len(completed_outcome_payload_hashes)
+            or outcome_membership[
+                "right_censored_position_count"
+            ]
+            != len(censored_outcome_payload_hashes)
+            or outcome_membership[
+                "completed_candidate_payload_hashes_sha256"
+            ]
+            != _sha256(completed_outcome_payload_hashes)
+            or outcome_membership[
+                "right_censored_position_payload_hashes_sha256"
+            ]
+            != _sha256(censored_outcome_payload_hashes)
+            or sidecars["execution"]["completed_candidate_count"]
+            != len(completed_outcome_payload_hashes)
+            or main_file["strict_outcome_candidate_count"]
+            != len(completed_outcome_payload_hashes)
+            + len(censored_outcome_payload_hashes)
+            or outcome_membership["row_count"]
+            != main_file["strict_outcome_candidate_count"]
+            or outcome_membership["completed_candidates_sha256"]
+            != sidecars["execution"]["outcome_receipt"][
+                "completed_candidates_sha256"
+            ]
+            or outcome_membership["completed_candidates_sha256"]
+            != sidecars["execution"]["completed_candidates_sha256"]
+            or sidecars["execution"][
+                "right_censored_position_count"
+            ]
+            != len(censored_outcome_payload_hashes)
+            or outcome_membership[
+                "right_censored_positions_sha256"
+            ]
+            != sidecars["execution"]["outcome_receipt"][
+                "right_censored_positions_sha256"
+            ]
+            or outcome_membership[
+                "right_censored_positions_sha256"
+            ]
+            != sidecars["execution"][
+                "right_censored_positions_sha256"
+            ]
+            or sidecars["execution"][
+                "completed_candidate_payload_hashes_sha256"
+            ]
+            != _sha256(completed_outcome_payload_hashes)
+            or sidecars["execution"]["outcome_receipt"][
+                "completed_candidate_payload_hashes_sha256"
+            ]
+            != _sha256(completed_outcome_payload_hashes)
+            or sidecars["execution"][
+                "right_censored_position_payload_hashes_sha256"
+            ]
+            != _sha256(censored_outcome_payload_hashes)
+            or sidecars["execution"]["outcome_receipt"][
+                "right_censored_position_payload_hashes_sha256"
+            ]
+            != _sha256(censored_outcome_payload_hashes)
+            or outcome_membership[
+                "strict_outcome_candidate_payload_hashes_sha256"
+            ]
+            != _sha256(
+                [
+                    *completed_outcome_payload_hashes,
+                    *censored_outcome_payload_hashes,
+                ]
+            )
+            or sidecars["execution"][
+                "strict_outcome_candidate_payload_hashes_sha256"
+            ]
+            != outcome_membership[
+                "strict_outcome_candidate_payload_hashes_sha256"
+            ]
+            or sidecars["execution"]["outcome_receipt"][
+                "strict_outcome_candidate_payload_hashes_sha256"
+            ]
+            != outcome_membership[
+                "strict_outcome_candidate_payload_hashes_sha256"
+            ]
+            or main_file[
+                "strict_outcome_candidate_payload_hashes_sha256"
+            ]
+            != outcome_membership[
+                "strict_outcome_candidate_payload_hashes_sha256"
+            ]
+            or outcome_membership[
+                "strict_outcome_candidates_sha256"
+            ]
+            != main_file["strict_outcome_candidates_sha256"]
+        ):
+            raise ValueError
+        scored_execution_evidence = dict(
+            selection["scored_execution_candidate_evidence"]
+        )
+        evidence_receipt_sha256 = str(
+            scored_execution_evidence.pop("receipt_sha256")
+        )
+        evidence_rows = scored_execution_evidence["rows"]
+        if (
+            scored_execution_evidence.get("schema_version")
+            != "ranked-liquidity-score-evidence/v3"
+            or scored_execution_evidence.get("columns")
+            != list(SCORED_EXECUTION_EVIDENCE_COLUMNS)
+            or not isinstance(evidence_rows, list)
+            or scored_execution_evidence.get("row_count")
+            != len(evidence_rows)
+            or scored_execution_evidence.get("rows_sha256")
+            != _sha256(evidence_rows)
+            or evidence_receipt_sha256
+            != _sha256(scored_execution_evidence)
+        ):
+            raise ValueError
+        input_candidate_keys: list[str] = []
+        positive_candidate_keys: list[str] = []
+        candidate_payload_hashes: list[str] = []
+        positive_candidate_payload_hashes: list[str] = []
+        reconstructed_candidate_table: list[dict[str, Any]] = []
+        positive_payload_by_trade_key: dict[str, str] = {}
+        positive_outcome_payload_by_trade_key: dict[str, str] = {}
+        prior_sort_key: tuple[str, str, str] | None = None
+        all_trade_keys: list[str] = []
+        for row in evidence_rows:
+            if not isinstance(row, list) or len(row) != len(
+                SCORED_EXECUTION_EVIDENCE_COLUMNS
+            ):
+                raise ValueError
+            (
+                candidate_key_value,
+                signal_date_value,
+                trade_key_value,
+                security_id_value,
+                industry_value,
+                score_value,
+                amount_value,
+                right_censored_value,
+                outcome_payload_sha256_value,
+                payload_sha256_value,
+            ) = row
+            candidate_key = str(candidate_key_value or "")
+            signal_date = str(signal_date_value or "")
+            trade_key = str(trade_key_value or "")
+            security_id = str(security_id_value or "")
+            industry = str(industry_value or "").strip()
+            score = float(score_value)
+            amount = float(amount_value)
+            outcome_payload_sha256 = str(
+                outcome_payload_sha256_value or ""
+            )
+            payload_sha256 = str(payload_sha256_value or "")
+            sort_key = (signal_date, security_id, candidate_key)
+            trade_key_parts = trade_key.split("|")
+            if (
+                not candidate_key
+                or not signal_date
+                or not trade_key
+                or not security_id
+                or not industry
+                or len(trade_key_parts) != 4
+                or trade_key_parts[0] != security_id
+                or trade_key_parts[1] != signal_date
+                or not is_mainboard_chinext_symbol(
+                    security_id.rsplit(":", 1)[-1]
+                )
+                or not math.isfinite(score)
+                or not math.isfinite(amount)
+                or not isinstance(right_censored_value, bool)
+                or len(outcome_payload_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in outcome_payload_sha256
+                )
+                or len(payload_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in payload_sha256
+                )
+                or (
+                    prior_sort_key is not None
+                    and sort_key < prior_sort_key
+                )
+                or outcome_membership_by_candidate_key.get(
+                    candidate_key
+                )
+                != (
+                    right_censored_value,
+                    outcome_payload_sha256,
+                )
+            ):
+                raise ValueError
+            prior_sort_key = sort_key
+            input_candidate_keys.append(candidate_key)
+            all_trade_keys.append(trade_key)
+            candidate_payload_hashes.append(payload_sha256)
+            if score > 0.0:
+                positive_candidate_keys.append(candidate_key)
+                positive_candidate_payload_hashes.append(payload_sha256)
+                if trade_key in positive_payload_by_trade_key:
+                    raise ValueError
+                positive_payload_by_trade_key[trade_key] = payload_sha256
+                positive_outcome_payload_by_trade_key[trade_key] = (
+                    outcome_payload_sha256
+                )
+                reconstructed_candidate_table.append(
+                    {
+                        "trade_key": trade_key,
+                        "candidate_key": candidate_key,
+                        "security_id": security_id,
+                        "signal_industry": industry,
+                        "predicted_net_return_pct": score,
+                        "candidate_amount": amount,
+                        "right_censored": right_censored_value,
+                    }
+                )
+        if (
+            len(input_candidate_keys) != len(set(input_candidate_keys))
+            or len(all_trade_keys) != len(set(all_trade_keys))
+            or scored_execution_evidence[
+                "candidate_payload_hashes_sha256"
+            ]
+            != _sha256(candidate_payload_hashes)
+            or scored_execution_evidence[
+                "positive_candidate_payload_hashes_sha256"
+            ]
+            != _sha256(positive_candidate_payload_hashes)
+        ):
+            raise ValueError
+        reconstructed_candidate_table.sort(
+            key=lambda item: item["trade_key"]
+        )
+        reconstructed_trade_keys = [
+            item["trade_key"]
+            for item in reconstructed_candidate_table
+        ]
+        if len(reconstructed_trade_keys) != len(
+            set(reconstructed_trade_keys)
+        ):
+            raise ValueError
+        positive_candidate_count = int(
+            positive_pool_receipt["positive_candidate_count"]
+        )
+        _replay_selection_summary(
+            main_selection,
+            reconstructed_candidate_table,
+            strategy_spec=expected_strategy,
+            rank_mode="predicted_net_return",
+        )
+        _replay_selection_summary(
+            baseline_selection,
+            reconstructed_candidate_table,
+            strategy_spec=expected_strategy,
+            rank_mode="signal_date_amount",
+        )
+        if (
+            positive_pool_receipt.get("schema_version")
+            != "continuous-ridge-positive-score-pool/v1"
+            or positive_pool_receipt.get("comparison")
+            != (
+                "predicted_net_return_pct_"
+                "strictly_greater_than_zero"
+            )
+            or _sha256(positive_pool_receipt)
+            != positive_pool_receipt_sha256
+            or main_file["positive_pool_receipt_sha256"]
+            != positive_pool_receipt_sha256
+            or scored_execution_evidence["rows_sha256"]
+            != main_file[
+                "scored_execution_candidate_evidence_rows_sha256"
+            ]
+            or scored_execution_evidence[
+                "candidate_payload_hashes_sha256"
+            ]
+            != main_file[
+                "scored_execution_candidate_payload_hashes_sha256"
+            ]
+            or len(evidence_rows)
+            != main_file["scored_execution_candidate_count"]
+            or positive_pool_receipt["input_candidate_count"]
+            != len(evidence_rows)
+            or positive_pool_receipt["input_candidate_keys_sha256"]
+            != _sha256(input_candidate_keys)
+            or positive_pool_receipt["positive_candidate_count"]
+            != len(positive_candidate_keys)
+            or positive_pool_receipt[
+                "positive_candidate_keys_sha256"
+            ]
+            != _sha256(positive_candidate_keys)
+            or main_sweep["schema_version"]
+            != "strict-ranked-liquidity-ridge-fixed-oof/v3"
+            or baseline_sweep["schema_version"]
+            != "strict-ranked-liquidity-ridge-fixed-oof/v3"
+            or main_file["main_sweep"] != main_sweep
+            or main_file["amount_baseline_sweep"] != baseline_sweep
+            or main_selection["schema_version"]
+            != "continuous-ridge-industry-selection-receipt/v1"
+            or baseline_selection["schema_version"]
+            != "continuous-ridge-industry-selection-receipt/v1"
+            or main_selection["parameters"]["rank_mode"]
+            != "predicted_net_return"
+            or baseline_selection["parameters"]["rank_mode"]
+            != "signal_date_amount"
+            or sidecars["execution"]["outcome_receipt"]["schema_version"]
+            != "ranked-liquidity-ridge-strict-outcome/v3"
+            or main_selection["candidate_table_sha256"]
+            != baseline_selection["candidate_table_sha256"]
+            or main_selection["candidate_table_sha256"]
+            != _sha256(reconstructed_candidate_table)
+            or main_selection["candidate_table_sha256"]
+            != main_file["comparison"]["shared_candidate_table_sha256"]
+            or selection["positive_candidate_count"]
+            != positive_candidate_count
+            or main_file["positive_candidate_count"]
+            != positive_candidate_count
+            or main_selection["candidate_count"]
+            != positive_candidate_count
+            or baseline_selection["candidate_count"]
+            != positive_candidate_count
+            or main_sweep["selection_candidate_count"]
+            != positive_candidate_count
+            or baseline_sweep["selection_candidate_count"]
+            != positive_candidate_count
+            or main_sweep["top"][0]["selection_candidate_count"]
+            != positive_candidate_count
+            or baseline_sweep["top"][0]["selection_candidate_count"]
+            != positive_candidate_count
+            or positive_pool_receipt["input_candidate_count"]
+            != main_file["scored_execution_candidate_count"]
+            or selection[
+                "positive_candidate_payload_hashes_sha256"
+            ]
+            != scored_execution_evidence[
+                "positive_candidate_payload_hashes_sha256"
+            ]
+            or main_file[
+                "positive_candidate_payload_hashes_sha256"
+            ]
+            != scored_execution_evidence[
+                "positive_candidate_payload_hashes_sha256"
+            ]
+            or selection["positive_candidate_keys_sha256"]
+            != positive_pool_receipt[
+                "positive_candidate_keys_sha256"
+            ]
+            or main_file["positive_candidate_keys_sha256"]
+            != positive_pool_receipt[
+                "positive_candidate_keys_sha256"
+            ]
+        ):
+            raise ValueError
+        _verify_compact_receipt_summary(
+            sidecars["execution"]["entry_preflight_receipt"]
+        )
+        _verify_compact_receipt_summary(
+            sidecars["execution"]["outcome_receipt"]
+        )
+        selected_evidence = selection["selected_evidence"]
+        main_selected_keys = main_selection["selected_trade_keys"]
+        baseline_selected_keys = baseline_selection["selected_trade_keys"]
+        expected_selected_keys = sorted(
+            set(main_selected_keys) | set(baseline_selected_keys)
+        )
+        selected_evidence_keys = [
+            _selection_trade_key(item) for item in selected_evidence
+        ]
+        candidate_table_by_trade_key = {
+            str(item["trade_key"]): item
+            for item in reconstructed_candidate_table
+        }
+        selected_projection_mismatch = False
+        for item, trade_key in zip(
+            selected_evidence,
+            selected_evidence_keys,
+        ):
+            selected_projection = {
+                "trade_key": trade_key,
+                "candidate_key": str(
+                    item.get("candidate_key") or ""
+                ),
+                "security_id": str(
+                    item.get("security_id") or ""
+                ),
+                "signal_industry": str(
+                    item.get("signal_industry") or ""
+                ).strip(),
+                "predicted_net_return_pct": float(
+                    item.get("predicted_net_return_pct")
+                ),
+                "candidate_amount": float(
+                    item.get("candidate_amount")
+                ),
+                "right_censored": item.get("right_censored") is True,
+            }
+            if (
+                candidate_table_by_trade_key.get(trade_key)
+                != selected_projection
+            ):
+                selected_projection_mismatch = True
+                break
+        if (
+            len(main_selected_keys) != main_selection["selected_count"]
+            or len(main_selected_keys) != len(set(main_selected_keys))
+            or _sha256(main_selected_keys)
+            != main_selection["selected_trade_keys_sha256"]
+            or len(baseline_selected_keys)
+            != baseline_selection["selected_count"]
+            or len(baseline_selected_keys)
+            != len(set(baseline_selected_keys))
+            or _sha256(baseline_selected_keys)
+            != baseline_selection["selected_trade_keys_sha256"]
+            or selected_evidence_keys != expected_selected_keys
+            or selected_projection_mismatch
+            or _sha256(selected_evidence)
+            != selection["selected_evidence_sha256"]
+            or any(
+                positive_payload_by_trade_key.get(
+                    _selection_trade_key(item)
+                )
+                != _sha256(dict(item))
+                for item in selected_evidence
+            )
+            or any(
+                positive_outcome_payload_by_trade_key.get(
+                    _selection_trade_key(item)
+                )
+                != _sha256(
+                    _outcome_payload_from_scored_candidate(item)
+                )
+                for item in selected_evidence
+            )
+            or any(
+                float(item.get("score"))
+                != float(item.get("predicted_net_return_pct"))
+                or float(item.get("rank_score"))
+                != float(item.get("predicted_net_return_pct"))
+                for item in selected_evidence
+            )
+            or any(
+                not is_mainboard_chinext_symbol(
+                    str(item.get("symbol") or "")
+                )
+                for item in selected_evidence
+            )
+        ):
+            raise ValueError
+        selected_evidence_by_trade_key = {
+            _selection_trade_key(item): dict(item)
+            for item in selected_evidence
+        }
+        _verify_recomputed_trade_metrics(
+            main_sweep,
+            main_selected_keys,
+            selected_evidence_by_trade_key,
+            frozen_signal_sessions,
+            strategy_spec=expected_strategy,
+        )
+        _verify_recomputed_trade_metrics(
+            baseline_sweep,
+            baseline_selected_keys,
+            selected_evidence_by_trade_key,
+            frozen_signal_sessions,
+            strategy_spec=expected_strategy,
+        )
+        main_gate = _recompute_fixed_oof_gate(
+            main_sweep,
+            main_selection,
+            reconstructed_candidate_table,
+            strategy_spec=expected_strategy,
+            rank_mode="predicted_net_return",
+        )
+        baseline_gate = _recompute_fixed_oof_gate(
+            baseline_sweep,
+            baseline_selection,
+            reconstructed_candidate_table,
+            strategy_spec=expected_strategy,
+            rank_mode="signal_date_amount",
+        )
+        expected_advancement_gate = bool(
+            main_gate["target_all_pass"]
+            and main_gate["rolling_stability_pass"]
+            and main_gate["evidence_complete"]
+            and baseline_gate["evidence_complete"]
+        )
+        if (
+            selection["advancement_gate_passed"]
+            is not expected_advancement_gate
+            or main_file["scope"]["advancement_gate_passed"]
+            is not expected_advancement_gate
+            or main_file["advancement_gate"][
+                "all_required_gates_passed"
+            ]
+            is not expected_advancement_gate
+            or main_file["advancement_gate"]["embargo_consumed"]
+            is not False
+            or main_file["advancement_gate"]["final_oos_consumed"]
+            is not False
+        ):
+            raise ValueError
+    except (
+        KeyError,
+        IndexError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise ValueError(
+            "rolling result bundle verification failed"
+        ) from exc
+    verification = {
+        "schema_version": (
+            "ranked-liquidity-rolling-result-bundle-verification/v3"
+        ),
+        "strategy_sha256": strategy_digest,
+        "producer_root_sha256": main_file["producer_code"][
+            "root_sha256"
+        ],
+        "main_artifact_sha256": main_digest,
+        "sidecar_artifact_sha256": {
+            name: runtime_sidecars[name]["artifact_sha256"]
+            for name in sorted(runtime_sidecars)
+        },
+        "checks": {
+            "independent_rolling_oof_replay": True,
+            "exact_trailing_126_session_windows": True,
+            "window_external_labels_excluded": True,
+            "window_internal_mature_labels_bound": True,
+            "immature_labels_purged": True,
+            "six_fold_geometry_matches_v2": True,
+            "content_addressing_verified": True,
+            "shared_positive_candidate_pool_verified": True,
+            "selected_board_scope_verified": True,
+        },
+        "verified": True,
+    }
+    verification["receipt_sha256"] = _sha256(verification)
+    return verification
+
+
+def _run_audited_pit_ranked_liquidity_ridge_oof(
     *,
     settings: Settings,
     audited_pit_universe_path: str | Path,
@@ -2753,14 +4782,70 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
     start_date: str,
     end_date: str,
     output_dir: str | Path,
+    strategy_spec: Mapping[str, Any],
+    artifact_version: int,
+    training_window_sessions: int | None,
 ) -> dict[str, Any]:
     if not isinstance(settings, Settings):
         raise AuditedPITDevelopmentReplayError(
             "ranked-liquidity replay requires frozen settings"
         )
-    _write_replay_progress(output_dir, "starting")
-    _assert_shared_strict_execution_contract()
-    producer_code = _producer_binding()
+    if artifact_version not in {2, 3}:
+        raise AuditedPITDevelopmentReplayError(
+            "ranked-liquidity replay version is invalid"
+        )
+    expected_strategy_schema = (
+        "development-pit-cross-sectional-ranked-liquidity-ridge-oof/v2"
+        if artifact_version == 2
+        else (
+            "development-pit-cross-sectional-ranked-liquidity-"
+            "ridge-rolling-oof/v3"
+        )
+    )
+    if strategy_spec.get("schema_version") != expected_strategy_schema:
+        raise AuditedPITDevelopmentReplayError(
+            "ranked-liquidity strategy identity is invalid"
+        )
+    frozen_window = strategy_spec["walk_forward"].get(
+        "training_window_sessions"
+    )
+    if (
+        (artifact_version == 2 and training_window_sessions is not None)
+        or (
+            artifact_version == 3
+            and (
+                training_window_sessions is None
+                or int(frozen_window) != int(training_window_sessions)
+            )
+        )
+    ):
+        raise AuditedPITDevelopmentReplayError(
+            "ranked-liquidity training window differs from frozen strategy"
+        )
+    if artifact_version == 3 and (
+        int(
+            strategy_spec["walk_forward"]["minimum_training_sessions"]
+        )
+        != 126
+        or int(training_window_sessions) != 126
+        or int(strategy_spec["walk_forward"]["validation_sessions"]) != 63
+        or float(strategy_spec["model"]["ridge_lambda"]) != 1.0
+    ):
+        raise AuditedPITDevelopmentReplayError(
+            "ranked-liquidity rolling strategy differs from preregistration"
+        )
+
+    def write_progress(stage: str, **details: Any) -> None:
+        _write_replay_progress(
+            output_dir,
+            stage,
+            artifact_version=artifact_version,
+            **details,
+        )
+
+    write_progress("starting")
+    _assert_shared_strict_execution_contract(strategy_spec)
+    producer_code = _producer_binding(artifact_version=artifact_version)
     contract = load_temporal_partition_contract(temporal_contract_path)
     if contract["contract_sha256"] != expected_temporal_contract_sha256:
         raise AuditedPITDevelopmentReplayError(
@@ -2819,13 +4904,12 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
             end_date=end_date,
         )
         if len(sessions) != int(
-            CONTINUOUS_RIDGE_OOF_SPEC["required_market_session_count"]
+            strategy_spec["required_market_session_count"]
         ):
             raise AuditedPITDevelopmentReplayError(
                 "ranked-liquidity market session count differs from freeze"
             )
-        _write_replay_progress(
-            output_dir,
+        write_progress(
             "artifact_verified",
             market_session_count=len(sessions),
         )
@@ -2837,8 +4921,7 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
             sessions=sessions,
             security_code_transition_contract=transition_contract,
         )
-        _write_replay_progress(
-            output_dir,
+        write_progress(
             "bars_loaded",
             bar_row_count=len(bars),
         )
@@ -2847,11 +4930,13 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
             _build_exact_cross_section_features(
                 bars,
                 sessions,
+                minimum_cross_section_members=int(
+                    strategy_spec["minimum_cross_section_members"]
+                ),
             )
         )
         verify_feature_receipt(features, feature_receipt)
-        _write_replay_progress(
-            output_dir,
+        write_progress(
             "features_built",
             feature_candidate_count=len(features),
         )
@@ -2859,7 +4944,8 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
         tail_candidates, tail_receipt = _apply_uniform_tail_cutoff(
             feature_candidates,
             sessions=sessions,
-            family=str(CONTINUOUS_RIDGE_OOF_SPEC["signal_tag"]),
+            family=str(strategy_spec["signal_tag"]),
+            strategy_spec=strategy_spec,
         )
         tail_offset = int(
             tail_receipt["required_signal_to_exit_offset_sessions"]
@@ -2877,8 +4963,7 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
             raise AuditedPITDevelopmentReplayError(
                 "ranked-liquidity tail feature pool differs from cutoff"
             )
-        _write_replay_progress(
-            output_dir,
+        write_progress(
             "tail_cutoff_applied",
             kept_candidate_count=len(tail_candidates),
             cut_candidate_count=int(tail_receipt["cut_count"]),
@@ -2928,8 +5013,7 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
                 sessions=sessions,
             )
         )
-        _write_replay_progress(
-            output_dir,
+        write_progress(
             "execution_evidence_loaded",
             execution_evidence_row_count=bulk_next_open_receipt[
                 "evidence_row_count"
@@ -2950,6 +5034,7 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
                 frames_by_symbol=frames_by_symbol,
                 sessions=sessions,
                 adapter=adapter,
+                strategy_spec=strategy_spec,
             )
         )
         completed_candidates, censored_positions, outcome_receipt = (
@@ -2961,6 +5046,11 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
                 verdict_cache=verdict_cache,
                 suspension_evidence=suspension_evidence,
                 terminal_listing_evidence=terminal_listing_evidence,
+                strategy_spec=strategy_spec,
+                receipt_schema_version=(
+                    "ranked-liquidity-ridge-strict-outcome/"
+                    f"v{artifact_version}"
+                ),
             )
         )
         execution = {
@@ -2973,8 +5063,7 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
             "outcome_receipt": outcome_receipt,
             "verdict_cache_count": len(verdict_cache),
         }
-        _write_replay_progress(
-            output_dir,
+        write_progress(
             "outcomes_built",
             completed_candidate_count=len(completed_candidates),
             right_censored_position_count=len(censored_positions),
@@ -3065,26 +5154,33 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
         outcome_candidates,
         sessions,
         minimum_training_sessions=int(
-            CONTINUOUS_RIDGE_OOF_SPEC["walk_forward"][
+            strategy_spec["walk_forward"][
                 "minimum_training_sessions"
             ]
         ),
+        training_window_sessions=training_window_sessions,
         validation_sessions=int(
-            CONTINUOUS_RIDGE_OOF_SPEC["walk_forward"][
+            strategy_spec["walk_forward"][
                 "validation_sessions"
             ]
         ),
         require_nonempty_validation_folds=True,
+        receipt_schema_version=(
+            "ranked-liquidity-ridge-purged-oof-receipt/"
+            f"v{artifact_version}"
+        ),
+        ridge_lambda=float(strategy_spec["model"]["ridge_lambda"]),
+        strategy_spec=strategy_spec,
     )
     expected_fold_ranges = _fold_ranges(
         sessions,
         minimum_training_sessions=int(
-            CONTINUOUS_RIDGE_OOF_SPEC["walk_forward"][
+            strategy_spec["walk_forward"][
                 "minimum_training_sessions"
             ]
         ),
         validation_sessions=int(
-            CONTINUOUS_RIDGE_OOF_SPEC["walk_forward"][
+            strategy_spec["walk_forward"][
                 "validation_sessions"
             ]
         ),
@@ -3095,14 +5191,31 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
     ]
     if (
         len(expected_fold_ranges)
-        != int(CONTINUOUS_RIDGE_OOF_SPEC["required_oof_fold_count"])
+        != int(strategy_spec["required_oof_fold_count"])
         or observed_fold_ranges != expected_fold_ranges
     ):
         raise AuditedPITDevelopmentReplayError(
             "ranked-liquidity OOF folds differ from frozen six-fold plan"
         )
-    _write_replay_progress(
-        output_dir,
+    oof_replay_verification = None
+    if training_window_sessions is not None:
+        oof_replay_verification = verify_rolling_oof_receipt(
+            tail_features,
+            outcome_candidates,
+            sessions,
+            scored_oof,
+            oof_receipt,
+            minimum_training_sessions=int(
+                strategy_spec["walk_forward"][
+                    "minimum_training_sessions"
+                ]
+            ),
+            training_window_sessions=training_window_sessions,
+            validation_sessions=int(
+                strategy_spec["walk_forward"]["validation_sessions"]
+            ),
+        )
+    write_progress(
         "oof_scored",
         oof_candidate_count=len(scored_oof),
         fold_count=len(oof_receipt["folds"]),
@@ -3139,7 +5252,7 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
         scored_execution_candidates
     )
     minimum_training_sessions = int(
-        CONTINUOUS_RIDGE_OOF_SPEC["walk_forward"][
+        strategy_spec["walk_forward"][
             "minimum_training_sessions"
         ]
     )
@@ -3152,13 +5265,21 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
         positive_candidates,
         rank_mode="predicted_net_return",
         evaluation_session_dates=evaluation_sessions,
+        strategy_spec=strategy_spec,
+        sweep_schema_version=(
+            f"strict-ranked-liquidity-ridge-fixed-oof/v{artifact_version}"
+        ),
     )
     baseline_sweep, baseline_selection_receipt = _evaluate_fixed_oof(
         positive_candidates,
         rank_mode="signal_date_amount",
         evaluation_session_dates=evaluation_sessions,
+        strategy_spec=strategy_spec,
+        sweep_schema_version=(
+            f"strict-ranked-liquidity-ridge-fixed-oof/v{artifact_version}"
+        ),
     )
-    selection_spec = CONTINUOUS_RIDGE_OOF_SPEC["selection"]
+    selection_spec = strategy_spec["selection"]
     main_selected, replayed_main_receipt = (
         _select_with_industry_cap_receipt(
             positive_candidates,
@@ -3201,8 +5322,7 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
         main_row,
         baseline_row,
     )
-    _write_replay_progress(
-        output_dir,
+    write_progress(
         "selection_evaluated",
         positive_candidate_count=len(positive_candidates),
         advancement_gate_passed=advancement_gate,
@@ -3214,7 +5334,22 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
     selected_evidence = [
         selected_union[key] for key in sorted(selected_union)
     ]
-    strategy_sha256 = _sha256(CONTINUOUS_RIDGE_OOF_SPEC)
+    scored_execution_evidence = (
+        _compact_scored_execution_evidence(
+            scored_execution_candidates
+        )
+        if artifact_version == 3
+        else None
+    )
+    outcome_membership_evidence = (
+        _compact_outcome_membership_evidence(
+            execution["completed_candidates"],
+            execution["right_censored_positions"],
+        )
+        if artifact_version == 3
+        else None
+    )
+    strategy_sha256 = _sha256(strategy_spec)
 
     sidecar_common = {
         "strategy_sha256": strategy_sha256,
@@ -3222,22 +5357,32 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
         "producer_code": producer_code,
     }
     feature_sidecar = {
-        "schema_version": "ranked-liquidity-feature-sidecar/v2",
+        "schema_version": (
+            f"ranked-liquidity-feature-sidecar/v{artifact_version}"
+        ),
         **sidecar_common,
         "bar_loader_receipt": bar_loader_receipt,
         "feature_receipt": feature_receipt,
     }
     model_sidecar = {
-        "schema_version": "ranked-liquidity-model-sidecar/v2",
+        "schema_version": (
+            f"ranked-liquidity-model-sidecar/v{artifact_version}"
+        ),
         **sidecar_common,
         "oof_receipt": oof_receipt,
         "oof_candidate_count": len(scored_oof),
         "oof_scores_sha256": oof_receipt["oof_scores_sha256"],
     }
+    if oof_replay_verification is not None:
+        model_sidecar["oof_replay_verification"] = (
+            oof_replay_verification
+        )
     entry_receipt = execution["entry_preflight_receipt"]
     outcome_receipt = execution["outcome_receipt"]
     execution_sidecar = {
-        "schema_version": "ranked-liquidity-execution-sidecar/v2",
+        "schema_version": (
+            f"ranked-liquidity-execution-sidecar/v{artifact_version}"
+        ),
         **sidecar_common,
         "security_code_transition_evidence": transition_evidence,
         "bulk_next_open_evidence_receipt": bulk_next_open_receipt,
@@ -3263,18 +5408,58 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
         "completed_candidate_count": len(
             execution["completed_candidates"]
         ),
-        "completed_candidates_sha256": _sha256(
-            execution["completed_candidates"]
-        ),
         "right_censored_position_count": len(
             execution["right_censored_positions"]
         ),
-        "right_censored_positions_sha256": _sha256(
-            execution["right_censored_positions"]
-        ),
     }
+    if artifact_version == 3:
+        execution_sidecar.update(
+            {
+                "outcome_membership_evidence": (
+                    outcome_membership_evidence
+                ),
+                "completed_candidates_sha256": (
+                    outcome_membership_evidence[
+                        "completed_candidates_sha256"
+                    ]
+                ),
+                "completed_candidate_payload_hashes_sha256": (
+                    outcome_membership_evidence[
+                        "completed_candidate_payload_hashes_sha256"
+                    ]
+                ),
+                "right_censored_positions_sha256": (
+                    outcome_membership_evidence[
+                        "right_censored_positions_sha256"
+                    ]
+                ),
+                "right_censored_position_payload_hashes_sha256": (
+                    outcome_membership_evidence[
+                        "right_censored_position_payload_hashes_sha256"
+                    ]
+                ),
+                "strict_outcome_candidate_payload_hashes_sha256": (
+                    outcome_membership_evidence[
+                        "strict_outcome_candidate_payload_hashes_sha256"
+                    ]
+                ),
+            }
+        )
+    else:
+        execution_sidecar.update(
+            {
+                "completed_candidates_sha256": _sha256(
+                    execution["completed_candidates"]
+                ),
+                "right_censored_positions_sha256": _sha256(
+                    execution["right_censored_positions"]
+                ),
+            }
+        )
     selection_sidecar = {
-        "schema_version": "ranked-liquidity-selection-sidecar/v2",
+        "schema_version": (
+            f"ranked-liquidity-selection-sidecar/v{artifact_version}"
+        ),
         **sidecar_common,
         "positive_pool_receipt": positive_pool_receipt,
         "main_selection_receipt": _compact_receipt_summary(
@@ -3301,11 +5486,32 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
         "amount_baseline_sweep": baseline_sweep,
         "advancement_gate_passed": advancement_gate,
     }
+    if artifact_version == 3:
+        selection_sidecar.update(
+            {
+                "scored_execution_candidate_evidence": (
+                    scored_execution_evidence
+                ),
+                "positive_candidate_count": len(positive_candidates),
+                "positive_candidate_payload_hashes_sha256": (
+                    scored_execution_evidence[
+                        "positive_candidate_payload_hashes_sha256"
+                    ]
+                ),
+                "positive_candidate_keys_sha256": (
+                    positive_pool_receipt[
+                        "positive_candidate_keys_sha256"
+                    ]
+                ),
+            }
+        )
     main_payload = {
-        "schema_version": "ranked-liquidity-ridge-result/v2",
+        "schema_version": (
+            f"ranked-liquidity-ridge-result/v{artifact_version}"
+        ),
         "strategy_sha256": strategy_sha256,
         "strategy": {
-            **CONTINUOUS_RIDGE_OOF_SPEC,
+            **strategy_spec,
             "strategy_sha256": strategy_sha256,
         },
         "source": source,
@@ -3329,11 +5535,7 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
         "scored_execution_candidate_count": len(
             scored_execution_candidates
         ),
-        "scored_execution_candidates_sha256": _sha256(
-            scored_execution_candidates
-        ),
         "positive_candidate_count": len(positive_candidates),
-        "positive_candidates_sha256": _sha256(positive_candidates),
         "main_sweep": main_sweep,
         "amount_baseline_sweep": baseline_sweep,
         "advancement_gate": {
@@ -3364,6 +5566,48 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
             "baseline_evidence_completeness_is_advancement_gate": True,
         },
     }
+    if artifact_version == 3:
+        main_payload.update(
+            {
+                "scored_execution_candidate_evidence_rows_sha256": (
+                    scored_execution_evidence["rows_sha256"]
+                ),
+                "strict_outcome_candidate_payload_hashes_sha256": (
+                    outcome_membership_evidence[
+                        "strict_outcome_candidate_payload_hashes_sha256"
+                    ]
+                ),
+                "scored_execution_candidate_payload_hashes_sha256": (
+                    scored_execution_evidence[
+                        "candidate_payload_hashes_sha256"
+                    ]
+                ),
+                "positive_candidate_payload_hashes_sha256": (
+                    scored_execution_evidence[
+                        "positive_candidate_payload_hashes_sha256"
+                    ]
+                ),
+                "positive_candidate_keys_sha256": (
+                    positive_pool_receipt[
+                        "positive_candidate_keys_sha256"
+                    ]
+                ),
+                "positive_pool_receipt_sha256": (
+                    positive_pool_receipt["receipt_sha256"]
+                ),
+            }
+        )
+    else:
+        main_payload.update(
+            {
+                "scored_execution_candidates_sha256": _sha256(
+                    scored_execution_candidates
+                ),
+                "positive_candidates_sha256": _sha256(
+                    positive_candidates
+                ),
+            }
+        )
     result = _write_result_bundle(
         output_dir,
         main_payload=main_payload,
@@ -3375,10 +5619,112 @@ def run_audited_pit_ranked_liquidity_ridge_oof(
         },
         expected_producer_code=producer_code,
     )
-    _write_replay_progress(
-        output_dir,
+    if artifact_version == 3:
+        verification = verify_rolling_result_bundle(
+            result,
+            expected_strategy_spec=strategy_spec,
+        )
+        runtime_verification = _write_content_addressed(
+            Path(output_dir) / "verifications",
+            verification,
+        )
+        result = {
+            **result,
+            "verification": verification,
+            "runtime_verification": runtime_verification,
+        }
+    write_progress(
         "completed",
         artifact_sha256=result["artifact"]["artifact_sha256"],
         advancement_gate_passed=advancement_gate,
     )
     return result
+
+
+def run_audited_pit_ranked_liquidity_ridge_oof(
+    *,
+    settings: Settings,
+    audited_pit_universe_path: str | Path,
+    expected_coverage_audit_sha256: str,
+    expected_artifact_root_sha256: str,
+    temporal_contract_path: str | Path,
+    expected_temporal_contract_sha256: str,
+    security_code_transition_evidence_root: str | Path,
+    expected_security_code_transition_contract_sha256: str,
+    start_date: str,
+    end_date: str,
+    output_dir: str | Path,
+) -> dict[str, Any]:
+    return _run_audited_pit_ranked_liquidity_ridge_oof(
+        settings=settings,
+        audited_pit_universe_path=audited_pit_universe_path,
+        expected_coverage_audit_sha256=expected_coverage_audit_sha256,
+        expected_artifact_root_sha256=expected_artifact_root_sha256,
+        temporal_contract_path=temporal_contract_path,
+        expected_temporal_contract_sha256=(
+            expected_temporal_contract_sha256
+        ),
+        security_code_transition_evidence_root=(
+            security_code_transition_evidence_root
+        ),
+        expected_security_code_transition_contract_sha256=(
+            expected_security_code_transition_contract_sha256
+        ),
+        start_date=start_date,
+        end_date=end_date,
+        output_dir=output_dir,
+        strategy_spec=CONTINUOUS_RIDGE_OOF_SPEC,
+        artifact_version=2,
+        training_window_sessions=None,
+    )
+
+
+def run_audited_pit_ranked_liquidity_ridge_rolling_oof(
+    *,
+    settings: Settings,
+    audited_pit_universe_path: str | Path,
+    expected_coverage_audit_sha256: str,
+    expected_artifact_root_sha256: str,
+    temporal_contract_path: str | Path,
+    expected_temporal_contract_sha256: str,
+    security_code_transition_evidence_root: str | Path,
+    expected_security_code_transition_contract_sha256: str,
+    start_date: str,
+    end_date: str,
+    output_dir: str | Path,
+) -> dict[str, Any]:
+    if (
+        _sha256(ROLLING_CONTINUOUS_RIDGE_OOF_SPEC)
+        != _ROLLING_CONTINUOUS_RIDGE_OOF_SPEC_SHA256
+    ):
+        raise AuditedPITDevelopmentReplayError(
+            "ranked-liquidity rolling strategy differs from "
+            "preregistered canonical hash"
+        )
+    training_window_sessions = int(
+        ROLLING_CONTINUOUS_RIDGE_OOF_SPEC["walk_forward"][
+            "training_window_sessions"
+        ]
+    )
+    return _run_audited_pit_ranked_liquidity_ridge_oof(
+        settings=settings,
+        audited_pit_universe_path=audited_pit_universe_path,
+        expected_coverage_audit_sha256=expected_coverage_audit_sha256,
+        expected_artifact_root_sha256=expected_artifact_root_sha256,
+        temporal_contract_path=temporal_contract_path,
+        expected_temporal_contract_sha256=(
+            expected_temporal_contract_sha256
+        ),
+        security_code_transition_evidence_root=(
+            security_code_transition_evidence_root
+        ),
+        expected_security_code_transition_contract_sha256=(
+            expected_security_code_transition_contract_sha256
+        ),
+        start_date=start_date,
+        end_date=end_date,
+        output_dir=output_dir,
+        strategy_spec=ROLLING_CONTINUOUS_RIDGE_OOF_SPEC,
+        artifact_version=3,
+        training_window_sessions=training_window_sessions,
+    )
