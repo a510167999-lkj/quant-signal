@@ -540,6 +540,23 @@ def test_independent_verifier_replays_and_rejects_tampering(
             validation_sessions=2,
         )
 
+    tampered_scores = scored.copy(deep=True)
+    probability_column = "predicted_positive_utility_probability"
+    tampered_scores.loc[0, probability_column] = float(
+        tampered_scores.loc[0, probability_column]
+    ) + 0.001
+    with pytest.raises(ValueError, match="shallow GBDT rolling OOF"):
+        verify_shallow_gbdt_rolling_oof_receipt(
+            features,
+            outcomes,
+            sessions,
+            tampered_scores,
+            receipt,
+            minimum_training_sessions=4,
+            training_window_sessions=4,
+            validation_sessions=2,
+        )
+
 
 def test_second_fold_drops_old_sessions_and_validation_outcomes_do_not_leak(
     monkeypatch: pytest.MonkeyPatch,
@@ -626,23 +643,6 @@ def test_rolling_oof_rejects_nan_keys_and_non_boolean_censor_flag(
             features,
             invalid_outcomes,
             sessions,
-            minimum_training_sessions=4,
-            training_window_sessions=4,
-            validation_sessions=2,
-        )
-
-    tampered_scores = scored.copy(deep=True)
-    probability_column = "predicted_positive_utility_probability"
-    tampered_scores.loc[0, probability_column] = float(
-        tampered_scores.loc[0, probability_column]
-    ) + 0.001
-    with pytest.raises(ValueError, match="shallow GBDT rolling OOF"):
-        verify_shallow_gbdt_rolling_oof_receipt(
-            features,
-            outcomes,
-            sessions,
-            tampered_scores,
-            receipt,
             minimum_training_sessions=4,
             training_window_sessions=4,
             validation_sessions=2,
