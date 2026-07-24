@@ -156,6 +156,30 @@ def test_gbdt_gate_is_exactly_strictly_greater_than_one_half() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("base", "field", "value"),
+    [
+        (SHALLOW_GBDT_SCORE_CONTRACT, "value", 0.0),
+        (SHALLOW_GBDT_SCORE_CONTRACT, "semantic", "mutated"),
+        (SHALLOW_GBDT_SCORE_CONTRACT, "unit", "percentage_points"),
+        (RIDGE_SCORE_CONTRACT, "gate", "gte"),
+        (RIDGE_SCORE_CONTRACT, "domain", "closed_interval_0_1"),
+    ],
+)
+def test_public_helpers_reject_contract_drift(
+    base: Mapping[str, object],
+    field: str,
+    value: object,
+) -> None:
+    mutated = {**base, field: value}
+
+    with pytest.raises(ValueError, match="frozen"):
+        candidate_passes_gate(
+            _candidate(gbdt_score=0.75, ridge_score=1.25),
+            contract=mutated,
+        )
+
+
 def test_selection_rank_key_uses_real_score_then_amount_then_security_id() -> None:
     candidates = [
         _candidate(
@@ -231,6 +255,27 @@ def test_baseline_rank_key_uses_only_amount_then_security_id() -> None:
         "cn-a-share:000002.SZ",
         "cn-a-share:000003.SZ",
     ]
+
+    invalid = _candidate(ridge_score=0.1, gbdt_score=0.75)
+    with pytest.raises(ValueError, match="predicted_net_return_pct"):
+        selection_rank_key(
+            invalid,
+            contract=SHALLOW_GBDT_SCORE_CONTRACT,
+            rank_mode="baseline",
+        )
+
+
+def test_legacy_rank_mode_names_preserve_ridge_receipt_semantics() -> None:
+    candidate = _candidate(ridge_score=1.25)
+
+    assert selection_rank_key(
+        candidate,
+        rank_mode="predicted_net_return",
+    ) == selection_rank_key(candidate, rank_mode="main")
+    assert selection_rank_key(
+        candidate,
+        rank_mode="signal_date_amount",
+    ) == selection_rank_key(candidate, rank_mode="baseline")
 
 
 @pytest.mark.parametrize(
