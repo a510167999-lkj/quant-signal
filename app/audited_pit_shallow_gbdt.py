@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 import hashlib
 import json
 from math import ceil
@@ -40,6 +41,8 @@ FROZEN_XGBOOST_PARAMS: Mapping[str, Any] = MappingProxyType(
     }
 )
 _XGBOOST_VERSION = "3.2.0"
+_FRICTION_PERCENTAGE_POINTS = 0.45
+_PROBABILITY_COLUMN = "predicted_positive_utility_probability"
 
 
 def _float64_vector(
@@ -81,6 +84,18 @@ def _array_sha256(values: np.ndarray) -> str:
     digest.update(b"\0")
     digest.update(array.tobytes(order="C"))
     return digest.hexdigest()
+
+
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _model_json(booster: Any) -> bytes:
@@ -319,3 +334,520 @@ def predict_shallow_gbdt_fold(
         "row_count": len(matrix),
     }
     return probabilities, receipt
+
+
+def _ordered_signal_sessions(sessions: Sequence[str]) -> list[str]:
+    values = [str(value) for value in sessions]
+    try:
+        parsed = [date.fromisoformat(value) for value in values]
+    except ValueError as exc:
+        raise ValueError("signal sessions must use ISO dates") from exc
+    if (
+        not values
+        or values != sorted(values)
+        or len(values) != len(set(values))
+        or [value.isoformat() for value in parsed] != values
+    ):
+        raise ValueError("signal sessions must be ordered and unique")
+    return values
+
+
+def _rolling_oof_inputs(
+    features: pd.DataFrame,
+    outcomes: Sequence[Mapping[str, Any]],
+    sessions: Sequence[str],
+    *,
+    minimum_training_sessions: int,
+    training_window_sessions: int,
+    validation_sessions: int,
+) -> tuple[
+    list[str],
+    pd.DataFrame,
+    dict[str, dict[str, Any]],
+]:
+    session_dates = _ordered_signal_sessions(sessions)
+    if (
+        minimum_training_sessions <= 0
+        or training_window_sessions <= 0
+        or training_window_sessions > minimum_training_sessions
+        or validation_sessions <= 0
+        or len(session_dates) <= minimum_training_sessions
+    ):
+        raise ValueError("shallow GBDT rolling window lengths are invalid")
+    required = {"candidate_key", "signal_date", *FEATURE_NAMES}
+    if not isinstance(features, pd.DataFrame) or not required.issubset(
+        features.columns
+    ):
+        raise ValueError("shallow GBDT rolling OOF features are incomplete")
+    rows = features.copy(deep=True)
+    rows["candidate_key"] = rows["candidate_key"].astype(str)
+    rows["signal_date"] = rows["signal_date"].astype(str)
+    if (
+        rows.empty
+        or rows["candidate_key"].eq("").any()
+        or rows["candidate_key"].duplicated().any()
+        or not rows["signal_date"].isin(session_dates).all()
+    ):
+        raise ValueError("shallow GBDT rolling OOF feature keys are invalid")
+    _float64_feature_matrix(
+        rows.loc[:, list(FEATURE_NAMES)].to_numpy(dtype=np.float64)
+    )
+    feature_dates = dict(zip(rows["candidate_key"], rows["signal_date"]))
+    session_set = set(session_dates)
+    outcome_lookup: dict[str, dict[str, Any]] = {}
+    for raw_outcome in outcomes:
+        outcome = dict(raw_outcome)
+        key = str(outcome.get("candidate_key") or "")
+        if (
+            not key
+            or key in outcome_lookup
+            or key not in feature_dates
+        ):
+            raise ValueError(
+                "shallow GBDT rolling OOF outcomes have invalid keys"
+            )
+        if outcome.get("right_censored") is not True:
+            exit_date = str(outcome.get("exit_date") or "")
+            try:
+                gross_return = float(outcome.get("return_pct"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "shallow GBDT rolling OOF outcome return is invalid"
+                ) from exc
+            if (
+                exit_date not in session_set
+                or exit_date <= feature_dates[key]
+                or not np.isfinite(gross_return)
+            ):
+                raise ValueError(
+                    "shallow GBDT rolling OOF outcome boundary is invalid"
+                )
+            outcome["exit_date"] = exit_date
+            outcome["return_pct"] = gross_return
+        outcome_lookup[key] = outcome
+    return session_dates, rows, outcome_lookup
+
+
+def _rolling_fold_members(
+    rows: pd.DataFrame,
+    outcome_lookup: Mapping[str, Mapping[str, Any]],
+    training_window: Sequence[str],
+    validation_start: str,
+) -> dict[str, Any]:
+    window_set = set(training_window)
+    training_records: list[dict[str, Any]] = []
+    window_keys: list[str] = []
+    right_censored_keys: list[str] = []
+    incomplete_keys: list[str] = []
+    immature_keys: list[str] = []
+    for row in rows.itertuples(index=False):
+        signal_date = str(row.signal_date)
+        if signal_date not in window_set:
+            continue
+        key = str(row.candidate_key)
+        window_keys.append(key)
+        outcome = outcome_lookup.get(key)
+        if outcome is None:
+            incomplete_keys.append(key)
+            continue
+        if outcome.get("right_censored") is True:
+            right_censored_keys.append(key)
+            continue
+        exit_date = str(outcome["exit_date"])
+        if exit_date >= validation_start:
+            immature_keys.append(key)
+            continue
+        training_records.append(
+            {
+                "candidate_key": key,
+                "signal_date": signal_date,
+                "exit_date": exit_date,
+                "net_return": (
+                    float(outcome["return_pct"])
+                    - _FRICTION_PERCENTAGE_POINTS
+                ),
+                "features": [
+                    float(getattr(row, name)) for name in FEATURE_NAMES
+                ],
+            }
+        )
+    training_records.sort(
+        key=lambda item: (item["signal_date"], item["candidate_key"])
+    )
+    for keys in (
+        window_keys,
+        right_censored_keys,
+        incomplete_keys,
+        immature_keys,
+    ):
+        keys.sort()
+    if not training_records:
+        raise ValueError(
+            "shallow GBDT rolling OOF fold has no mature training rows"
+        )
+    return {
+        "training_records": training_records,
+        "window_keys": window_keys,
+        "right_censored_keys": right_censored_keys,
+        "incomplete_keys": incomplete_keys,
+        "immature_keys": immature_keys,
+    }
+
+
+def _fold_receipt(
+    *,
+    fold_index: int,
+    validation_start: str,
+    validation_end: str,
+    training_window: Sequence[str],
+    members: Mapping[str, Any],
+    clipped_returns: np.ndarray,
+    cutoff: float,
+    cutoff_index: int,
+    labels: np.ndarray,
+    weights: np.ndarray,
+    daily_abs_sums: np.ndarray,
+    fit_receipt: Mapping[str, Any],
+    predict_receipt: Mapping[str, Any],
+    validation: pd.DataFrame,
+    score_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    training_records = list(members["training_records"])
+    validation_keys = validation["candidate_key"].astype(str).tolist()
+    receipt = {
+        "fold": fold_index,
+        "validation_start": validation_start,
+        "validation_end": validation_end,
+        "training_window_type": "trailing_frozen_signal_sessions",
+        "training_window_session_count": len(training_window),
+        "training_window_start": training_window[0],
+        "training_window_end": training_window[-1],
+        "training_window_sessions_sha256": _canonical_sha256(
+            list(training_window)
+        ),
+        "window_candidate_count": len(members["window_keys"]),
+        "window_candidate_keys_sha256": _canonical_sha256(
+            members["window_keys"]
+        ),
+        "right_censored_window_candidate_count": len(
+            members["right_censored_keys"]
+        ),
+        "right_censored_window_candidate_keys_sha256": _canonical_sha256(
+            members["right_censored_keys"]
+        ),
+        "incomplete_window_candidate_count": len(
+            members["incomplete_keys"]
+        ),
+        "incomplete_window_candidate_keys_sha256": _canonical_sha256(
+            members["incomplete_keys"]
+        ),
+        "purged_immature_candidate_count": len(members["immature_keys"]),
+        "purged_immature_candidate_keys_sha256": _canonical_sha256(
+            members["immature_keys"]
+        ),
+        "training_candidate_count": len(training_records),
+        "training_signal_date_count": len(
+            {item["signal_date"] for item in training_records}
+        ),
+        "training_last_exit_date": max(
+            item["exit_date"] for item in training_records
+        ),
+        "training_candidate_keys_sha256": _canonical_sha256(
+            [item["candidate_key"] for item in training_records]
+        ),
+        "training_rows_sha256": _canonical_sha256(training_records),
+        "training_label": (
+            "gross_return_pct_minus_0.45_then_fold_p99_symmetric_clip"
+        ),
+        "clip": {
+            "method": (
+                "absolute_p99_zero_based_nearest_rank_symmetric"
+            ),
+            "cutoff": cutoff,
+            "cutoff_index": cutoff_index,
+            "clipped_net_returns_sha256": _array_sha256(clipped_returns),
+        },
+        "targets": {
+            "label": "positive_clipped_net_return",
+            "weight": (
+                "abs_clipped_return_over_same_signal_date_abs_sum"
+            ),
+            "labels_sha256": _array_sha256(labels),
+            "weights_sha256": _array_sha256(weights),
+            "daily_abs_sums_sha256": _array_sha256(daily_abs_sums),
+        },
+        "fit_receipt": dict(fit_receipt),
+        "predict_receipt": dict(predict_receipt),
+        "validation_candidate_count": len(validation),
+        "validation_signal_date_count": int(
+            validation["signal_date"].nunique()
+        ),
+        "validation_candidate_keys_sha256": _canonical_sha256(
+            validation_keys
+        ),
+        "score_rows_sha256": _canonical_sha256(list(score_rows)),
+    }
+    receipt["receipt_sha256"] = _canonical_sha256(receipt)
+    return receipt
+
+
+def _compute_shallow_gbdt_rolling_oof(
+    features: pd.DataFrame,
+    outcomes: Sequence[Mapping[str, Any]],
+    sessions: Sequence[str],
+    *,
+    minimum_training_sessions: int,
+    training_window_sessions: int,
+    validation_sessions: int,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    session_dates, rows, outcome_lookup = _rolling_oof_inputs(
+        features,
+        outcomes,
+        sessions,
+        minimum_training_sessions=minimum_training_sessions,
+        training_window_sessions=training_window_sessions,
+        validation_sessions=validation_sessions,
+    )
+    scored_frames: list[pd.DataFrame] = []
+    fold_receipts: list[dict[str, Any]] = []
+    for fold_index, start_position in enumerate(
+        range(
+            minimum_training_sessions,
+            len(session_dates),
+            validation_sessions,
+        ),
+        start=1,
+    ):
+        validation_start = session_dates[start_position]
+        validation_end = session_dates[
+            min(
+                start_position + validation_sessions - 1,
+                len(session_dates) - 1,
+            )
+        ]
+        validation = rows[
+            rows["signal_date"].between(
+                validation_start,
+                validation_end,
+                inclusive="both",
+            )
+        ].sort_values(["signal_date", "candidate_key"], kind="mergesort")
+        if validation.empty:
+            raise ValueError(
+                "shallow GBDT rolling OOF fold has no validation rows"
+            )
+        training_window = session_dates[
+            start_position - training_window_sessions : start_position
+        ]
+        if len(training_window) != training_window_sessions:
+            raise ValueError(
+                "shallow GBDT rolling OOF training window is incomplete"
+            )
+        members = _rolling_fold_members(
+            rows,
+            outcome_lookup,
+            training_window,
+            validation_start,
+        )
+        training_records = members["training_records"]
+        x_train = np.ascontiguousarray(
+            [item["features"] for item in training_records],
+            dtype=np.float64,
+        )
+        raw_returns = np.ascontiguousarray(
+            [item["net_return"] for item in training_records],
+            dtype=np.float64,
+        )
+        clipped, cutoff, cutoff_index = clip_training_net_returns(
+            raw_returns
+        )
+        labels, weights, daily_abs_sums = build_daily_utility_targets(
+            clipped,
+            [item["signal_date"] for item in training_records],
+        )
+        booster, fit_receipt = fit_shallow_gbdt_fold(
+            x_train,
+            labels,
+            weights,
+        )
+        validation_matrix = np.ascontiguousarray(
+            validation.loc[:, list(FEATURE_NAMES)].to_numpy(
+                dtype=np.float64
+            )
+        )
+        probabilities, predict_receipt = predict_shallow_gbdt_fold(
+            booster,
+            validation_matrix,
+        )
+        scored = validation.copy()
+        scored[_PROBABILITY_COLUMN] = probabilities
+        scored_frames.append(scored)
+        score_rows = [
+            {
+                "candidate_key": str(row.candidate_key),
+                "signal_date": str(row.signal_date),
+                _PROBABILITY_COLUMN: float(probability),
+            }
+            for row, probability in zip(
+                validation.itertuples(index=False),
+                probabilities,
+                strict=True,
+            )
+        ]
+        fold_receipts.append(
+            _fold_receipt(
+                fold_index=fold_index,
+                validation_start=validation_start,
+                validation_end=validation_end,
+                training_window=training_window,
+                members=members,
+                clipped_returns=clipped,
+                cutoff=cutoff,
+                cutoff_index=cutoff_index,
+                labels=labels,
+                weights=weights,
+                daily_abs_sums=daily_abs_sums,
+                fit_receipt=fit_receipt,
+                predict_receipt=predict_receipt,
+                validation=validation,
+                score_rows=score_rows,
+            )
+        )
+    if not scored_frames:
+        raise ValueError("shallow GBDT rolling OOF produced no scores")
+    scored_oof = pd.concat(scored_frames, ignore_index=True).sort_values(
+        ["signal_date", "candidate_key"],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    if scored_oof["candidate_key"].duplicated().any():
+        raise ValueError(
+            "shallow GBDT rolling OOF keys overlap across folds"
+        )
+    score_payload = [
+        {
+            "candidate_key": str(row.candidate_key),
+            "signal_date": str(row.signal_date),
+            _PROBABILITY_COLUMN: float(
+                getattr(row, _PROBABILITY_COLUMN)
+            ),
+        }
+        for row in scored_oof.itertuples(index=False)
+    ]
+    receipt = {
+        "schema_version": (
+            "audited-pit-shallow-gbdt-rolling-oof-receipt/v1"
+        ),
+        "minimum_training_sessions": minimum_training_sessions,
+        "training_window_sessions": training_window_sessions,
+        "validation_sessions": validation_sessions,
+        "friction_percentage_points": _FRICTION_PERCENTAGE_POINTS,
+        "purge": "complete_exit_date_strictly_before_validation_start",
+        "probability_column": _PROBABILITY_COLUMN,
+        "probability_gate": "strictly_greater_than_0.5",
+        "fold_count": len(fold_receipts),
+        "folds": fold_receipts,
+        "folds_sha256": _canonical_sha256(fold_receipts),
+        "oof_candidate_count": len(scored_oof),
+        "oof_candidate_keys_sha256": _canonical_sha256(
+            scored_oof["candidate_key"].astype(str).tolist()
+        ),
+        "oof_scores_sha256": _canonical_sha256(score_payload),
+        "frozen_signal_sessions": session_dates,
+        "frozen_signal_sessions_sha256": _canonical_sha256(
+            session_dates
+        ),
+    }
+    receipt["receipt_sha256"] = _canonical_sha256(receipt)
+    return scored_oof, receipt
+
+
+def build_shallow_gbdt_rolling_oof_scores(
+    features: pd.DataFrame,
+    outcomes: Sequence[Mapping[str, Any]],
+    sessions: Sequence[str],
+    *,
+    minimum_training_sessions: int = 126,
+    training_window_sessions: int = 126,
+    validation_sessions: int = 63,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    return _compute_shallow_gbdt_rolling_oof(
+        features,
+        outcomes,
+        sessions,
+        minimum_training_sessions=minimum_training_sessions,
+        training_window_sessions=training_window_sessions,
+        validation_sessions=validation_sessions,
+    )
+
+
+def verify_shallow_gbdt_rolling_oof_receipt(
+    features: pd.DataFrame,
+    outcomes: Sequence[Mapping[str, Any]],
+    sessions: Sequence[str],
+    scored_oof: pd.DataFrame,
+    receipt: Mapping[str, Any],
+    *,
+    minimum_training_sessions: int = 126,
+    training_window_sessions: int = 126,
+    validation_sessions: int = 63,
+) -> dict[str, Any]:
+    try:
+        expected_scores, expected_receipt = (
+            _compute_shallow_gbdt_rolling_oof(
+                features,
+                outcomes,
+                sessions,
+                minimum_training_sessions=minimum_training_sessions,
+                training_window_sessions=training_window_sessions,
+                validation_sessions=validation_sessions,
+            )
+        )
+        if dict(receipt) != expected_receipt:
+            raise ValueError
+        required = {
+            "candidate_key",
+            "signal_date",
+            _PROBABILITY_COLUMN,
+        }
+        if (
+            not isinstance(scored_oof, pd.DataFrame)
+            or not required.issubset(scored_oof.columns)
+            or len(scored_oof) != len(expected_scores)
+        ):
+            raise ValueError
+        actual_payload = [
+            {
+                "candidate_key": str(row.candidate_key),
+                "signal_date": str(row.signal_date),
+                _PROBABILITY_COLUMN: float(
+                    getattr(row, _PROBABILITY_COLUMN)
+                ),
+            }
+            for row in scored_oof.itertuples(index=False)
+        ]
+        expected_payload = [
+            {
+                "candidate_key": str(row.candidate_key),
+                "signal_date": str(row.signal_date),
+                _PROBABILITY_COLUMN: float(
+                    getattr(row, _PROBABILITY_COLUMN)
+                ),
+            }
+            for row in expected_scores.itertuples(index=False)
+        ]
+        if (
+            actual_payload != expected_payload
+            or _canonical_sha256(actual_payload)
+            != expected_receipt["oof_scores_sha256"]
+        ):
+            raise ValueError
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "shallow GBDT rolling OOF verification failed"
+        ) from exc
+    return {
+        "verified": True,
+        "receipt_sha256": expected_receipt["receipt_sha256"],
+        "fold_count": expected_receipt["fold_count"],
+        "oof_candidate_count": expected_receipt["oof_candidate_count"],
+    }
