@@ -277,6 +277,23 @@ def test_legacy_rank_mode_names_preserve_ridge_receipt_semantics() -> None:
         rank_mode="signal_date_amount",
     ) == selection_rank_key(candidate, rank_mode="baseline")
 
+    gbdt_candidate = _candidate(gbdt_score=0.75)
+    with pytest.raises(ValueError, match="rank mode"):
+        selection_rank_key(
+            gbdt_candidate,
+            contract=SHALLOW_GBDT_SCORE_CONTRACT,
+            rank_mode="predicted_net_return",
+        )
+    assert selection_rank_key(
+        gbdt_candidate,
+        contract=SHALLOW_GBDT_SCORE_CONTRACT,
+        rank_mode="positive_utility_probability",
+    ) == selection_rank_key(
+        gbdt_candidate,
+        contract=SHALLOW_GBDT_SCORE_CONTRACT,
+        rank_mode="main",
+    )
+
 
 @pytest.mark.parametrize(
     ("candidate", "rank_mode"),
