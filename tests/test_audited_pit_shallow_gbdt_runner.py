@@ -285,3 +285,93 @@ def test_model_oof_adapter_rejects_mutated_global_gbdt_spec() -> None:
     finally:
         gbdt.SHALLOW_GBDT_OOF_SPEC.clear()
         gbdt.SHALLOW_GBDT_OOF_SPEC.update(original)
+
+
+def test_public_shallow_gbdt_runner_delegates_only_the_frozen_variant(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_private_runner(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"schema_version": "synthetic-gbdt-run/v1"}
+
+    monkeypatch.setattr(
+        ridge,
+        "_run_audited_pit_ranked_liquidity_ridge_oof",
+        fake_private_runner,
+    )
+    result = ridge.run_audited_pit_ranked_liquidity_shallow_gbdt_rolling_oof(
+        settings="settings",
+        audited_pit_universe_path=tmp_path / "universe.sqlite3",
+        expected_coverage_audit_sha256="a" * 64,
+        expected_artifact_root_sha256="b" * 64,
+        temporal_contract_path=tmp_path / "temporal.json",
+        expected_temporal_contract_sha256="c" * 64,
+        security_code_transition_evidence_root=tmp_path / "transition",
+        expected_security_code_transition_contract_sha256="d" * 64,
+        start_date="2024-07-05",
+        end_date="2026-07-03",
+        output_dir=tmp_path / "output",
+    )
+
+    assert result == {"schema_version": "synthetic-gbdt-run/v1"}
+    assert captured["strategy_spec"] == gbdt.SHALLOW_GBDT_OOF_SPEC
+    assert captured["artifact_version"] == 3
+    assert captured["training_window_sessions"] == 126
+
+
+def test_jobs_cli_dispatches_frozen_shallow_gbdt_rolling_oof(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from app import jobs
+
+    captured: dict[str, Any] = {}
+
+    def fake_runner(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"schema_version": "synthetic-gbdt-result/v1"}
+
+    monkeypatch.setattr(
+        jobs,
+        "run_audited_pit_ranked_liquidity_shallow_gbdt_rolling_oof",
+        fake_runner,
+        raising=False,
+    )
+    monkeypatch.setattr(jobs, "get_settings", lambda: "settings")
+    result = jobs.main(
+        [
+            (
+                "research-audited-pit-ranked-liquidity-"
+                "shallow-gbdt-rolling-oof"
+            ),
+            "--audited-pit-universe-path",
+            str(tmp_path / "universe.sqlite3"),
+            "--expected-coverage-audit-sha256",
+            "a" * 64,
+            "--expected-artifact-root-sha256",
+            "b" * 64,
+            "--temporal-contract-path",
+            str(tmp_path / "temporal.json"),
+            "--expected-temporal-contract-sha256",
+            "c" * 64,
+            "--security-code-transition-evidence-root",
+            str(tmp_path / "transition"),
+            "--expected-security-code-transition-contract-sha256",
+            "d" * 64,
+            "--start-date",
+            "2024-07-05",
+            "--end-date",
+            "2026-07-03",
+            "--output-dir",
+            str(tmp_path / "output"),
+        ]
+    )
+
+    assert result == 0
+    assert captured["settings"] == "settings"
+    assert captured["start_date"] == "2024-07-05"
+    assert captured["end_date"] == "2026-07-03"
+    assert captured["output_dir"] == str(tmp_path / "output")
