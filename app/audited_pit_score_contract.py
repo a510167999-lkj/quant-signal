@@ -110,7 +110,18 @@ def selection_rank_key(
     if not isinstance(security_id, str) or not security_id:
         raise ValueError("candidate security_id is invalid")
     score = candidate_score(candidate, contract=contract)
-    if rank_mode in {"main", "predicted_net_return"}:
+    is_model_rank = (
+        rank_mode == "main"
+        or (
+            contract is RIDGE_SCORE_CONTRACT
+            and rank_mode == "predicted_net_return"
+        )
+        or (
+            contract is SHALLOW_GBDT_SCORE_CONTRACT
+            and rank_mode == "positive_utility_probability"
+        )
+    )
+    if is_model_rank:
         if contract.get("main_rank_mode") != "score_descending":
             raise ValueError("score contract rank mode is unsupported")
         return (
