@@ -13,12 +13,14 @@ from app import audited_pit_continuous_ridge_oof as ridge
 from app import audited_pit_shallow_gbdt as shallow_gbdt
 
 
-_SESSIONS = [
-    "2025-01-02",
-    "2025-01-03",
-    "2025-01-06",
-    "2025-01-07",
-]
+_SESSIONS = pd.bdate_range(
+    end="2025-01-07",
+    periods=int(
+        shallow_gbdt.SHALLOW_GBDT_OOF_SPEC[
+            "required_market_session_count"
+        ]
+    ),
+).strftime("%Y-%m-%d").tolist()
 
 
 def _candidate(
@@ -88,7 +90,19 @@ def _scored_candidates() -> list[dict]:
     ]
 
 
-def _shared_receipts(candidates: list[dict] | None = None) -> dict:
+def _shared_receipts(
+    candidates: list[dict] | None = None,
+    *,
+    sessions: list[str] | None = None,
+) -> dict:
+    session_dates = sessions or _SESSIONS
+    evaluation_session_dates = session_dates[
+        int(
+            shallow_gbdt.SHALLOW_GBDT_OOF_SPEC["walk_forward"][
+                "minimum_training_sessions"
+            ]
+        ) :
+    ]
     scored_candidates = candidates or _scored_candidates()
     positive_candidates, positive_pool_receipt = ridge._positive_score_pool(
         scored_candidates,
@@ -97,7 +111,7 @@ def _shared_receipts(candidates: list[dict] | None = None) -> dict:
     main_sweep, main_selection_receipt = ridge._evaluate_fixed_oof(
         positive_candidates,
         rank_mode="positive_utility_probability",
-        evaluation_session_dates=_SESSIONS,
+        evaluation_session_dates=evaluation_session_dates,
         strategy_spec=shallow_gbdt.SHALLOW_GBDT_OOF_SPEC,
         sweep_schema_version="strict-ranked-liquidity-shallow-gbdt-fixed-oof/v1",
         score_contract=shallow_gbdt.SHALLOW_GBDT_SCORE_CONTRACT,
@@ -106,7 +120,7 @@ def _shared_receipts(candidates: list[dict] | None = None) -> dict:
         ridge._evaluate_fixed_oof(
             positive_candidates,
             rank_mode="signal_date_amount",
-            evaluation_session_dates=_SESSIONS,
+            evaluation_session_dates=evaluation_session_dates,
             strategy_spec=shallow_gbdt.SHALLOW_GBDT_OOF_SPEC,
             sweep_schema_version="strict-ranked-liquidity-shallow-gbdt-fixed-oof/v1",
             score_contract=shallow_gbdt.SHALLOW_GBDT_SCORE_CONTRACT,
@@ -131,6 +145,60 @@ def _shared_receipts(candidates: list[dict] | None = None) -> dict:
         )
         for candidate in scored_candidates
     ]
+    outcome_membership = ridge._compact_outcome_membership_evidence(
+        completed_candidates,
+        [],
+    )
+    fold_ranges = ridge._fold_ranges(
+        session_dates,
+        minimum_training_sessions=int(
+            shallow_gbdt.SHALLOW_GBDT_OOF_SPEC["walk_forward"][
+                "minimum_training_sessions"
+            ]
+        ),
+        validation_sessions=int(
+            shallow_gbdt.SHALLOW_GBDT_OOF_SPEC["walk_forward"][
+                "validation_sessions"
+            ]
+        ),
+    )
+    oof_receipt = {
+        "schema_version": (
+            "audited-pit-shallow-gbdt-rolling-oof-receipt/v1"
+        ),
+        "fold_count": len(fold_ranges),
+        "folds": [
+            {
+                "validation_start": validation_start,
+                "validation_end": validation_end,
+            }
+            for validation_start, validation_end in fold_ranges
+        ],
+        "frozen_signal_sessions": session_dates,
+        "frozen_signal_sessions_sha256": ridge._sha256(session_dates),
+        "oof_scores_sha256": "2" * 64,
+        "oof_candidate_count": 4,
+    }
+    oof_receipt["receipt_sha256"] = ridge._sha256(oof_receipt)
+    outcome_receipt = {
+        "schema_version": (
+            "ranked-liquidity-shallow-gbdt-strict-outcome/v1"
+        ),
+        "completed_candidate_count": len(completed_candidates),
+        "completed_candidates_sha256": outcome_membership[
+            "completed_candidates_sha256"
+        ],
+        "right_censored_position_count": 0,
+        "right_censored_positions_sha256": outcome_membership[
+            "right_censored_positions_sha256"
+        ],
+        "strict_outcome_candidate_payload_hashes_sha256": (
+            outcome_membership[
+                "strict_outcome_candidate_payload_hashes_sha256"
+            ]
+        ),
+    }
+    outcome_receipt["receipt_sha256"] = ridge._sha256(outcome_receipt)
     return {
         "source": {
             "coverage_audit_sha256": "a" * 64,
@@ -138,31 +206,24 @@ def _shared_receipts(candidates: list[dict] | None = None) -> dict:
             "temporal_contract_sha256": "c" * 64,
             "security_code_transition_contract_sha256": "d" * 64,
             "temporal_role": "development",
-            "market_session_count": 504,
-            "exact_membership_session_count": 504,
+            "market_session_count": len(session_dates),
+            "exact_membership_session_count": len(session_dates),
         },
         "features": {
             "bar_loader_receipt": {"schema_version": "synthetic-bars/v1"},
             "feature_receipt": {
                 "schema_version": "synthetic-features/v1",
-                "session_count": 504,
-                "sessions_sha256": "e" * 64,
+                "session_count": len(session_dates),
+                "sessions_sha256": ridge._sha256(session_dates),
                 "feature_rows_sha256": "f" * 64,
             },
         },
         "model": {
-            "oof_receipt": {
-                "schema_version": (
-                    "audited-pit-shallow-gbdt-rolling-oof-receipt/v1"
-                ),
-                "receipt_sha256": "1" * 64,
-                "oof_scores_sha256": "2" * 64,
-                "oof_candidate_count": 4,
-            },
+            "oof_receipt": oof_receipt,
             "oof_replay_verification": {
                 "verified": True,
-                "receipt_sha256": "1" * 64,
-                "fold_count": 6,
+                "receipt_sha256": oof_receipt["receipt_sha256"],
+                "fold_count": len(fold_ranges),
                 "oof_candidate_count": 4,
             },
         },
@@ -179,9 +240,7 @@ def _shared_receipts(candidates: list[dict] | None = None) -> dict:
             "entry_preflight_receipt": {
                 "schema_version": "synthetic-entry/v1"
             },
-            "outcome_receipt": {
-                "schema_version": "synthetic-outcome/v1"
-            },
+            "outcome_receipt": outcome_receipt,
             "completed_candidates": completed_candidates,
             "right_censored_positions": [],
         },
@@ -214,15 +273,19 @@ def _shared_receipts(candidates: list[dict] | None = None) -> dict:
     }
 
 
-def _build_payloads(candidates: list[dict] | None = None) -> dict:
+def _build_payloads(
+    candidates: list[dict] | None = None,
+    *,
+    sessions: list[str] | None = None,
+) -> dict:
     """The new builder receives only already-produced shared receipts."""
     return ridge.build_ranked_liquidity_result_payloads(
         strategy_spec=shallow_gbdt.SHALLOW_GBDT_OOF_SPEC,
-        shared_receipts=_shared_receipts(candidates),
+        shared_receipts=_shared_receipts(candidates, sessions=sessions),
     )
 
 
-def _replay_inputs() -> dict:
+def _replay_inputs(*, sessions: list[str] | None = None) -> dict:
     candidates = _scored_candidates()
     return {
         "tail_features": pd.DataFrame(),
@@ -233,7 +296,7 @@ def _replay_inputs() -> dict:
             )
             for candidate in candidates
         ],
-        "sessions": _SESSIONS,
+        "sessions": sessions or _SESSIONS,
         "scored_oof": pd.DataFrame(
             [
                 {
@@ -249,8 +312,13 @@ def _replay_inputs() -> dict:
     }
 
 
-def _bundle_with_fake_oof_replay(monkeypatch, tmp_path: Path) -> tuple[dict, dict]:
-    payloads = _build_payloads()
+def _bundle_with_fake_oof_replay(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    sessions: list[str] | None = None,
+) -> tuple[dict, dict]:
+    payloads = _build_payloads(sessions=sessions)
     bundle = ridge._write_result_bundle(
         tmp_path / "bundle",
         main_payload=payloads["main_payload"],
@@ -269,7 +337,7 @@ def _bundle_with_fake_oof_replay(monkeypatch, tmp_path: Path) -> tuple[dict, dic
         return {
             "verified": True,
             "receipt_sha256": receipt["receipt_sha256"],
-            "fold_count": 6,
+            "fold_count": receipt["fold_count"],
             "oof_candidate_count": 4,
         }
 
@@ -278,7 +346,7 @@ def _bundle_with_fake_oof_replay(monkeypatch, tmp_path: Path) -> tuple[dict, dic
         "_verify_shallow_gbdt_result_bundle_oof_replay",
         fake_independent_replay,
     )
-    return bundle, _replay_inputs()
+    return bundle, _replay_inputs(sessions=sessions)
 
 
 def _tamper_selection_bundle(
@@ -310,6 +378,43 @@ def _tamper_selection_bundle(
     )
     if mutate_main is not None:
         mutate_main(main_document, selection_document)
+    tampered["artifact"] = ridge._write_content_addressed(
+        tmp_path / "tampered",
+        main_document,
+    )
+    return tampered
+
+
+def _tamper_bundle_documents(
+    bundle: dict,
+    tmp_path: Path,
+    *,
+    mutate_main=None,
+    sidecar_mutators: dict | None = None,
+) -> dict:
+    tampered = deepcopy(bundle)
+    main_document = json.loads(
+        Path(tampered["artifact"]["path"]).read_text(encoding="utf-8")
+    )
+    main_document.pop("artifact_sha256")
+    for name, mutate_sidecar in (sidecar_mutators or {}).items():
+        sidecar_document = json.loads(
+            Path(
+                tampered["runtime_sidecars"][name]["path"]
+            ).read_text(encoding="utf-8")
+        )
+        sidecar_document.pop("artifact_sha256")
+        mutate_sidecar(sidecar_document)
+        sidecar_runtime = ridge._write_content_addressed(
+            tmp_path / "tampered" / "sidecars",
+            sidecar_document,
+        )
+        tampered["runtime_sidecars"][name] = sidecar_runtime
+        main_document["sidecars"][name] = ridge._stable_sidecar_reference(
+            sidecar_runtime
+        )
+    if mutate_main is not None:
+        mutate_main(main_document)
     tampered["artifact"] = ridge._write_content_addressed(
         tmp_path / "tampered",
         main_document,
@@ -415,6 +520,16 @@ def test_shallow_gbdt_variant_payload_builder_uses_frozen_schemas_and_probabilit
         "predicted_net_return_pct" not in selected
         for selected in selection["selected_evidence"]
     )
+    assert len(_SESSIONS) == int(
+        shallow_gbdt.SHALLOW_GBDT_OOF_SPEC[
+            "required_market_session_count"
+        ]
+    )
+    assert payloads["sidecar_payloads"]["models"]["oof_receipt"][
+        "fold_count"
+    ] == int(
+        shallow_gbdt.SHALLOW_GBDT_OOF_SPEC["required_oof_fold_count"]
+    )
 
 
 def test_shallow_gbdt_payload_builder_rejects_positive_candidates_that_do_not_match_strict_score_gate():
@@ -428,6 +543,137 @@ def test_shallow_gbdt_payload_builder_rejects_positive_candidates_that_do_not_ma
         ridge.build_ranked_liquidity_result_payloads(
             strategy_spec=shallow_gbdt.SHALLOW_GBDT_OOF_SPEC,
             shared_receipts=shared_receipts,
+        )
+
+
+def test_shallow_gbdt_result_bundle_rejects_truncated_frozen_session_geometry(
+    monkeypatch,
+    tmp_path: Path,
+):
+    truncated_sessions = _SESSIONS[63:]
+    bundle, replay_inputs = _bundle_with_fake_oof_replay(
+        monkeypatch,
+        tmp_path,
+        sessions=truncated_sessions,
+    )
+    model_document = json.loads(
+        Path(bundle["runtime_sidecars"]["models"]["path"]).read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert model_document["oof_receipt"]["fold_count"] == 5
+    with pytest.raises(
+        ValueError,
+        match="shallow GBDT result bundle verification failed",
+    ):
+        ridge.verify_shallow_gbdt_result_bundle(
+            bundle,
+            **replay_inputs,
+        )
+
+
+def test_shallow_gbdt_result_bundle_rejects_rehashed_source_session_count_tamper(
+    monkeypatch,
+    tmp_path: Path,
+):
+    bundle, replay_inputs = _bundle_with_fake_oof_replay(
+        monkeypatch,
+        tmp_path,
+    )
+
+    def rewrite_source(document: dict) -> None:
+        document["source"]["market_session_count"] = len(_SESSIONS) - 1
+        document["source"]["exact_membership_session_count"] = (
+            len(_SESSIONS) - 1
+        )
+
+    tampered = _tamper_bundle_documents(
+        bundle,
+        tmp_path,
+        mutate_main=rewrite_source,
+        sidecar_mutators={
+            name: rewrite_source
+            for name in bundle["runtime_sidecars"]
+        },
+    )
+    with pytest.raises(
+        ValueError,
+        match="shallow GBDT result bundle verification failed",
+    ):
+        ridge.verify_shallow_gbdt_result_bundle(
+            tampered,
+            **replay_inputs,
+        )
+
+
+def test_shallow_gbdt_result_bundle_rejects_rehashed_feature_session_binding_tamper(
+    monkeypatch,
+    tmp_path: Path,
+):
+    bundle, replay_inputs = _bundle_with_fake_oof_replay(
+        monkeypatch,
+        tmp_path,
+    )
+
+    def rewrite_feature_sessions(feature_sidecar: dict) -> None:
+        receipt = feature_sidecar["feature_receipt"]
+        receipt["session_count"] = len(_SESSIONS) - 1
+        receipt["sessions_sha256"] = ridge._sha256(_SESSIONS[:-1])
+
+    tampered = _tamper_bundle_documents(
+        bundle,
+        tmp_path,
+        sidecar_mutators={"features": rewrite_feature_sessions},
+    )
+    with pytest.raises(
+        ValueError,
+        match="shallow GBDT result bundle verification failed",
+    ):
+        ridge.verify_shallow_gbdt_result_bundle(
+            tampered,
+            **replay_inputs,
+        )
+
+
+def test_shallow_gbdt_result_bundle_rejects_rehashed_outcome_receipt_that_conflicts_with_membership(
+    monkeypatch,
+    tmp_path: Path,
+):
+    bundle, replay_inputs = _bundle_with_fake_oof_replay(
+        monkeypatch,
+        tmp_path,
+    )
+
+    def rewrite_outcome_receipt(execution_sidecar: dict) -> None:
+        receipt = execution_sidecar["outcome_receipt"]
+        receipt["schema_version"] = "forged-outcome/v999"
+        receipt["completed_candidate_count"] = 999
+        receipt["completed_candidates_sha256"] = "0" * 64
+        receipt["right_censored_position_count"] = 999
+        receipt["right_censored_positions_sha256"] = "1" * 64
+        receipt["strict_outcome_candidate_payload_hashes_sha256"] = (
+            "2" * 64
+        )
+        unsigned = {
+            key: value
+            for key, value in receipt.items()
+            if key != "receipt_sha256"
+        }
+        receipt["receipt_sha256"] = ridge._sha256(unsigned)
+
+    tampered = _tamper_bundle_documents(
+        bundle,
+        tmp_path,
+        sidecar_mutators={"execution": rewrite_outcome_receipt},
+    )
+    with pytest.raises(
+        ValueError,
+        match="shallow GBDT result bundle verification failed",
+    ):
+        ridge.verify_shallow_gbdt_result_bundle(
+            tampered,
+            **replay_inputs,
         )
 
 
