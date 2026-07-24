@@ -396,16 +396,87 @@ class _NoopProcessGuard:
         return None
 
 
+def _validated_job_memory_limit_bytes(value: object) -> int | None:
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value <= 0
+        or value > ctypes.c_size_t(-1).value
+    ):
+        raise LauncherError("launcher job memory limit is invalid")
+    return value
+
+
 class _WindowsJobProcessGuard:
     description = "windows-job-object-active-process-limit-2-venv-trampoline"
 
-    def __init__(self, handle: int, kernel32):
+    def __init__(
+        self,
+        handle: int,
+        kernel32,
+        limits_type,
+        accounting_type,
+        *,
+        job_memory_limit_bytes: int | None,
+    ):
         self._handle = handle
         self._kernel32 = kernel32
+        self._limits_type = limits_type
+        self._accounting_type = accounting_type
+        self.job_memory_limit_bytes = job_memory_limit_bytes
+        if job_memory_limit_bytes is not None:
+            self.description = (
+                "windows-job-object-active-process-limit-2-venv-trampoline-"
+                f"hard-job-memory-limit-{job_memory_limit_bytes}-bytes"
+            )
 
     def terminate_tree(self) -> None:
         if self._handle and not self._kernel32.TerminateJobObject(self._handle, 1):
             raise ctypes.WinError(ctypes.get_last_error())
+
+    def peak_job_memory_bytes(self) -> int:
+        if not self._handle:
+            raise LauncherError("launcher process guard is closed")
+        limits = self._limits_type()
+        if not self._kernel32.QueryInformationJobObject(
+            self._handle,
+            9,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+            None,
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return int(limits.PeakJobMemoryUsed)
+
+    def wait_for_tree(self, timeout_seconds: float) -> bool:
+        if not self._handle:
+            raise LauncherError("launcher process guard is closed")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(float(timeout_seconds))
+            or timeout_seconds <= 0
+        ):
+            raise LauncherError("launcher process tree timeout is invalid")
+        deadline = time.monotonic() + float(timeout_seconds)
+        while True:
+            accounting = self._accounting_type()
+            if not self._kernel32.QueryInformationJobObject(
+                self._handle,
+                1,
+                ctypes.byref(accounting),
+                ctypes.sizeof(accounting),
+                None,
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if int(accounting.ActiveProcesses) == 0:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(remaining, 0.05))
 
     def close(self) -> None:
         if self._handle:
@@ -414,8 +485,11 @@ class _WindowsJobProcessGuard:
             self._handle = 0
 
 
-def _attach_process_guard(process):
+def _attach_process_guard(process, *, job_memory_limit_bytes: int | None = None):
+    memory_limit = _validated_job_memory_limit_bytes(job_memory_limit_bytes)
     if os.name != "nt":
+        if memory_limit is not None:
+            raise LauncherError("launcher hard job memory limit requires Windows")
         return _NoopProcessGuard()
 
     from ctypes import wintypes
@@ -456,6 +530,18 @@ def _attach_process_guard(process):
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         )
 
+    class JOBOBJECT_BASIC_ACCOUNTING_INFORMATION(ctypes.Structure):
+        _fields_ = (
+            ("TotalUserTime", ctypes.c_int64),
+            ("TotalKernelTime", ctypes.c_int64),
+            ("ThisPeriodTotalUserTime", ctypes.c_int64),
+            ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+            ("TotalPageFaultCount", wintypes.DWORD),
+            ("TotalProcesses", wintypes.DWORD),
+            ("ActiveProcesses", wintypes.DWORD),
+            ("TotalTerminatedProcesses", wintypes.DWORD),
+        )
+
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
     kernel32.CreateJobObjectW.restype = wintypes.HANDLE
@@ -466,6 +552,14 @@ def _attach_process_guard(process):
         wintypes.DWORD,
     )
     kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.QueryInformationJobObject.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    )
+    kernel32.QueryInformationJobObject.restype = wintypes.BOOL
     kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
     kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
     kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
@@ -480,6 +574,9 @@ def _attach_process_guard(process):
         limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
         limits.BasicLimitInformation.LimitFlags = 0x00000008 | 0x00002000
         limits.BasicLimitInformation.ActiveProcessLimit = 2
+        if memory_limit is not None:
+            limits.BasicLimitInformation.LimitFlags |= 0x00000200
+            limits.JobMemoryLimit = memory_limit
         if not kernel32.SetInformationJobObject(
             handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)
         ):
@@ -489,7 +586,13 @@ def _attach_process_guard(process):
     except BaseException:
         kernel32.CloseHandle(handle)
         raise
-    return _WindowsJobProcessGuard(handle, kernel32)
+    return _WindowsJobProcessGuard(
+        handle,
+        kernel32,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        job_memory_limit_bytes=memory_limit,
+    )
 
 
 def _resume_suspended_process(process) -> None:
@@ -571,6 +674,110 @@ def _terminate_and_reap(process) -> tuple[bool, bool]:
     else:
         process.wait()
     return terminated, killed
+
+
+def run_resource_capped_command(
+    *,
+    command: Sequence[str],
+    cwd: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    job_memory_limit_bytes: int,
+    environment: Mapping[str, str] | None = None,
+) -> dict:
+    memory_limit = _validated_job_memory_limit_bytes(job_memory_limit_bytes)
+    if memory_limit is None:
+        raise LauncherError("launcher job memory limit is required")
+    if os.name != "nt":
+        raise LauncherError("launcher hard job memory limit requires Windows")
+    tokens = list(command)
+    if not tokens or any(not isinstance(token, str) or not token for token in tokens):
+        raise LauncherError("launcher resource-capped command is invalid")
+    working_directory = Path(cwd).resolve(strict=True)
+    if not working_directory.is_dir():
+        raise LauncherError("launcher resource-capped cwd is invalid")
+    stdout = Path(stdout_path).resolve()
+    stderr = Path(stderr_path).resolve()
+    if stdout == stderr or stdout.exists() or stderr.exists():
+        raise LauncherError("launcher resource-capped output path is invalid")
+    if not stdout.parent.is_dir() or not stderr.parent.is_dir():
+        raise LauncherError("launcher resource-capped output parent is invalid")
+
+    started_at = _utc_now()
+    process = None
+    guard = None
+    peak_job_memory_bytes = None
+    try:
+        with stdout.open("xb") as stdout_handle, stderr.open("xb") as stderr_handle:
+            process = subprocess.Popen(
+                tokens,
+                cwd=str(working_directory),
+                env=dict(environment) if environment is not None else None,
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                creationflags=_CREATE_SUSPENDED,
+            )
+            guard = _attach_process_guard(
+                process,
+                job_memory_limit_bytes=memory_limit,
+            )
+            guard_description = guard.description
+            _resume_suspended_process(process)
+            exit_code = process.wait()
+            process_tree_drained = guard.wait_for_tree(30.0)
+            if not process_tree_drained:
+                guard.terminate_tree()
+                if not guard.wait_for_tree(5.0):
+                    raise LauncherError("launcher process tree did not terminate")
+                raise LauncherError("launcher process tree did not drain")
+            peak_job_memory_bytes = guard.peak_job_memory_bytes()
+        return {
+            "schema_version": "research-resource-capped-command-receipt/v1",
+            "pid": process.pid,
+            "started_at_utc": started_at,
+            "finished_at_utc": _utc_now(),
+            "command_sha256": hashlib.sha256(
+                _canonical_bytes({"tokens": tokens})
+            ).hexdigest(),
+            "argument_count": len(tokens),
+            "cwd": str(working_directory),
+            "shell": False,
+            "use_shell_execute": False,
+            "created_suspended": True,
+            "stdin_closed": True,
+            "process_tree_guard": guard_description,
+            "job_memory_limit_bytes": memory_limit,
+            "job_memory_limit_hard": True,
+            "peak_job_memory_bytes": peak_job_memory_bytes,
+            "exit_code": exit_code,
+            "child_reaped": process.poll() is not None,
+            "process_tree_drained": process_tree_drained,
+            "stdout": {
+                "path": str(stdout),
+                "bytes": stdout.stat().st_size,
+                "sha256": _sha256_file(stdout),
+            },
+            "stderr": {
+                "path": str(stderr),
+                "bytes": stderr.stat().st_size,
+                "sha256": _sha256_file(stderr),
+            },
+        }
+    except BaseException:
+        try:
+            if guard is not None:
+                terminate_tree = getattr(guard, "terminate_tree", None)
+                if terminate_tree is not None:
+                    terminate_tree()
+        finally:
+            if process is not None:
+                _terminate_and_reap(process)
+        raise
+    finally:
+        if guard is not None:
+            guard.close()
 
 
 def run_supervised(
