@@ -4541,6 +4541,8 @@ def verify_shallow_gbdt_result_bundle(
     outcome_candidates: Sequence[Mapping[str, Any]],
     sessions: Sequence[str],
     scored_oof: pd.DataFrame,
+    expected_source: Mapping[str, Any],
+    expected_outcome_receipt: Mapping[str, Any],
 ) -> dict[str, Any]:
     try:
         from app import audited_pit_shallow_gbdt as shallow_gbdt
@@ -4565,6 +4567,8 @@ def verify_shallow_gbdt_result_bundle(
             or main_document.get("producer_code")
             != variant["producer_binding"]()
         ):
+            raise ValueError
+        if main_document.get("source") != dict(expected_source):
             raise ValueError
         embedded_strategy = dict(main_document["strategy"])
         embedded_strategy_sha256 = str(
@@ -4780,6 +4784,8 @@ def verify_shallow_gbdt_result_bundle(
         )
         execution = sidecars["execution"]
         stored_outcome_receipt = dict(execution["outcome_receipt"])
+        if stored_outcome_receipt != dict(expected_outcome_receipt):
+            raise ValueError
         if "summary_receipt_sha256" in stored_outcome_receipt:
             _verify_compact_receipt_summary(stored_outcome_receipt)
         else:
@@ -6700,6 +6706,24 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
         )
         entry_receipt = execution["entry_preflight_receipt"]
         strict_outcome_receipt = execution["outcome_receipt"]
+        compact_entry_receipt = _compact_receipt_summary(
+            entry_receipt,
+            omitted_fields={
+                "events": {
+                    "count_field": "event_count",
+                    "sha256_field": "events_sha256",
+                }
+            },
+        )
+        compact_outcome_receipt = _compact_receipt_summary(
+            strict_outcome_receipt,
+            omitted_fields={
+                "execution_events": {
+                    "count_field": "execution_event_count",
+                    "sha256_field": "execution_events_sha256",
+                }
+            },
+        )
         payloads = build_ranked_liquidity_result_payloads(
             strategy_spec=strategy_spec,
             shared_receipts={
@@ -6724,30 +6748,8 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
                     "tail_cutoff_receipt": execution[
                         "tail_cutoff_receipt"
                     ],
-                    "entry_preflight_receipt": (
-                        _compact_receipt_summary(
-                            entry_receipt,
-                            omitted_fields={
-                                "events": {
-                                    "count_field": "event_count",
-                                    "sha256_field": "events_sha256",
-                                }
-                            },
-                        )
-                    ),
-                    "outcome_receipt": _compact_receipt_summary(
-                        strict_outcome_receipt,
-                        omitted_fields={
-                            "execution_events": {
-                                "count_field": (
-                                    "execution_event_count"
-                                ),
-                                "sha256_field": (
-                                    "execution_events_sha256"
-                                ),
-                            }
-                        },
-                    ),
+                    "entry_preflight_receipt": compact_entry_receipt,
+                    "outcome_receipt": compact_outcome_receipt,
                     "completed_candidates": execution[
                         "completed_candidates"
                     ],
@@ -6798,6 +6800,8 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
             outcome_candidates=outcome_candidates,
             sessions=sessions,
             scored_oof=scored_oof,
+            expected_source=source,
+            expected_outcome_receipt=compact_outcome_receipt,
         )
         runtime_verification = _write_content_addressed(
             Path(output_dir) / "verifications",
