@@ -4639,6 +4639,66 @@ def verify_shallow_gbdt_result_bundle(
             model_sidecar["oof_replay_verification"]
         )
         walk_forward = expected_strategy["walk_forward"]
+        frozen_sessions = _ordered_sessions(sessions)
+        receipt_sessions = oof_receipt.get(
+            "frozen_signal_sessions"
+        )
+        folds = oof_receipt.get("folds")
+        receipt_unsigned = dict(oof_receipt)
+        receipt_sha256 = str(
+            receipt_unsigned.pop("receipt_sha256", "") or ""
+        )
+        expected_fold_ranges = _fold_ranges(
+            frozen_sessions,
+            minimum_training_sessions=int(
+                walk_forward["minimum_training_sessions"]
+            ),
+            validation_sessions=int(
+                walk_forward["validation_sessions"]
+            ),
+        )
+        observed_fold_ranges = (
+            [
+                (
+                    str(fold.get("validation_start") or ""),
+                    str(fold.get("validation_end") or ""),
+                )
+                for fold in folds
+            ]
+            if isinstance(folds, list)
+            and all(isinstance(fold, Mapping) for fold in folds)
+            else []
+        )
+        feature_receipt = sidecars["features"]["feature_receipt"]
+        if (
+            list(sessions) != frozen_sessions
+            or len(frozen_sessions)
+            != int(expected_strategy["required_market_session_count"])
+            or receipt_sessions != frozen_sessions
+            or oof_receipt.get("frozen_signal_sessions_sha256")
+            != _sha256(frozen_sessions)
+            or receipt_sha256 != _sha256(receipt_unsigned)
+            or not isinstance(folds, list)
+            or oof_receipt.get("fold_count") != len(folds)
+            or len(folds)
+            != int(expected_strategy["required_oof_fold_count"])
+            or observed_fold_ranges != expected_fold_ranges
+            or stored_oof_verification.get("receipt_sha256")
+            != receipt_sha256
+            or stored_oof_verification.get("fold_count")
+            != len(folds)
+            or feature_receipt.get("session_count")
+            != len(frozen_sessions)
+            or feature_receipt.get("sessions_sha256")
+            != _sha256(frozen_sessions)
+            or main_document["source"].get("market_session_count")
+            != len(frozen_sessions)
+            or main_document["source"].get(
+                "exact_membership_session_count"
+            )
+            != len(frozen_sessions)
+        ):
+            raise ValueError
         replay_verification = (
             _verify_shallow_gbdt_result_bundle_oof_replay(
                 tail_features,
@@ -4719,8 +4779,66 @@ def verify_shallow_gbdt_result_bundle(
             )
         )
         execution = sidecars["execution"]
+        stored_outcome_receipt = dict(execution["outcome_receipt"])
+        if "summary_receipt_sha256" in stored_outcome_receipt:
+            _verify_compact_receipt_summary(stored_outcome_receipt)
+        else:
+            unsigned_outcome_receipt = dict(stored_outcome_receipt)
+            outcome_receipt_sha256 = str(
+                unsigned_outcome_receipt.pop("receipt_sha256", "") or ""
+            )
+            if (
+                not outcome_receipt_sha256
+                or outcome_receipt_sha256
+                != _sha256(unsigned_outcome_receipt)
+            ):
+                raise ValueError
+        completed_sha256 = _audited_payload_sha256(
+            replayed_completed,
+            root_path="$.completed_candidates",
+        )
+        censored_sha256 = _audited_payload_sha256(
+            replayed_censored,
+            root_path="$.right_censored_positions",
+        )
         if (
-            execution.get("outcome_membership_evidence")
+            stored_outcome_receipt.get("schema_version")
+            != variant["strict_outcome_schema_version"]
+            or stored_outcome_receipt.get(
+                "completed_candidate_count"
+            )
+            != len(replayed_completed)
+            or stored_outcome_receipt.get(
+                "completed_candidates_sha256"
+            )
+            != completed_sha256
+            or stored_outcome_receipt.get(
+                "right_censored_position_count"
+            )
+            != len(replayed_censored)
+            or stored_outcome_receipt.get(
+                "right_censored_positions_sha256"
+            )
+            != censored_sha256
+            or (
+                "strict_outcome_candidate_payload_hashes_sha256"
+                in stored_outcome_receipt
+                and stored_outcome_receipt[
+                    "strict_outcome_candidate_payload_hashes_sha256"
+                ]
+                != replayed_outcome_membership[
+                    "strict_outcome_candidate_payload_hashes_sha256"
+                ]
+            )
+            or (
+                "input_executable_candidate_count"
+                in stored_outcome_receipt
+                and stored_outcome_receipt[
+                    "input_executable_candidate_count"
+                ]
+                != len(outcome_candidates)
+            )
+            or execution.get("outcome_membership_evidence")
             != replayed_outcome_membership
             or execution.get("completed_candidate_count")
             != len(replayed_completed)
