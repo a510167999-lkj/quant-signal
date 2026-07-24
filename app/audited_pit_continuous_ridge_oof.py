@@ -5114,6 +5114,24 @@ def _score_and_evaluate_oof_variant(
     adapter = variant["model_adapter"]
     if not isinstance(adapter, ModelOOFAdapter):
         raise ValueError("ranked-liquidity model adapter is invalid")
+    if adapter.model_id == "continuous_ridge":
+        frozen_strategy_spec = deepcopy(
+            ROLLING_CONTINUOUS_RIDGE_OOF_SPEC
+        )
+    else:
+        from app import audited_pit_shallow_gbdt as shallow_gbdt
+
+        frozen_strategy_spec = deepcopy(
+            shallow_gbdt.SHALLOW_GBDT_OOF_SPEC
+        )
+        if (
+            _sha256(frozen_strategy_spec)
+            != shallow_gbdt._SHALLOW_GBDT_OOF_SPEC_SHA256
+        ):
+            raise ValueError(
+                "ranked-liquidity frozen strategy copy drifted"
+            )
+    strategy_spec = frozen_strategy_spec
     score_contract = frozen_score_contract(adapter.score_contract)
     if dict(score_contract) != variant["score_contract"]:
         raise ValueError(
