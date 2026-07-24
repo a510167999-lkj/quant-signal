@@ -4239,6 +4239,517 @@ def _write_result_bundle(
     }
 
 
+def build_ranked_liquidity_result_payloads(
+    *,
+    strategy_spec: Mapping[str, Any],
+    shared_receipts: Mapping[str, Any],
+) -> dict[str, Any]:
+    variant = resolve_ranked_liquidity_run_variant(strategy_spec)
+    if variant["model_adapter"].model_id == "continuous_ridge":
+        frozen_strategy = deepcopy(
+            ROLLING_CONTINUOUS_RIDGE_OOF_SPEC
+        )
+    else:
+        from app import audited_pit_shallow_gbdt as shallow_gbdt
+
+        frozen_strategy = deepcopy(
+            shallow_gbdt.SHALLOW_GBDT_OOF_SPEC
+        )
+    if _sha256(strategy_spec) != _sha256(frozen_strategy):
+        raise ValueError(
+            "ranked-liquidity result strategy is not frozen"
+        )
+    score_contract = frozen_score_contract(
+        variant["score_contract"]
+    )
+    shared = deepcopy(dict(shared_receipts))
+    source = dict(shared["source"])
+    feature_values = dict(shared["features"])
+    model_values = dict(shared["model"])
+    execution_values = dict(shared["execution"])
+    selection_values = dict(shared["selection"])
+    scope = dict(shared["scope"])
+    producer_code = variant["producer_binding"]()
+    if (
+        producer_code.get("schema_version")
+        != variant["producer_schema_version"]
+    ):
+        raise ValueError(
+            "ranked-liquidity producer schema differs from variant"
+        )
+    strategy_sha256 = _sha256(frozen_strategy)
+    sidecar_common = {
+        "strategy_sha256": strategy_sha256,
+        "source": source,
+        "producer_code": producer_code,
+    }
+    completed_candidates = [
+        dict(candidate)
+        for candidate in execution_values.pop(
+            "completed_candidates",
+            [],
+        )
+    ]
+    censored_positions = [
+        dict(candidate)
+        for candidate in execution_values.pop(
+            "right_censored_positions",
+            [],
+        )
+    ]
+    outcome_membership = _compact_outcome_membership_evidence(
+        completed_candidates,
+        censored_positions,
+    )
+    scored_candidates = [
+        dict(candidate)
+        for candidate in selection_values.pop(
+            "scored_execution_candidates"
+        )
+    ]
+    positive_candidates = [
+        dict(candidate)
+        for candidate in selection_values.pop("positive_candidates")
+    ]
+    for candidate in scored_candidates:
+        candidate_score(candidate, contract=score_contract)
+    positive_pool_receipt = dict(
+        selection_values.pop("positive_pool_receipt")
+    )
+    main_selected = [
+        dict(candidate)
+        for candidate in selection_values.pop("main_selected")
+    ]
+    baseline_selected = [
+        dict(candidate)
+        for candidate in selection_values.pop("baseline_selected")
+    ]
+    selected_by_key = {
+        _selection_trade_key(candidate): candidate
+        for candidate in [*main_selected, *baseline_selected]
+    }
+    selected_evidence = [
+        selected_by_key[key] for key in sorted(selected_by_key)
+    ]
+    for candidate in selected_evidence:
+        candidate_score(candidate, contract=score_contract)
+    scored_evidence = _compact_scored_execution_evidence(
+        scored_candidates,
+        score_contract=score_contract,
+    )
+    feature_sidecar = {
+        "schema_version": variant["sidecar_schema_versions"][
+            "features"
+        ],
+        **sidecar_common,
+        **feature_values,
+    }
+    model_sidecar = {
+        "schema_version": variant["sidecar_schema_versions"]["models"],
+        **sidecar_common,
+        **model_values,
+        "oof_candidate_count": int(
+            model_values["oof_receipt"]["oof_candidate_count"]
+        ),
+        "oof_scores_sha256": model_values["oof_receipt"][
+            "oof_scores_sha256"
+        ],
+    }
+    execution_sidecar = {
+        "schema_version": variant["sidecar_schema_versions"][
+            "execution"
+        ],
+        **sidecar_common,
+        **execution_values,
+        "outcome_membership_evidence": outcome_membership,
+        "completed_candidate_count": len(completed_candidates),
+        "right_censored_position_count": len(censored_positions),
+        "completed_candidates_sha256": outcome_membership[
+            "completed_candidates_sha256"
+        ],
+        "right_censored_positions_sha256": outcome_membership[
+            "right_censored_positions_sha256"
+        ],
+        "strict_outcome_candidate_payload_hashes_sha256": (
+            outcome_membership[
+                "strict_outcome_candidate_payload_hashes_sha256"
+            ]
+        ),
+    }
+    main_sweep = dict(selection_values["main_sweep"])
+    baseline_sweep = dict(
+        selection_values["amount_baseline_sweep"]
+    )
+    advancement_gate_passed = bool(
+        selection_values["advancement_gate_passed"]
+    )
+    selection_sidecar = {
+        "schema_version": variant["sidecar_schema_versions"][
+            "selection"
+        ],
+        **sidecar_common,
+        **selection_values,
+        "positive_pool_receipt": positive_pool_receipt,
+        "scored_execution_candidate_evidence": scored_evidence,
+        "selected_evidence": selected_evidence,
+        "selected_evidence_sha256": _sha256(selected_evidence),
+        "positive_candidate_count": len(positive_candidates),
+        "positive_candidate_payload_hashes_sha256": scored_evidence[
+            "positive_candidate_payload_hashes_sha256"
+        ],
+        "positive_candidate_keys_sha256": positive_pool_receipt[
+            "positive_candidate_keys_sha256"
+        ],
+    }
+    main_row = (
+        dict(main_sweep["top"][0])
+        if isinstance(main_sweep.get("top"), list)
+        and main_sweep["top"]
+        else {}
+    )
+    baseline_row = (
+        dict(baseline_sweep["top"][0])
+        if isinstance(baseline_sweep.get("top"), list)
+        and baseline_sweep["top"]
+        else {}
+    )
+    main_payload = {
+        "schema_version": variant["result_schema_version"],
+        "strategy_sha256": strategy_sha256,
+        "strategy": {
+            **frozen_strategy,
+            "strategy_sha256": strategy_sha256,
+        },
+        "source": source,
+        "scope": scope,
+        "feature_rows_sha256": feature_values["feature_receipt"][
+            "feature_rows_sha256"
+        ],
+        "strict_outcome_candidate_count": (
+            len(completed_candidates) + len(censored_positions)
+        ),
+        "strict_outcome_candidates_sha256": outcome_membership[
+            "strict_outcome_candidates_sha256"
+        ],
+        "strict_outcome_candidate_payload_hashes_sha256": (
+            outcome_membership[
+                "strict_outcome_candidate_payload_hashes_sha256"
+            ]
+        ),
+        "oof_candidate_count": model_sidecar[
+            "oof_candidate_count"
+        ],
+        "oof_scores_sha256": model_sidecar["oof_scores_sha256"],
+        "scored_execution_candidate_count": len(scored_candidates),
+        "scored_execution_candidate_evidence_rows_sha256": (
+            scored_evidence["rows_sha256"]
+        ),
+        "scored_execution_candidate_payload_hashes_sha256": (
+            scored_evidence["candidate_payload_hashes_sha256"]
+        ),
+        "positive_candidate_count": len(positive_candidates),
+        "positive_candidate_payload_hashes_sha256": scored_evidence[
+            "positive_candidate_payload_hashes_sha256"
+        ],
+        "positive_candidate_keys_sha256": positive_pool_receipt[
+            "positive_candidate_keys_sha256"
+        ],
+        "positive_pool_receipt_sha256": positive_pool_receipt[
+            "receipt_sha256"
+        ],
+        "main_sweep": main_sweep,
+        "amount_baseline_sweep": baseline_sweep,
+        "advancement_gate": {
+            "main_latest_and_full_quality_passed": bool(
+                main_row.get("target_all_pass")
+            ),
+            "main_rolling_12m_stability_passed": bool(
+                main_row.get("target_rolling_12m_stability_pass")
+            ),
+            "main_evidence_complete": bool(
+                main_row.get("evidence_complete")
+            ),
+            "amount_baseline_evidence_complete": bool(
+                baseline_row.get("evidence_complete")
+            ),
+            "all_required_gates_passed": advancement_gate_passed,
+            "embargo_consumed": False,
+            "final_oos_consumed": False,
+        },
+        "comparison": {
+            "shared_positive_candidate_table": True,
+            "shared_candidate_table_sha256": selection_values[
+                "main_selection_receipt"
+            ].get("candidate_table_sha256"),
+            "independent_portfolio_replays": True,
+            "same_execution_contract": True,
+            "baseline_performance_is_advancement_gate": False,
+            "baseline_evidence_completeness_is_advancement_gate": True,
+        },
+    }
+    return {
+        "main_payload": main_payload,
+        "sidecar_payloads": {
+            "features": feature_sidecar,
+            "models": model_sidecar,
+            "execution": execution_sidecar,
+            "selection": selection_sidecar,
+        },
+        "producer_code": producer_code,
+    }
+
+
+def _verify_shallow_gbdt_result_bundle_oof_replay(
+    tail_features: pd.DataFrame,
+    outcome_candidates: Sequence[Mapping[str, Any]],
+    sessions: Sequence[str],
+    scored_oof: pd.DataFrame,
+    receipt: Mapping[str, Any],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    from app.audited_pit_shallow_gbdt import (
+        verify_shallow_gbdt_rolling_oof_receipt,
+    )
+
+    return verify_shallow_gbdt_rolling_oof_receipt(
+        tail_features,
+        outcome_candidates,
+        sessions,
+        scored_oof,
+        receipt,
+        **kwargs,
+    )
+
+
+def verify_shallow_gbdt_result_bundle(
+    result: Mapping[str, Any],
+    *,
+    tail_features: pd.DataFrame,
+    outcome_candidates: Sequence[Mapping[str, Any]],
+    sessions: Sequence[str],
+    scored_oof: pd.DataFrame,
+) -> dict[str, Any]:
+    try:
+        from app import audited_pit_shallow_gbdt as shallow_gbdt
+
+        expected_strategy = shallow_gbdt.SHALLOW_GBDT_OOF_SPEC
+        variant = resolve_ranked_liquidity_run_variant(
+            expected_strategy
+        )
+        runtime_result = dict(result)
+        artifact = dict(runtime_result["artifact"])
+        main_path = Path(str(artifact["path"]))
+        main_document = json.loads(
+            main_path.read_text(encoding="utf-8")
+        )
+        main_digest = str(main_document.pop("artifact_sha256"))
+        if (
+            main_digest != artifact["artifact_sha256"]
+            or _sha256(main_document) != main_digest
+            or main_path.name != f"{main_digest}.json"
+            or main_document.get("schema_version")
+            != variant["result_schema_version"]
+            or main_document.get("producer_code")
+            != variant["producer_binding"]()
+        ):
+            raise ValueError
+        embedded_strategy = dict(main_document["strategy"])
+        embedded_strategy_sha256 = str(
+            embedded_strategy.pop("strategy_sha256")
+        )
+        if (
+            embedded_strategy != expected_strategy
+            or embedded_strategy_sha256
+            != shallow_gbdt._SHALLOW_GBDT_OOF_SPEC_SHA256
+            or main_document.get("strategy_sha256")
+            != embedded_strategy_sha256
+        ):
+            raise ValueError
+        scope = main_document["scope"]
+        required_scope = {
+            "point_in_time": True,
+            "development_only": True,
+            "strict_artifact_native_execution": True,
+            "intraday_fill_claimed": False,
+            "embargo_consumed": False,
+            "final_oos_consumed": False,
+            "eligible_for_profile_registration": False,
+            "production_recommendation_eligible": False,
+        }
+        if any(
+            scope.get(key) is not expected
+            for key, expected in required_scope.items()
+        ):
+            raise ValueError
+        runtime_sidecars = dict(
+            runtime_result["runtime_sidecars"]
+        )
+        expected_sidecar_schemas = variant[
+            "sidecar_schema_versions"
+        ]
+        if (
+            set(runtime_sidecars) != set(expected_sidecar_schemas)
+            or set(main_document["sidecars"])
+            != set(expected_sidecar_schemas)
+        ):
+            raise ValueError
+        sidecars: dict[str, dict[str, Any]] = {}
+        sidecar_digests: dict[str, str] = {}
+        for name in sorted(expected_sidecar_schemas):
+            runtime = dict(runtime_sidecars[name])
+            sidecar_path = Path(str(runtime["path"]))
+            sidecar = json.loads(
+                sidecar_path.read_text(encoding="utf-8")
+            )
+            sidecar_digest = str(sidecar.pop("artifact_sha256"))
+            if (
+                sidecar_digest != runtime["artifact_sha256"]
+                or _sha256(sidecar) != sidecar_digest
+                or sidecar_path.name != f"{sidecar_digest}.json"
+                or main_document["sidecars"][name]
+                != _stable_sidecar_reference(runtime)
+                or sidecar.get("schema_version")
+                != expected_sidecar_schemas[name]
+                or sidecar.get("strategy_sha256")
+                != embedded_strategy_sha256
+                or sidecar.get("source")
+                != main_document["source"]
+                or sidecar.get("producer_code")
+                != main_document["producer_code"]
+            ):
+                raise ValueError
+            sidecars[name] = sidecar
+            sidecar_digests[name] = sidecar_digest
+        model_sidecar = sidecars["models"]
+        oof_receipt = dict(model_sidecar["oof_receipt"])
+        stored_oof_verification = dict(
+            model_sidecar["oof_replay_verification"]
+        )
+        walk_forward = expected_strategy["walk_forward"]
+        replay_verification = (
+            _verify_shallow_gbdt_result_bundle_oof_replay(
+                tail_features,
+                outcome_candidates,
+                sessions,
+                scored_oof,
+                oof_receipt,
+                minimum_training_sessions=int(
+                    walk_forward["minimum_training_sessions"]
+                ),
+                training_window_sessions=int(
+                    walk_forward["training_window_sessions"]
+                ),
+                validation_sessions=int(
+                    walk_forward["validation_sessions"]
+                ),
+            )
+        )
+        if (
+            replay_verification != stored_oof_verification
+            or replay_verification.get("verified") is not True
+            or model_sidecar.get("oof_candidate_count")
+            != oof_receipt.get("oof_candidate_count")
+            or model_sidecar.get("oof_scores_sha256")
+            != oof_receipt.get("oof_scores_sha256")
+            or main_document.get("oof_candidate_count")
+            != oof_receipt.get("oof_candidate_count")
+            or main_document.get("oof_scores_sha256")
+            != oof_receipt.get("oof_scores_sha256")
+        ):
+            raise ValueError
+        selection = sidecars["selection"]
+        scored_evidence = dict(
+            selection["scored_execution_candidate_evidence"]
+        )
+        evidence_receipt_sha256 = str(
+            scored_evidence.pop("receipt_sha256")
+        )
+        expected_columns = list(
+            SCORED_EXECUTION_EVIDENCE_COLUMNS
+        )
+        expected_columns[5] = (
+            "predicted_positive_utility_probability"
+        )
+        positive_pool_receipt = dict(
+            selection["positive_pool_receipt"]
+        )
+        positive_pool_sha256 = str(
+            positive_pool_receipt.pop("receipt_sha256")
+        )
+        if (
+            scored_evidence.get("schema_version")
+            != "ranked-liquidity-shallow-gbdt-score-evidence/v1"
+            or scored_evidence.get("columns") != expected_columns
+            or evidence_receipt_sha256 != _sha256(scored_evidence)
+            or "predicted_net_return_pct"
+            in json.dumps(
+                selection,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            or positive_pool_receipt.get("schema_version")
+            != "shallow-gbdt-positive-utility-pool/v1"
+            or positive_pool_receipt.get("comparison")
+            != (
+                "predicted_positive_utility_probability_"
+                "strictly_greater_than_0.5"
+            )
+            or positive_pool_sha256
+            != _sha256(positive_pool_receipt)
+            or main_document.get("positive_pool_receipt_sha256")
+            != positive_pool_sha256
+            or selection["main_sweep"].get("schema_version")
+            != variant["sweep_schema_version"]
+            or selection["amount_baseline_sweep"].get(
+                "schema_version"
+            )
+            != variant["sweep_schema_version"]
+            or selection["main_selection_receipt"].get(
+                "schema_version"
+            )
+            != "shallow-gbdt-industry-selection-receipt/v1"
+            or selection[
+                "amount_baseline_selection_receipt"
+            ].get("schema_version")
+            != "shallow-gbdt-industry-selection-receipt/v1"
+            or main_document.get("main_sweep")
+            != selection["main_sweep"]
+            or main_document.get("amount_baseline_sweep")
+            != selection["amount_baseline_sweep"]
+        ):
+            raise ValueError
+        verification = {
+            "schema_version": (
+                "ranked-liquidity-shallow-gbdt-"
+                "result-bundle-verification/v1"
+            ),
+            "strategy_sha256": embedded_strategy_sha256,
+            "producer_root_sha256": main_document["producer_code"][
+                "root_sha256"
+            ],
+            "main_artifact_sha256": main_digest,
+            "sidecar_artifact_sha256": sidecar_digests,
+            "checks": {
+                "independent_rolling_oof_replay": True,
+                "content_addressing_verified": True,
+                "probability_score_contract_verified": True,
+                "shared_positive_candidate_pool_verified": True,
+            },
+            "verified": True,
+        }
+        verification["receipt_sha256"] = _sha256(verification)
+        return verification
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise ValueError(
+            "shallow GBDT result bundle verification failed"
+        ) from exc
+
+
 def verify_rolling_result_bundle(
     result: Mapping[str, Any],
     *,
