@@ -236,6 +236,8 @@ def test_fold_fit_receipt_freezes_runtime_parameters_and_dmatrix_contract() -> N
     assert receipt["dmatrix"] == _expected_dmatrix_contract(len(matrix))
     model_json = bytes(booster.save_raw(raw_format="json"))
     assert receipt["model_json_sha256"] == hashlib.sha256(model_json).hexdigest()
+    model_raw = bytes(booster.save_raw())
+    assert receipt["model_raw_sha256"] == hashlib.sha256(model_raw).hexdigest()
     np.testing.assert_array_equal(matrix, original_matrix)
     np.testing.assert_array_equal(labels, original_labels)
     np.testing.assert_array_equal(weights, original_weights)
