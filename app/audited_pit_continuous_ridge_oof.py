@@ -6016,6 +6016,7 @@ def _score_and_evaluate_oof_variant(
     outcome_candidates: Sequence[Mapping[str, Any]],
     sessions: Sequence[str],
     strategy_spec: Mapping[str, Any],
+    include_scored_oof: bool = False,
 ) -> dict[str, Any]:
     variant = resolve_ranked_liquidity_run_variant(strategy_spec)
     adapter = variant["model_adapter"]
@@ -6100,11 +6101,14 @@ def _score_and_evaluate_oof_variant(
         sessions=sessions,
         strategy_spec=strategy_spec,
     )
-    return {
+    result = {
         "oof_receipt": oof_receipt,
         "oof_replay_verification": oof_replay_verification,
         **evaluated,
     }
+    if include_scored_oof:
+        result["scored_oof"] = scored_oof
+    return result
 
 
 def _run_audited_pit_ranked_liquidity_ridge_oof(
@@ -6132,12 +6136,35 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
         raise AuditedPITDevelopmentReplayError(
             "ranked-liquidity replay version is invalid"
         )
+    shallow_gbdt_strategy_schema = (
+        "development-pit-cross-sectional-shallow-gbdt-"
+        "utility-logit-rolling-126-oof/v1"
+    )
+    run_variant = (
+        resolve_ranked_liquidity_run_variant(strategy_spec)
+        if (
+            artifact_version == 3
+            and strategy_spec.get("schema_version")
+            == shallow_gbdt_strategy_schema
+        )
+        else None
+    )
+    model_id = (
+        run_variant["model_adapter"].model_id
+        if run_variant is not None
+        else "continuous_ridge"
+    )
+    is_shallow_gbdt = model_id == "shallow_gbdt_utility_logit"
     expected_strategy_schema = (
         "development-pit-cross-sectional-ranked-liquidity-ridge-oof/v2"
         if artifact_version == 2
         else (
-            "development-pit-cross-sectional-ranked-liquidity-"
-            "ridge-rolling-oof/v3"
+            run_variant["strategy_schema_version"]
+            if run_variant is not None
+            else (
+                "development-pit-cross-sectional-ranked-liquidity-"
+                "ridge-rolling-oof/v3"
+            )
         )
     )
     if strategy_spec.get("schema_version") != expected_strategy_schema:
@@ -6167,13 +6194,31 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
         != 126
         or int(training_window_sessions) != 126
         or int(strategy_spec["walk_forward"]["validation_sessions"]) != 63
-        or float(strategy_spec["model"]["ridge_lambda"]) != 1.0
+        or (
+            not is_shallow_gbdt
+            and float(strategy_spec["model"]["ridge_lambda"]) != 1.0
+        )
     ):
         raise AuditedPITDevelopmentReplayError(
             "ranked-liquidity rolling strategy differs from preregistration"
         )
 
     def write_progress(stage: str, **details: Any) -> None:
+        if is_shallow_gbdt:
+            write_json(
+                str(
+                    Path(output_dir)
+                    / run_variant["progress_file_name"]
+                ),
+                {
+                    "schema_version": run_variant[
+                        "progress_schema_version"
+                    ],
+                    "stage": str(stage),
+                    **details,
+                },
+            )
+            return
         _write_replay_progress(
             output_dir,
             stage,
@@ -6183,7 +6228,11 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
 
     write_progress("starting")
     _assert_shared_strict_execution_contract(strategy_spec)
-    producer_code = _producer_binding(artifact_version=artifact_version)
+    producer_code = (
+        run_variant["producer_binding"]()
+        if is_shallow_gbdt
+        else _producer_binding(artifact_version=artifact_version)
+    )
     contract = load_temporal_partition_contract(temporal_contract_path)
     if contract["contract_sha256"] != expected_temporal_contract_sha256:
         raise AuditedPITDevelopmentReplayError(
@@ -6386,8 +6435,12 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
                 terminal_listing_evidence=terminal_listing_evidence,
                 strategy_spec=strategy_spec,
                 receipt_schema_version=(
-                    "ranked-liquidity-ridge-strict-outcome/"
-                    f"v{artifact_version}"
+                    run_variant["strict_outcome_schema_version"]
+                    if is_shallow_gbdt
+                    else (
+                        "ranked-liquidity-ridge-strict-outcome/"
+                        f"v{artifact_version}"
+                    )
                 ),
             )
         )
@@ -6487,6 +6540,161 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
             str(item["security_id"]),
         )
     )
+    if is_shallow_gbdt:
+        evaluated = _score_and_evaluate_oof_variant(
+            tail_features=tail_features,
+            outcome_candidates=outcome_candidates,
+            sessions=sessions,
+            strategy_spec=strategy_spec,
+            include_scored_oof=True,
+        )
+        scored_oof = evaluated.pop("scored_oof")
+        oof_receipt = evaluated["oof_receipt"]
+        oof_replay_verification = evaluated[
+            "oof_replay_verification"
+        ]
+        scored_execution_candidates = evaluated[
+            "scored_execution_candidates"
+        ]
+        positive_candidates = evaluated["positive_candidates"]
+        positive_pool_receipt = evaluated["positive_pool_receipt"]
+        main_sweep = evaluated["main_sweep"]
+        baseline_sweep = evaluated["baseline_sweep"]
+        main_selection_receipt = evaluated[
+            "main_selection_receipt"
+        ]
+        baseline_selection_receipt = evaluated[
+            "baseline_selection_receipt"
+        ]
+        main_selected = evaluated["main_selected"]
+        baseline_selected = evaluated["baseline_selected"]
+        advancement_gate = evaluated["advancement_gate_passed"]
+        write_progress(
+            "oof_scored",
+            oof_candidate_count=len(scored_oof),
+            fold_count=len(oof_receipt["folds"]),
+        )
+        write_progress(
+            "selection_evaluated",
+            positive_candidate_count=len(positive_candidates),
+            advancement_gate_passed=advancement_gate,
+        )
+        entry_receipt = execution["entry_preflight_receipt"]
+        strict_outcome_receipt = execution["outcome_receipt"]
+        payloads = build_ranked_liquidity_result_payloads(
+            strategy_spec=strategy_spec,
+            shared_receipts={
+                "source": source,
+                "features": {
+                    "bar_loader_receipt": bar_loader_receipt,
+                    "feature_receipt": feature_receipt,
+                },
+                "model": {
+                    "oof_receipt": oof_receipt,
+                    "oof_replay_verification": (
+                        oof_replay_verification
+                    ),
+                },
+                "execution": {
+                    "security_code_transition_evidence": (
+                        transition_evidence
+                    ),
+                    "bulk_next_open_evidence_receipt": (
+                        bulk_next_open_receipt
+                    ),
+                    "tail_cutoff_receipt": execution[
+                        "tail_cutoff_receipt"
+                    ],
+                    "entry_preflight_receipt": (
+                        _compact_receipt_summary(
+                            entry_receipt,
+                            omitted_fields={
+                                "events": {
+                                    "count_field": "event_count",
+                                    "sha256_field": "events_sha256",
+                                }
+                            },
+                        )
+                    ),
+                    "outcome_receipt": _compact_receipt_summary(
+                        strict_outcome_receipt,
+                        omitted_fields={
+                            "execution_events": {
+                                "count_field": (
+                                    "execution_event_count"
+                                ),
+                                "sha256_field": (
+                                    "execution_events_sha256"
+                                ),
+                            }
+                        },
+                    ),
+                    "completed_candidates": execution[
+                        "completed_candidates"
+                    ],
+                    "right_censored_positions": execution[
+                        "right_censored_positions"
+                    ],
+                },
+                "selection": {
+                    "scored_execution_candidates": (
+                        scored_execution_candidates
+                    ),
+                    "positive_candidates": positive_candidates,
+                    "positive_pool_receipt": positive_pool_receipt,
+                    "main_sweep": main_sweep,
+                    "amount_baseline_sweep": baseline_sweep,
+                    "main_selection_receipt": (
+                        main_selection_receipt
+                    ),
+                    "amount_baseline_selection_receipt": (
+                        baseline_selection_receipt
+                    ),
+                    "main_selected": main_selected,
+                    "baseline_selected": baseline_selected,
+                    "advancement_gate_passed": advancement_gate,
+                },
+                "scope": {
+                    "point_in_time": True,
+                    "development_only": True,
+                    "strict_artifact_native_execution": True,
+                    "intraday_fill_claimed": False,
+                    "embargo_consumed": False,
+                    "final_oos_consumed": False,
+                    "advancement_gate_passed": advancement_gate,
+                    "eligible_for_profile_registration": False,
+                    "production_recommendation_eligible": False,
+                },
+            },
+        )
+        result = _write_result_bundle(
+            output_dir,
+            main_payload=payloads["main_payload"],
+            sidecar_payloads=payloads["sidecar_payloads"],
+            expected_producer_code=payloads["producer_code"],
+        )
+        verification = verify_shallow_gbdt_result_bundle(
+            result,
+            tail_features=tail_features,
+            outcome_candidates=outcome_candidates,
+            sessions=sessions,
+            scored_oof=scored_oof,
+        )
+        runtime_verification = _write_content_addressed(
+            Path(output_dir) / "verifications",
+            verification,
+        )
+        result = {
+            **result,
+            "verification": verification,
+            "runtime_verification": runtime_verification,
+        }
+        write_progress(
+            "completed",
+            artifact_sha256=result["artifact"]["artifact_sha256"],
+            advancement_gate_passed=advancement_gate,
+        )
+        return result
     scored_oof, oof_receipt = _build_purged_oof_scores(
         tail_features,
         outcome_candidates,
@@ -7063,6 +7271,59 @@ def run_audited_pit_ranked_liquidity_ridge_rolling_oof(
         end_date=end_date,
         output_dir=output_dir,
         strategy_spec=ROLLING_CONTINUOUS_RIDGE_OOF_SPEC,
+        artifact_version=3,
+        training_window_sessions=training_window_sessions,
+    )
+
+
+def run_audited_pit_ranked_liquidity_shallow_gbdt_rolling_oof(
+    *,
+    settings: Settings,
+    audited_pit_universe_path: str | Path,
+    expected_coverage_audit_sha256: str,
+    expected_artifact_root_sha256: str,
+    temporal_contract_path: str | Path,
+    expected_temporal_contract_sha256: str,
+    security_code_transition_evidence_root: str | Path,
+    expected_security_code_transition_contract_sha256: str,
+    start_date: str,
+    end_date: str,
+    output_dir: str | Path,
+) -> dict[str, Any]:
+    from app import audited_pit_shallow_gbdt as shallow_gbdt
+
+    if (
+        _sha256(shallow_gbdt.SHALLOW_GBDT_OOF_SPEC)
+        != shallow_gbdt._SHALLOW_GBDT_OOF_SPEC_SHA256
+    ):
+        raise AuditedPITDevelopmentReplayError(
+            "shallow GBDT rolling strategy differs from preregistered "
+            "canonical hash"
+        )
+    training_window_sessions = int(
+        shallow_gbdt.SHALLOW_GBDT_OOF_SPEC["walk_forward"][
+            "training_window_sessions"
+        ]
+    )
+    return _run_audited_pit_ranked_liquidity_ridge_oof(
+        settings=settings,
+        audited_pit_universe_path=audited_pit_universe_path,
+        expected_coverage_audit_sha256=expected_coverage_audit_sha256,
+        expected_artifact_root_sha256=expected_artifact_root_sha256,
+        temporal_contract_path=temporal_contract_path,
+        expected_temporal_contract_sha256=(
+            expected_temporal_contract_sha256
+        ),
+        security_code_transition_evidence_root=(
+            security_code_transition_evidence_root
+        ),
+        expected_security_code_transition_contract_sha256=(
+            expected_security_code_transition_contract_sha256
+        ),
+        start_date=start_date,
+        end_date=end_date,
+        output_dir=output_dir,
+        strategy_spec=shallow_gbdt.SHALLOW_GBDT_OOF_SPEC,
         artifact_version=3,
         training_window_sessions=training_window_sessions,
     )
