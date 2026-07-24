@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from math import ceil
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
@@ -37,6 +39,7 @@ FROZEN_XGBOOST_PARAMS: Mapping[str, Any] = MappingProxyType(
         "validate_parameters": True,
     }
 )
+_XGBOOST_VERSION = "3.2.0"
 
 
 def _float64_vector(
@@ -49,10 +52,87 @@ def _float64_vector(
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{label} must be numeric") from exc
     if vector.ndim != 1:
-        raise ValueError(f"{label} must be one-dimensional")
+        raise ValueError(f"{label} shape must be one-dimensional")
     if not np.isfinite(vector).all():
         raise ValueError(f"{label} must be finite")
     return np.ascontiguousarray(vector)
+
+
+def _float64_feature_matrix(values: np.ndarray) -> np.ndarray:
+    try:
+        matrix = np.asarray(values, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("feature matrix must be numeric") from exc
+    if matrix.ndim != 2 or matrix.shape[1] != len(FEATURE_NAMES):
+        raise ValueError("feature matrix shape is invalid")
+    if not np.isfinite(matrix).all():
+        raise ValueError("feature matrix must be finite")
+    return np.ascontiguousarray(matrix)
+
+
+def _array_sha256(values: np.ndarray) -> str:
+    array = np.ascontiguousarray(values)
+    digest = hashlib.sha256()
+    digest.update(str(array.dtype).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(
+        json.dumps(list(array.shape), separators=(",", ":")).encode("ascii")
+    )
+    digest.update(b"\0")
+    digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _model_json(booster: Any) -> bytes:
+    return bytes(booster.save_raw(raw_format="json"))
+
+
+def _dmatrix_contract(row_count: int) -> dict[str, Any]:
+    return {
+        "shape": [row_count, len(FEATURE_NAMES)],
+        "dtype": "float64",
+        "c_contiguous": True,
+        "feature_names": list(FEATURE_NAMES),
+        "feature_types": ["float"] * len(FEATURE_NAMES),
+        "nthread": 1,
+        "missing": "NaN",
+        "enable_categorical": False,
+    }
+
+
+def _xgboost_runtime() -> tuple[Any, dict[str, Any]]:
+    import xgboost as xgb
+
+    if xgb.__version__ != _XGBOOST_VERSION:
+        raise RuntimeError(
+            f"xgboost version must be {_XGBOOST_VERSION}, got {xgb.__version__}"
+        )
+    build_info = xgb.build_info()
+    if not isinstance(build_info, dict) or not build_info:
+        raise RuntimeError("xgboost build_info must be a non-empty mapping")
+    return xgb, {
+        "xgboost_version": xgb.__version__,
+        "xgboost_build_info": build_info,
+    }
+
+
+def _make_dmatrix(
+    xgb: Any,
+    matrix: np.ndarray,
+    *,
+    labels: np.ndarray | None = None,
+    weights: np.ndarray | None = None,
+) -> Any:
+    return xgb.DMatrix(
+        data=matrix,
+        label=labels,
+        weight=weights,
+        feature_names=list(FEATURE_NAMES),
+        feature_types=["float"] * len(FEATURE_NAMES),
+        nthread=1,
+        missing=np.nan,
+        enable_categorical=False,
+    )
 
 
 def clip_training_net_returns(
@@ -137,3 +217,97 @@ def positive_utility_mask(
     if ((values < 0.0) | (values > 1.0)).any():
         raise ValueError("probabilities must be within [0, 1]")
     return np.ascontiguousarray(values > 0.5)
+
+
+def fit_shallow_gbdt_fold(
+    features: np.ndarray,
+    labels: Sequence[float] | np.ndarray,
+    weights: Sequence[float] | np.ndarray,
+) -> tuple[Any, dict[str, Any]]:
+    matrix = _float64_feature_matrix(features)
+    label_values = _float64_vector(labels, label="labels")
+    weight_values = _float64_vector(weights, label="weights")
+    if len(label_values) != len(matrix) or len(weight_values) != len(matrix):
+        raise ValueError("labels and weights shape must match feature matrix")
+    if not np.isin(label_values, (0.0, 1.0)).all():
+        raise ValueError("labels must contain only binary label values")
+    if (weight_values < 0.0).any():
+        raise ValueError("weights must be non-negative")
+    total_weight = float(weight_values.sum(dtype=np.float64))
+    if not np.isfinite(total_weight) or total_weight <= 0.0:
+        raise ValueError("weights must have a positive finite sum")
+
+    xgb, runtime = _xgboost_runtime()
+    dmatrix = _make_dmatrix(
+        xgb,
+        matrix,
+        labels=label_values,
+        weights=weight_values,
+    )
+    booster = xgb.train(
+        params=dict(FROZEN_XGBOOST_PARAMS),
+        dtrain=dmatrix,
+        num_boost_round=NUM_BOOST_ROUND,
+    )
+    model_json = _model_json(booster)
+    model_config = booster.save_config().encode("utf-8")
+    receipt = {
+        "schema_version": "audited-pit-shallow-gbdt-fit-receipt/v1",
+        "runtime": runtime,
+        "parameters": dict(FROZEN_XGBOOST_PARAMS),
+        "num_boost_round": NUM_BOOST_ROUND,
+        "dmatrix": _dmatrix_contract(len(matrix)),
+        "inputs": {
+            "features_sha256": _array_sha256(matrix),
+            "labels_sha256": _array_sha256(label_values),
+            "weights_sha256": _array_sha256(weight_values),
+            "weight_sum": total_weight,
+        },
+        "model_json_sha256": hashlib.sha256(model_json).hexdigest(),
+        "model_config_sha256": hashlib.sha256(model_config).hexdigest(),
+    }
+    return booster, receipt
+
+
+def predict_shallow_gbdt_fold(
+    booster: Any,
+    features: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    matrix = _float64_feature_matrix(features)
+    xgb, runtime = _xgboost_runtime()
+    dmatrix = _make_dmatrix(xgb, matrix)
+    raw_margins = np.ascontiguousarray(
+        booster.predict(dmatrix, output_margin=True)
+    )
+    probabilities = np.ascontiguousarray(booster.predict(dmatrix))
+    if (
+        raw_margins.ndim != 1
+        or probabilities.ndim != 1
+        or len(raw_margins) != len(matrix)
+        or len(probabilities) != len(matrix)
+        or not np.isfinite(raw_margins).all()
+        or not np.isfinite(probabilities).all()
+        or ((probabilities < 0.0) | (probabilities > 1.0)).any()
+    ):
+        raise RuntimeError("xgboost prediction output is invalid")
+    expected_probabilities = 1.0 / (1.0 + np.exp(-raw_margins))
+    if not np.allclose(
+        probabilities,
+        expected_probabilities,
+        rtol=0.0,
+        atol=np.finfo(expected_probabilities.dtype).eps,
+    ):
+        raise RuntimeError("xgboost probabilities do not match raw-margin sigmoid")
+
+    model_json = _model_json(booster)
+    receipt = {
+        "schema_version": "audited-pit-shallow-gbdt-prediction-receipt/v1",
+        "runtime": runtime,
+        "dmatrix": _dmatrix_contract(len(matrix)),
+        "model_json_sha256": hashlib.sha256(model_json).hexdigest(),
+        "features_sha256": _array_sha256(matrix),
+        "raw_margin_sha256": _array_sha256(raw_margins),
+        "probability_sha256": _array_sha256(probabilities),
+        "row_count": len(matrix),
+    }
+    return probabilities, receipt
