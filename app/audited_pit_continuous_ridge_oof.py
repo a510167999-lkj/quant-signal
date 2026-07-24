@@ -36,6 +36,7 @@ from app.audited_pit_score_contract import (
     candidate_passes_gate,
     candidate_score,
     frozen_score_contract,
+    score_evidence_payload,
     selection_rank_key as _contract_selection_rank_key,
     validate_selection_rank_mode,
 )
@@ -4174,6 +4175,10 @@ def _assert_producer_binding_unchanged(
     schema_version = str(expected.get("schema_version") or "")
     if schema_version == "audited-pit-ranked-liquidity-producer/v3":
         actual = _producer_binding(artifact_version=3)
+    elif schema_version == (
+        "audited-pit-ranked-liquidity-shallow-gbdt-producer/v1"
+    ):
+        actual = _shallow_gbdt_producer_binding()
     else:
         actual = _producer_binding()
     if actual != dict(expected):
@@ -5096,6 +5101,196 @@ def verify_rolling_result_bundle(
     }
     verification["receipt_sha256"] = _sha256(verification)
     return verification
+
+
+def _score_and_evaluate_oof_variant(
+    *,
+    tail_features: pd.DataFrame,
+    outcome_candidates: Sequence[Mapping[str, Any]],
+    sessions: Sequence[str],
+    strategy_spec: Mapping[str, Any],
+) -> dict[str, Any]:
+    variant = resolve_ranked_liquidity_run_variant(strategy_spec)
+    adapter = variant["model_adapter"]
+    if not isinstance(adapter, ModelOOFAdapter):
+        raise ValueError("ranked-liquidity model adapter is invalid")
+    score_contract = frozen_score_contract(adapter.score_contract)
+    if dict(score_contract) != variant["score_contract"]:
+        raise ValueError(
+            "ranked-liquidity variant score contract drifted"
+        )
+    walk_forward = strategy_spec["walk_forward"]
+    minimum_training_sessions = int(
+        walk_forward["minimum_training_sessions"]
+    )
+    training_window_sessions = int(
+        walk_forward["training_window_sessions"]
+    )
+    validation_sessions = int(
+        walk_forward["validation_sessions"]
+    )
+    common_oof_kwargs = {
+        "minimum_training_sessions": minimum_training_sessions,
+        "training_window_sessions": training_window_sessions,
+        "validation_sessions": validation_sessions,
+    }
+    build_kwargs = dict(common_oof_kwargs)
+    if adapter.model_id == "continuous_ridge":
+        build_kwargs.update(
+            {
+                "require_nonempty_validation_folds": True,
+                "receipt_schema_version": (
+                    "ranked-liquidity-ridge-purged-oof-receipt/v3"
+                ),
+                "ridge_lambda": float(
+                    strategy_spec["model"]["ridge_lambda"]
+                ),
+                "strategy_spec": strategy_spec,
+            }
+        )
+    scored_oof, oof_receipt = adapter.build_scores(
+        tail_features,
+        outcome_candidates,
+        sessions,
+        **build_kwargs,
+    )
+    expected_fold_ranges = _fold_ranges(
+        sessions,
+        minimum_training_sessions=minimum_training_sessions,
+        validation_sessions=validation_sessions,
+    )
+    observed_fold_ranges = [
+        (str(fold["validation_start"]), str(fold["validation_end"]))
+        for fold in oof_receipt["folds"]
+    ]
+    if (
+        len(expected_fold_ranges)
+        != int(strategy_spec["required_oof_fold_count"])
+        or observed_fold_ranges != expected_fold_ranges
+    ):
+        raise AuditedPITDevelopmentReplayError(
+            "ranked-liquidity OOF folds differ from frozen six-fold plan"
+        )
+    oof_replay_verification = adapter.verify_receipt(
+        tail_features,
+        outcome_candidates,
+        sessions,
+        scored_oof,
+        oof_receipt,
+        **common_oof_kwargs,
+    )
+    if oof_replay_verification.get("verified") is not True:
+        raise AuditedPITDevelopmentReplayError(
+            "ranked-liquidity OOF replay verification failed"
+        )
+    score_field = adapter.score_field
+    required_score_columns = {"candidate_key", score_field}
+    if (
+        not isinstance(scored_oof, pd.DataFrame)
+        or not required_score_columns.issubset(scored_oof.columns)
+    ):
+        raise AuditedPITDevelopmentReplayError(
+            "ranked-liquidity OOF score table is invalid"
+        )
+    score_lookup: dict[str, float] = {}
+    for row in scored_oof.itertuples(index=False):
+        candidate_key = str(row.candidate_key)
+        if not candidate_key or candidate_key in score_lookup:
+            raise AuditedPITDevelopmentReplayError(
+                "ranked-liquidity OOF score keys are duplicated"
+            )
+        score_lookup[candidate_key] = float(
+            getattr(row, score_field)
+        )
+    scored_execution_candidates: list[dict[str, Any]] = []
+    for raw_candidate in outcome_candidates:
+        candidate = dict(raw_candidate)
+        candidate_key = str(candidate.get("candidate_key") or "")
+        if candidate_key not in score_lookup:
+            continue
+        scored_execution_candidates.append(
+            score_evidence_payload(
+                {
+                    **candidate,
+                    score_field: score_lookup[candidate_key],
+                },
+                contract=score_contract,
+            )
+        )
+    scored_execution_candidates.sort(
+        key=lambda item: (
+            str(item["signal_date"]),
+            str(item["security_id"]),
+        )
+    )
+    positive_candidates, positive_pool_receipt = _positive_score_pool(
+        scored_execution_candidates,
+        score_contract=score_contract,
+    )
+    evaluation_sessions = list(sessions[minimum_training_sessions:])
+    if not evaluation_sessions:
+        raise AuditedPITDevelopmentReplayError(
+            "ranked-liquidity evaluation session grid is empty"
+        )
+    main_sweep, main_selection_receipt = _evaluate_fixed_oof(
+        positive_candidates,
+        rank_mode=variant["main_rank_mode"],
+        evaluation_session_dates=evaluation_sessions,
+        strategy_spec=strategy_spec,
+        sweep_schema_version=variant["sweep_schema_version"],
+        score_contract=score_contract,
+    )
+    baseline_sweep, baseline_selection_receipt = _evaluate_fixed_oof(
+        positive_candidates,
+        rank_mode=variant["baseline_rank_mode"],
+        evaluation_session_dates=evaluation_sessions,
+        strategy_spec=strategy_spec,
+        sweep_schema_version=variant["sweep_schema_version"],
+        score_contract=score_contract,
+    )
+    selection_spec = strategy_spec["selection"]
+    main_selected, replayed_main_receipt = (
+        _select_with_industry_cap_receipt(
+            positive_candidates,
+            rank_mode=variant["main_rank_mode"],
+            top_n=int(selection_spec["top_n"]),
+            max_active_positions=int(
+                selection_spec["max_active_positions"]
+            ),
+            score_contract=score_contract,
+        )
+    )
+    baseline_selected, replayed_baseline_receipt = (
+        _select_with_industry_cap_receipt(
+            positive_candidates,
+            rank_mode=variant["baseline_rank_mode"],
+            top_n=int(selection_spec["top_n"]),
+            max_active_positions=int(
+                selection_spec["max_active_positions"]
+            ),
+            score_contract=score_contract,
+        )
+    )
+    if (
+        replayed_main_receipt != main_selection_receipt
+        or replayed_baseline_receipt != baseline_selection_receipt
+    ):
+        raise AuditedPITDevelopmentReplayError(
+            "ranked-liquidity selection replay differs from evaluation"
+        )
+    return {
+        "oof_receipt": oof_receipt,
+        "oof_replay_verification": oof_replay_verification,
+        "scored_execution_candidates": scored_execution_candidates,
+        "positive_candidates": positive_candidates,
+        "positive_pool_receipt": positive_pool_receipt,
+        "main_sweep": main_sweep,
+        "baseline_sweep": baseline_sweep,
+        "main_selection_receipt": main_selection_receipt,
+        "baseline_selection_receipt": baseline_selection_receipt,
+        "main_selected": main_selected,
+        "baseline_selected": baseline_selected,
+    }
 
 
 def _run_audited_pit_ranked_liquidity_ridge_oof(
