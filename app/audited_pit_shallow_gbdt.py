@@ -87,6 +87,10 @@ def _model_json(booster: Any) -> bytes:
     return bytes(booster.save_raw(raw_format="json"))
 
 
+def _model_raw(booster: Any) -> bytes:
+    return bytes(booster.save_raw())
+
+
 def _dmatrix_contract(row_count: int) -> dict[str, Any]:
     return {
         "shape": [row_count, len(FEATURE_NAMES)],
@@ -250,6 +254,7 @@ def fit_shallow_gbdt_fold(
         num_boost_round=NUM_BOOST_ROUND,
     )
     model_json = _model_json(booster)
+    model_raw = _model_raw(booster)
     model_config = booster.save_config().encode("utf-8")
     receipt = {
         "schema_version": "audited-pit-shallow-gbdt-fit-receipt/v1",
@@ -264,6 +269,7 @@ def fit_shallow_gbdt_fold(
             "weight_sum": total_weight,
         },
         "model_json_sha256": hashlib.sha256(model_json).hexdigest(),
+        "model_raw_sha256": hashlib.sha256(model_raw).hexdigest(),
         "model_config_sha256": hashlib.sha256(model_config).hexdigest(),
     }
     return booster, receipt
@@ -300,11 +306,13 @@ def predict_shallow_gbdt_fold(
         raise RuntimeError("xgboost probabilities do not match raw-margin sigmoid")
 
     model_json = _model_json(booster)
+    model_raw = _model_raw(booster)
     receipt = {
         "schema_version": "audited-pit-shallow-gbdt-prediction-receipt/v1",
         "runtime": runtime,
         "dmatrix": _dmatrix_contract(len(matrix)),
         "model_json_sha256": hashlib.sha256(model_json).hexdigest(),
+        "model_raw_sha256": hashlib.sha256(model_raw).hexdigest(),
         "features_sha256": _array_sha256(matrix),
         "raw_margin_sha256": _array_sha256(raw_margins),
         "probability_sha256": _array_sha256(probabilities),
