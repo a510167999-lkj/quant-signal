@@ -4316,6 +4316,19 @@ def build_ranked_liquidity_result_payloads(
     positive_pool_receipt = dict(
         selection_values.pop("positive_pool_receipt")
     )
+    expected_positive_candidates, expected_positive_pool_receipt = (
+        _positive_score_pool(
+            scored_candidates,
+            score_contract=score_contract,
+        )
+    )
+    if (
+        positive_candidates != expected_positive_candidates
+        or positive_pool_receipt != expected_positive_pool_receipt
+    ):
+        raise ValueError(
+            "ranked-liquidity positive candidates differ from strict score gate"
+        )
     main_selected = [
         dict(candidate)
         for candidate in selection_values.pop("main_selected")
@@ -4657,6 +4670,90 @@ def verify_shallow_gbdt_result_bundle(
             != oof_receipt.get("oof_scores_sha256")
         ):
             raise ValueError
+        score_contract = frozen_score_contract(
+            variant["score_contract"]
+        )
+        replayed_scored_candidates = (
+            _scored_execution_candidates_from_oof(
+                outcome_candidates,
+                scored_oof,
+                score_contract=score_contract,
+            )
+        )
+        replayed_selection = _evaluate_scored_oof_variant(
+            scored_execution_candidates=replayed_scored_candidates,
+            sessions=sessions,
+            strategy_spec=expected_strategy,
+        )
+        replayed_scored_evidence = (
+            _compact_scored_execution_evidence(
+                replayed_scored_candidates,
+                score_contract=score_contract,
+            )
+        )
+        replayed_selected_by_key = {
+            _selection_trade_key(candidate): candidate
+            for candidate in [
+                *replayed_selection["main_selected"],
+                *replayed_selection["baseline_selected"],
+            ]
+        }
+        replayed_selected_evidence = [
+            replayed_selected_by_key[key]
+            for key in sorted(replayed_selected_by_key)
+        ]
+        replayed_completed = [
+            dict(candidate)
+            for candidate in outcome_candidates
+            if candidate.get("right_censored") is not True
+        ]
+        replayed_censored = [
+            dict(candidate)
+            for candidate in outcome_candidates
+            if candidate.get("right_censored") is True
+        ]
+        replayed_outcome_membership = (
+            _compact_outcome_membership_evidence(
+                replayed_completed,
+                replayed_censored,
+            )
+        )
+        execution = sidecars["execution"]
+        if (
+            execution.get("outcome_membership_evidence")
+            != replayed_outcome_membership
+            or execution.get("completed_candidate_count")
+            != len(replayed_completed)
+            or execution.get("right_censored_position_count")
+            != len(replayed_censored)
+            or execution.get("completed_candidates_sha256")
+            != replayed_outcome_membership[
+                "completed_candidates_sha256"
+            ]
+            or execution.get("right_censored_positions_sha256")
+            != replayed_outcome_membership[
+                "right_censored_positions_sha256"
+            ]
+            or execution.get(
+                "strict_outcome_candidate_payload_hashes_sha256"
+            )
+            != replayed_outcome_membership[
+                "strict_outcome_candidate_payload_hashes_sha256"
+            ]
+            or main_document.get("strict_outcome_candidate_count")
+            != len(outcome_candidates)
+            or main_document.get("strict_outcome_candidates_sha256")
+            != replayed_outcome_membership[
+                "strict_outcome_candidates_sha256"
+            ]
+            or main_document.get(
+                "strict_outcome_candidate_payload_hashes_sha256"
+            )
+            != replayed_outcome_membership[
+                "strict_outcome_candidate_payload_hashes_sha256"
+            ]
+        ):
+            raise ValueError
         selection = sidecars["selection"]
         scored_evidence = dict(
             selection["scored_execution_candidate_evidence"]
@@ -4718,6 +4815,114 @@ def verify_shallow_gbdt_result_bundle(
             != selection["amount_baseline_sweep"]
         ):
             raise ValueError
+        replayed_positive_candidates = replayed_selection[
+            "positive_candidates"
+        ]
+        replayed_positive_pool_receipt = replayed_selection[
+            "positive_pool_receipt"
+        ]
+        replayed_main_sweep = replayed_selection["main_sweep"]
+        replayed_baseline_sweep = replayed_selection[
+            "baseline_sweep"
+        ]
+        replayed_main_receipt = replayed_selection[
+            "main_selection_receipt"
+        ]
+        replayed_baseline_receipt = replayed_selection[
+            "baseline_selection_receipt"
+        ]
+        replayed_advancement = replayed_selection[
+            "advancement_gate_passed"
+        ]
+        replayed_main_row = replayed_main_sweep["top"][0]
+        replayed_baseline_row = replayed_baseline_sweep["top"][0]
+        replayed_advancement_gate = {
+            "main_latest_and_full_quality_passed": bool(
+                replayed_main_row.get("target_all_pass")
+            ),
+            "main_rolling_12m_stability_passed": bool(
+                replayed_main_row.get(
+                    "target_rolling_12m_stability_pass"
+                )
+            ),
+            "main_evidence_complete": bool(
+                replayed_main_row.get("evidence_complete")
+            ),
+            "amount_baseline_evidence_complete": bool(
+                replayed_baseline_row.get("evidence_complete")
+            ),
+            "all_required_gates_passed": replayed_advancement,
+            "embargo_consumed": False,
+            "final_oos_consumed": False,
+        }
+        if (
+            selection["scored_execution_candidate_evidence"]
+            != replayed_scored_evidence
+            or selection["positive_pool_receipt"]
+            != replayed_positive_pool_receipt
+            or selection["positive_candidate_count"]
+            != len(replayed_positive_candidates)
+            or selection["positive_candidate_payload_hashes_sha256"]
+            != replayed_scored_evidence[
+                "positive_candidate_payload_hashes_sha256"
+            ]
+            or selection["positive_candidate_keys_sha256"]
+            != replayed_positive_pool_receipt[
+                "positive_candidate_keys_sha256"
+            ]
+            or selection["main_sweep"] != replayed_main_sweep
+            or selection["amount_baseline_sweep"]
+            != replayed_baseline_sweep
+            or selection["main_selection_receipt"]
+            != replayed_main_receipt
+            or selection["amount_baseline_selection_receipt"]
+            != replayed_baseline_receipt
+            or selection["selected_evidence"]
+            != replayed_selected_evidence
+            or selection["selected_evidence_sha256"]
+            != _sha256(replayed_selected_evidence)
+            or selection["advancement_gate_passed"]
+            is not replayed_advancement
+            or main_document.get("scored_execution_candidate_count")
+            != len(replayed_scored_candidates)
+            or main_document.get(
+                "scored_execution_candidate_evidence_rows_sha256"
+            )
+            != replayed_scored_evidence["rows_sha256"]
+            or main_document.get(
+                "scored_execution_candidate_payload_hashes_sha256"
+            )
+            != replayed_scored_evidence[
+                "candidate_payload_hashes_sha256"
+            ]
+            or main_document.get("positive_candidate_count")
+            != len(replayed_positive_candidates)
+            or main_document.get(
+                "positive_candidate_payload_hashes_sha256"
+            )
+            != replayed_scored_evidence[
+                "positive_candidate_payload_hashes_sha256"
+            ]
+            or main_document.get("positive_candidate_keys_sha256")
+            != replayed_positive_pool_receipt[
+                "positive_candidate_keys_sha256"
+            ]
+            or main_document.get("positive_pool_receipt_sha256")
+            != replayed_positive_pool_receipt["receipt_sha256"]
+            or main_document.get("main_sweep")
+            != replayed_main_sweep
+            or main_document.get("amount_baseline_sweep")
+            != replayed_baseline_sweep
+            or main_document.get("advancement_gate")
+            != replayed_advancement_gate
+            or main_document["scope"].get("advancement_gate_passed")
+            is not replayed_advancement
+            or main_document.get("comparison", {}).get(
+                "shared_candidate_table_sha256"
+            )
+            != replayed_main_receipt.get("candidate_table_sha256")
+        ):
+            raise ValueError
         verification = {
             "schema_version": (
                 "ranked-liquidity-shallow-gbdt-"
@@ -4734,6 +4939,9 @@ def verify_shallow_gbdt_result_bundle(
                 "content_addressing_verified": True,
                 "probability_score_contract_verified": True,
                 "shared_positive_candidate_pool_verified": True,
+                "strict_outcome_membership_verified": True,
+                "independent_selection_replay": True,
+                "independent_sweep_and_gate_replay": True,
             },
             "verified": True,
         }
@@ -5614,6 +5822,194 @@ def verify_rolling_result_bundle(
     return verification
 
 
+def _frozen_variant_strategy_spec(
+    variant: Mapping[str, Any],
+) -> dict[str, Any]:
+    adapter = variant["model_adapter"]
+    if not isinstance(adapter, ModelOOFAdapter):
+        raise ValueError("ranked-liquidity model adapter is invalid")
+    if adapter.model_id == "continuous_ridge":
+        return deepcopy(ROLLING_CONTINUOUS_RIDGE_OOF_SPEC)
+
+    from app import audited_pit_shallow_gbdt as shallow_gbdt
+
+    frozen_strategy = deepcopy(shallow_gbdt.SHALLOW_GBDT_OOF_SPEC)
+    if (
+        _sha256(frozen_strategy)
+        != shallow_gbdt._SHALLOW_GBDT_OOF_SPEC_SHA256
+    ):
+        raise ValueError("ranked-liquidity frozen strategy copy drifted")
+    return frozen_strategy
+
+
+def _scored_execution_candidates_from_oof(
+    outcome_candidates: Sequence[Mapping[str, Any]],
+    scored_oof: pd.DataFrame,
+    *,
+    score_contract: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    metadata = _score_contract_metadata(score_contract)
+    score_field = str(metadata["field"])
+    required_columns = {"candidate_key", score_field}
+    if (
+        not isinstance(scored_oof, pd.DataFrame)
+        or not required_columns.issubset(scored_oof.columns)
+    ):
+        raise AuditedPITDevelopmentReplayError(
+            "ranked-liquidity OOF score table is invalid"
+        )
+
+    outcome_by_key: dict[str, dict[str, Any]] = {}
+    for raw_candidate in outcome_candidates:
+        candidate = dict(raw_candidate)
+        candidate_key = str(candidate.get("candidate_key") or "")
+        if not candidate_key or candidate_key in outcome_by_key:
+            raise AuditedPITDevelopmentReplayError(
+                "ranked-liquidity outcome candidate keys are invalid"
+            )
+        outcome_by_key[candidate_key] = candidate
+
+    score_lookup: dict[str, float] = {}
+    signal_date_lookup: dict[str, str] = {}
+    for row in scored_oof.itertuples(index=False):
+        candidate_key = str(row.candidate_key)
+        if (
+            not candidate_key
+            or candidate_key in score_lookup
+            or candidate_key not in outcome_by_key
+        ):
+            raise AuditedPITDevelopmentReplayError(
+                "ranked-liquidity OOF score keys are invalid"
+            )
+        score_lookup[candidate_key] = float(getattr(row, score_field))
+        if "signal_date" in scored_oof.columns:
+            signal_date_lookup[candidate_key] = str(row.signal_date)
+
+    scored_candidates: list[dict[str, Any]] = []
+    for candidate_key, score in score_lookup.items():
+        candidate = outcome_by_key[candidate_key]
+        if (
+            candidate_key in signal_date_lookup
+            and signal_date_lookup[candidate_key]
+            != str(candidate.get("signal_date") or "")
+        ):
+            raise AuditedPITDevelopmentReplayError(
+                "ranked-liquidity OOF signal dates differ from outcomes"
+            )
+        scored_candidates.append(
+            score_evidence_payload(
+                {**candidate, score_field: score},
+                contract=score_contract,
+            )
+        )
+    scored_candidates.sort(
+        key=lambda item: (
+            str(item["signal_date"]),
+            str(item["security_id"]),
+            str(item["candidate_key"]),
+        )
+    )
+    return scored_candidates
+
+
+def _evaluate_scored_oof_variant(
+    *,
+    scored_execution_candidates: Sequence[Mapping[str, Any]],
+    sessions: Sequence[str],
+    strategy_spec: Mapping[str, Any],
+) -> dict[str, Any]:
+    variant = resolve_ranked_liquidity_run_variant(strategy_spec)
+    frozen_strategy = _frozen_variant_strategy_spec(variant)
+    if _sha256(strategy_spec) != _sha256(frozen_strategy):
+        raise ValueError("ranked-liquidity evaluation strategy is not frozen")
+    score_contract = frozen_score_contract(variant["score_contract"])
+    scored_candidates = [
+        dict(candidate) for candidate in scored_execution_candidates
+    ]
+    for candidate in scored_candidates:
+        candidate_score(candidate, contract=score_contract)
+    positive_candidates, positive_pool_receipt = _positive_score_pool(
+        scored_candidates,
+        score_contract=score_contract,
+    )
+
+    ordered_sessions = _ordered_sessions(sessions)
+    minimum_training_sessions = int(
+        frozen_strategy["walk_forward"]["minimum_training_sessions"]
+    )
+    evaluation_sessions = list(
+        ordered_sessions[minimum_training_sessions:]
+    )
+    if not evaluation_sessions and len(ordered_sessions) <= minimum_training_sessions:
+        evaluation_sessions = ordered_sessions
+    if not evaluation_sessions:
+        raise AuditedPITDevelopmentReplayError(
+            "ranked-liquidity evaluation session grid is empty"
+        )
+
+    main_sweep, main_selection_receipt = _evaluate_fixed_oof(
+        positive_candidates,
+        rank_mode=variant["main_rank_mode"],
+        evaluation_session_dates=evaluation_sessions,
+        strategy_spec=frozen_strategy,
+        sweep_schema_version=variant["sweep_schema_version"],
+        score_contract=score_contract,
+    )
+    baseline_sweep, baseline_selection_receipt = _evaluate_fixed_oof(
+        positive_candidates,
+        rank_mode=variant["baseline_rank_mode"],
+        evaluation_session_dates=evaluation_sessions,
+        strategy_spec=frozen_strategy,
+        sweep_schema_version=variant["sweep_schema_version"],
+        score_contract=score_contract,
+    )
+    selection_spec = frozen_strategy["selection"]
+    main_selected, replayed_main_receipt = (
+        _select_with_industry_cap_receipt(
+            positive_candidates,
+            rank_mode=variant["main_rank_mode"],
+            top_n=int(selection_spec["top_n"]),
+            max_active_positions=int(
+                selection_spec["max_active_positions"]
+            ),
+            score_contract=score_contract,
+        )
+    )
+    baseline_selected, replayed_baseline_receipt = (
+        _select_with_industry_cap_receipt(
+            positive_candidates,
+            rank_mode=variant["baseline_rank_mode"],
+            top_n=int(selection_spec["top_n"]),
+            max_active_positions=int(
+                selection_spec["max_active_positions"]
+            ),
+            score_contract=score_contract,
+        )
+    )
+    if (
+        replayed_main_receipt != main_selection_receipt
+        or replayed_baseline_receipt != baseline_selection_receipt
+    ):
+        raise AuditedPITDevelopmentReplayError(
+            "ranked-liquidity selection replay differs from evaluation"
+        )
+    return {
+        "scored_execution_candidates": scored_candidates,
+        "positive_candidates": positive_candidates,
+        "positive_pool_receipt": positive_pool_receipt,
+        "main_sweep": main_sweep,
+        "baseline_sweep": baseline_sweep,
+        "main_selection_receipt": main_selection_receipt,
+        "baseline_selection_receipt": baseline_selection_receipt,
+        "main_selected": main_selected,
+        "baseline_selected": baseline_selected,
+        "advancement_gate_passed": _advancement_gate_passes(
+            main_sweep["top"][0],
+            baseline_sweep["top"][0],
+        ),
+    }
+
+
 def _score_and_evaluate_oof_variant(
     *,
     tail_features: pd.DataFrame,
@@ -5623,25 +6019,7 @@ def _score_and_evaluate_oof_variant(
 ) -> dict[str, Any]:
     variant = resolve_ranked_liquidity_run_variant(strategy_spec)
     adapter = variant["model_adapter"]
-    if not isinstance(adapter, ModelOOFAdapter):
-        raise ValueError("ranked-liquidity model adapter is invalid")
-    if adapter.model_id == "continuous_ridge":
-        frozen_strategy_spec = deepcopy(
-            ROLLING_CONTINUOUS_RIDGE_OOF_SPEC
-        )
-    else:
-        from app import audited_pit_shallow_gbdt as shallow_gbdt
-
-        frozen_strategy_spec = deepcopy(
-            shallow_gbdt.SHALLOW_GBDT_OOF_SPEC
-        )
-        if (
-            _sha256(frozen_strategy_spec)
-            != shallow_gbdt._SHALLOW_GBDT_OOF_SPEC_SHA256
-        ):
-            raise ValueError(
-                "ranked-liquidity frozen strategy copy drifted"
-            )
+    frozen_strategy_spec = _frozen_variant_strategy_spec(variant)
     strategy_spec = frozen_strategy_spec
     score_contract = frozen_score_contract(adapter.score_contract)
     if dict(score_contract) != variant["score_contract"]:
@@ -5712,113 +6090,20 @@ def _score_and_evaluate_oof_variant(
         raise AuditedPITDevelopmentReplayError(
             "ranked-liquidity OOF replay verification failed"
         )
-    score_field = adapter.score_field
-    required_score_columns = {"candidate_key", score_field}
-    if (
-        not isinstance(scored_oof, pd.DataFrame)
-        or not required_score_columns.issubset(scored_oof.columns)
-    ):
-        raise AuditedPITDevelopmentReplayError(
-            "ranked-liquidity OOF score table is invalid"
-        )
-    score_lookup: dict[str, float] = {}
-    for row in scored_oof.itertuples(index=False):
-        candidate_key = str(row.candidate_key)
-        if not candidate_key or candidate_key in score_lookup:
-            raise AuditedPITDevelopmentReplayError(
-                "ranked-liquidity OOF score keys are duplicated"
-            )
-        score_lookup[candidate_key] = float(
-            getattr(row, score_field)
-        )
-    scored_execution_candidates: list[dict[str, Any]] = []
-    for raw_candidate in outcome_candidates:
-        candidate = dict(raw_candidate)
-        candidate_key = str(candidate.get("candidate_key") or "")
-        if candidate_key not in score_lookup:
-            continue
-        scored_execution_candidates.append(
-            score_evidence_payload(
-                {
-                    **candidate,
-                    score_field: score_lookup[candidate_key],
-                },
-                contract=score_contract,
-            )
-        )
-    scored_execution_candidates.sort(
-        key=lambda item: (
-            str(item["signal_date"]),
-            str(item["security_id"]),
-        )
-    )
-    positive_candidates, positive_pool_receipt = _positive_score_pool(
-        scored_execution_candidates,
+    scored_execution_candidates = _scored_execution_candidates_from_oof(
+        outcome_candidates,
+        scored_oof,
         score_contract=score_contract,
     )
-    evaluation_sessions = list(sessions[minimum_training_sessions:])
-    if not evaluation_sessions:
-        raise AuditedPITDevelopmentReplayError(
-            "ranked-liquidity evaluation session grid is empty"
-        )
-    main_sweep, main_selection_receipt = _evaluate_fixed_oof(
-        positive_candidates,
-        rank_mode=variant["main_rank_mode"],
-        evaluation_session_dates=evaluation_sessions,
+    evaluated = _evaluate_scored_oof_variant(
+        scored_execution_candidates=scored_execution_candidates,
+        sessions=sessions,
         strategy_spec=strategy_spec,
-        sweep_schema_version=variant["sweep_schema_version"],
-        score_contract=score_contract,
     )
-    baseline_sweep, baseline_selection_receipt = _evaluate_fixed_oof(
-        positive_candidates,
-        rank_mode=variant["baseline_rank_mode"],
-        evaluation_session_dates=evaluation_sessions,
-        strategy_spec=strategy_spec,
-        sweep_schema_version=variant["sweep_schema_version"],
-        score_contract=score_contract,
-    )
-    selection_spec = strategy_spec["selection"]
-    main_selected, replayed_main_receipt = (
-        _select_with_industry_cap_receipt(
-            positive_candidates,
-            rank_mode=variant["main_rank_mode"],
-            top_n=int(selection_spec["top_n"]),
-            max_active_positions=int(
-                selection_spec["max_active_positions"]
-            ),
-            score_contract=score_contract,
-        )
-    )
-    baseline_selected, replayed_baseline_receipt = (
-        _select_with_industry_cap_receipt(
-            positive_candidates,
-            rank_mode=variant["baseline_rank_mode"],
-            top_n=int(selection_spec["top_n"]),
-            max_active_positions=int(
-                selection_spec["max_active_positions"]
-            ),
-            score_contract=score_contract,
-        )
-    )
-    if (
-        replayed_main_receipt != main_selection_receipt
-        or replayed_baseline_receipt != baseline_selection_receipt
-    ):
-        raise AuditedPITDevelopmentReplayError(
-            "ranked-liquidity selection replay differs from evaluation"
-        )
     return {
         "oof_receipt": oof_receipt,
         "oof_replay_verification": oof_replay_verification,
-        "scored_execution_candidates": scored_execution_candidates,
-        "positive_candidates": positive_candidates,
-        "positive_pool_receipt": positive_pool_receipt,
-        "main_sweep": main_sweep,
-        "baseline_sweep": baseline_sweep,
-        "main_selection_receipt": main_selection_receipt,
-        "baseline_selection_receipt": baseline_selection_receipt,
-        "main_selected": main_selected,
-        "baseline_selected": baseline_selected,
+        **evaluated,
     }
 
 
