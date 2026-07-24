@@ -255,7 +255,17 @@ def resolve_model_oof_adapter(
         )
     from app import audited_pit_shallow_gbdt as shallow_gbdt
 
-    if dict(strategy_spec) == shallow_gbdt.SHALLOW_GBDT_OOF_SPEC:
+    shallow_spec_sha256 = shallow_gbdt._SHALLOW_GBDT_OOF_SPEC_SHA256
+    if (
+        _sha256(shallow_gbdt.SHALLOW_GBDT_OOF_SPEC)
+        == shallow_spec_sha256
+        and _sha256(strategy_spec) == shallow_spec_sha256
+        and dict(strategy_spec) == shallow_gbdt.SHALLOW_GBDT_OOF_SPEC
+        and frozen_score_contract(
+            strategy_spec["selection"]["score_contract"]
+        )
+        is SHALLOW_GBDT_SCORE_CONTRACT
+    ):
         return ModelOOFAdapter(
             model_id="shallow_gbdt_utility_logit",
             score_contract=SHALLOW_GBDT_SCORE_CONTRACT,
@@ -3992,6 +4002,170 @@ def _producer_binding(*, artifact_version: int = 2) -> dict[str, Any]:
         **identity,
         "root_sha256": _sha256(identity),
     }
+
+
+def _assert_shallow_gbdt_entrypoints_frozen() -> None:
+    from app import audited_pit_shallow_gbdt as shallow_gbdt
+
+    if (
+        shallow_gbdt.build_shallow_gbdt_rolling_oof_scores
+        is not shallow_gbdt._FROZEN_BUILD_SHALLOW_GBDT_ROLLING_OOF_SCORES
+        or shallow_gbdt.verify_shallow_gbdt_rolling_oof_receipt
+        is not (
+            shallow_gbdt
+            ._FROZEN_VERIFY_SHALLOW_GBDT_ROLLING_OOF_RECEIPT
+        )
+    ):
+        raise ValueError("shallow GBDT model entrypoints are not frozen")
+
+
+def _shallow_gbdt_producer_binding() -> dict[str, Any]:
+    from app import audited_pit_shallow_gbdt as shallow_gbdt
+
+    _assert_shallow_gbdt_entrypoints_frozen()
+    _, xgboost_runtime = shallow_gbdt._xgboost_runtime()
+    ridge_binding = _producer_binding(artifact_version=3)
+    root = Path(__file__).resolve().parent
+    identity = {
+        "schema_version": (
+            "audited-pit-ranked-liquidity-shallow-gbdt-producer/v1"
+        ),
+        "base_ranked_liquidity_producer_root_sha256": (
+            ridge_binding["root_sha256"]
+        ),
+        "strict_dependency_modules": (
+            ridge_binding["strict_dependency_modules"]
+        ),
+        "shared_ranked_liquidity_module_sha256": hashlib.sha256(
+            Path(__file__).read_bytes()
+        ).hexdigest(),
+        "shallow_gbdt_module_sha256": hashlib.sha256(
+            Path(shallow_gbdt.__file__).read_bytes()
+        ).hexdigest(),
+        "score_contract_module_sha256": hashlib.sha256(
+            (root / "audited_pit_score_contract.py").read_bytes()
+        ).hexdigest(),
+        "python_version": sys.version,
+        "numpy_version": np.__version__,
+        "numpy_build_config": np.show_config(mode="dicts"),
+        "pandas_version": pd.__version__,
+        "pypdf_version": package_version("pypdf"),
+        "xgboost_version": xgboost_runtime["xgboost_version"],
+        "xgboost_build_info": xgboost_runtime["xgboost_build_info"],
+        "xgboost_parameters": dict(
+            shallow_gbdt.FROZEN_XGBOOST_PARAMS
+        ),
+        "num_boost_round": shallow_gbdt.NUM_BOOST_ROUND,
+        "score_contract_sha256": _sha256(
+            dict(SHALLOW_GBDT_SCORE_CONTRACT)
+        ),
+        "strategy_sha256": (
+            shallow_gbdt._SHALLOW_GBDT_OOF_SPEC_SHA256
+        ),
+    }
+    return {
+        **identity,
+        "root_sha256": _sha256(identity),
+    }
+
+
+def resolve_ranked_liquidity_run_variant(
+    strategy_spec: Mapping[str, Any],
+) -> dict[str, Any]:
+    try:
+        model_adapter = resolve_model_oof_adapter(strategy_spec)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "ranked-liquidity run variant must match a frozen strategy"
+        ) from exc
+    if model_adapter.model_id == "continuous_ridge":
+        return {
+            "strategy_schema_version": (
+                "development-pit-cross-sectional-ranked-liquidity-"
+                "ridge-rolling-oof/v3"
+            ),
+            "progress_file_name": (
+                ".ranked_liquidity_v3_progress.json"
+            ),
+            "progress_schema_version": (
+                "ranked-liquidity-replay-progress/v3"
+            ),
+            "producer_schema_version": (
+                "audited-pit-ranked-liquidity-producer/v3"
+            ),
+            "result_schema_version": (
+                "ranked-liquidity-ridge-result/v3"
+            ),
+            "sidecar_schema_versions": {
+                name: f"ranked-liquidity-{name}-sidecar/v3"
+                for name in (
+                    "features",
+                    "models",
+                    "execution",
+                    "selection",
+                )
+            },
+            "strict_outcome_schema_version": (
+                "ranked-liquidity-ridge-strict-outcome/v3"
+            ),
+            "sweep_schema_version": (
+                "strict-ranked-liquidity-ridge-fixed-oof/v3"
+            ),
+            "model_adapter": model_adapter,
+            "main_rank_mode": "predicted_net_return",
+            "baseline_rank_mode": "signal_date_amount",
+            "score_contract": dict(RIDGE_SCORE_CONTRACT),
+            "producer_binding": (
+                lambda: _producer_binding(artifact_version=3)
+            ),
+            "artifact_semantics_version": 3,
+        }
+    if model_adapter.model_id == "shallow_gbdt_utility_logit":
+        _assert_shallow_gbdt_entrypoints_frozen()
+        return {
+            "strategy_schema_version": (
+                "development-pit-cross-sectional-shallow-gbdt-"
+                "utility-logit-rolling-126-oof/v1"
+            ),
+            "progress_file_name": (
+                ".ranked_liquidity_shallow_gbdt_v1_progress.json"
+            ),
+            "progress_schema_version": (
+                "ranked-liquidity-shallow-gbdt-replay-progress/v1"
+            ),
+            "producer_schema_version": (
+                "audited-pit-ranked-liquidity-shallow-gbdt-producer/v1"
+            ),
+            "result_schema_version": (
+                "ranked-liquidity-shallow-gbdt-result/v1"
+            ),
+            "sidecar_schema_versions": {
+                name: (
+                    f"ranked-liquidity-shallow-gbdt-{name}-sidecar/v1"
+                )
+                for name in (
+                    "features",
+                    "models",
+                    "execution",
+                    "selection",
+                )
+            },
+            "strict_outcome_schema_version": (
+                "ranked-liquidity-shallow-gbdt-strict-outcome/v1"
+            ),
+            "sweep_schema_version": (
+                "strict-ranked-liquidity-shallow-gbdt-fixed-oof/v1"
+            ),
+            "model_adapter": model_adapter,
+            "main_rank_mode": "positive_utility_probability",
+            "baseline_rank_mode": "signal_date_amount",
+            "score_contract": dict(SHALLOW_GBDT_SCORE_CONTRACT),
+            "producer_binding": _shallow_gbdt_producer_binding,
+            "artifact_semantics_version": 3,
+        }
+    raise ValueError(
+        "ranked-liquidity run variant must match a frozen strategy"
+    )
 
 
 def _assert_producer_binding_unchanged(

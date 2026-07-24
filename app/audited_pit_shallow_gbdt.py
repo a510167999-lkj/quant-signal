@@ -117,6 +117,9 @@ SHALLOW_GBDT_OOF_SPEC.update(
         },
     }
 )
+_SHALLOW_GBDT_OOF_SPEC_SHA256 = (
+    "53d00badc8683670ef3d6c02307697e2c3ef8ec769b9d8da072d36420cea70ac"
+)
 
 
 def _float64_vector(
@@ -1505,3 +1508,11 @@ def verify_shallow_gbdt_rolling_oof_receipt(
         "fold_count": expected_receipt["fold_count"],
         "oof_candidate_count": expected_receipt["oof_candidate_count"],
     }
+
+
+_FROZEN_BUILD_SHALLOW_GBDT_ROLLING_OOF_SCORES = (
+    build_shallow_gbdt_rolling_oof_scores
+)
+_FROZEN_VERIFY_SHALLOW_GBDT_ROLLING_OOF_RECEIPT = (
+    verify_shallow_gbdt_rolling_oof_receipt
+)
