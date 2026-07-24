@@ -287,6 +287,7 @@ def _build_payloads(
 
 def _replay_inputs(*, sessions: list[str] | None = None) -> dict:
     candidates = _scored_candidates()
+    shared = _shared_receipts(candidates, sessions=sessions)
     return {
         "tail_features": pd.DataFrame(),
         "outcome_candidates": [
@@ -309,6 +310,10 @@ def _replay_inputs(*, sessions: list[str] | None = None) -> dict:
                 for candidate in candidates
             ]
         ),
+        "expected_source": shared["source"],
+        "expected_outcome_receipt": shared["execution"][
+            "outcome_receipt"
+        ],
     }
 
 
