@@ -257,3 +257,48 @@ def test_producer_assertion_selects_the_shallow_gbdt_binding(monkeypatch):
     )
     with pytest.raises(ValueError, match="producer code changed"):
         ridge._assert_producer_binding_unchanged(expected)
+
+
+def test_variant_scoring_uses_a_frozen_strategy_copy(
+    monkeypatch,
+):
+    sessions = _sessions()
+    features, outcomes = _variant_inputs(sessions=sessions)
+    strategy = deepcopy(shallow_gbdt.SHALLOW_GBDT_OOF_SPEC)
+    captured: dict = {}
+    adapter = _fake_adapter(
+        model_id="shallow_gbdt_utility_logit",
+        score_contract=dict(ridge.SHALLOW_GBDT_SCORE_CONTRACT),
+        score_field="predicted_positive_utility_probability",
+        scores=[0.9, 0.8, 0.7],
+        captured=captured,
+    )
+    original_build = adapter.build_scores
+
+    def mutating_build(*args, **kwargs):
+        strategy["selection"]["top_n"] = 1
+        return original_build(*args, **kwargs)
+
+    adapter = ridge.ModelOOFAdapter(
+        model_id=adapter.model_id,
+        score_contract=adapter.score_contract,
+        score_field=adapter.score_field,
+        build_scores=mutating_build,
+        verify_receipt=adapter.verify_receipt,
+    )
+    monkeypatch.setattr(
+        ridge,
+        "resolve_model_oof_adapter",
+        lambda strategy_spec: adapter,
+    )
+    monkeypatch.setattr(ridge, "_trade_metrics", _passing_metrics)
+
+    result = ridge._score_and_evaluate_oof_variant(
+        tail_features=features,
+        outcome_candidates=outcomes,
+        sessions=sessions,
+        strategy_spec=strategy,
+    )
+
+    assert len(result["main_selected"]) == 3
+    assert result["main_selection_receipt"]["parameters"]["top_n"] == 3
