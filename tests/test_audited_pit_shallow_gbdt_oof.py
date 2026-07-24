@@ -334,6 +334,18 @@ def test_rolling_oof_freezes_purge_utility_targets_and_receipts(
         _canonical_sha256(sessions[:4])
     )
     assert first_fold["window_candidate_count"] == 160
+    eligible_keys = sorted(
+        {
+            str(outcome["candidate_key"])
+            for outcome in outcomes
+            if str(outcome["candidate_key"]).split("|")[0] in sessions[:4]
+            and outcome.get("right_censored") is False
+        }
+    )
+    assert first_fold["eligible_complete_window_candidate_count"] == 158
+    assert first_fold[
+        "eligible_complete_window_candidate_keys_sha256"
+    ] == _canonical_sha256(eligible_keys)
     assert first_fold["right_censored_window_candidate_count"] == 1
     assert first_fold["right_censored_window_candidate_keys_sha256"] == (
         _canonical_sha256([f"{sessions[0]}|039"])
@@ -384,8 +396,34 @@ def test_rolling_oof_freezes_purge_utility_targets_and_receipts(
         for member_index in range(40)
     ]
     assert first_fold["validation_candidate_count"] == 80
+    assert first_fold["validation_signal_sessions"] == sessions[4:6]
+    assert first_fold["validation_signal_sessions_sha256"] == (
+        _canonical_sha256(sessions[4:6])
+    )
     assert first_fold["validation_candidate_keys_sha256"] == (
         _canonical_sha256(validation_keys)
+    )
+    first_positive_rows = [
+        {
+            "candidate_key": str(row.candidate_key),
+            "signal_date": str(row.signal_date),
+            "predicted_positive_utility_probability": float(
+                row.predicted_positive_utility_probability
+            ),
+        }
+        for row in scored[
+            scored["signal_date"].isin(sessions[4:6])
+        ].itertuples(index=False)
+        if float(row.predicted_positive_utility_probability) > 0.5
+    ]
+    assert first_fold["positive_utility_candidate_count"] == 26
+    assert first_fold["positive_utility_candidate_keys_sha256"] == (
+        _canonical_sha256(
+            [row["candidate_key"] for row in first_positive_rows]
+        )
+    )
+    assert first_fold["positive_utility_rows_sha256"] == (
+        _canonical_sha256(first_positive_rows)
     )
     assert first_fold["receipt_sha256"] == _canonical_sha256(
         {
@@ -410,6 +448,20 @@ def test_rolling_oof_freezes_purge_utility_targets_and_receipts(
         scored["candidate_key"].astype(str).tolist()
     )
     assert receipt["oof_scores_sha256"] == _canonical_sha256(score_payload)
+    positive_rows = [
+        row
+        for row in score_payload
+        if row["predicted_positive_utility_probability"] > 0.5
+    ]
+    assert receipt["positive_utility_candidate_count"] == 52
+    assert receipt["positive_utility_candidate_keys_sha256"] == (
+        _canonical_sha256(
+            [row["candidate_key"] for row in positive_rows]
+        )
+    )
+    assert receipt["positive_utility_rows_sha256"] == _canonical_sha256(
+        positive_rows
+    )
     assert receipt["folds_sha256"] == _canonical_sha256(receipt["folds"])
     assert receipt["receipt_sha256"] == _canonical_sha256(
         {
@@ -444,6 +496,19 @@ def test_independent_verifier_replays_and_rejects_tampering(
         "build_shallow_gbdt_rolling_oof_scores",
         public_builder_must_not_be_called,
     )
+    for private_name in (
+        "_compute_shallow_gbdt_rolling_oof",
+        "_rolling_oof_inputs",
+        "_rolling_fold_members",
+        "_fold_receipt",
+        "clip_training_net_returns",
+        "build_daily_utility_targets",
+    ):
+        monkeypatch.setattr(
+            gbdt,
+            private_name,
+            public_builder_must_not_be_called,
+        )
     assert verify_shallow_gbdt_rolling_oof_receipt(
         features,
         outcomes,
@@ -470,6 +535,97 @@ def test_independent_verifier_replays_and_rejects_tampering(
             sessions,
             scored,
             tampered_receipt,
+            minimum_training_sessions=4,
+            training_window_sessions=4,
+            validation_sessions=2,
+        )
+
+
+def test_second_fold_drops_old_sessions_and_validation_outcomes_do_not_leak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, features, outcomes = _fixture()
+    _install_fake_fold_model(monkeypatch)
+    scored, receipt = build_shallow_gbdt_rolling_oof_scores(
+        features,
+        outcomes,
+        sessions,
+        minimum_training_sessions=4,
+        training_window_sessions=4,
+        validation_sessions=2,
+    )
+
+    second_fold = receipt["folds"][1]
+    assert second_fold["training_window_start"] == sessions[2]
+    assert second_fold["training_window_end"] == sessions[5]
+    assert second_fold["training_window_sessions_sha256"] == (
+        _canonical_sha256(sessions[2:6])
+    )
+    expected_window_keys = [
+        f"{signal_date}|{member_index:03d}"
+        for signal_date in sessions[2:6]
+        for member_index in range(40)
+    ]
+    assert second_fold["window_candidate_keys_sha256"] == (
+        _canonical_sha256(expected_window_keys)
+    )
+
+    changed = deepcopy(outcomes)
+    for outcome in changed:
+        if str(outcome["candidate_key"]).split("|")[0] in sessions[4:6]:
+            if outcome.get("right_censored") is False:
+                outcome["return_pct"] = float(outcome["return_pct"]) + 500.0
+    rescored, changed_receipt = build_shallow_gbdt_rolling_oof_scores(
+        features,
+        changed,
+        sessions,
+        minimum_training_sessions=4,
+        training_window_sessions=4,
+        validation_sessions=2,
+    )
+    probability_column = "predicted_positive_utility_probability"
+    pd.testing.assert_series_equal(
+        scored.loc[
+            scored["signal_date"].isin(sessions[4:6]),
+            probability_column,
+        ].reset_index(drop=True),
+        rescored.loc[
+            rescored["signal_date"].isin(sessions[4:6]),
+            probability_column,
+        ].reset_index(drop=True),
+    )
+    assert receipt["folds"][0] == changed_receipt["folds"][0]
+
+
+def test_rolling_oof_rejects_nan_keys_and_non_boolean_censor_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, features, outcomes = _fixture()
+    _install_fake_fold_model(monkeypatch)
+    invalid_features = features.copy(deep=True)
+    invalid_features.loc[0, "candidate_key"] = np.nan
+    with pytest.raises(ValueError, match="key"):
+        build_shallow_gbdt_rolling_oof_scores(
+            invalid_features,
+            outcomes,
+            sessions,
+            minimum_training_sessions=4,
+            training_window_sessions=4,
+            validation_sessions=2,
+        )
+
+    invalid_outcomes = deepcopy(outcomes)
+    invalid_outcomes[0] = {
+        "candidate_key": invalid_outcomes[0]["candidate_key"],
+        "exit_date": sessions[1],
+        "return_pct": 1.0,
+        "right_censored": 1,
+    }
+    with pytest.raises(ValueError, match="right_censored"):
+        build_shallow_gbdt_rolling_oof_scores(
+            features,
+            invalid_outcomes,
+            sessions,
             minimum_training_sessions=4,
             training_window_sessions=4,
             validation_sessions=2,
