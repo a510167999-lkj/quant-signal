@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 
 import numpy as np
@@ -12,7 +14,9 @@ from app.audited_pit_shallow_gbdt import (
     NUM_BOOST_ROUND,
     build_daily_utility_targets,
     clip_training_net_returns,
+    fit_shallow_gbdt_fold,
     positive_utility_mask,
+    predict_shallow_gbdt_fold,
     prepare_feature_matrix,
 )
 
@@ -29,6 +33,48 @@ EXPECTED_FEATURE_NAMES = (
     "cross_section_above_ma20_fraction",
     "cross_section_median_return_5d_pct",
 )
+
+
+def _array_sha256(values: np.ndarray) -> str:
+    array = np.ascontiguousarray(values)
+    digest = hashlib.sha256()
+    digest.update(str(array.dtype).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(
+        json.dumps(list(array.shape), separators=(",", ":")).encode("ascii")
+    )
+    digest.update(b"\0")
+    digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _fold_fixture() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    generator = np.random.default_rng(20260724)
+    matrix = np.ascontiguousarray(
+        generator.normal(size=(64, len(EXPECTED_FEATURE_NAMES))),
+        dtype=np.float64,
+    )
+    labels = (
+        matrix[:, 0] * matrix[:, 1] + matrix[:, 2] - 0.25 * matrix[:, 3] > 0.0
+    ).astype(np.float64)
+    weights = np.ascontiguousarray(
+        np.linspace(1.0, 2.0, len(matrix), dtype=np.float64)
+    )
+    weights /= weights.sum()
+    return matrix, labels, weights
+
+
+def _expected_dmatrix_contract(row_count: int) -> dict[str, object]:
+    return {
+        "shape": [row_count, len(EXPECTED_FEATURE_NAMES)],
+        "dtype": "float64",
+        "c_contiguous": True,
+        "feature_names": list(EXPECTED_FEATURE_NAMES),
+        "feature_types": ["float"] * len(EXPECTED_FEATURE_NAMES),
+        "nthread": 1,
+        "missing": "NaN",
+        "enable_categorical": False,
+    }
 
 
 def test_p99_uses_zero_based_nearest_rank_and_clips_symmetrically() -> None:
@@ -171,3 +217,154 @@ def test_xgboost_parameters_and_round_count_are_frozen() -> None:
         "validate_parameters": True,
     }
     assert NUM_BOOST_ROUND == 200
+
+
+def test_fold_fit_receipt_freezes_runtime_parameters_and_dmatrix_contract() -> None:
+    matrix, labels, weights = _fold_fixture()
+    original_matrix = matrix.copy()
+    original_labels = labels.copy()
+    original_weights = weights.copy()
+
+    booster, receipt = fit_shallow_gbdt_fold(matrix, labels, weights)
+
+    assert receipt["schema_version"] == "audited-pit-shallow-gbdt-fit-receipt/v1"
+    assert receipt["runtime"]["xgboost_version"] == "3.3.0"
+    assert isinstance(receipt["runtime"]["xgboost_build_info"], dict)
+    assert receipt["runtime"]["xgboost_build_info"]
+    assert receipt["parameters"] == FROZEN_XGBOOST_PARAMS
+    assert receipt["num_boost_round"] == NUM_BOOST_ROUND == 200
+    assert receipt["dmatrix"] == _expected_dmatrix_contract(len(matrix))
+    model_json = bytes(booster.save_raw(raw_format="json"))
+    assert receipt["model_json_sha256"] == hashlib.sha256(model_json).hexdigest()
+    np.testing.assert_array_equal(matrix, original_matrix)
+    np.testing.assert_array_equal(labels, original_labels)
+    np.testing.assert_array_equal(weights, original_weights)
+
+
+@pytest.mark.parametrize(
+    ("labels", "weights", "match"),
+    [
+        (
+            np.array([0.0, 1.0], dtype=np.float64),
+            np.ones(64, dtype=np.float64),
+            "shape",
+        ),
+        (
+            np.zeros(64, dtype=np.float64),
+            np.array([1.0], dtype=np.float64),
+            "shape",
+        ),
+        (
+            np.full((64, 1), 1.0, dtype=np.float64),
+            np.ones(64, dtype=np.float64),
+            "shape",
+        ),
+        (
+            np.full(64, np.nan, dtype=np.float64),
+            np.ones(64, dtype=np.float64),
+            "finite",
+        ),
+        (
+            np.full(64, np.inf, dtype=np.float64),
+            np.ones(64, dtype=np.float64),
+            "finite",
+        ),
+        (
+            np.full(64, -0.01, dtype=np.float64),
+            np.ones(64, dtype=np.float64),
+            "label",
+        ),
+        (
+            np.full(64, 1.01, dtype=np.float64),
+            np.ones(64, dtype=np.float64),
+            "label",
+        ),
+        (
+            np.zeros(64, dtype=np.float64),
+            np.full(64, np.nan, dtype=np.float64),
+            "finite",
+        ),
+        (
+            np.zeros(64, dtype=np.float64),
+            np.full(64, np.inf, dtype=np.float64),
+            "finite",
+        ),
+        (
+            np.zeros(64, dtype=np.float64),
+            np.full(64, -0.01, dtype=np.float64),
+            "weight",
+        ),
+        (
+            np.zeros(64, dtype=np.float64),
+            np.zeros(64, dtype=np.float64),
+            "positive",
+        ),
+    ],
+)
+def test_fold_fit_rejects_invalid_labels_and_weights(
+    labels: np.ndarray,
+    weights: np.ndarray,
+    match: str,
+) -> None:
+    matrix, _, _ = _fold_fixture()
+
+    with pytest.raises(ValueError, match=match):
+        fit_shallow_gbdt_fold(matrix, labels, weights)
+
+
+def test_fold_fit_is_deterministic_and_prediction_receipt_binds_both_outputs() -> None:
+    matrix, labels, weights = _fold_fixture()
+
+    booster_a, fit_receipt_a = fit_shallow_gbdt_fold(matrix, labels, weights)
+    booster_b, fit_receipt_b = fit_shallow_gbdt_fold(matrix, labels, weights)
+    probabilities_a, prediction_receipt_a = predict_shallow_gbdt_fold(
+        booster_a,
+        matrix,
+    )
+    probabilities_b, prediction_receipt_b = predict_shallow_gbdt_fold(
+        booster_b,
+        matrix,
+    )
+
+    assert fit_receipt_a["model_json_sha256"] == fit_receipt_b["model_json_sha256"]
+    np.testing.assert_array_equal(probabilities_a, probabilities_b)
+    assert prediction_receipt_a == prediction_receipt_b
+    assert (
+        prediction_receipt_a["schema_version"]
+        == "audited-pit-shallow-gbdt-prediction-receipt/v1"
+    )
+    assert prediction_receipt_a["dmatrix"] == _expected_dmatrix_contract(len(matrix))
+    assert (
+        prediction_receipt_a["model_json_sha256"]
+        == fit_receipt_a["model_json_sha256"]
+    )
+
+    raw_margins = np.asarray(
+        booster_a.inplace_predict(matrix, predict_type="margin"),
+    )
+    expected_probabilities = 1.0 / (1.0 + np.exp(-raw_margins))
+    np.testing.assert_allclose(
+        probabilities_a,
+        expected_probabilities,
+        rtol=0.0,
+        atol=np.finfo(expected_probabilities.dtype).eps,
+    )
+    assert prediction_receipt_a["raw_margin_sha256"] == _array_sha256(raw_margins)
+    assert prediction_receipt_a["probability_sha256"] == _array_sha256(
+        probabilities_a
+    )
+    assert prediction_receipt_a["row_count"] == len(matrix)
+
+
+def test_fold_prediction_preserves_input_and_rejects_nonfinite_matrix() -> None:
+    matrix, labels, weights = _fold_fixture()
+    booster, _ = fit_shallow_gbdt_fold(matrix, labels, weights)
+    original = matrix.copy()
+
+    predict_shallow_gbdt_fold(booster, matrix)
+
+    np.testing.assert_array_equal(matrix, original)
+    invalid = matrix.copy()
+    invalid[0, 0] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        predict_shallow_gbdt_fold(booster, invalid)
