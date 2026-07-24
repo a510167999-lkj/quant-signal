@@ -34,7 +34,9 @@ from app.audited_pit_score_contract import (
     SHALLOW_GBDT_SCORE_CONTRACT,
     candidate_passes_gate,
     candidate_score,
+    frozen_score_contract,
     selection_rank_key as _contract_selection_rank_key,
+    validate_selection_rank_mode,
 )
 from app.audited_pit_trend_pullback import (
     TREND_PULLBACK_SPEC,
@@ -2316,8 +2318,8 @@ SCORED_EXECUTION_EVIDENCE_COLUMNS = (
 def _score_contract_metadata(
     score_contract: Mapping[str, Any],
 ) -> dict[str, Any]:
-    payload = dict(score_contract)
-    if payload == dict(RIDGE_SCORE_CONTRACT):
+    frozen = frozen_score_contract(score_contract)
+    if frozen is RIDGE_SCORE_CONTRACT:
         return {
             "field": "predicted_net_return_pct",
             "evidence_schema": "ranked-liquidity-score-evidence/v3",
@@ -2329,7 +2331,7 @@ def _score_contract_metadata(
                 "continuous-ridge-industry-selection-receipt/v1"
             ),
         }
-    if payload == dict(SHALLOW_GBDT_SCORE_CONTRACT):
+    if frozen is SHALLOW_GBDT_SCORE_CONTRACT:
         return {
             "field": "predicted_positive_utility_probability",
             "evidence_schema": (
@@ -2655,6 +2657,10 @@ def _select_with_industry_cap_receipt(
     score_contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     metadata = _score_contract_metadata(score_contract)
+    validate_selection_rank_mode(
+        rank_mode,
+        contract=score_contract,
+    )
     if top_n <= 0 or max_active_positions <= 0:
         raise ValueError("continuous ridge selection capacities are invalid")
     candidate_table = _selection_candidate_table(
@@ -3186,6 +3192,7 @@ def _evaluate_fixed_oof(
     evaluation_session_dates: Sequence[str],
     strategy_spec: Mapping[str, Any] = CONTINUOUS_RIDGE_OOF_SPEC,
     sweep_schema_version: str = "strict-ranked-liquidity-ridge-fixed-oof/v2",
+    score_contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     session_dates = _ordered_sessions(evaluation_session_dates)
     allowed_censor_reasons = {
@@ -3207,6 +3214,7 @@ def _evaluate_fixed_oof(
         rank_mode=rank_mode,
         top_n=int(selection["top_n"]),
         max_active_positions=int(selection["max_active_positions"]),
+        score_contract=score_contract,
     )
     selected_censored = [
         trade for trade in selected if trade.get("right_censored") is True
@@ -3379,7 +3387,15 @@ def _recompute_fixed_oof_gate(
     *,
     strategy_spec: Mapping[str, Any],
     rank_mode: str,
+    score_contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> dict[str, bool]:
+    frozen_score_contract(score_contract)
+    validate_selection_rank_mode(
+        rank_mode,
+        contract=score_contract,
+    )
+    for candidate in candidate_table:
+        candidate_score(candidate, contract=score_contract)
     top = sweep.get("top")
     if not isinstance(top, list) or len(top) != 1:
         raise ValueError("fixed OOF sweep must contain one result row")
@@ -3503,9 +3519,14 @@ def _recompute_fixed_oof_gate(
         f"{strategy_spec['signal_tag']}|"
         f"{rank_mode}|all_market_levels"
     )
+    expected_sweep_schema = (
+        "strict-ranked-liquidity-ridge-fixed-oof/v3"
+        if frozen_score_contract(score_contract)
+        is RIDGE_SCORE_CONTRACT
+        else "strict-ranked-liquidity-shallow-gbdt-fixed-oof/v1"
+    )
     if (
-        sweep.get("schema_version")
-        != "strict-ranked-liquidity-ridge-fixed-oof/v3"
+        sweep.get("schema_version") != expected_sweep_schema
         or sweep.get("selection_candidate_count")
         != len(candidate_table)
         or sweep.get("qualified_trade_count")
@@ -3608,7 +3629,13 @@ def _replay_selection_summary(
     *,
     strategy_spec: Mapping[str, Any],
     rank_mode: str,
+    score_contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> list[str]:
+    metadata = _score_contract_metadata(score_contract)
+    validate_selection_rank_mode(
+        rank_mode,
+        contract=score_contract,
+    )
     summary = dict(receipt)
     _verify_compact_receipt_summary(summary)
     selection_spec = strategy_spec["selection"]
@@ -3628,6 +3655,7 @@ def _replay_selection_summary(
     by_signal_date: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for compact_candidate in candidate_table:
         candidate = dict(compact_candidate)
+        candidate_score(candidate, contract=score_contract)
         trade_key = str(candidate.get("trade_key") or "")
         trade_key_parts = trade_key.split("|")
         if (
@@ -3651,25 +3679,14 @@ def _replay_selection_summary(
             for trade in active_positions
             if date.fromisoformat(str(trade["exit_date"])) > signal_day
         ]
-        if rank_mode == "predicted_net_return":
-            trades = sorted(
-                by_signal_date[signal_date],
-                key=lambda trade: (
-                    -float(trade["predicted_net_return_pct"]),
-                    -float(trade["candidate_amount"]),
-                    str(trade["security_id"]),
-                ),
-            )
-        elif rank_mode == "signal_date_amount":
-            trades = sorted(
-                by_signal_date[signal_date],
-                key=lambda trade: (
-                    -float(trade["candidate_amount"]),
-                    str(trade["security_id"]),
-                ),
-            )
-        else:
-            raise ValueError("selection rank mode is invalid")
+        trades = sorted(
+            by_signal_date[signal_date],
+            key=lambda trade: _selection_rank_key(
+                trade,
+                rank_mode=rank_mode,
+                score_contract=score_contract,
+            ),
+        )
         ordered_keys = [str(trade["trade_key"]) for trade in trades]
         if len(ordered_keys) != len(set(ordered_keys)):
             raise ValueError("daily selection keys are duplicated")
@@ -3755,8 +3772,7 @@ def _replay_selection_summary(
     }
     full_receipt_without_self_hash["days"] = days
     if (
-        summary.get("schema_version")
-        != "continuous-ridge-industry-selection-receipt/v1"
+        summary.get("schema_version") != metadata["selection_schema"]
         or summary.get("parameters") != expected_parameters
         or summary.get("candidate_count") != len(candidate_table)
         or summary.get("candidate_table_sha256")

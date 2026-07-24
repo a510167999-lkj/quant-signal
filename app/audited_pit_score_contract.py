@@ -35,13 +35,82 @@ SHALLOW_GBDT_SCORE_CONTRACT: Mapping[str, Any] = MappingProxyType(
 )
 
 
-def _frozen_contract(contract: Mapping[str, Any]) -> Mapping[str, Any]:
-    value = dict(contract)
-    if value == dict(RIDGE_SCORE_CONTRACT):
+def _exact_contract_match(
+    contract: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> bool:
+    if set(contract) != set(expected):
+        return False
+    return all(
+        type(contract[key]) is type(expected[key])
+        and contract[key] == expected[key]
+        for key in expected
+    )
+
+
+def frozen_score_contract(
+    contract: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    if _exact_contract_match(contract, RIDGE_SCORE_CONTRACT):
         return RIDGE_SCORE_CONTRACT
-    if value == dict(SHALLOW_GBDT_SCORE_CONTRACT):
+    if _exact_contract_match(contract, SHALLOW_GBDT_SCORE_CONTRACT):
         return SHALLOW_GBDT_SCORE_CONTRACT
     raise ValueError("score contract must match a frozen contract")
+
+
+def _mapping_key_is_nested(
+    value: Any,
+    *,
+    forbidden_key: str,
+    seen: set[int],
+) -> bool:
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in seen:
+            return False
+        seen.add(identity)
+        if any(
+            isinstance(key, str) and key == forbidden_key
+            for key in value
+        ):
+            return True
+        return any(
+            _mapping_key_is_nested(
+                item,
+                forbidden_key=forbidden_key,
+                seen=seen,
+            )
+            for item in value.values()
+        )
+    if isinstance(value, (list, tuple)):
+        identity = id(value)
+        if identity in seen:
+            return False
+        seen.add(identity)
+        return any(
+            _mapping_key_is_nested(
+                item,
+                forbidden_key=forbidden_key,
+                seen=seen,
+            )
+            for item in value
+        )
+    return False
+
+
+def validate_selection_rank_mode(
+    rank_mode: str,
+    *,
+    contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
+) -> None:
+    contract = frozen_score_contract(contract)
+    valid_modes = {"main", "baseline", "signal_date_amount"}
+    if contract is RIDGE_SCORE_CONTRACT:
+        valid_modes.add("predicted_net_return")
+    else:
+        valid_modes.add("positive_utility_probability")
+    if rank_mode not in valid_modes:
+        raise ValueError("selection rank mode is unsupported")
 
 
 def _finite_number(value: Any, *, label: str) -> float:
@@ -58,13 +127,17 @@ def candidate_score(
     *,
     contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> float:
-    contract = _frozen_contract(contract)
+    contract = frozen_score_contract(contract)
     field = str(contract.get("field") or "")
     if not field or field not in candidate:
         raise ValueError("candidate score field is missing")
     if (
         field != "predicted_net_return_pct"
-        and "predicted_net_return_pct" in candidate
+        and _mapping_key_is_nested(
+            candidate,
+            forbidden_key="predicted_net_return_pct",
+            seen=set(),
+        )
     ):
         raise ValueError(
             "predicted_net_return_pct is forbidden by this score contract"
@@ -85,7 +158,7 @@ def candidate_passes_gate(
     *,
     contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> bool:
-    contract = _frozen_contract(contract)
+    contract = frozen_score_contract(contract)
     if contract.get("gate") != "strict_gt":
         raise ValueError("score contract gate is unsupported")
     threshold = _finite_number(
@@ -101,7 +174,8 @@ def selection_rank_key(
     rank_mode: str,
     contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> tuple[Any, ...]:
-    contract = _frozen_contract(contract)
+    contract = frozen_score_contract(contract)
+    validate_selection_rank_mode(rank_mode, contract=contract)
     amount = _finite_number(
         candidate.get("candidate_amount"),
         label="candidate amount",
