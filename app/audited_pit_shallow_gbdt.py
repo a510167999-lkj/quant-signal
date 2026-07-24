@@ -523,10 +523,14 @@ def _fold_receipt(
     fit_receipt: Mapping[str, Any],
     predict_receipt: Mapping[str, Any],
     validation: pd.DataFrame,
+    validation_signal_sessions: Sequence[str],
     score_rows: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     training_records = list(members["training_records"])
     validation_keys = validation["candidate_key"].astype(str).tolist()
+    observed_validation_signal_sessions = sorted(
+        validation["signal_date"].astype(str).unique().tolist()
+    )
     receipt = {
         "fold": fold_index,
         "validation_start": validation_start,
@@ -601,11 +605,15 @@ def _fold_receipt(
         "validation_signal_date_count": int(
             validation["signal_date"].nunique()
         ),
-        "validation_signal_sessions": sorted(
-            validation["signal_date"].astype(str).unique().tolist()
-        ),
+        "validation_signal_sessions": list(validation_signal_sessions),
         "validation_signal_sessions_sha256": _canonical_sha256(
-            sorted(validation["signal_date"].astype(str).unique().tolist())
+            list(validation_signal_sessions)
+        ),
+        "observed_validation_signal_sessions": (
+            observed_validation_signal_sessions
+        ),
+        "observed_validation_signal_sessions_sha256": _canonical_sha256(
+            observed_validation_signal_sessions
         ),
         "validation_candidate_keys_sha256": _canonical_sha256(
             validation_keys
@@ -664,6 +672,12 @@ def _compute_shallow_gbdt_rolling_oof(
             min(
                 start_position + validation_sessions - 1,
                 len(session_dates) - 1,
+            )
+        ]
+        validation_signal_sessions = session_dates[
+            start_position : min(
+                start_position + validation_sessions,
+                len(session_dates),
             )
         ]
         validation = rows[
@@ -751,6 +765,7 @@ def _compute_shallow_gbdt_rolling_oof(
                 fit_receipt=fit_receipt,
                 predict_receipt=predict_receipt,
                 validation=validation,
+                validation_signal_sessions=validation_signal_sessions,
                 score_rows=score_rows,
             )
         )
@@ -831,6 +846,128 @@ def build_shallow_gbdt_rolling_oof_scores(
         training_window_sessions=training_window_sessions,
         validation_sessions=validation_sessions,
     )
+
+
+def _independent_xgboost_fold_replay(
+    x_train: np.ndarray,
+    labels: np.ndarray,
+    weights: np.ndarray,
+    x_validation: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any], dict[str, Any]]:
+    import xgboost as xgb
+
+    if xgb.__version__ != _XGBOOST_VERSION:
+        raise ValueError
+    build_info = xgb.build_info()
+    if not isinstance(build_info, dict) or not build_info:
+        raise ValueError
+    feature_names = list(FEATURE_NAMES)
+    feature_types = ["float"] * len(FEATURE_NAMES)
+    train_matrix = xgb.DMatrix(
+        data=x_train,
+        label=labels,
+        weight=weights,
+        feature_names=feature_names,
+        feature_types=feature_types,
+        nthread=1,
+        missing=np.nan,
+        enable_categorical=False,
+    )
+    booster = xgb.train(
+        params=dict(FROZEN_XGBOOST_PARAMS),
+        dtrain=train_matrix,
+        num_boost_round=NUM_BOOST_ROUND,
+    )
+    model_json = bytes(booster.save_raw(raw_format="json"))
+    model_raw = bytes(booster.save_raw())
+    model_config = booster.save_config().encode("utf-8")
+    runtime = {
+        "xgboost_version": xgb.__version__,
+        "xgboost_build_info": build_info,
+    }
+    train_contract = {
+        "shape": [len(x_train), len(FEATURE_NAMES)],
+        "dtype": "float64",
+        "c_contiguous": True,
+        "feature_names": feature_names,
+        "feature_types": feature_types,
+        "nthread": 1,
+        "missing": "NaN",
+        "enable_categorical": False,
+    }
+    fit_receipt = {
+        "schema_version": "audited-pit-shallow-gbdt-fit-receipt/v1",
+        "runtime": runtime,
+        "parameters": dict(FROZEN_XGBOOST_PARAMS),
+        "num_boost_round": NUM_BOOST_ROUND,
+        "dmatrix": train_contract,
+        "inputs": {
+            "features_sha256": _array_sha256(x_train),
+            "labels_sha256": _array_sha256(labels),
+            "weights_sha256": _array_sha256(weights),
+            "weight_sum": float(weights.sum(dtype=np.float64)),
+        },
+        "model_json_sha256": hashlib.sha256(model_json).hexdigest(),
+        "model_raw_sha256": hashlib.sha256(model_raw).hexdigest(),
+        "model_config_sha256": hashlib.sha256(
+            model_config
+        ).hexdigest(),
+    }
+
+    validation_matrix = xgb.DMatrix(
+        data=x_validation,
+        feature_names=feature_names,
+        feature_types=feature_types,
+        nthread=1,
+        missing=np.nan,
+        enable_categorical=False,
+    )
+    raw_margins = np.ascontiguousarray(
+        booster.predict(validation_matrix, output_margin=True)
+    )
+    probabilities = np.ascontiguousarray(
+        booster.predict(validation_matrix)
+    )
+    expected_probabilities = 1.0 / (1.0 + np.exp(-raw_margins))
+    if (
+        raw_margins.ndim != 1
+        or probabilities.ndim != 1
+        or len(probabilities) != len(x_validation)
+        or not np.isfinite(raw_margins).all()
+        or not np.isfinite(probabilities).all()
+        or ((probabilities < 0.0) | (probabilities > 1.0)).any()
+        or not np.allclose(
+            probabilities,
+            expected_probabilities,
+            rtol=0.0,
+            atol=np.finfo(expected_probabilities.dtype).eps,
+        )
+    ):
+        raise ValueError
+    validation_contract = {
+        "shape": [len(x_validation), len(FEATURE_NAMES)],
+        "dtype": "float64",
+        "c_contiguous": True,
+        "feature_names": feature_names,
+        "feature_types": feature_types,
+        "nthread": 1,
+        "missing": "NaN",
+        "enable_categorical": False,
+    }
+    predict_receipt = {
+        "schema_version": (
+            "audited-pit-shallow-gbdt-prediction-receipt/v1"
+        ),
+        "runtime": runtime,
+        "dmatrix": validation_contract,
+        "model_json_sha256": hashlib.sha256(model_json).hexdigest(),
+        "model_raw_sha256": hashlib.sha256(model_raw).hexdigest(),
+        "features_sha256": _array_sha256(x_validation),
+        "raw_margin_sha256": _array_sha256(raw_margins),
+        "probability_sha256": _array_sha256(probabilities),
+        "row_count": len(x_validation),
+    }
+    return probabilities, fit_receipt, predict_receipt
 
 
 def _independent_shallow_gbdt_rolling_oof_replay(
@@ -920,6 +1057,12 @@ def _independent_shallow_gbdt_rolling_oof_replay(
             min(
                 start_position + validation_sessions - 1,
                 len(session_dates) - 1,
+            )
+        ]
+        validation_signal_sessions = session_dates[
+            start_position : min(
+                start_position + validation_sessions,
+                len(session_dates),
             )
         ]
         validation = rows[
@@ -1034,18 +1177,19 @@ def _independent_shallow_gbdt_rolling_oof_replay(
         weights = np.ascontiguousarray(
             np.abs(clipped) / daily_abs_sums
         )
-        booster, fit_receipt = fit_shallow_gbdt_fold(
-            x_train,
-            labels,
-            weights,
-        )
         validation_matrix = np.ascontiguousarray(
             validation.loc[:, list(FEATURE_NAMES)].to_numpy(
                 dtype=np.float64
             )
         )
-        probabilities, predict_receipt = predict_shallow_gbdt_fold(
-            booster,
+        (
+            probabilities,
+            fit_receipt,
+            predict_receipt,
+        ) = _independent_xgboost_fold_replay(
+            x_train,
+            labels,
+            weights,
             validation_matrix,
         )
         fold_score_rows = [
@@ -1062,7 +1206,7 @@ def _independent_shallow_gbdt_rolling_oof_replay(
         ]
         score_payload.extend(fold_score_rows)
         validation_keys = validation["candidate_key"].astype(str).tolist()
-        validation_signal_sessions = sorted(
+        observed_validation_signal_sessions = sorted(
             validation["signal_date"].astype(str).unique().tolist()
         )
         positive_rows = [
@@ -1153,6 +1297,12 @@ def _independent_shallow_gbdt_rolling_oof_replay(
             "validation_signal_sessions": validation_signal_sessions,
             "validation_signal_sessions_sha256": _canonical_sha256(
                 validation_signal_sessions
+            ),
+            "observed_validation_signal_sessions": (
+                observed_validation_signal_sessions
+            ),
+            "observed_validation_signal_sessions_sha256": (
+                _canonical_sha256(observed_validation_signal_sessions)
             ),
             "validation_candidate_keys_sha256": _canonical_sha256(
                 validation_keys
