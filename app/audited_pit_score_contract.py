@@ -35,6 +35,15 @@ SHALLOW_GBDT_SCORE_CONTRACT: Mapping[str, Any] = MappingProxyType(
 )
 
 
+def _frozen_contract(contract: Mapping[str, Any]) -> Mapping[str, Any]:
+    value = dict(contract)
+    if value == dict(RIDGE_SCORE_CONTRACT):
+        return RIDGE_SCORE_CONTRACT
+    if value == dict(SHALLOW_GBDT_SCORE_CONTRACT):
+        return SHALLOW_GBDT_SCORE_CONTRACT
+    raise ValueError("score contract must match a frozen contract")
+
+
 def _finite_number(value: Any, *, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{label} must be numeric")
@@ -49,6 +58,7 @@ def candidate_score(
     *,
     contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> float:
+    contract = _frozen_contract(contract)
     field = str(contract.get("field") or "")
     if not field or field not in candidate:
         raise ValueError("candidate score field is missing")
@@ -75,6 +85,7 @@ def candidate_passes_gate(
     *,
     contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> bool:
+    contract = _frozen_contract(contract)
     if contract.get("gate") != "strict_gt":
         raise ValueError("score contract gate is unsupported")
     threshold = _finite_number(
@@ -90,6 +101,7 @@ def selection_rank_key(
     rank_mode: str,
     contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> tuple[Any, ...]:
+    contract = _frozen_contract(contract)
     amount = _finite_number(
         candidate.get("candidate_amount"),
         label="candidate amount",
@@ -97,15 +109,16 @@ def selection_rank_key(
     security_id = candidate.get("security_id")
     if not isinstance(security_id, str) or not security_id:
         raise ValueError("candidate security_id is invalid")
-    if rank_mode == "main":
+    score = candidate_score(candidate, contract=contract)
+    if rank_mode in {"main", "predicted_net_return"}:
         if contract.get("main_rank_mode") != "score_descending":
             raise ValueError("score contract rank mode is unsupported")
         return (
-            -candidate_score(candidate, contract=contract),
+            -score,
             -amount,
             security_id,
         )
-    if rank_mode == "baseline":
+    if rank_mode in {"baseline", "signal_date_amount"}:
         return (-amount, security_id)
     raise ValueError("selection rank mode is unsupported")
 
