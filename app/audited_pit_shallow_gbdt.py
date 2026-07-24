@@ -456,7 +456,10 @@ def _rolling_oof_inputs(
         features.columns
     ):
         raise ValueError("shallow GBDT rolling OOF features are incomplete")
-    rows = features.copy(deep=True)
+    rows = features.loc[
+        :,
+        ["candidate_key", "signal_date", *FEATURE_NAMES],
+    ].copy()
     if (
         rows["candidate_key"].isna().any()
         or rows["signal_date"].isna().any()
@@ -478,8 +481,7 @@ def _rolling_oof_inputs(
     session_set = set(session_dates)
     outcome_lookup: dict[str, dict[str, Any]] = {}
     for raw_outcome in outcomes:
-        outcome = dict(raw_outcome)
-        key = str(outcome.get("candidate_key") or "")
+        key = str(raw_outcome.get("candidate_key") or "")
         if (
             not key
             or key in outcome_lookup
@@ -488,14 +490,19 @@ def _rolling_oof_inputs(
             raise ValueError(
                 "shallow GBDT rolling OOF outcomes have invalid keys"
             )
-        if type(outcome.get("right_censored")) is not bool:
+        right_censored = raw_outcome.get("right_censored")
+        if type(right_censored) is not bool:
             raise ValueError(
                 "shallow GBDT rolling OOF right_censored must be boolean"
             )
-        if outcome.get("right_censored") is not True:
-            exit_date = str(outcome.get("exit_date") or "")
+        outcome = {
+            "candidate_key": key,
+            "right_censored": right_censored,
+        }
+        if right_censored is not True:
+            exit_date = str(raw_outcome.get("exit_date") or "")
             try:
-                gross_return = float(outcome.get("return_pct"))
+                gross_return = float(raw_outcome.get("return_pct"))
             except (TypeError, ValueError) as exc:
                 raise ValueError(
                     "shallow GBDT rolling OOF outcome return is invalid"
@@ -811,7 +818,7 @@ def _compute_shallow_gbdt_rolling_oof(
             booster,
             validation_matrix,
         )
-        scored = validation.copy()
+        scored = validation.loc[:, ["candidate_key", "signal_date"]].copy()
         scored[_PROBABILITY_COLUMN] = probabilities
         scored_frames.append(scored)
         score_rows = [
@@ -1075,7 +1082,10 @@ def _independent_shallow_gbdt_rolling_oof_replay(
         or features["signal_date"].isna().any()
     ):
         raise ValueError
-    rows = features.copy(deep=True)
+    rows = features.loc[
+        :,
+        ["candidate_key", "signal_date", *FEATURE_NAMES],
+    ].copy()
     rows["candidate_key"] = rows["candidate_key"].astype(str)
     rows["signal_date"] = rows["signal_date"].astype(str)
     if (
@@ -1093,22 +1103,27 @@ def _independent_shallow_gbdt_rolling_oof_replay(
         or not np.isfinite(feature_matrix).all()
     ):
         raise ValueError
+    del feature_matrix
     feature_dates = dict(zip(rows["candidate_key"], rows["signal_date"]))
     session_set = set(session_dates)
     outcome_lookup: dict[str, dict[str, Any]] = {}
     for raw_outcome in outcomes:
-        outcome = dict(raw_outcome)
-        key = str(outcome.get("candidate_key") or "")
+        key = str(raw_outcome.get("candidate_key") or "")
+        right_censored = raw_outcome.get("right_censored")
         if (
             not key
             or key in outcome_lookup
             or key not in feature_dates
-            or type(outcome.get("right_censored")) is not bool
+            or type(right_censored) is not bool
         ):
             raise ValueError
-        if outcome["right_censored"] is False:
-            exit_date = str(outcome.get("exit_date") or "")
-            gross_return = float(outcome.get("return_pct"))
+        outcome = {
+            "candidate_key": key,
+            "right_censored": right_censored,
+        }
+        if right_censored is False:
+            exit_date = str(raw_outcome.get("exit_date") or "")
+            gross_return = float(raw_outcome.get("return_pct"))
             if (
                 exit_date not in session_set
                 or exit_date <= feature_dates[key]
@@ -1482,22 +1497,20 @@ def verify_shallow_gbdt_rolling_oof_receipt(
             or len(scored_oof) != len(expected_payload)
         ):
             raise ValueError
-        actual_payload = [
-            {
+        for row, expected in zip(
+            scored_oof.itertuples(index=False),
+            expected_payload,
+            strict=True,
+        ):
+            actual = {
                 "candidate_key": str(row.candidate_key),
                 "signal_date": str(row.signal_date),
                 _PROBABILITY_COLUMN: float(
                     getattr(row, _PROBABILITY_COLUMN)
                 ),
             }
-            for row in scored_oof.itertuples(index=False)
-        ]
-        if (
-            actual_payload != expected_payload
-            or _canonical_sha256(actual_payload)
-            != expected_receipt["oof_scores_sha256"]
-        ):
-            raise ValueError
+            if actual != expected:
+                raise ValueError
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(
             "shallow GBDT rolling OOF verification failed"

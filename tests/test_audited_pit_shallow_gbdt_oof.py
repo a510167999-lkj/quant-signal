@@ -219,6 +219,49 @@ def test_rolling_oof_defaults_freeze_126_by_63_design() -> None:
     assert signature.parameters["validation_sessions"].default == 63
 
 
+def test_rolling_oof_inputs_keep_only_model_columns_and_minimal_outcomes() -> None:
+    sessions, features, outcomes = _fixture()
+    features["unused_blob"] = [{"payload": "x" * 1_000}] * len(features)
+    bloated_outcomes = [
+        {
+            **outcome,
+            "unused_execution_payload": {
+                "events": ["x" * 1_000],
+                "mark_to_market": list(range(100)),
+            },
+        }
+        for outcome in outcomes
+    ]
+
+    _, rows, outcome_lookup = gbdt._rolling_oof_inputs(
+        features,
+        bloated_outcomes,
+        sessions,
+        minimum_training_sessions=4,
+        training_window_sessions=4,
+        validation_sessions=2,
+    )
+
+    assert rows.columns.tolist() == [
+        "candidate_key",
+        "signal_date",
+        *FEATURE_NAMES,
+    ]
+    assert all(
+        set(outcome) <= {
+            "candidate_key",
+            "right_censored",
+            "exit_date",
+            "return_pct",
+        }
+        for outcome in outcome_lookup.values()
+    )
+    assert all(
+        "unused_execution_payload" not in outcome
+        for outcome in outcome_lookup.values()
+    )
+
+
 @pytest.mark.parametrize(
     "session_mutation",
     [
@@ -281,7 +324,11 @@ def test_rolling_oof_freezes_purge_utility_targets_and_receipts(
         sessions
     )
 
-    assert scored.columns[-1] == "predicted_positive_utility_probability"
+    assert scored.columns.tolist() == [
+        "candidate_key",
+        "signal_date",
+        "predicted_positive_utility_probability",
+    ]
     assert scored["candidate_key"].is_unique
     assert scored[["signal_date", "candidate_key"]].to_dict("records") == (
         scored.sort_values(

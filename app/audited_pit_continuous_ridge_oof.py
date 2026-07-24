@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date
+import gc
 import hashlib
 from importlib.metadata import version as package_version
 import json
@@ -2424,7 +2425,7 @@ def _compact_outcome_membership_evidence(
     right_censored_positions: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     completed = sorted(
-        (dict(candidate) for candidate in completed_candidates),
+        completed_candidates,
         key=lambda item: (
             str(item.get("signal_date") or ""),
             str(item.get("security_id") or ""),
@@ -2432,7 +2433,7 @@ def _compact_outcome_membership_evidence(
         ),
     )
     censored = sorted(
-        (dict(candidate) for candidate in right_censored_positions),
+        right_censored_positions,
         key=lambda item: (
             str(item.get("signal_date") or ""),
             str(item.get("security_id") or ""),
@@ -2523,7 +2524,7 @@ def _compact_scored_execution_evidence(
         *SCORED_EXECUTION_EVIDENCE_COLUMNS[6:],
     )
     ordered = sorted(
-        (dict(candidate) for candidate in candidates),
+        candidates,
         key=lambda item: (
             str(item.get("signal_date") or ""),
             str(item.get("security_id") or ""),
@@ -2605,7 +2606,7 @@ def _positive_score_pool(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     metadata = _score_contract_metadata(score_contract)
     ordered = sorted(
-        (dict(candidate) for candidate in candidates),
+        candidates,
         key=lambda item: (
             str(item.get("signal_date") or ""),
             str(item.get("security_id") or ""),
@@ -2629,7 +2630,7 @@ def _positive_score_pool(
             raise
         input_keys.append(key)
         if candidate_passes_gate(candidate, contract=score_contract):
-            positive.append(candidate)
+            positive.append(dict(candidate))
             positive_keys.append(key)
     if len(input_keys) != len(set(input_keys)):
         raise ValueError("continuous ridge score pool keys are duplicated")
@@ -3011,7 +3012,7 @@ def _build_strict_outcomes(
     events: list[dict[str, Any]] = []
     status_counts: Counter[str] = Counter()
     ordered = sorted(
-        (dict(candidate) for candidate in executable_candidates),
+        executable_candidates,
         key=lambda item: (
             str(item.get("signal_date") or ""),
             str(item.get("security_id") or ""),
@@ -4262,7 +4263,7 @@ def build_ranked_liquidity_result_payloads(
     score_contract = frozen_score_contract(
         variant["score_contract"]
     )
-    shared = deepcopy(dict(shared_receipts))
+    shared = dict(shared_receipts)
     source = dict(shared["source"])
     feature_values = dict(shared["features"])
     model_values = dict(shared["model"])
@@ -4283,34 +4284,30 @@ def build_ranked_liquidity_result_payloads(
         "source": source,
         "producer_code": producer_code,
     }
-    completed_candidates = [
-        dict(candidate)
-        for candidate in execution_values.pop(
+    completed_candidates = list(
+        execution_values.pop(
             "completed_candidates",
             [],
         )
-    ]
-    censored_positions = [
-        dict(candidate)
-        for candidate in execution_values.pop(
+    )
+    censored_positions = list(
+        execution_values.pop(
             "right_censored_positions",
             [],
         )
-    ]
+    )
     outcome_membership = _compact_outcome_membership_evidence(
         completed_candidates,
         censored_positions,
     )
-    scored_candidates = [
-        dict(candidate)
-        for candidate in selection_values.pop(
+    scored_candidates = list(
+        selection_values.pop(
             "scored_execution_candidates"
         )
-    ]
-    positive_candidates = [
-        dict(candidate)
-        for candidate in selection_values.pop("positive_candidates")
-    ]
+    )
+    positive_candidates = list(
+        selection_values.pop("positive_candidates")
+    )
     for candidate in scored_candidates:
         candidate_score(candidate, contract=score_contract)
     positive_pool_receipt = dict(
@@ -4329,14 +4326,10 @@ def build_ranked_liquidity_result_payloads(
         raise ValueError(
             "ranked-liquidity positive candidates differ from strict score gate"
         )
-    main_selected = [
-        dict(candidate)
-        for candidate in selection_values.pop("main_selected")
-    ]
-    baseline_selected = [
-        dict(candidate)
-        for candidate in selection_values.pop("baseline_selected")
-    ]
+    main_selected = list(selection_values.pop("main_selected"))
+    baseline_selected = list(
+        selection_values.pop("baseline_selected")
+    )
     selected_by_key = {
         _selection_trade_key(candidate): candidate
         for candidate in [*main_selected, *baseline_selected]
@@ -4767,12 +4760,12 @@ def verify_shallow_gbdt_result_bundle(
             for key in sorted(replayed_selected_by_key)
         ]
         replayed_completed = [
-            dict(candidate)
+            candidate
             for candidate in outcome_candidates
             if candidate.get("right_censored") is not True
         ]
         replayed_censored = [
-            dict(candidate)
+            candidate
             for candidate in outcome_candidates
             if candidate.get("right_censored") is True
         ]
@@ -5983,15 +5976,14 @@ def _scored_execution_candidates_from_oof(
             "ranked-liquidity OOF score table is invalid"
         )
 
-    outcome_by_key: dict[str, dict[str, Any]] = {}
+    outcome_by_key: dict[str, Mapping[str, Any]] = {}
     for raw_candidate in outcome_candidates:
-        candidate = dict(raw_candidate)
-        candidate_key = str(candidate.get("candidate_key") or "")
+        candidate_key = str(raw_candidate.get("candidate_key") or "")
         if not candidate_key or candidate_key in outcome_by_key:
             raise AuditedPITDevelopmentReplayError(
                 "ranked-liquidity outcome candidate keys are invalid"
             )
-        outcome_by_key[candidate_key] = candidate
+        outcome_by_key[candidate_key] = raw_candidate
 
     score_lookup: dict[str, float] = {}
     signal_date_lookup: dict[str, str] = {}
@@ -6048,9 +6040,7 @@ def _evaluate_scored_oof_variant(
     if _sha256(strategy_spec) != _sha256(frozen_strategy):
         raise ValueError("ranked-liquidity evaluation strategy is not frozen")
     score_contract = frozen_score_contract(variant["score_contract"])
-    scored_candidates = [
-        dict(candidate) for candidate in scored_execution_candidates
-    ]
+    scored_candidates = list(scored_execution_candidates)
     for candidate in scored_candidates:
         candidate_score(candidate, contract=score_contract)
     positive_candidates, positive_pool_receipt = _positive_score_pool(
@@ -6452,6 +6442,7 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
             "features_built",
             feature_candidate_count=len(features),
         )
+        feature_candidate_count = len(features)
         feature_candidates = features.to_dict("records")
         tail_candidates, tail_receipt = _apply_uniform_tail_cutoff(
             feature_candidates,
@@ -6468,8 +6459,9 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
                 "ranked-liquidity tail cutoff removed every session"
             )
         tail_session_set = set(sessions[:allowed_session_count])
-        tail_features = features[
-            features["signal_date"].astype(str).isin(tail_session_set)
+        tail_features = features.loc[
+            features["signal_date"].astype(str).isin(tail_session_set),
+            ["candidate_key", "signal_date", *FEATURE_NAMES],
         ].copy()
         if len(tail_features) != int(tail_receipt["kept_count"]):
             raise AuditedPITDevelopmentReplayError(
@@ -6569,15 +6561,30 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
                 ),
             )
         )
+        compact_entry_receipt = _compact_receipt_summary(
+            entry_receipt,
+            omitted_fields={
+                "events": {
+                    "count_field": "event_count",
+                    "sha256_field": "events_sha256",
+                }
+            },
+        )
+        compact_outcome_receipt = _compact_receipt_summary(
+            outcome_receipt,
+            omitted_fields={
+                "execution_events": {
+                    "count_field": "execution_event_count",
+                    "sha256_field": "execution_events_sha256",
+                }
+            },
+        )
         execution = {
-            "tail_candidates": tail_candidates,
-            "executable_candidates": executable_candidates,
             "completed_candidates": completed_candidates,
             "right_censored_positions": censored_positions,
             "tail_cutoff_receipt": tail_receipt,
-            "entry_preflight_receipt": entry_receipt,
-            "outcome_receipt": outcome_receipt,
-            "verdict_cache_count": len(verdict_cache),
+            "entry_preflight_receipt": compact_entry_receipt,
+            "outcome_receipt": compact_outcome_receipt,
         }
         write_progress(
             "outcomes_built",
@@ -6655,6 +6662,30 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
     finally:
         universe.close()
 
+    del (
+        adapter,
+        bars,
+        base_adapter,
+        bulk_adapter,
+        completed_candidates,
+        connection,
+        censored_positions,
+        entry_receipt,
+        executable_candidates,
+        feature_candidates,
+        features,
+        frames_by_symbol,
+        outcome_receipt,
+        raw_suspension_evidence,
+        raw_terminal_listing_evidence,
+        suspension_evidence,
+        tail_candidates,
+        terminal_listing_evidence,
+        universe,
+        verdict_cache,
+    )
+    gc.collect()
+
     outcome_candidates = [
         *execution["completed_candidates"],
         *execution["right_censored_positions"],
@@ -6704,26 +6735,8 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
             positive_candidate_count=len(positive_candidates),
             advancement_gate_passed=advancement_gate,
         )
-        entry_receipt = execution["entry_preflight_receipt"]
-        strict_outcome_receipt = execution["outcome_receipt"]
-        compact_entry_receipt = _compact_receipt_summary(
-            entry_receipt,
-            omitted_fields={
-                "events": {
-                    "count_field": "event_count",
-                    "sha256_field": "events_sha256",
-                }
-            },
-        )
-        compact_outcome_receipt = _compact_receipt_summary(
-            strict_outcome_receipt,
-            omitted_fields={
-                "execution_events": {
-                    "count_field": "execution_event_count",
-                    "sha256_field": "execution_events_sha256",
-                }
-            },
-        )
+        compact_entry_receipt = execution["entry_preflight_receipt"]
+        compact_outcome_receipt = execution["outcome_receipt"]
         payloads = build_ranked_liquidity_result_payloads(
             strategy_spec=strategy_spec,
             shared_receipts={
@@ -6794,6 +6807,23 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
             sidecar_payloads=payloads["sidecar_payloads"],
             expected_producer_code=payloads["producer_code"],
         )
+        del (
+            baseline_selected,
+            baseline_selection_receipt,
+            baseline_sweep,
+            evaluated,
+            execution,
+            main_selected,
+            main_selection_receipt,
+            main_sweep,
+            oof_receipt,
+            oof_replay_verification,
+            payloads,
+            positive_candidates,
+            positive_pool_receipt,
+            scored_execution_candidates,
+        )
+        gc.collect()
         verification = verify_shallow_gbdt_result_bundle(
             result,
             tail_features=tail_features,
@@ -7046,8 +7076,8 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
         model_sidecar["oof_replay_verification"] = (
             oof_replay_verification
         )
-    entry_receipt = execution["entry_preflight_receipt"]
-    outcome_receipt = execution["outcome_receipt"]
+    compact_entry_receipt = execution["entry_preflight_receipt"]
+    compact_outcome_receipt = execution["outcome_receipt"]
     execution_sidecar = {
         "schema_version": (
             f"ranked-liquidity-execution-sidecar/v{artifact_version}"
@@ -7056,24 +7086,8 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
         "security_code_transition_evidence": transition_evidence,
         "bulk_next_open_evidence_receipt": bulk_next_open_receipt,
         "tail_cutoff_receipt": execution["tail_cutoff_receipt"],
-        "entry_preflight_receipt": _compact_receipt_summary(
-            entry_receipt,
-            omitted_fields={
-                "events": {
-                    "count_field": "event_count",
-                    "sha256_field": "events_sha256",
-                }
-            },
-        ),
-        "outcome_receipt": _compact_receipt_summary(
-            outcome_receipt,
-            omitted_fields={
-                "execution_events": {
-                    "count_field": "execution_event_count",
-                    "sha256_field": "execution_events_sha256",
-                }
-            },
-        ),
+        "entry_preflight_receipt": compact_entry_receipt,
+        "outcome_receipt": compact_outcome_receipt,
         "completed_candidate_count": len(
             execution["completed_candidates"]
         ),
@@ -7195,7 +7209,7 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
             "eligible_for_profile_registration": False,
             "production_recommendation_eligible": False,
         },
-        "feature_candidate_count": len(features),
+        "feature_candidate_count": feature_candidate_count,
         "feature_rows_sha256": feature_receipt["feature_rows_sha256"],
         "strict_outcome_candidate_count": len(outcome_candidates),
         "strict_outcome_candidates_sha256": _sha256(outcome_candidates),
