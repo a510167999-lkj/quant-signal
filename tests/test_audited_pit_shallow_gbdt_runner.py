@@ -109,6 +109,12 @@ def test_shallow_gbdt_oof_spec_freezes_full_preregistered_design() -> None:
     spec = gbdt.SHALLOW_GBDT_OOF_SPEC
 
     assert spec == _expected_shallow_gbdt_spec()
+    assert gbdt._SHALLOW_GBDT_OOF_SPEC_SHA256 == (
+        "53d00badc8683670ef3d6c02307697e2c3ef8ec769b9d8da072d36420cea70ac"
+    )
+    assert gbdt._canonical_sha256(spec) == (
+        gbdt._SHALLOW_GBDT_OOF_SPEC_SHA256
+    )
     assert spec["features"] == list(ridge.FEATURE_NAMES)
     assert spec["market_scope"] == (
         ridge.ROLLING_CONTINUOUS_RIDGE_OOF_SPEC["market_scope"]
@@ -265,3 +271,17 @@ def test_model_oof_adapter_preserves_legacy_ridge_and_binds_gbdt_score_contract(
     ]
     assert verification == {"verified": True}
 
+
+def test_model_oof_adapter_rejects_mutated_global_gbdt_spec() -> None:
+    original = deepcopy(gbdt.SHALLOW_GBDT_OOF_SPEC)
+    try:
+        gbdt.SHALLOW_GBDT_OOF_SPEC["model"]["parameters"][
+            "max_depth"
+        ] = 99
+        with pytest.raises(ValueError, match="frozen"):
+            ridge.resolve_model_oof_adapter(
+                gbdt.SHALLOW_GBDT_OOF_SPEC
+            )
+    finally:
+        gbdt.SHALLOW_GBDT_OOF_SPEC.clear()
+        gbdt.SHALLOW_GBDT_OOF_SPEC.update(original)
