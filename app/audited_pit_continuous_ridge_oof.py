@@ -3194,6 +3194,23 @@ def _evaluate_fixed_oof(
     sweep_schema_version: str = "strict-ranked-liquidity-ridge-fixed-oof/v2",
     score_contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    frozen_contract = frozen_score_contract(score_contract)
+    validate_selection_rank_mode(
+        rank_mode,
+        contract=score_contract,
+    )
+    allowed_sweep_schemas = (
+        {
+            "strict-ranked-liquidity-ridge-fixed-oof/v2",
+            "strict-ranked-liquidity-ridge-fixed-oof/v3",
+        }
+        if frozen_contract is RIDGE_SCORE_CONTRACT
+        else {"strict-ranked-liquidity-shallow-gbdt-fixed-oof/v1"}
+    )
+    if sweep_schema_version not in allowed_sweep_schemas:
+        raise ValueError(
+            "fixed OOF sweep schema differs from score contract"
+        )
     session_dates = _ordered_sessions(evaluation_session_dates)
     allowed_censor_reasons = {
         "no_strict_sell_fill_through_coverage_end",
@@ -3389,7 +3406,8 @@ def _recompute_fixed_oof_gate(
     rank_mode: str,
     score_contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
 ) -> dict[str, bool]:
-    frozen_score_contract(score_contract)
+    frozen_contract = frozen_score_contract(score_contract)
+    metadata = _score_contract_metadata(score_contract)
     validate_selection_rank_mode(
         rank_mode,
         contract=score_contract,
@@ -3521,10 +3539,16 @@ def _recompute_fixed_oof_gate(
     )
     expected_sweep_schema = (
         "strict-ranked-liquidity-ridge-fixed-oof/v3"
-        if frozen_score_contract(score_contract)
-        is RIDGE_SCORE_CONTRACT
+        if frozen_contract is RIDGE_SCORE_CONTRACT
         else "strict-ranked-liquidity-shallow-gbdt-fixed-oof/v1"
     )
+    if (
+        selection_receipt.get("schema_version")
+        != metadata["selection_schema"]
+    ):
+        raise ValueError(
+            "fixed OOF selection receipt schema differs from score contract"
+        )
     if (
         sweep.get("schema_version") != expected_sweep_schema
         or sweep.get("selection_candidate_count")
