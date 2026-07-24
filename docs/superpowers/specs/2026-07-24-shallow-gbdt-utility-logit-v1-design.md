@@ -106,7 +106,9 @@ p^*(x)>0.5\iff E[u\mid x]>0.
 
 ## 5. 唯一模型规格
 
-依赖固定为 `xgboost==3.3.0`。正式 producer 必须把 Python、NumPy、Pandas、XGBoost 版本、XGBoost `build_info()`、模块哈希和模型参数纳入 producer binding。
+依赖固定为 `xgboost==3.2.0`。正式 producer 必须把 Python、NumPy、Pandas、XGBoost 版本、XGBoost `build_info()`、模块哈希和模型参数纳入 producer binding。
+
+实施前兼容性更正：预注册初稿写为 `xgboost==3.3.0`，但该发行版声明 `Requires-Python >=3.12`，而冻结项目运行时为 Python 3.11.5。本更正在安装任何 XGBoost、训练任何模型或生成任何 OOF 分数前完成，只把依赖改为当时可安装的最新 Python 3.11 兼容版 `3.2.0`；模型公式、参数、数据、分折、门槛和一次性证伪规则均不变。
 
 使用 XGBoost 原生 `train`/`DMatrix` 接口，参数唯一固定为：
 

@@ -228,7 +228,7 @@ def test_fold_fit_receipt_freezes_runtime_parameters_and_dmatrix_contract() -> N
     booster, receipt = fit_shallow_gbdt_fold(matrix, labels, weights)
 
     assert receipt["schema_version"] == "audited-pit-shallow-gbdt-fit-receipt/v1"
-    assert receipt["runtime"]["xgboost_version"] == "3.3.0"
+    assert receipt["runtime"]["xgboost_version"] == "3.2.0"
     assert isinstance(receipt["runtime"]["xgboost_build_info"], dict)
     assert receipt["runtime"]["xgboost_build_info"]
     assert receipt["parameters"] == FROZEN_XGBOOST_PARAMS
