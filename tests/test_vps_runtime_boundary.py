@@ -172,13 +172,37 @@ def test_jobs_runtime_role_fails_closed(
         "research-audited-pit-shallow-gbdt-build-training-dataset",
         runtime_role="local_research",
     )
-    jobs._assert_runtime_command_allowed(
-        "research-audited-pit-shallow-gbdt-build-training-dataset",
-        runtime_role="",
-    )
     monkeypatch.setenv("VPS_RUNTIME_ROLE", "recommendation_only")
     with pytest.raises(ValueError, match="VPS.*禁止"):
         jobs.main(["research-backtest"])
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "research-backtest",
+        "research-historical-sweep",
+        "research-build-pit-universe",
+        "research-audited-pit-ranked-liquidity-ridge-oof",
+        "research-audited-pit-shallow-gbdt-build-training-dataset",
+    ],
+)
+def test_research_commands_require_explicit_local_research_role(
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VPS_RUNTIME_ROLE", raising=False)
+    with pytest.raises(ValueError, match="local_research"):
+        jobs._assert_runtime_command_allowed(command)
+    with pytest.raises(ValueError, match="local_research"):
+        jobs._assert_runtime_command_allowed(command, runtime_role="")
+    with pytest.raises(ValueError, match="local_research"):
+        jobs._assert_runtime_command_allowed(command, runtime_role="  ")
+
+    jobs._assert_runtime_command_allowed(
+        command,
+        runtime_role="local_research",
+    )
 
 
 def _bash_executable() -> str | None:
