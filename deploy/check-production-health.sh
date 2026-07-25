@@ -1,5 +1,6 @@
 #!/bin/bash
 set -u
+export VPS_RUNTIME_ROLE=recommendation_only
 
 PROJECT_DIR=${PROJECT_DIR:-/home/ubuntu/quant-signal}
 SYSTEMCTL_BIN=${SYSTEMCTL_BIN:-systemctl}

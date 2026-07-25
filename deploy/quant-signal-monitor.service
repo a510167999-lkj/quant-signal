@@ -9,5 +9,5 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/quant-signal
 EnvironmentFile=/home/ubuntu/quant-signal/.env
-ExecStart=/home/ubuntu/quant-signal/.venv/bin/python -m app.jobs monitor-recommendations
+ExecStart=/usr/bin/env VPS_RUNTIME_ROLE=recommendation_only /home/ubuntu/quant-signal/.venv/bin/python -m app.jobs monitor-recommendations
 TimeoutStartSec=20min

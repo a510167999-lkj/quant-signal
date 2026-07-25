@@ -301,7 +301,11 @@ def test_health_systemd_units_have_expected_contract():
     assert "Group=ubuntu" in service
     assert "WorkingDirectory=/home/ubuntu/quant-signal" in service
     assert "EnvironmentFile=/home/ubuntu/quant-signal/.env" in service
-    assert "ExecStart=/home/ubuntu/quant-signal/deploy/check-production-health.sh" in service
+    assert (
+        "ExecStart=/usr/bin/env VPS_RUNTIME_ROLE=recommendation_only "
+        "/home/ubuntu/quant-signal/deploy/check-production-health.sh"
+        in service
+    )
     assert "OnUnitActiveSec=5min" in timer
     assert "Unit=quant-signal-health.service" in timer
 

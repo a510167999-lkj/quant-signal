@@ -3599,6 +3599,42 @@ def _compact_hold_sweep_result(hold_days: int, payload, sweep_payload, output_li
     }
 
 
+VPS_RECOMMENDATION_ONLY_COMMANDS = frozenset(
+    {
+        "generate-recommendations",
+        "jiaoch-connectivity-check",
+        "monitor-planned-exits",
+        "monitor-recommendations",
+        "mootdx-l1-check",
+        "production-check",
+        "warm-market-cache",
+    }
+)
+
+
+def _assert_runtime_command_allowed(
+    command: str,
+    *,
+    runtime_role: str | None = None,
+) -> None:
+    role = (
+        os.getenv("VPS_RUNTIME_ROLE", "")
+        if runtime_role is None
+        else runtime_role
+    )
+    if not isinstance(role, str):
+        raise ValueError("未知的运行角色")
+    normalized_role = role.strip().casefold()
+    if normalized_role in {"", "local_research"}:
+        return
+    if normalized_role != "recommendation_only":
+        raise ValueError(f"未知的运行角色：{role}")
+    if command not in VPS_RECOMMENDATION_ONLY_COMMANDS:
+        raise ValueError(
+            f"VPS recommendation_only 角色禁止执行命令：{command}"
+        )
+
+
 def main(argv=None) -> int:
     configure_logging()
     parser = argparse.ArgumentParser(description="Quant signal scheduled jobs")
@@ -4556,6 +4592,7 @@ def main(argv=None) -> int:
     current_pool_market_fetch.add_argument("--temporal-role", default="development")
 
     args = parser.parse_args(argv)
+    _assert_runtime_command_allowed(args.command)
     if args.command in {"research-backtest", "research-sweep"}:
         raise ValueError(
             "legacy mutable research command is disabled; use audited historical or file validation commands"

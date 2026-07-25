@@ -54,6 +54,14 @@ Market values:
 
 ## VPS deployment
 
+部署目标边界固定为“本机研究、VPS 推理”：
+
+- PIT/研究/训练数据集物化、因子研究、训练、调参、OOF/回放评估和冻结模型包签名只能在本机完成。
+- VPS 可刷新当日推理所需的行情与上下文缓存，但不得用这些缓存训练、调参或生成研究制品。
+- VPS 的 `app.jobs` 固定为 `recommendation_only` 角色，只允许推荐、监控、健康检查和推理输入缓存命令；不运行任何 `research-*`，也不自动下单。
+- 合格冻结包尚未产生；最终证据门通过前，生产 profile 缺失并保持每日 0 只。通过后 VPS 才能加载摘要/签名匹配的冻结包，生成并分发每日 0–3 只推荐。
+- 遗留的 `deploy/research-vps-tasks.sh` 已改为固定退出码 64 的停用入口；本地研究入口位于 `scripts/research-local-tasks.sh`。
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
@@ -70,6 +78,7 @@ Then use the examples in `deploy/quant-signal.service`, `deploy/nginx.conf`, and
 Daily jobs:
 
 ```bash
+export VPS_RUNTIME_ROLE=recommendation_only
 python -m app.jobs generate-recommendations --force --run-slot pre_open
 python -m app.jobs generate-recommendations --force --run-slot open_confirm
 python -m app.jobs generate-recommendations --force --run-slot pre_close
@@ -88,6 +97,9 @@ python -m app.jobs monitor-planned-exits --force   # post-close: profit-lock / c
 
 当前股票池审计采用“生成”和“激活”分离的两步流程。`research-current-pool-audit`
 仍只写入内容寻址的不可变审计文件；确认该文件后，再将它原子激活到运行时路径：
+
+下面两条命令只在本机或本机的发布暂存目录运行；VPS 不执行
+`research-*`。激活后的只读制品由后续冻结包发布流程复制到 VPS：
 
 ```bash
 python -m app.jobs research-current-pool-audit \
@@ -120,6 +132,7 @@ Production timer units:
 Production health check:
 
 ```bash
+export VPS_RUNTIME_ROLE=recommendation_only
 python -m app.jobs production-check --no-alert
 deploy/check-production-health.sh
 ```

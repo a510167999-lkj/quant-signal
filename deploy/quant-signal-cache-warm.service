@@ -9,5 +9,5 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/quant-signal
 EnvironmentFile=/home/ubuntu/quant-signal/.env
-ExecStart=/home/ubuntu/quant-signal/.venv/bin/python -m app.jobs warm-market-cache --max-deep 500 --workers 4 --lookback-days 620
+ExecStart=/usr/bin/env VPS_RUNTIME_ROLE=recommendation_only /home/ubuntu/quant-signal/.venv/bin/python -m app.jobs warm-market-cache --max-deep 500 --workers 4 --lookback-days 620
 TimeoutStartSec=2h

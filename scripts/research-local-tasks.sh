@@ -1,7 +1,7 @@
 #!/bin/bash
 # 本地研究任务：第4（slippage/成本敏感性）+ 第5（市场风格切换）
 # 用从 VPS 拉来的 413-symbols 缓存跑（akshare 取数不通但缓存够）
-# 用法：nohup bash deploy/research-local-tasks.sh &
+# 用法：nohup bash scripts/research-local-tasks.sh &
 cd "$(dirname "$0")/.." || exit 1
 export UNIVERSE_CACHE_PATH=data/uni_cached413.json
 OUT=data/research_cache/local_research
