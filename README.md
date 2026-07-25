@@ -39,6 +39,22 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 
 Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
 
+所有 `research-*` CLI 都要求在当前本机进程环境中显式声明研究角色；
+该门禁在加载研究配置或执行任何研究逻辑前生效。不要把此角色写进 VPS
+服务或部署脚本。
+
+```bash
+export VPS_RUNTIME_ROLE=local_research
+python -m app.jobs research-...
+```
+
+PowerShell 使用：
+
+```powershell
+$env:VPS_RUNTIME_ROLE = "local_research"
+python -m app.jobs research-...
+```
+
 ## API examples
 
 ```bash

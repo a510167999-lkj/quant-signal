@@ -3625,7 +3625,14 @@ def _assert_runtime_command_allowed(
     if not isinstance(role, str):
         raise ValueError("未知的运行角色")
     normalized_role = role.strip().casefold()
-    if normalized_role in {"", "local_research"}:
+    if not normalized_role:
+        if command.startswith("research-"):
+            raise ValueError(
+                "研究命令必须显式设置 VPS_RUNTIME_ROLE=local_research："
+                f"{command}"
+            )
+        return
+    if normalized_role == "local_research":
         return
     if normalized_role != "recommendation_only":
         raise ValueError(f"未知的运行角色：{role}")

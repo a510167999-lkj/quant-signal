@@ -143,7 +143,11 @@ def test_deploy_shell_entrypoints_are_closed_set() -> None:
 
 def test_local_research_script_is_not_part_of_deploy_tree() -> None:
     assert not (DEPLOY_DIR / "research-local-tasks.sh").exists()
-    assert (PROJECT_ROOT / "scripts" / "research-local-tasks.sh").is_file()
+    script = PROJECT_ROOT / "scripts" / "research-local-tasks.sh"
+    assert script.is_file()
+    assert "export VPS_RUNTIME_ROLE=local_research" in script.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_jobs_runtime_role_fails_closed(
@@ -158,6 +162,7 @@ def test_jobs_runtime_role_fails_closed(
             command,
             runtime_role="recommendation_only",
         )
+        jobs._assert_runtime_command_allowed(command, runtime_role="")
     with pytest.raises(ValueError, match="VPS.*禁止"):
         jobs._assert_runtime_command_allowed(
             "research-audited-pit-shallow-gbdt-build-training-dataset",
@@ -203,6 +208,22 @@ def test_research_commands_require_explicit_local_research_role(
         command,
         runtime_role="local_research",
     )
+
+
+def test_research_main_rejects_missing_role_before_business_logic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("VPS_RUNTIME_ROLE", raising=False)
+    monkeypatch.setattr(
+        jobs,
+        "run_candidate_research_backtest",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("research business logic executed")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="local_research"):
+        jobs.main(["research-backtest"])
 
 
 def _bash_executable() -> str | None:

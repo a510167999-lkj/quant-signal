@@ -3,6 +3,7 @@
 # 用从 VPS 拉来的 413-symbols 缓存跑（akshare 取数不通但缓存够）
 # 用法：nohup bash scripts/research-local-tasks.sh &
 cd "$(dirname "$0")/.." || exit 1
+export VPS_RUNTIME_ROLE=local_research
 export UNIVERSE_CACHE_PATH=data/uni_cached413.json
 OUT=data/research_cache/local_research
 mkdir -p "$OUT"
