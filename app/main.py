@@ -17,7 +17,13 @@ from app.market_data import MarketDataError, build_market_data_provider
 from app.performance import evaluate_recommendation_performance
 from app.production_status import build_production_status
 from app.recommendations import RUN_SLOT_AUTO, RUN_SLOT_CONTEXTS, RecommendationService
-from app.schemas import AnalyzeRequest, AnalyzeResponse, HoldingsUpdate, WatchlistUpdate
+from app.schemas import (
+    AnalyzeRequest,
+    AnalyzeResponse,
+    HoldingsUpdate,
+    RecommendationSnapshot,
+    WatchlistUpdate,
+)
 from app.storage import read_json
 from app.watchlist import load_watchlist, save_watchlist
 
@@ -165,7 +171,11 @@ def create_app() -> FastAPI:
         save_holdings(SETTINGS.holdings_path, items)
         return {"items": load_holdings(SETTINGS.holdings_path)}
 
-    @app.get("/api/recommendations/latest", dependencies=[Depends(require_basic_auth)])
+    @app.get(
+        "/api/recommendations/latest",
+        response_model=RecommendationSnapshot,
+        dependencies=[Depends(require_basic_auth)],
+    )
     def latest_recommendations():
         return RECOMMENDATIONS.latest()
 
@@ -189,7 +199,11 @@ def create_app() -> FastAPI:
     def production_status():
         return build_production_status(SETTINGS)
 
-    @app.post("/api/recommendations/run", dependencies=[Depends(require_basic_auth)])
+    @app.post(
+        "/api/recommendations/run",
+        response_model=RecommendationSnapshot,
+        dependencies=[Depends(require_basic_auth)],
+    )
     def run_recommendations(
         background_tasks: BackgroundTasks,
         force: bool = Query(False),

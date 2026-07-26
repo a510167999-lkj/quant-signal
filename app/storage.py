@@ -39,6 +39,23 @@ def append_jsonl(path: str, payload: Dict[str, Any]) -> None:
         handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
+def append_jsonl_durable(path: str, payload: Dict[str, Any]) -> None:
+    file_path = Path(path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with file_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        )
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def read_jsonl(path: str, limit: int = 2000) -> List[Dict[str, Any]]:
     file_path = Path(path)
     if not file_path.exists():
@@ -55,6 +72,31 @@ def read_jsonl(path: str, limit: int = 2000) -> List[Dict[str, Any]]:
             continue
         if isinstance(item, dict):
             items.append(item)
+    return items
+
+
+def read_jsonl_strict(path: str) -> List[Dict[str, Any]]:
+    file_path = Path(path)
+    if not file_path.exists():
+        return []
+    items: List[Dict[str, Any]] = []
+    for line_number, line in enumerate(
+        file_path.read_text(encoding="utf-8").splitlines(),
+        start=1,
+    ):
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"invalid JSONL record at line {line_number}"
+            ) from exc
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"invalid JSONL object at line {line_number}"
+            )
+        items.append(item)
     return items
 
 

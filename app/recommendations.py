@@ -25,6 +25,16 @@ from app.market_regime import evaluate_market_regime
 from app.mootdx_l1 import MootdxL1QuoteProvider
 from app.news_context import NewsContextProvider
 from app.production_status import build_production_status
+from app.recommendation_contract import (
+    build_publication_ledger_record,
+    canonical_recommendation_symbol,
+    cap_daily_publications,
+    recommendation_operation_contract_errors,
+    recommendation_publication_receipt_errors,
+    recommendation_snapshot_publication_errors,
+    recommendation_snapshot_sha256,
+    validate_publication_ledger,
+)
 from app.recommendation_evidence import verify_profile_evidence_receipt
 from app.recommendation_gate import evaluate_recommendation_gate
 from app.recommendation_profile import (
@@ -41,7 +51,15 @@ from app.signal_tags import (
     build_proxy_market_tags,
     build_signal_tags,
 )
-from app.storage import append_jsonl, read_json, read_jsonl, unique_by_key, write_json
+from app.storage import (
+    append_jsonl,
+    append_jsonl_durable,
+    read_json,
+    read_jsonl,
+    read_jsonl_strict,
+    unique_by_key,
+    write_json,
+)
 from app.trading_calendar import (
     is_a_share_trading_time,
     is_trade_day,
@@ -750,6 +768,8 @@ def _compact_analysis(
         risks.insert(0, "外部消息存在风险信号，需人工复核。")
     if fund_flow_context.get("level") in {"high_outflow", "outflow_risk"}:
         risks.insert(0, "近期主力资金流出，需降低仓位或等待确认。")
+    if not risks:
+        risks.append("价格触及止损位或严格信号失效。")
     short_plan = ((result.get("trade_plans") or {}).get("short_term") or {})
     holding_period = short_plan.get("horizon") or short_plan.get("holding_period")
     trigger_conditions = list(
@@ -891,6 +911,8 @@ def _selection_rejection_reason(
         return "strict_signal_failed"
     if not (compact.get("strategy_quality") or {}).get("passed"):
         return "strategy_quality_failed"
+    if recommendation_operation_contract_errors(compact):
+        return "operation_contract_incomplete"
     return None
 
 
@@ -904,10 +926,12 @@ def _selection_funnel_explanation(funnel: Dict[str, Any]) -> str:
         "score_below_floor": "评分不足",
         "strict_signal_failed": "严格信号未通过",
         "strategy_quality_failed": "历史质量未通过",
+        "operation_contract_incomplete": "操作建议不完整",
         "announcement_blocked": "公告风险阻断",
         "news_blocked": "新闻风险阻断",
         "fund_flow_blocked": "资金流风险阻断",
         "result_limit": "超过推荐数量上限",
+        "daily_result_limit": "超过目标交易日累计推荐上限",
         "run_failed": "推荐任务失败",
         "current_pool_gate_failed": "股票池审计门禁未通过",
     }
@@ -1073,6 +1097,7 @@ class RecommendationService:
         gate["enabled"] = True
         gate["strategy_profile"] = profile_to_dict(self.profile)
         gate["evidence_receipt_id"] = payload.get("evidence_receipt_id")
+        gate["evidence_receipt_sha256"] = payload.get("receipt_sha256")
         gate["receipt_status"] = receipt_status or "missing"
         gate["receipt_verified"] = bool(payload and receipt_check.get("ok"))
         gate["production_health"] = {
@@ -1173,11 +1198,52 @@ class RecommendationService:
         }
         stored_hash = payload.get("current_pool_audit_sha256")
         current_hash = current_pool_gate.get("canonical_sha256")
+        raw_items = payload.get("items")
+        item_values = raw_items if isinstance(raw_items, list) else []
         item_symbols = {
             str(item.get("symbol") or "").strip().upper().split(".", 1)[0]
-            for item in (payload.get("items") or [])
+            for item in item_values
             if isinstance(item, dict)
         }
+        snapshot_contract_errors = list(
+            recommendation_snapshot_publication_errors(payload)
+        )
+        if isinstance(raw_items, list) and raw_items:
+            ledger_path = (
+                f"{self.settings.recommendation_history_path}.publications"
+            )
+            try:
+                ledger_rows = read_jsonl_strict(ledger_path)
+            except (OSError, TypeError, ValueError):
+                snapshot_contract_errors.append("publication_ledger")
+            else:
+                snapshot_contract_errors.extend(
+                    recommendation_publication_receipt_errors(
+                        payload,
+                        ledger_rows,
+                    )
+                )
+        snapshot_contract_errors = list(
+            dict.fromkeys(snapshot_contract_errors)
+        )
+        stored_publication_gate = payload.get("publication_gate")
+        if not isinstance(stored_publication_gate, dict):
+            stored_publication_gate = {}
+        stored_daily_cap = payload.get("daily_publication_cap")
+        if not isinstance(stored_daily_cap, dict):
+            stored_daily_cap = {}
+        stored_profile_gate = payload.get("profile_gate")
+        if not isinstance(stored_profile_gate, dict):
+            stored_profile_gate = {}
+        publication_claimed = (
+            payload.get("recommendation_status") == "live_proven"
+            and payload.get("live_proof") is True
+            and payload.get("evidence_scope") == "live_proof"
+            and stored_publication_gate.get("status") == "allowed"
+            and stored_publication_gate.get("reason") is None
+            and stored_daily_cap.get("valid") is True
+            and stored_profile_gate.get("live_proof") is True
+        )
         if not current_pool_gate.get("passed"):
             reason = "current_pool_gate_failed"
         elif not stored_hash:
@@ -1188,22 +1254,37 @@ class RecommendationService:
             reason = "current_pool_symbol_outside_audit"
         elif not current_pool_gate.get("production_recommendation_eligible"):
             reason = "current_pool_not_production_eligible"
+        elif snapshot_contract_errors:
+            reason = "snapshot_contract_invalid"
         else:
             reason = None
         if reason is None:
-            payload["current_pool_gate"] = gate_public
-            payload["publication_gate"] = {"status": "allowed", "reason": None}
+            payload["current_pool_revalidation"] = gate_public
+            if publication_claimed:
+                payload["publication_gate"] = {
+                    "status": "allowed",
+                    "reason": None,
+                }
             return payload
 
         execution_statuses = {"running", "generation_failed", "not_run_not_trade_day"}
         original_status = str(payload.get("recommendation_status") or "")
         preserve_execution_status = original_status in execution_statuses
+        blocked_status = (
+            "blocked_snapshot_contract"
+            if reason == "snapshot_contract_invalid"
+            else "blocked_current_pool_gate"
+        )
+        result_status = (
+            original_status
+            if preserve_execution_status
+            and reason != "snapshot_contract_invalid"
+            else blocked_status
+        )
         summary = dict(payload.get("summary") or {})
         summary.update(
             {
-                "recommendation_status": original_status
-                if preserve_execution_status
-                else "blocked_current_pool_gate",
+                "recommendation_status": result_status,
                 "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
                 "live_proof": False,
                 "auto_order": False,
@@ -1215,17 +1296,23 @@ class RecommendationService:
         errors = list(payload.get("errors") or [])
         errors.append(
             {
-                "stage": "current_pool_gate",
-                "reasons": gate_public.get("reasons") or [reason],
+                "stage": (
+                    "snapshot_contract"
+                    if reason == "snapshot_contract_invalid"
+                    else "current_pool_gate"
+                ),
+                "reasons": (
+                    list(snapshot_contract_errors)
+                    if reason == "snapshot_contract_invalid"
+                    else gate_public.get("reasons") or [reason]
+                ),
             }
         )
         payload.update(
             {
                 "items": [],
                 "errors": errors[:50],
-                "recommendation_status": original_status
-                if preserve_execution_status
-                else "blocked_current_pool_gate",
+                "recommendation_status": result_status,
                 "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
                 "live_proof": False,
                 "auto_order": False,
@@ -1491,6 +1578,124 @@ class RecommendationService:
                 if item.get("market") == "a" and item.get("symbol"):
                     symbols.add(str(item["symbol"]))
         return symbols
+
+    def _published_symbols_for_target_trade_date(
+        self, target_trade_date: str
+    ) -> set[str]:
+        ledger_path = f"{self.settings.recommendation_history_path}.publications"
+        ledger_rows = read_jsonl_strict(ledger_path)
+        if ledger_rows:
+            states = validate_publication_ledger(ledger_rows)
+            if target_trade_date in states:
+                return set(states[target_trade_date])
+        symbols: set[str] = set()
+        for run in read_jsonl_strict(
+            self.settings.recommendation_history_path
+        ):
+            if str(run.get("target_trade_date") or "")[:10] != target_trade_date:
+                continue
+            for item in run.get("items") or []:
+                if not isinstance(item, dict):
+                    raise ValueError(
+                        "recommendation history item is invalid"
+                    )
+                symbol = canonical_recommendation_symbol(item.get("symbol"))
+                if symbol:
+                    symbols.add(symbol)
+        return symbols
+
+    def _cap_daily_publications(
+        self,
+        items: List[Dict[str, Any]],
+        prior_symbols: set[str],
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        limit = 3
+        if self.profile:
+            limit = min(limit, self.profile.max_recommendations)
+        return cap_daily_publications(
+            items,
+            prior_symbols,
+            max_recommendations=limit,
+        )
+
+    def _commit_publication_ledger(
+        self,
+        payload: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        contract_errors = recommendation_snapshot_publication_errors(
+            payload,
+            require_receipt=False,
+        )
+        if contract_errors:
+            raise ValueError(
+                "recommendation publication contract is invalid: "
+                + ",".join(contract_errors)
+            )
+        published_symbols = {
+            canonical_recommendation_symbol(item.get("symbol"))
+            for item in payload.get("items") or []
+            if isinstance(item, dict)
+            and canonical_recommendation_symbol(item.get("symbol"))
+        }
+        if not published_symbols:
+            return None
+        target_trade_date = str(
+            payload.get("target_trade_date") or ""
+        )[:10]
+        expected_prior = set(
+            (payload.get("daily_publication_cap") or {}).get(
+                "prior_symbols"
+            )
+            or []
+        )
+        current_prior = self._published_symbols_for_target_trade_date(
+            target_trade_date
+        )
+        if {
+            canonical_recommendation_symbol(symbol)
+            for symbol in expected_prior
+        } != current_prior:
+            raise ValueError(
+                "recommendation publication prior state drifted"
+            )
+        ledger_path = (
+            f"{self.settings.recommendation_history_path}.publications"
+        )
+        ledger_rows = read_jsonl_strict(ledger_path)
+        validate_publication_ledger(ledger_rows)
+        record = build_publication_ledger_record(
+            sequence=len(ledger_rows) + 1,
+            generated_at=str(payload.get("generated_at") or ""),
+            target_trade_date=target_trade_date,
+            prior_symbols=current_prior,
+            published_symbols=published_symbols,
+            previous_record_hash=(
+                str(ledger_rows[-1]["record_hash"])
+                if ledger_rows
+                else None
+            ),
+            seeded_from_legacy_history=(
+                not any(
+                    str(row.get("target_trade_date") or "")[:10]
+                    == target_trade_date
+                    for row in ledger_rows
+                )
+                and bool(current_prior)
+            ),
+            snapshot_sha256=recommendation_snapshot_sha256(payload),
+            current_pool_audit_sha256=str(
+                payload.get("current_pool_audit_sha256") or ""
+            ),
+            profile_evidence_receipt_sha256=str(
+                (payload.get("profile_gate") or {}).get(
+                    "evidence_receipt_sha256"
+                )
+                or ""
+            ),
+        )
+        append_jsonl_durable(ledger_path, record)
+        payload["publication_receipt"] = record
+        return record
 
     def generate_daily_recommendations(
         self,
@@ -1908,6 +2113,14 @@ class RecommendationService:
                         reject(candidate, "news_blocked")
                     elif not compact["fund_flow_context"].get("allow_recommendation", True):
                         reject(candidate, "fund_flow_blocked")
+                    elif contract_errors := (
+                        recommendation_operation_contract_errors(compact)
+                    ):
+                        reject(
+                            candidate,
+                            "operation_contract_incomplete",
+                            ",".join(contract_errors),
+                        )
                     else:
                         items.append(compact)
             except Exception as exc:
@@ -1965,7 +2178,28 @@ class RecommendationService:
         current_pool_production_eligible = bool(
             current_pool_gate.get("production_recommendation_eligible", False)
         )
-        final_live_proof = profile_live_proof and current_pool_production_eligible
+        evidence_live_proof = (
+            profile_live_proof and current_pool_production_eligible
+        )
+        final_live_proof = evidence_live_proof
+        daily_limit = 3
+        if self.profile:
+            daily_limit = min(daily_limit, self.profile.max_recommendations)
+        prior_published_symbols = (
+            self._published_symbols_for_target_trade_date(target_text)
+        )
+        daily_cap_valid = len(prior_published_symbols) <= daily_limit
+        daily_selected, daily_rejected = self._cap_daily_publications(
+            selected,
+            prior_published_symbols,
+        )
+        publication_contract_errors = {
+            str(item.get("symbol") or ""): list(
+                recommendation_operation_contract_errors(item)
+            )
+            for item in selected
+            if recommendation_operation_contract_errors(item)
+        }
         if pool_changed:
             final_status = "blocked_current_pool_gate"
             publication_reason = "current_pool_audit_changed"
@@ -1978,10 +2212,44 @@ class RecommendationService:
         elif not profile_live_proof:
             final_status = "blocked_profile_gate"
             publication_reason = "profile_not_live_proven"
+        elif publication_contract_errors:
+            final_live_proof = False
+            final_status = "blocked_operation_contract"
+            publication_reason = "operation_contract_incomplete"
+        elif not daily_cap_valid:
+            final_live_proof = False
+            final_status = "blocked_daily_publication_cap"
+            publication_reason = "daily_publication_history_exceeded"
         else:
             final_status = "live_proven"
             publication_reason = None
-        public_selected = selected if final_live_proof else []
+        if final_live_proof:
+            for item in daily_rejected:
+                reject(item, "daily_result_limit")
+        public_selected = daily_selected if final_live_proof else []
+        rejection_counts = Counter(item["reason"] for item in rejections)
+        published_symbols = {
+            str(item.get("symbol") or "")
+            for item in public_selected
+            if item.get("symbol")
+        }
+        daily_publication_cap = {
+            "target_trade_date": target_text,
+            "limit": daily_limit,
+            "prior_symbols": sorted(prior_published_symbols),
+            "prior_count": len(prior_published_symbols),
+            "remaining_before_run": max(
+                0,
+                daily_limit - len(prior_published_symbols),
+            ),
+            "published_this_run": len(
+                published_symbols - prior_published_symbols
+            ),
+            "rejected_this_run": (
+                len(daily_rejected) if final_live_proof else 0
+            ),
+            "valid": daily_cap_valid,
+        }
         final_evidence_scope = "live_proof" if final_live_proof else EVIDENCE_SCOPE_DEVELOPMENT_ONLY
         current_pool_gate_public["publication_allowed"] = final_live_proof
         if publication_reason:
@@ -2034,6 +2302,7 @@ class RecommendationService:
                 "status": "allowed" if final_live_proof else "blocked",
                 "reason": publication_reason,
             },
+            "daily_publication_cap": daily_publication_cap,
             "profile_gate": profile_gate,
             "current_pool_gate": current_pool_gate_public,
             "strategy_profile": strategy_profile,
@@ -2052,6 +2321,7 @@ class RecommendationService:
                     "status": "allowed" if final_live_proof else "blocked",
                     "reason": publication_reason,
                 },
+                "daily_publication_cap": daily_publication_cap,
                 "profile_gate": profile_gate,
                 "current_pool_gate": current_pool_gate_public,
                 "strategy_profile": strategy_profile,
@@ -2101,8 +2371,12 @@ class RecommendationService:
             },
             "disclaimer": self.disclaimer,
         }
+        self._commit_publication_ledger(payload)
+        append_jsonl_durable(
+            self.settings.recommendation_history_path,
+            payload,
+        )
         write_json(self.settings.latest_recommendations_path, payload)
-        append_jsonl(self.settings.recommendation_history_path, payload)
         self._append_recommendation_audit(payload, rejections=rejections)
         return payload
 

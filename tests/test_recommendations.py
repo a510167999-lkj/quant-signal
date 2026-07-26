@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 
+import app.recommendations as recommendations_module
 from app.config import Settings
 from app.current_pool import POLICY_ID
 from app.recommendations import (
@@ -16,7 +17,15 @@ from app.recommendations import (
     _selection_funnel_explanation,
     _selection_rejection_reason,
 )
+from app.recommendation_contract import (
+    build_publication_ledger_record,
+    recommendation_operation_contract_errors,
+    recommendation_publication_receipt_errors,
+    recommendation_snapshot_publication_errors,
+    recommendation_snapshot_sha256,
+)
 from app.recommendation_profile import DEFAULT_PROFILE, profile_to_dict
+from app.schemas import RecommendationSnapshot
 from app.storage import append_jsonl, read_jsonl, write_json
 from tests.test_signals import sample_frame
 
@@ -320,6 +329,780 @@ def test_selection_rejection_reason_uses_first_decisive_gate(overrides, reason):
     }
     compact.update(overrides)
     assert _selection_rejection_reason(compact, {"BUY", "WATCH"}, 2.0) == reason
+
+
+def complete_operation_contract_item():
+    return {
+        "action": "BUY",
+        "score": 5.0,
+        "strict_signal": {"passed": True},
+        "strategy_quality": {"passed": True},
+        "symbol": "600519",
+        "market": "a",
+        "auto_order": False,
+        "entry_zone": {"low": 99.0, "high": 101.0},
+        "levels": {
+            "support": 98.0,
+            "resistance": 105.0,
+            "stop_loss": 96.0,
+            "take_profit": 108.0,
+        },
+        "trade_plans": {"short_term": {"horizon": "3-10 trading days"}},
+        "operation_advice": {
+            "action": "buy",
+            "entry_zone": {"low": 99.0, "high": 101.0},
+            "stop_loss": 96.0,
+            "take_profit": 108.0,
+            "holding_period": "3-10 trading days",
+            "invalidation": "close_below_stop",
+            "trigger_conditions": ["entry_zone_and_signal_confirmed"],
+            "take_profit_or_reduce": {
+                "condition": "price_gte_take_profit",
+                "trigger_price": 108.0,
+                "action": "reduce_or_take_profit",
+            },
+            "invalidation_conditions": ["close_below_stop"],
+            "expected_holding_period": "3-10 trading days",
+        },
+        "risks": ["止损纪律"],
+    }
+
+
+def publication_payload(symbols, prior_symbols=(), target="2026-07-13"):
+    items = []
+    for symbol in symbols:
+        item = complete_operation_contract_item()
+        item["symbol"] = symbol
+        items.append(item)
+    prior = set(prior_symbols)
+    published = set(symbols)
+    return {
+        "generated_at": f"{target}T15:02:00+08:00",
+        "trade_date": target,
+        "signal_date": target,
+        "target_trade_date": target,
+        "items": items,
+        "errors": [],
+        "recommendation_status": "live_proven",
+        "evidence_scope": "live_proof",
+        "live_proof": True,
+        "auto_order": False,
+        "publication_gate": {"status": "allowed", "reason": None},
+        "profile_gate": {
+            "live_proof": True,
+            "evidence_receipt_sha256": "b" * 64,
+        },
+        "daily_publication_cap": {
+            "target_trade_date": target,
+            "limit": 3,
+            "prior_symbols": sorted(prior),
+            "prior_count": len(prior),
+            "remaining_before_run": max(0, 3 - len(prior)),
+            "published_this_run": len(published - prior),
+            "rejected_this_run": 0,
+            "valid": True,
+        },
+        "current_pool_audit_sha256": "a" * 64,
+        "summary": {},
+    }
+
+
+@pytest.mark.parametrize(
+    "missing_path",
+    [
+        ("entry_zone", "low"),
+        ("levels", "support"),
+        ("operation_advice", "entry_zone", "high"),
+        ("operation_advice", "stop_loss"),
+        ("operation_advice", "take_profit"),
+        ("operation_advice", "holding_period"),
+        ("operation_advice", "invalidation"),
+        ("operation_advice", "trigger_conditions"),
+        ("operation_advice", "take_profit_or_reduce"),
+        ("operation_advice", "invalidation_conditions"),
+        ("operation_advice", "expected_holding_period"),
+        ("risks",),
+        ("trade_plans", "short_term", "horizon"),
+    ],
+)
+def test_selection_rejects_incomplete_operation_contract(missing_path):
+    compact = complete_operation_contract_item()
+    mutated = json.loads(json.dumps(compact))
+    parent = mutated
+    for key in missing_path[:-1]:
+        parent = parent[key]
+    parent.pop(missing_path[-1])
+
+    assert (
+        _selection_rejection_reason(mutated, {"BUY", "WATCH"}, 2.0)
+        == "operation_contract_incomplete"
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "expected_error"),
+    [
+        (("entry_zone", "low"), float("nan"), "entry_zone"),
+        (("levels", "stop_loss"), float("inf"), "levels"),
+        (
+            ("operation_advice", "trigger_conditions"),
+            [None],
+            "trigger_conditions",
+        ),
+        (("risks",), ["   "], "risks"),
+        (
+            ("operation_advice", "holding_period"),
+            123,
+            "holding_period",
+        ),
+        (
+            ("operation_advice", "entry_zone", "low"),
+            100.0,
+            "entry_zone_mismatch",
+        ),
+        (
+            ("operation_advice", "stop_loss"),
+            95.0,
+            "stop_loss_mismatch",
+        ),
+        (
+            ("operation_advice", "expected_holding_period"),
+            "10-20 trading days",
+            "holding_period_mismatch",
+        ),
+    ],
+)
+def test_operation_contract_rejects_invalid_values(
+    path, value, expected_error
+):
+    item = complete_operation_contract_item()
+    parent = item
+    for key in path[:-1]:
+        parent = parent[key]
+    parent[path[-1]] = value
+
+    assert expected_error in recommendation_operation_contract_errors(item)
+
+
+def test_daily_publication_cap_counts_prior_target_trade_date_symbols(tmp_path):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    append_jsonl(
+        service.settings.recommendation_history_path,
+        {
+            "target_trade_date": "2026-07-13",
+            "items": [
+                {"symbol": "600001", "market": "a"},
+                {"symbol": "600002", "market": "a"},
+            ],
+        },
+    )
+    append_jsonl(
+        service.settings.recommendation_history_path,
+        {
+            "target_trade_date": "2026-07-14",
+            "items": [{"symbol": "600099", "market": "a"}],
+        },
+    )
+
+    prior = service._published_symbols_for_target_trade_date("2026-07-13")
+    published, rejected = service._cap_daily_publications(
+        [
+            {"symbol": "600003", "market": "a"},
+            {"symbol": "600004", "market": "a"},
+        ],
+        prior,
+    )
+
+    assert prior == {"600001", "600002"}
+    assert [item["symbol"] for item in published] == ["600003"]
+    assert [item["symbol"] for item in rejected] == ["600004"]
+
+
+def test_publication_ledger_reserves_symbols_before_latest_snapshot(tmp_path):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    item = complete_operation_contract_item()
+    payload = {
+        "generated_at": "2026-07-13T15:02:00+08:00",
+        "target_trade_date": "2026-07-13",
+        "items": [item],
+        "recommendation_status": "live_proven",
+        "evidence_scope": "live_proof",
+        "live_proof": True,
+        "auto_order": False,
+        "publication_gate": {"status": "allowed", "reason": None},
+        "profile_gate": {
+            "live_proof": True,
+            "evidence_receipt_sha256": "b" * 64,
+        },
+        "current_pool_audit_sha256": "a" * 64,
+        "daily_publication_cap": {
+            "target_trade_date": "2026-07-13",
+            "limit": 3,
+            "prior_symbols": [],
+            "prior_count": 0,
+            "remaining_before_run": 3,
+            "published_this_run": 1,
+            "rejected_this_run": 0,
+            "valid": True,
+        },
+    }
+
+    receipt = service._commit_publication_ledger(payload)
+
+    assert receipt["symbols_after_commit"] == ["600519"]
+    assert payload["publication_receipt"]["record_hash"] == receipt["record_hash"]
+    assert not Path(service.settings.latest_recommendations_path).exists()
+    resumed = RecommendationService(
+        service.settings,
+        FakeProvider(),
+        "risk",
+    )
+    assert resumed._published_symbols_for_target_trade_date(
+        "2026-07-13"
+    ) == {"600519"}
+
+
+def test_daily_publication_legacy_history_is_counted_conservatively(tmp_path):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    append_jsonl(
+        service.settings.recommendation_history_path,
+        {
+            "target_trade_date": "2026-07-13",
+            "recommendation_status": "blocked_profile_gate",
+            "items": [{"symbol": " 600001.SH "}],
+        },
+    )
+
+    assert service._published_symbols_for_target_trade_date(
+        "2026-07-13"
+    ) == {"600001"}
+
+
+def test_daily_publication_corrupt_ledger_fails_closed(tmp_path):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    ledger_path = Path(
+        f"{service.settings.recommendation_history_path}.publications"
+    )
+    ledger_path.write_text('{"broken":', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid JSONL record"):
+        service._published_symbols_for_target_trade_date("2026-07-13")
+
+
+def test_latest_fails_closed_on_inconsistent_publication_state(
+    tmp_path, monkeypatch
+):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    payload = {
+        "generated_at": "2026-07-13T15:02:00+08:00",
+        "target_trade_date": "2026-07-13",
+        "items": [complete_operation_contract_item()],
+        "errors": [],
+        "recommendation_status": "blocked_profile_gate",
+        "evidence_scope": "development_only",
+        "live_proof": False,
+        "auto_order": False,
+        "publication_gate": {
+            "status": "blocked",
+            "reason": "profile_not_live_proven",
+        },
+        "profile_gate": {"live_proof": False},
+        "daily_publication_cap": {
+            "target_trade_date": "2026-07-13",
+            "limit": 3,
+            "prior_symbols": [],
+            "prior_count": 0,
+            "remaining_before_run": 3,
+            "published_this_run": 1,
+            "rejected_this_run": 0,
+            "valid": True,
+        },
+        "current_pool_audit_sha256": "a" * 64,
+        "summary": {},
+    }
+    write_json(service.settings.latest_recommendations_path, payload)
+    monkeypatch.setattr(
+        service,
+        "_current_pool_gate",
+        lambda moment, run_slot=None: {
+            "passed": True,
+            "production_recommendation_eligible": True,
+            "allowed_symbols": {"600519"},
+            "canonical_sha256": "a" * 64,
+            "source_as_of": "2026-07-13",
+        },
+    )
+
+    result = service.latest()
+
+    assert result["items"] == []
+    assert result["publication_gate"] == {
+        "status": "blocked",
+        "reason": "snapshot_contract_invalid",
+    }
+    assert result["errors"][-1]["stage"] == "snapshot_contract"
+
+
+@pytest.mark.parametrize("items", [[None], [42]])
+def test_latest_fails_closed_for_non_mapping_items(
+    tmp_path, monkeypatch, items
+):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    payload = {
+        "generated_at": "2026-07-13T15:02:00+08:00",
+        "target_trade_date": "2026-07-13",
+        "items": items,
+        "errors": [],
+        "recommendation_status": "live_proven",
+        "evidence_scope": "live_proof",
+        "live_proof": True,
+        "auto_order": False,
+        "publication_gate": {"status": "allowed", "reason": None},
+        "profile_gate": {
+            "live_proof": True,
+            "evidence_receipt_sha256": "b" * 64,
+        },
+        "daily_publication_cap": {
+            "target_trade_date": "2026-07-13",
+            "limit": 3,
+            "prior_symbols": [],
+            "prior_count": 0,
+            "remaining_before_run": 3,
+            "published_this_run": 1,
+            "rejected_this_run": 0,
+            "valid": True,
+        },
+        "current_pool_audit_sha256": "a" * 64,
+        "summary": {},
+    }
+    write_json(service.settings.latest_recommendations_path, payload)
+    monkeypatch.setattr(
+        service,
+        "_current_pool_gate",
+        lambda moment, run_slot=None: {
+            "passed": True,
+            "production_recommendation_eligible": True,
+            "allowed_symbols": {"600519"},
+            "canonical_sha256": "a" * 64,
+            "source_as_of": "2026-07-13",
+        },
+    )
+
+    result = service.latest()
+
+    assert result["items"] == []
+    assert result["publication_gate"]["reason"] == "snapshot_contract_invalid"
+    assert result["recommendation_status"] == "blocked_snapshot_contract"
+    assert result["summary"]["recommendation_status"] == (
+        "blocked_snapshot_contract"
+    )
+
+
+def test_latest_requires_receipt_committed_to_ledger(tmp_path, monkeypatch):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    payload = {
+        "generated_at": "2026-07-13T15:02:00+08:00",
+        "target_trade_date": "2026-07-13",
+        "items": [complete_operation_contract_item()],
+        "errors": [],
+        "recommendation_status": "live_proven",
+        "evidence_scope": "live_proof",
+        "live_proof": True,
+        "auto_order": False,
+        "publication_gate": {"status": "allowed", "reason": None},
+        "profile_gate": {
+            "live_proof": True,
+            "evidence_receipt_sha256": "b" * 64,
+        },
+        "daily_publication_cap": {
+            "target_trade_date": "2026-07-13",
+            "limit": 3,
+            "prior_symbols": [],
+            "prior_count": 0,
+            "remaining_before_run": 3,
+            "published_this_run": 1,
+            "rejected_this_run": 0,
+            "valid": True,
+        },
+        "current_pool_audit_sha256": "a" * 64,
+        "summary": {},
+    }
+    write_json(service.settings.latest_recommendations_path, payload)
+    monkeypatch.setattr(
+        service,
+        "_current_pool_gate",
+        lambda moment, run_slot=None: {
+            "passed": True,
+            "production_recommendation_eligible": True,
+            "allowed_symbols": {"600519"},
+            "canonical_sha256": "a" * 64,
+            "source_as_of": "2026-07-13",
+        },
+    )
+
+    result = service.latest()
+
+    assert result["items"] == []
+    assert result["publication_gate"]["reason"] == "snapshot_contract_invalid"
+
+
+def test_latest_accepts_snapshot_with_receipt_in_ledger(tmp_path, monkeypatch):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    payload = publication_payload(["600519"])
+    service._commit_publication_ledger(payload)
+    write_json(service.settings.latest_recommendations_path, payload)
+    monkeypatch.setattr(
+        service,
+        "_current_pool_gate",
+        lambda moment, run_slot=None: {
+            "passed": True,
+            "production_recommendation_eligible": True,
+            "allowed_symbols": {"600519"},
+            "canonical_sha256": "a" * 64,
+            "source_as_of": "2026-07-13",
+        },
+    )
+
+    result = service.latest()
+
+    assert [item["symbol"] for item in result["items"]] == ["600519"]
+    assert result["publication_gate"] == {
+        "status": "allowed",
+        "reason": None,
+    }
+    validated = RecommendationSnapshot.model_validate(result)
+    assert [item.symbol for item in validated.items] == ["600519"]
+    assert validated.model_extra["current_pool_revalidation"][
+        "canonical_sha256"
+    ] == "a" * 64
+
+
+def test_latest_rejects_self_hashed_receipt_not_in_ledger(
+    tmp_path, monkeypatch
+):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    committed = publication_payload(["600519"], target="2026-07-13")
+    committed_receipt = service._commit_publication_ledger(committed)
+    forged = publication_payload(["600520"], target="2026-07-14")
+    forged["publication_receipt"] = build_publication_ledger_record(
+        sequence=2,
+        generated_at=forged["generated_at"],
+        target_trade_date=forged["target_trade_date"],
+        prior_symbols=set(),
+        published_symbols={"600520"},
+        previous_record_hash=committed_receipt["record_hash"],
+        seeded_from_legacy_history=False,
+        snapshot_sha256=recommendation_snapshot_sha256(forged),
+        current_pool_audit_sha256="a" * 64,
+        profile_evidence_receipt_sha256="b" * 64,
+    )
+    write_json(service.settings.latest_recommendations_path, forged)
+    monkeypatch.setattr(
+        service,
+        "_current_pool_gate",
+        lambda moment, run_slot=None: {
+            "passed": True,
+            "production_recommendation_eligible": True,
+            "allowed_symbols": {"600520"},
+            "canonical_sha256": "a" * 64,
+            "source_as_of": "2026-07-14",
+        },
+    )
+
+    result = service.latest()
+
+    assert result["items"] == []
+    assert result["publication_gate"]["reason"] == "snapshot_contract_invalid"
+    assert "publication_receipt_not_in_ledger" in result["errors"][-1][
+        "reasons"
+    ]
+
+
+def test_latest_rejects_fourth_forged_symbol_after_daily_ledger_is_full(
+    tmp_path, monkeypatch
+):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    committed = publication_payload(["600519", "600520", "600521"])
+    service._commit_publication_ledger(committed)
+    forged = publication_payload(
+        ["600522"],
+        prior_symbols=["600519", "600520", "600521"],
+    )
+    write_json(service.settings.latest_recommendations_path, forged)
+    monkeypatch.setattr(
+        service,
+        "_current_pool_gate",
+        lambda moment, run_slot=None: {
+            "passed": True,
+            "production_recommendation_eligible": True,
+            "allowed_symbols": {
+                "600519",
+                "600520",
+                "600521",
+                "600522",
+            },
+            "canonical_sha256": "a" * 64,
+            "source_as_of": "2026-07-13",
+        },
+    )
+
+    result = service.latest()
+
+    assert result["items"] == []
+    assert result["publication_gate"]["reason"] == "snapshot_contract_invalid"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["prior_symbols", "published_symbols", "symbols_after_commit"],
+)
+def test_malformed_publication_receipt_symbols_fail_closed(field):
+    payload = publication_payload(["600519"])
+    payload["publication_receipt"] = build_publication_ledger_record(
+        sequence=1,
+        generated_at=payload["generated_at"],
+        target_trade_date=payload["target_trade_date"],
+        prior_symbols=set(),
+        published_symbols={"600519"},
+        previous_record_hash=None,
+        seeded_from_legacy_history=False,
+        snapshot_sha256=recommendation_snapshot_sha256(payload),
+        current_pool_audit_sha256="a" * 64,
+        profile_evidence_receipt_sha256="b" * 64,
+    )
+    payload["publication_receipt"][field] = 42
+
+    errors = recommendation_publication_receipt_errors(payload)
+
+    assert "publication_receipt_binding" in errors
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("prior_count", "not-an-int"),
+        ("prior_count", True),
+        ("published_this_run", []),
+        ("remaining_before_run", -1),
+        ("rejected_this_run", -1),
+    ],
+)
+def test_snapshot_daily_cap_rejects_malformed_counts_without_raising(
+    field, value
+):
+    payload = {
+        "generated_at": "2026-07-13T15:02:00+08:00",
+        "target_trade_date": "2026-07-13",
+        "items": [complete_operation_contract_item()],
+        "recommendation_status": "live_proven",
+        "evidence_scope": "live_proof",
+        "live_proof": True,
+        "auto_order": False,
+        "publication_gate": {"status": "allowed", "reason": None},
+        "profile_gate": {
+            "live_proof": True,
+            "evidence_receipt_sha256": "b" * 64,
+        },
+        "daily_publication_cap": {
+            "target_trade_date": "2026-07-13",
+            "limit": 3,
+            "prior_symbols": [],
+            "prior_count": 0,
+            "remaining_before_run": 3,
+            "published_this_run": 1,
+            "rejected_this_run": 0,
+            "valid": True,
+        },
+        "current_pool_audit_sha256": "a" * 64,
+    }
+    payload["daily_publication_cap"][field] = value
+
+    errors = recommendation_snapshot_publication_errors(payload)
+
+    assert "daily_publication_cap" in errors
+
+
+def test_empty_live_claim_must_still_satisfy_live_state_contract():
+    payload = {
+        "items": [],
+        "recommendation_status": "live_proven",
+        "evidence_scope": "development_only",
+        "live_proof": False,
+        "auto_order": False,
+        "publication_gate": {"status": "blocked", "reason": "forged"},
+        "profile_gate": {"live_proof": False},
+    }
+
+    errors = recommendation_snapshot_publication_errors(payload)
+
+    assert "live_proof" in errors
+    assert "evidence_scope" in errors
+    assert "publication_gate" in errors
+
+
+def test_non_live_empty_snapshot_rejects_explicit_auto_order_true():
+    errors = recommendation_snapshot_publication_errors(
+        {
+            "items": [],
+            "recommendation_status": "no_snapshot",
+            "auto_order": True,
+        }
+    )
+
+    assert "auto_order" in errors
+
+
+def test_empty_live_claim_requires_valid_generated_and_target_dates():
+    payload = publication_payload([])
+    payload["generated_at"] = ""
+    payload["target_trade_date"] = ""
+    payload["daily_publication_cap"]["target_trade_date"] = ""
+
+    errors = recommendation_snapshot_publication_errors(payload)
+
+    assert "generated_at" in errors
+    assert "target_trade_date" in errors
+
+
+def test_generation_enforces_target_trade_date_publication_cap(
+    tmp_path, monkeypatch
+):
+    evidence_path = tmp_path / "profile-evidence.json"
+    write_json(str(evidence_path), _live_profile_evidence_payload())
+    settings = replace(
+        make_settings(tmp_path),
+        recommendation_profile_id="primary_50_return_15_drawdown",
+        recommendation_profile_evidence_path=str(evidence_path),
+        scan_max_deep=6,
+        scan_result_limit=6,
+    )
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    service.industry = FakeIndustry()
+    service.industry_history = FakeIndustryHistory()
+    service.news = FakeNews()
+    service.announcements = FakeAnnouncement()
+    service.fund_flow = FakeFundFlow()
+    service.margin_eligibility = FakeMarginEligibility()
+    symbols = ["600519", "600520", "600521"]
+    service.universe = FakeUniverse(
+        [
+            {
+                "symbol": symbol,
+                "market": "a",
+                "name": f"测试股票{index}",
+                "latest": 100,
+                "amount": 100000000,
+                "change_pct": 7.0,
+                "volume": 10000,
+            }
+            for index, symbol in enumerate(symbols)
+        ]
+    )
+    industry_payload = FakeIndustry().build_map()
+    industry_payload["symbol_map"] = {
+        symbol: {
+            "industry": "测试行业",
+            "industry_rank": 1,
+            "industry_change_pct": 2.5,
+            "industry_score": 8,
+        }
+        for symbol in symbols
+    }
+    monkeypatch.setattr(
+        service.industry,
+        "build_map",
+        lambda use_cache_on_error=True: industry_payload,
+    )
+    append_jsonl(
+        settings.recommendation_history_path,
+        {
+            "target_trade_date": "2026-07-13",
+            "items": [
+                {"symbol": "600001", "market": "a"},
+                {"symbol": "600002", "market": "a"},
+            ],
+        },
+    )
+    fixed_now = datetime(
+        2026, 7, 13, 15, 2, tzinfo=ZoneInfo("Asia/Shanghai")
+    )
+    monkeypatch.setattr("app.recommendations.now_cn", lambda: fixed_now)
+    monkeypatch.setattr("app.recommendations.is_trade_day", lambda value: True)
+    monkeypatch.setattr(
+        "app.recommendations.build_production_status",
+        lambda settings: {"status": "healthy", "checks": []},
+    )
+    monkeypatch.setattr(
+        "app.recommendations._selection_rejection_reason",
+        lambda compact, allowed_actions, min_score: None,
+    )
+    monkeypatch.setattr(
+        service,
+        "_current_pool_gate",
+        lambda moment, run_slot: {
+            "passed": True,
+            "production_recommendation_eligible": True,
+            "allowed_symbols": set(symbols),
+            "canonical_sha256": "a" * 64,
+            "source_as_of": "2026-07-13",
+        },
+    )
+    commit_events = []
+    real_append_jsonl_durable = (
+        recommendations_module.append_jsonl_durable
+    )
+    real_write_json = recommendations_module.write_json
+
+    def record_append(path, payload):
+        commit_events.append(("append", str(path)))
+        real_append_jsonl_durable(path, payload)
+
+    def record_write(path, payload):
+        commit_events.append(("write", str(path)))
+        real_write_json(path, payload)
+
+    monkeypatch.setattr(
+        recommendations_module,
+        "append_jsonl_durable",
+        record_append,
+    )
+    monkeypatch.setattr(
+        recommendations_module,
+        "write_json",
+        record_write,
+    )
+
+    result = service.generate_daily_recommendations(
+        force=True,
+        run_slot="post_close",
+        target_trade_date="2026-07-13",
+    )
+
+    assert result["live_proof"] is True
+    assert len(result["items"]) == 1, json.dumps(
+        result["summary"]["selection_funnel"], ensure_ascii=False
+    )
+    assert result["daily_publication_cap"] == {
+        "target_trade_date": "2026-07-13",
+        "limit": 3,
+        "prior_symbols": ["600001", "600002"],
+        "prior_count": 2,
+        "remaining_before_run": 1,
+        "published_this_run": 1,
+        "rejected_this_run": 2,
+        "valid": True,
+    }
+    assert result["summary"]["selection_funnel"]["rejection_reasons"][
+        "daily_result_limit"
+    ] == 2
+    assert commit_events == [
+        (
+            "append",
+            f"{settings.recommendation_history_path}.publications",
+        ),
+        ("append", settings.recommendation_history_path),
+        ("write", settings.latest_recommendations_path),
+    ]
 
 
 def test_selection_funnel_explanation_names_top_zero_result_reasons():

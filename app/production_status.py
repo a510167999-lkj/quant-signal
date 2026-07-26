@@ -14,8 +14,13 @@ from zoneinfo import ZoneInfo
 from app.config import Settings
 from app.current_pool_gate import CurrentPoolGateError, load_current_pool_audit
 from app.industry_strength import IndustryStrengthProvider
+from app.recommendation_contract import (
+    recommendation_operation_contract_errors,
+    recommendation_publication_receipt_errors,
+    recommendation_snapshot_publication_errors,
+)
 from app.recommendation_evidence import verify_profile_evidence_receipt
-from app.storage import write_json
+from app.storage import read_jsonl_strict, write_json
 
 
 RANK = {"healthy": 0, "degraded": 1, "unhealthy": 2}
@@ -132,6 +137,16 @@ def _recommendations(settings: Settings, now: datetime, trade_dates: set[str]) -
             return _check("recommendations", "unhealthy", "推荐被策略证据/生产健康门槛阻断。")
         if payload.get("recommendation_status") == "blocked_current_pool_gate":
             return _check("recommendations", "unhealthy", "推荐被股票池审计/生产资格门禁阻断。")
+        if payload.get("recommendation_status") in {
+            "blocked_operation_contract",
+            "blocked_daily_publication_cap",
+            "blocked_snapshot_contract",
+        }:
+            return _check(
+                "recommendations",
+                "unhealthy",
+                "推荐被发布合同门禁阻断。",
+            )
         data_as_of = str(payload.get("data_as_of") or summary.get("data_as_of") or "")[:10]
         if payload.get("recommendation_status") not in {"not_run_not_trade_day", "no_snapshot"} and not data_as_of:
             return _check("recommendations", "unhealthy", "推荐缺少数据截至日期。")
@@ -169,31 +184,43 @@ def _recommendations(settings: Settings, now: datetime, trade_dates: set[str]) -
                 return _check("recommendations", "unhealthy", "推荐数据截至日期晚于生成时间。", data_as_of=data_as_of)
             if summary.get("data_as_of") and str(summary.get("data_as_of"))[:10] != data_as_of:
                 return _check("recommendations", "unhealthy", "推荐摘要数据截至日期与快照不一致。")
+        snapshot_contract_errors = list(
+            recommendation_snapshot_publication_errors(payload)
+        )
+        if items:
+            try:
+                ledger_rows = read_jsonl_strict(
+                    f"{settings.recommendation_history_path}.publications"
+                )
+            except (OSError, TypeError, ValueError):
+                snapshot_contract_errors.append("publication_ledger")
+            else:
+                snapshot_contract_errors.extend(
+                    recommendation_publication_receipt_errors(
+                        payload,
+                        ledger_rows,
+                    )
+                )
+        snapshot_contract_errors = list(
+            dict.fromkeys(snapshot_contract_errors)
+        )
+        if snapshot_contract_errors:
+            return _check(
+                "recommendations",
+                "unhealthy",
+                "推荐缺少完整操作建议或发布状态无效。",
+                contract_errors=list(snapshot_contract_errors),
+            )
         for item in items:
-            zone, levels = item.get("entry_zone") or {}, item.get("levels") or {}
-            plan = (item.get("trade_plans") or {}).get("short_term") or {}
-            advice = item.get("operation_advice") or {}
-            advice_zone = advice.get("entry_zone") or {}
-            required = all(zone.get(key) is not None for key in ("low", "high")) and all(
-                levels.get(key) is not None for key in ("support", "resistance", "stop_loss", "take_profit")
-            )
-            operation_contract = (
-                item.get("market") == "a"
-                and item.get("auto_order") is False
-                and advice.get("action")
-                and all(advice_zone.get(key) is not None for key in ("low", "high"))
-                and advice.get("stop_loss") is not None
-                and advice.get("take_profit") is not None
-                and (advice.get("holding_period") or plan.get("horizon") or plan.get("holding_period"))
-                and advice.get("invalidation")
-                and bool(advice.get("trigger_conditions"))
-                and (advice.get("take_profit_or_reduce") or {}).get("trigger_price")
-                == advice.get("take_profit")
-                and bool(advice.get("invalidation_conditions"))
-                and advice.get("expected_holding_period")
-            )
-            if not required or not operation_contract or not item.get("risks") or not (plan.get("horizon") or plan.get("holding_period")):
-                return _check("recommendations", "unhealthy", "推荐缺少完整操作建议。", symbol=item.get("symbol"))
+            contract_errors = recommendation_operation_contract_errors(item)
+            if contract_errors:
+                return _check(
+                    "recommendations",
+                    "unhealthy",
+                    "推荐缺少完整操作建议。",
+                    symbol=item.get("symbol"),
+                    contract_errors=list(contract_errors),
+                )
         return _check("recommendations", "healthy", "推荐快照可读且结构完整。", item_count=len(items), age_hours=round(age, 2))
     except Exception as exc:
         return _check("recommendations", "unhealthy", f"无法读取最新推荐：{type(exc).__name__}。")
