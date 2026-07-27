@@ -67,7 +67,56 @@ def _canonical_trade_date(value: Any, label: str) -> str:
 
 
 def _canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _freeze_json_value(value: Any, *, label: str) -> Any:
+    if isinstance(value, Mapping):
+        frozen: Dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{label} JSON object keys must be strings")
+            if key in frozen:
+                raise ValueError(f"{label} JSON object contains a duplicate key")
+            frozen[key] = _freeze_json_value(item, label=label)
+        return frozen
+    if isinstance(value, (list, tuple)):
+        return [_freeze_json_value(item, label=label) for item in value]
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{label} contains a non-finite JSON number")
+        return value
+    raise ValueError(f"{label} is not JSON serializable")
+
+
+def _freeze_json_mapping(value: Any, *, label: str) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be an object")
+    frozen = _freeze_json_value(value, label=label)
+    if not isinstance(frozen, dict):
+        raise ValueError(f"{label} must be an object")
+    return frozen
+
+
+def _freeze_json_list(value: Any, *, label: str) -> List[Any]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} are invalid")
+    frozen = _freeze_json_value(value, label=label)
+    if not isinstance(frozen, list):
+        raise ValueError(f"{label} are invalid")
+    return frozen
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError(f"non-standard JSON numeric constant: {value}")
 
 
 def _sha256(value: Any) -> str:
@@ -541,7 +590,10 @@ def validate_point_in_time_contract(
 def write_report_artifact(directory: str, report: Dict[str, Any]) -> Dict[str, Any]:
     artifact_dir = Path(directory)
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    content = (json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode(
+    content = (
+        json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
+        + "\n"
+    ).encode(
         "utf-8"
     )
     digest = hashlib.sha256(content).hexdigest()
@@ -1181,8 +1233,8 @@ def _read_ledger(
             if not line.strip():
                 continue
             try:
-                row = json.loads(line)
-            except json.JSONDecodeError as exc:
+                row = json.loads(line, parse_constant=_reject_json_constant)
+            except (json.JSONDecodeError, ValueError) as exc:
                 raise ValueError(f"invalid experiment ledger at line {line_number}") from exc
             if not isinstance(row, dict):
                 raise ValueError(f"invalid experiment ledger row at line {line_number}")
@@ -1925,9 +1977,8 @@ def _append_experiment_event_locked(
 def append_experiment_event(path: str, event: Dict[str, Any]) -> Dict[str, Any]:
     """Append one lifecycle event to a hash-chained experiment ledger."""
 
+    event = _freeze_json_mapping(event, label="ledger event")
     ledger_path = Path(path)
-    if not isinstance(event, dict):
-        raise ValueError("ledger event must be an object")
     experiment_id = str(event.get("experiment_id") or "").strip()
     event_id = str(event.get("event_id") or "").strip()
     event_type = str(event.get("event_type") or "").strip()
@@ -1947,10 +1998,7 @@ def append_experiment_event(path: str, event: Dict[str, Any]) -> Dict[str, Any]:
         "decision",
     }:
         raise ValueError("unsupported event_type")
-    try:
-        _canonical_json(event)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("ledger event is not JSON serializable") from exc
+    _canonical_json(event)
 
     contract = event.get("registration_contract")
     if (
@@ -2114,6 +2162,10 @@ def register_experiment_if_tip_matches(
 ) -> Dict[str, Any]:
     """Atomically compare the ledger control state and append one registration."""
 
+    event = _freeze_json_mapping(event, label="controlled ledger event")
+    allowed_nonterminal_records = _freeze_json_list(
+        allowed_nonterminal_records, label="allowed nonterminal records"
+    )
     if isinstance(expected_sequence, bool) or not isinstance(expected_sequence, int):
         raise ValueError("expected ledger sequence is invalid")
     if expected_sequence < 0:
@@ -2133,13 +2185,11 @@ def register_experiment_if_tip_matches(
         or any(character not in "0123456789abcdef" for character in expected_record_hash)
     ):
         raise ValueError("expected ledger tip hash is invalid")
-    if not isinstance(event, dict) or event.get("event_type") != "registered":
+    if event.get("event_type") != "registered":
         raise ValueError("controlled ledger event must be a registration")
     experiment_id = str(event.get("experiment_id") or "").strip()
     if not experiment_id:
         raise ValueError("experiment_id is required")
-    if not isinstance(allowed_nonterminal_records, list):
-        raise ValueError("allowed nonterminal records are invalid")
     if expected_ledger_file_sha256 is not None:
         _require_control_sha256(expected_ledger_file_sha256, "expected ledger file hash")
 
@@ -2369,6 +2419,12 @@ def complete_authorized_precompute_launch_if_current(
 ) -> Dict[str, Any]:
     """Atomically complete only the exact ledger-authorized launch."""
 
+    try:
+        run_result_artifact = _freeze_json_mapping(
+            run_result_artifact, label="precompute run result artifact"
+        )
+    except ValueError as exc:
+        raise ValueError("precompute run result artifact is invalid") from exc
     if not isinstance(experiment_id, str) or not experiment_id.strip():
         raise ValueError("experiment_id is required")
     for value, label in (
@@ -2380,7 +2436,7 @@ def complete_authorized_precompute_launch_if_current(
         (parent_proof_canonical_sha256, "parent proof canonical hash"),
     ):
         _require_control_sha256(value, label)
-    if not isinstance(run_result_artifact, dict) or set(run_result_artifact) != {
+    if set(run_result_artifact) != {
         "path",
         "basename",
         "bytes",
@@ -2973,6 +3029,12 @@ def complete_validation_started_experiment_if_current(
 ) -> Dict[str, Any]:
     """Atomically append one bound controlled validation completion."""
 
+    try:
+        completion_event = _freeze_json_mapping(
+            completion_event, label="controlled validation completion event"
+        )
+    except ValueError as exc:
+        raise ValueError("controlled validation completion event is invalid") from exc
     for value, label in (
         (registered_record_hash, "registered record hash"),
         (validation_started_record_hash, "validation started record hash"),
@@ -2980,8 +3042,6 @@ def complete_validation_started_experiment_if_current(
         _require_control_sha256(value, label)
     if not isinstance(experiment_id, str) or not experiment_id:
         raise ValueError("experiment id is invalid")
-    if not isinstance(completion_event, dict):
-        raise ValueError("controlled validation completion event is invalid")
     if any(
         field in completion_event
         for field in (

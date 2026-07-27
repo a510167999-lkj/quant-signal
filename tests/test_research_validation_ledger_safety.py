@@ -1,5 +1,8 @@
 import hashlib
+import json
 import os
+import threading
+from collections import UserDict
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -538,3 +541,130 @@ def test_path_identity_change_is_rejected(tmp_path, monkeypatch):
 
     assert replaced is True
     assert ledger.read_bytes() == b""
+
+
+class _SchemaSmugglingEvent(dict):
+    """Expose a benign contract to routing while retaining a controlled one."""
+
+    def get(self, key, default=None):
+        if key == "registration_contract":
+            return {"schema_version": "research-validation-registration/v1"}
+        return super().get(key, default)
+
+
+def test_generic_append_freezes_mapping_before_controlled_schema_routing(tmp_path):
+    ledger = tmp_path / "ledger.jsonl"
+    event = _SchemaSmugglingEvent(
+        _event(
+            "smuggled",
+            "registered",
+            registration_contract={"schema_version": "research-validation-registration/v4"},
+        )
+    )
+
+    with pytest.raises(ValueError, match="controlled registration"):
+        rv.append_experiment_event(str(ledger), event)
+
+    assert ledger.exists() is False
+    assert Path(f"{ledger}.lock").exists() is False
+
+
+def test_generic_append_snapshots_a_recursive_mapping_into_plain_json(tmp_path):
+    ledger = tmp_path / "ledger.jsonl"
+    event = UserDict(
+        _event(
+            "mapping",
+            "registered",
+            metadata=UserDict({"state": "frozen"}),
+        )
+    )
+
+    recorded = rv.append_experiment_event(str(ledger), event)
+    event["metadata"]["state"] = "changed"
+
+    assert type(recorded) is dict
+    assert type(recorded["metadata"]) is dict
+    assert recorded["metadata"] == {"state": "frozen"}
+    assert rv.read_experiment_ledger(str(ledger))[0]["metadata"] == {"state": "frozen"}
+
+
+def test_controlled_registration_freezes_mapping_before_v4_binding(tmp_path):
+    ledger = tmp_path / "ledger.jsonl"
+    rv.append_experiment_event(str(ledger), _event("prior", "registered"))
+    prior = rv.append_experiment_event(str(ledger), _event("prior", "failed"))
+    event = _SchemaSmugglingEvent(
+        _event(
+            "smuggled",
+            "registered",
+            registration_contract={"schema_version": "research-validation-registration/v4"},
+        )
+    )
+    before = ledger.read_bytes()
+
+    with pytest.raises(ValueError, match="v4|precompute|registration"):
+        rv.register_experiment_if_tip_matches(
+            str(ledger),
+            event,
+            expected_sequence=prior["sequence"],
+            expected_record_hash=prior["record_hash"],
+            allowed_nonterminal_records=[],
+            minimum_sequence_exclusive=prior["sequence"],
+        )
+
+    assert ledger.read_bytes() == before
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_ledger_reader_rejects_non_json_numeric_constants(tmp_path, constant):
+    ledger = tmp_path / "ledger.jsonl"
+    rv.append_experiment_event(str(ledger), _event("valid", "registered"))
+    with ledger.open("ab") as handle:
+        encoded = json.dumps({"bad": constant}).replace(f'"{constant}"', constant)
+        handle.write(encoded.encode())
+        handle.write(b"\n")
+
+    with pytest.raises(ValueError, match="invalid experiment ledger"):
+        rv.read_experiment_ledger(str(ledger))
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_canonical_ledger_json_rejects_non_finite_numbers(value):
+    with pytest.raises(ValueError):
+        rv._canonical_json({"value": value})
+
+
+def test_report_artifact_rejects_non_finite_numbers(tmp_path):
+    with pytest.raises(ValueError):
+        rv.write_report_artifact(str(tmp_path / "reports"), {"value": float("nan")})
+
+
+def test_concurrent_generic_appends_keep_a_single_valid_hash_chain(tmp_path):
+    ledger = tmp_path / "ledger.jsonl"
+    gate = threading.Barrier(3)
+    results = []
+    errors = []
+
+    def append(index):
+        try:
+            gate.wait(timeout=5)
+            results.append(
+                rv.append_experiment_event(
+                    str(ledger), _event(f"parallel-{index}", "registered")
+                )
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    workers = [threading.Thread(target=append, args=(index,)) for index in range(2)]
+    for worker in workers:
+        worker.start()
+    gate.wait(timeout=5)
+    for worker in workers:
+        worker.join(timeout=5)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert errors == []
+    assert sorted(item["sequence"] for item in results) == [1, 2]
+    rows = rv.read_experiment_ledger(str(ledger))
+    assert [row["sequence"] for row in rows] == [1, 2]
+    assert rows[1]["previous_record_hash"] == rows[0]["record_hash"]
