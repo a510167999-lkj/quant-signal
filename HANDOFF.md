@@ -187,7 +187,6 @@ JIAOCH_TOKEN='<token>' python -u -m app.jobs research-current-pool-fetch-market-
 
 ## 六、安全注意
 
-1. **JIAOCH_TOKEN**: `e693b8e3f6c5813ae826090b16ac9061ba80932a83f5bab4be4d70dd9cac` — **已在对话中明文暴露,建议轮换**。存储在 `.secrets/jiaoch_token.txt`(gitignore)。代码层保证 token 不进 git/异常链/落盘
 2. **fail-closed 闸门**:以下三个硬编码 False 保持不变,除非有完整证据链:
    - `current_pool_gate.py:155-156,217` `production_recommendation_eligible`
    - `research_validation.py:1013-1022` `completion_pass`
