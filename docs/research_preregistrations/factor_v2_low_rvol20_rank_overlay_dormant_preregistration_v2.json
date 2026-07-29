@@ -1,13 +1,24 @@
 {
-  "schema_version": "factor-v2-low-rvol20-rank-overlay-dormant-preregistration/v1",
-  "created_at_utc": "2026-07-29T03:04:13.5617211Z",
+  "schema_version": "factor-v2-low-rvol20-rank-overlay-dormant-preregistration/v2",
+  "created_at_utc": "2026-07-29T03:09:57.7458820Z",
   "external_anchor": {
     "kind": "git_introducing_commit_plus_raw_sha256_sidecar",
-    "json_path": "docs/research_preregistrations/factor_v2_low_rvol20_rank_overlay_dormant_preregistration_v1.json",
-    "sha256_sidecar_path": "docs/research_preregistrations/factor_v2_low_rvol20_rank_overlay_dormant_preregistration_v1.sha256",
+    "json_path": "docs/research_preregistrations/factor_v2_low_rvol20_rank_overlay_dormant_preregistration_v2.json",
+    "sha256_sidecar_path": "docs/research_preregistrations/factor_v2_low_rvol20_rank_overlay_dormant_preregistration_v2.sha256",
     "required_git_commit": "the first commit that adds both exact paths",
     "activation_rule": "the activator must read both files from the introducing commit, verify the JSON raw SHA-256 against the sidecar, and reject current or later replacements",
     "runtime_recalculation_of_an_unanchored_expected_hash_allowed": false
+  },
+  "supersession": {
+    "superseded_schema_version": "factor-v2-low-rvol20-rank-overlay-dormant-preregistration/v1",
+    "superseded_introducing_commit": "7b6e0d59c784a50e8421fd34d9229bc66c40e2fc",
+    "superseded_json_raw_sha256": "dfde6c8843dc09d8caef22893212b379ae813da8949cb741a33e60ce02d292e7",
+    "superseded_version_activation_allowed": false,
+    "reason_codes": [
+      "phase_one_source_replay_was_not_forbidden",
+      "minimal_decision_receipt_contract_was_incomplete",
+      "evaluation_claim_and_lock_identity_hashes_were_missing"
+    ]
   },
   "scope": {
     "temporal_role": "development",
@@ -20,7 +31,7 @@
     "production_recommendation_eligible": false
   },
   "pre_result_witness": {
-    "captured_at_utc": "2026-07-29T03:04:13.5617211Z",
+    "captured_at_utc": "2026-07-29T03:09:57.7458820Z",
     "performance_metrics_read_for_this_preregistration": false,
     "sqlite_database_opened_for_this_preregistration": false,
     "development_evaluation": {
@@ -39,7 +50,11 @@
         "audited_pit_factor_v2_development_evaluation_v1_development_4.run.status.json.claim|False|165|2026-07-29T02:44:43.3637568Z"
       ],
       "lock_path": "E:/AI workspace/quant-signal-lkj/data/research_runs/.factor_v2_development_evaluation.lock",
-      "claim_path": "E:/AI workspace/quant-signal-lkj/data/research_runs/audited_pit_factor_v2_development_evaluation_v1_development_4.run.status.json.claim"
+      "lock_file_sha256": "d8f176e31bfa6376aa648f1f863acfc211b69b9216b3f162be16fbdf48c59228",
+      "lock_file_bytes": 165,
+      "claim_path": "E:/AI workspace/quant-signal-lkj/data/research_runs/audited_pit_factor_v2_development_evaluation_v1_development_4.run.status.json.claim",
+      "claim_file_sha256": "d8f176e31bfa6376aa648f1f863acfc211b69b9216b3f162be16fbdf48c59228",
+      "claim_file_bytes": 165
     },
     "arm_statuses": [
       {
@@ -79,19 +94,66 @@
       "intraday_20"
     ],
     "required_condition": "all three preregistered_decision values are exactly RED",
-    "phase_one_allowed_input_only": "an independently published content-addressed decision_verification_receipt",
-    "decision_verification_receipt_required_fields": [
+    "phase_one_allowed_input_only": "one independently published content-addressed decision_verification_receipt with the exact schema and exact field set below",
+    "decision_verification_receipt_schema_version": "factor-v2-development-evaluation-decision-verification-receipt/v1",
+    "decision_verification_receipt_exact_fields": [
       "schema_version",
+      "temporal_role",
+      "factor_v2_spec_sha256",
       "evaluation_artifact_sha256",
       "evaluation_manifest_file_sha256",
       "evaluation_producer_root_sha256",
+      "verification_producer_root_sha256",
       "arm_order",
       "arm_decisions",
+      "source_run_identity",
+      "verified",
+      "embargo_consumed",
+      "final_oos_consumed",
+      "production_recommendation_eligible",
       "receipt_sha256"
     ],
+    "decision_verification_receipt_extra_fields_allowed": false,
+    "decision_verification_receipt_required_values": {
+      "temporal_role": "development",
+      "factor_v2_spec_sha256": "685487c7159a6f0e9748bb46265b93d4c86f4a9dc7dc734beac2c267547a2cdf",
+      "arm_order": [
+        "v2_control",
+        "overnight_20",
+        "intraday_20"
+      ],
+      "verified": true,
+      "embargo_consumed": false,
+      "final_oos_consumed": false,
+      "production_recommendation_eligible": false
+    },
+    "decision_verification_receipt_source_run_identity_exact_fields": [
+      "status_path",
+      "pid",
+      "started_at",
+      "runner_file_sha256",
+      "claim_file_sha256",
+      "lock_file_sha256"
+    ],
+    "decision_verification_receipt_source_run_identity_required_values": {
+      "status_path": "E:/AI workspace/quant-signal-lkj/data/research_runs/audited_pit_factor_v2_development_evaluation_v1_development_4.run.status.json",
+      "pid": 31564,
+      "started_at": "2026-07-29T02:44:43.361756+00:00",
+      "runner_file_sha256": "997f89e4f38262def6f1d846fa6a47355573b76efdd65eb4a5dee651e8034a4e",
+      "claim_file_sha256": "d8f176e31bfa6376aa648f1f863acfc211b69b9216b3f162be16fbdf48c59228",
+      "lock_file_sha256": "d8f176e31bfa6376aa648f1f863acfc211b69b9216b3f162be16fbdf48c59228"
+    },
+    "phase_one_allowed_operations": [
+      "read the decision receipt file bytes",
+      "verify the exact raw file hash supplied by its content-addressed descriptor",
+      "parse the exact JSON schema and reject any extra or missing field",
+      "verify its self hash and trusted verification producer root",
+      "compare its source_run_identity to the exact first evaluator run witnessed above"
+    ],
+    "phase_one_source_replay_allowed": false,
+    "phase_one_control_score_overlay_feature_outcome_performance_or_evaluation_manifest_read_allowed": false,
     "missing_minimal_decision_receipt_action": "STOP_FAIL_CLOSED",
     "any_green_action": "VOID_BEFORE_THE_OVERLAY_ACTIVATOR_CALLS_ANY_CONTROL_SCORE_OVERLAY_FEATURE_OUTCOME_OR_PERFORMANCE_READER",
-    "verifier_source_replay_is_not_an_overlay_reader": true,
     "all_red_phase_two": "only after phase one succeeds may the overlay activator perform complete source replay and overlay evaluation",
     "missing_unknown_or_unverified_decision_action": "STOP_FAIL_CLOSED",
     "activation_after_any_embargo_or_final_oos_consumption_allowed": false,
