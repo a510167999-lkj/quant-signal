@@ -152,7 +152,7 @@ def test_permission_denied_is_terminal_single_request_and_fixed_stk_mins_post(
     raw = json.dumps(
         {
             "code": -1,
-            "msg": "权限不足: 对不起，您没有 stk_mins 接口的访问权限",
+            "msg": "权限不足: 对不起，您没有 stk_mins 接口的访问权限，请联系客服添加！",
             "data": {
                 "fields": ["trade_time", "amount"],
                 "items": [["2026-07-28 09:31:00", 999_999_999]],
@@ -208,6 +208,50 @@ def test_permission_denied_is_terminal_single_request_and_fixed_stk_mins_post(
         allow_nan=False,
     ).encode("utf-8")
     assert b"999999999" not in Path(publication["path"]).read_bytes()
+
+
+def test_concurrency_limit_is_distinct_from_permission_denied(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    raw = json.dumps(
+        {
+            "code": -1,
+            "msg": "并发请求过多（上限2个），等待59秒后自动恢复，请稍后重试",
+            "data": None,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    transport = RecordingTransport(_response(raw))
+
+    _, manifest = _collect(tmp_path, transport, monkeypatch)
+
+    assert manifest["classification"] == "RATE_LIMITED_CONCURRENCY"
+    assert manifest["provider_code"] == -1
+    assert manifest["request_count"] == 1
+    assert manifest["retry_count"] == 0
+    assert manifest["fallback_used"] is False
+    _assert_unbound(manifest)
+
+
+def test_unclassified_code_minus_one_remains_source_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    transport = RecordingTransport(
+        _response(
+            json.dumps(
+                {"code": -1, "msg": "服务暂时不可用，请稍后重试", "data": None},
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+    )
+
+    _, manifest = _collect(tmp_path, transport, monkeypatch)
+
+    assert manifest["classification"] == "SOURCE_ERROR"
+    assert manifest["provider_code"] == -1
+    _assert_unbound(manifest)
 
 
 def test_any_nonzero_code_rejects_fake_rows(tmp_path: Path, monkeypatch) -> None:
