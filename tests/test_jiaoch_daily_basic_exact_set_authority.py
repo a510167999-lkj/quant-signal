@@ -290,7 +290,8 @@ def test_publishes_full_market_exact_set_then_derives_target_scope(
     assert verified["trade_dates"] == ["2025-02-14", "2025-02-17"]
     assert verified["trade_date_count"] == 2
     assert verified["exact_set_verified"] is True
-    assert verified["raw_ts_code_exact_set_verified"] is True
+    assert verified["raw_source_rows_bound"] is True
+    assert verified["source_ts_code_exact_set_verified_after_transition_filter"] is True
     assert verified["transition_resolved_identity_exact_set_verified"] is True
     assert verified["all_supported_segments_compared_before_scope_filter"] is True
     assert verified["factor_v3_target_scope"] == {
@@ -301,17 +302,20 @@ def test_publishes_full_market_exact_set_then_derives_target_scope(
     }
     assert len(verified["per_date_statistics"]) == 2
     for item in verified["per_date_statistics"]:
-        assert item["authoritative_daily_row_count"] == 4
-        assert item["daily_basic_row_count"] == 4
+        assert item["authoritative_daily_raw_row_count"] == 4
+        assert item["daily_basic_raw_row_count"] == 4
+        assert item["transition_filtered_row_count"] == 4
         assert item["target_scope_row_count"] == 2
-        assert item["authoritative_daily_segment_counts"] == {
+        assert item["authoritative_daily_raw_segment_counts"] == {
             "BSE": 1,
             "SSE_MAIN": 1,
             "SSE_STAR": 1,
             "SZSE_CHINEXT": 1,
             "SZSE_MAIN": 0,
         }
-        assert item["daily_basic_segment_counts"] == item["authoritative_daily_segment_counts"]
+        assert (
+            item["daily_basic_raw_segment_counts"] == item["authoritative_daily_raw_segment_counts"]
+        )
         assert item["missing_authoritative_daily_code_count"] == 0
         assert item["extra_daily_basic_code_count"] == 0
     assert (
@@ -330,6 +334,102 @@ def test_publishes_full_market_exact_set_then_derives_target_scope(
     assert verified["final_oos_consumed"] is False
     assert verified["production_profile_registered"] is False
     assert verified["production_recommendation_eligible"] is False
+
+
+def test_authoritative_transition_backfill_is_excluded_before_exact_set_comparison(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    daily = _daily_authority()
+    first = daily.partitions[0]
+    first_with_backfill = replace(
+        first,
+        ts_codes=tuple(sorted((*first.ts_codes, "302132.SZ"))),
+    )
+    daily = replace(
+        daily,
+        daily_table_rows=9,
+        partitions=(first_with_backfill, daily.partitions[1]),
+    )
+    partitions = {item.trade_date: _daily_basic_partition(item) for item in daily.partitions}
+    _install_authorities(
+        monkeypatch,
+        daily=daily,
+        daily_basic_by_date=partitions,
+    )
+    kwargs = _kwargs(tmp_path, daily)
+
+    publication = authority.publish_daily_basic_exact_set_coverage(**kwargs)
+    verified = authority.verify_daily_basic_exact_set_coverage(
+        **{key: value for key, value in kwargs.items() if key != "collection_set_refs"},
+        receipt_relative_path=publication["receipt_relative_path"],
+        expected_receipt_sha256=publication["receipt_sha256"],
+    )
+
+    first_stats = verified["per_date_statistics"][0]
+    assert first_stats["authoritative_daily_raw_row_count"] == 5
+    assert first_stats["daily_basic_raw_row_count"] == 5
+    assert first_stats["authoritative_daily_transition_excluded_row_count"] == 1
+    assert first_stats["daily_basic_transition_excluded_row_count"] == 1
+    assert first_stats["transition_filtered_row_count"] == 4
+    assert first_stats["daily_basic_transition_overlap_pair_count"] == 1
+    assert first_stats["daily_basic_transition_overlap_comparison_fields"] == [
+        "turnover_rate",
+        "turnover_rate_f",
+        "free_share",
+        "float_share",
+        "total_mv",
+        "circ_mv",
+    ]
+    assert verified["source_missingness"] == {
+        "extra_daily_basic_code_count": 0,
+        "missing_authoritative_daily_code_count": 0,
+        "status": "NONE_AFTER_AUTHORIZED_TRANSITION_FILTER",
+        "unproven_source_missingness_count": 0,
+    }
+
+
+@pytest.mark.parametrize("field", ["turnover_rate_f", "free_share"])
+def test_transition_overlap_factor_conflict_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    daily = _daily_authority()
+    first = daily.partitions[0]
+    first_with_backfill = replace(
+        first,
+        ts_codes=tuple(sorted((*first.ts_codes, "302132.SZ"))),
+    )
+    daily = replace(
+        daily,
+        daily_table_rows=9,
+        partitions=(first_with_backfill, daily.partitions[1]),
+    )
+    partitions = {item.trade_date: _daily_basic_partition(item) for item in daily.partitions}
+    first_basic = partitions[first.trade_date]
+    successor = next(row for row in first_basic.rows if row.ts_code == "302132.SZ")
+    conflicting = replace(
+        successor,
+        **{field: getattr(successor, field) + 0.25},
+    )
+    partitions[first.trade_date] = replace(
+        first_basic,
+        rows=tuple(
+            conflicting if row.ts_code == successor.ts_code else row for row in first_basic.rows
+        ),
+    )
+    _install_authorities(
+        monkeypatch,
+        daily=daily,
+        daily_basic_by_date=partitions,
+    )
+    kwargs = _kwargs(tmp_path, daily)
+
+    with pytest.raises(ValueError, match=field):
+        authority.publish_daily_basic_exact_set_coverage(**kwargs)
+
+    assert not list(kwargs["output_root"].rglob("*.json"))
 
 
 def test_publication_is_content_addressed_and_idempotent(
