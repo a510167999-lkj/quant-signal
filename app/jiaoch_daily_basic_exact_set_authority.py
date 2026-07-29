@@ -8,9 +8,11 @@ import hashlib
 import hmac
 import json
 import math
+import os
 from pathlib import Path
 import re
 from typing import Any, Mapping, Sequence
+import uuid
 
 from app import jiaoch_points_collection_set as points_collection
 from app import jiaoch_points_raw_authority as raw_authority
@@ -39,7 +41,7 @@ _MAX_RAW_BODY_BYTES = 32 * 1024 * 1024
 _MAX_PRODUCER_BYTES = 4 * 1024 * 1024
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _RECEIPT_PATH_PATTERN = re.compile(
-    r"daily_basic_exact_set_coverages/sha256/([0-9a-f]{2})/([0-9a-f]{64})\.json"
+    r"daily_basic_exact_set_coverage_candidates/sha256/([0-9a-f]{2})/([0-9a-f]{64})\.json"
 )
 _COLLECTION_PATH_PATTERN = re.compile(
     r"points_collection_sets/sha256/([0-9a-f]{2})/([0-9a-f]{64})\.json"
@@ -139,6 +141,7 @@ _RECEIPT_FIELDS = frozenset(
         "per_date_statistics",
         "per_date_statistics_sha256",
         "producer_binding",
+        "publication_capability_sha256",
         "production_profile_registered",
         "production_recommendation_eligible",
         "raw_source_rows_bound",
@@ -185,6 +188,15 @@ _POLICY_SHA256 = hashlib.sha256(
         allow_nan=False,
     ).encode("utf-8")
 ).hexdigest()
+_PRODUCER_FILES = (
+    "jiaoch_daily_basic_exact_set_authority.py",
+    "jiaoch_points_collection_set.py",
+    "jiaoch_points_raw_authority.py",
+    "jiaoch_points_response_normalization.py",
+    "research_pit_store.py",
+    "research_scope.py",
+    "research_security_code_transition.py",
+)
 
 
 @dataclass(frozen=True)
@@ -305,6 +317,18 @@ def _strict_nonnegative_int(value: Any, *, label: str) -> int:
     return value
 
 
+def _publication_capability(value: Any) -> str:
+    if type(value) is not str:
+        raise ValueError("daily_basic exact-set publication capability rejected")
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, ValueError):
+        raise ValueError("daily_basic exact-set publication capability rejected") from None
+    if parsed.version != 4 or str(parsed) != value:
+        raise ValueError("daily_basic exact-set publication capability rejected")
+    return value
+
+
 def _trade_date(value: Any, *, label: str = "trade_date") -> str:
     if type(value) is not str:
         raise ValueError(f"{label} rejected")
@@ -355,16 +379,23 @@ def _segment_counts(codes: Sequence[str]) -> dict[str, int]:
 
 
 def _producer_binding() -> dict[str, Any]:
-    source = raw_authority._read_safe_file(
-        Path(__file__),
-        label="daily_basic exact-set producer source",
-        max_bytes=_MAX_PRODUCER_BYTES,
+    source_root = raw_authority._safe_existing_directory(
+        Path(__file__).parent,
+        "daily_basic exact-set producer root",
     )
+    entries = []
+    for filename in _PRODUCER_FILES:
+        source = raw_authority._read_safe_file(
+            source_root / filename,
+            label="daily_basic exact-set producer source",
+            max_bytes=_MAX_PRODUCER_BYTES,
+        )
+        entries.append({"path": f"app/{filename}", "sha256": _sha256(source)})
     identity = {
+        "entries": entries,
         "policy_sha256": _POLICY_SHA256,
-        "producer_source_sha256": _sha256(source),
         "producer_version": PRODUCER_VERSION,
-        "schema": "jiaoch-daily-basic-exact-set-producer/v1",
+        "schema": "jiaoch-daily-basic-exact-set-producer/v2",
     }
     return {**identity, "root_sha256": _canonical_sha256(identity)}
 
@@ -644,10 +675,12 @@ def _transition_filter_codes(
     *,
     trade_date: str,
     transitions_by_code: Mapping[str, Mapping[str, Any]],
+    source_label: str,
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     filtered: list[str] = []
     identities: list[str] = []
     excluded: list[str] = []
+    source_codes = set(codes)
     for code in codes:
         descriptor = transitions_by_code.get(code)
         if descriptor is None:
@@ -660,6 +693,10 @@ def _transition_filter_codes(
             else str(descriptor["successor_ts_code"])
         )
         if code != expected:
+            if expected not in source_codes:
+                raise ValueError(
+                    f"{source_label} transition wrong-period alias lacks correct counterpart"
+                )
             excluded.append(code)
             continue
         filtered.append(code)
@@ -760,7 +797,12 @@ def _derive_receipt(
     collection_set_refs: Sequence[Mapping[str, Any]],
     security_code_transition_evidence_root: str | Path,
     expected_security_code_transition_contract_sha256: str,
+    publication_capability_sha256: str,
 ) -> dict[str, Any]:
+    capability_sha256 = _sha256_text(
+        publication_capability_sha256,
+        label="daily_basic exact-set publication capability sha256",
+    )
     daily = _load_audited_daily_authority(
         audited_universe_sqlite_path=audited_universe_sqlite_path,
         expected_coverage_audit_sha256=expected_coverage_audit_sha256,
@@ -809,11 +851,13 @@ def _derive_receipt(
             daily_raw_codes,
             trade_date=session,
             transitions_by_code=transitions_by_code,
+            source_label="authoritative daily",
         )
         basic_filtered, basic_identities, basic_excluded = _transition_filter_codes(
             basic_raw_codes,
             trade_date=session,
             transitions_by_code=transitions_by_code,
+            source_label="daily_basic",
         )
         missing = sorted(set(daily_filtered) - set(basic_filtered))
         extra = sorted(set(basic_filtered) - set(daily_filtered))
@@ -967,6 +1011,7 @@ def _derive_receipt(
         "per_date_statistics": per_date,
         "per_date_statistics_sha256": per_date_root,
         "producer_binding": producer,
+        "publication_capability_sha256": capability_sha256,
         "production_profile_registered": False,
         "production_recommendation_eligible": False,
         "raw_source_rows_bound": True,
@@ -1240,6 +1285,10 @@ def _validate_receipt_payload(payload: Any) -> dict[str, Any]:
     unsigned = {key: value for key, value in payload.items() if key != "authority_root_sha256"}
     if not hmac.compare_digest(_canonical_sha256(unsigned), authority_root):
         raise ValueError("daily_basic exact-set authority root rejected")
+    _sha256_text(
+        payload.get("publication_capability_sha256"),
+        label="daily_basic exact-set publication capability sha256",
+    )
     dates = payload.get("trade_dates")
     count = payload.get("trade_date_count")
     if (
@@ -1301,17 +1350,36 @@ def _receipt_path(
     )
 
 
-def _rollback_created_receipt(path: Path, expected_raw: bytes) -> None:
-    existing = raw_authority._read_safe_file(
-        path,
-        label="daily_basic exact-set rollback receipt",
-        max_bytes=len(expected_raw),
-        expected_size=len(expected_raw),
+def _write_receipt_candidate_create_only(path: Path, raw: bytes) -> bool:
+    parent = raw_authority._safe_existing_directory(
+        path.parent,
+        "daily_basic exact-set candidate parent",
     )
-    if not hmac.compare_digest(existing, expected_raw):
-        raise ValueError("daily_basic exact-set rollback identity rejected")
-    path.unlink()
-    raw_authority.fsync_directory(path.parent)
+    if parent / path.name != path or type(raw) is not bytes:
+        raise ValueError("daily_basic exact-set candidate input rejected")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        raw_authority._safe_existing_file(
+            path,
+            "daily_basic exact-set candidate",
+        )
+        raise ValueError("daily_basic exact-set candidate content-address conflict") from None
+    try:
+        handle = os.fdopen(descriptor, "wb")
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+    with handle:
+        handle.write(raw)
+        handle.flush()
+        os.fsync(handle.fileno())
+    raw_authority.fsync_directory(parent)
+    return True
 
 
 def publish_daily_basic_exact_set_coverage(
@@ -1329,6 +1397,8 @@ def publish_daily_basic_exact_set_coverage(
 ) -> dict[str, Any]:
     """Publish a development-only exact-set receipt without network or secrets."""
 
+    publication_capability = str(uuid.uuid4())
+    publication_capability_sha256 = _sha256(publication_capability.encode("utf-8"))
     receipt = _derive_receipt(
         audited_universe_sqlite_path=audited_universe_sqlite_path,
         expected_coverage_audit_sha256=expected_coverage_audit_sha256,
@@ -1341,6 +1411,7 @@ def publish_daily_basic_exact_set_coverage(
         expected_security_code_transition_contract_sha256=(
             expected_security_code_transition_contract_sha256
         ),
+        publication_capability_sha256=publication_capability_sha256,
     )
     _validate_receipt_payload(receipt)
     raw = _canonical_json(receipt)
@@ -1353,46 +1424,36 @@ def publish_daily_basic_exact_set_coverage(
     )
     directory = raw_authority._content_addressed_directory(
         root,
-        "daily_basic_exact_set_coverages",
+        "daily_basic_exact_set_coverage_candidates",
         digest,
     )
     path = directory / f"{digest}.json"
-    relative_path = f"daily_basic_exact_set_coverages/sha256/{digest[:2]}/{digest}.json"
-    created = False
-    try:
-        created = raw_authority._write_create_only(
-            path,
-            raw,
-            label="daily_basic exact-set receipt",
-            reuse_identical=True,
-        )
-        verify_daily_basic_exact_set_coverage(
-            audited_universe_sqlite_path=audited_universe_sqlite_path,
-            expected_coverage_audit_sha256=expected_coverage_audit_sha256,
-            expected_artifact_root_sha256=expected_artifact_root_sha256,
-            expected_temporal_contract_sha256=expected_temporal_contract_sha256,
-            expected_temporal_role=expected_temporal_role,
-            points_output_root=points_output_root,
-            security_code_transition_evidence_root=(security_code_transition_evidence_root),
-            expected_security_code_transition_contract_sha256=(
-                expected_security_code_transition_contract_sha256
-            ),
-            output_root=output_root,
-            receipt_relative_path=relative_path,
-            expected_receipt_sha256=digest,
-        )
-    except BaseException:
-        if created:
-            try:
-                _rollback_created_receipt(path, raw)
-            except Exception:
-                raise ValueError("daily_basic exact-set rollback failed") from None
-        raise
+    relative_path = f"daily_basic_exact_set_coverage_candidates/sha256/{digest[:2]}/{digest}.json"
+    created = _write_receipt_candidate_create_only(path, raw)
+    verify_daily_basic_exact_set_coverage(
+        audited_universe_sqlite_path=audited_universe_sqlite_path,
+        expected_coverage_audit_sha256=expected_coverage_audit_sha256,
+        expected_artifact_root_sha256=expected_artifact_root_sha256,
+        expected_temporal_contract_sha256=expected_temporal_contract_sha256,
+        expected_temporal_role=expected_temporal_role,
+        points_output_root=points_output_root,
+        security_code_transition_evidence_root=(security_code_transition_evidence_root),
+        expected_security_code_transition_contract_sha256=(
+            expected_security_code_transition_contract_sha256
+        ),
+        output_root=output_root,
+        receipt_relative_path=relative_path,
+        expected_receipt_sha256=digest,
+        publication_capability=publication_capability,
+    )
     return {
         "authority_root_sha256": receipt["authority_root_sha256"],
+        "publication_capability": publication_capability,
+        "publication_status": "DURABLE_POSTVERIFIED_AND_RETURNED",
         "receipt_created": created,
         "receipt_relative_path": relative_path,
         "receipt_sha256": digest,
+        "schema": "daily-basic-exact-set-publication/v1",
     }
 
 
@@ -1409,9 +1470,12 @@ def verify_daily_basic_exact_set_coverage(
     output_root: str | Path,
     receipt_relative_path: str,
     expected_receipt_sha256: str,
+    publication_capability: str,
 ) -> dict[str, Any]:
     """Replay every bound input and verify one content-addressed receipt offline."""
 
+    capability = _publication_capability(publication_capability)
+    capability_sha256 = _sha256(capability.encode("utf-8"))
     root = raw_authority._safe_existing_directory(
         Path(output_root),
         "daily_basic exact-set output root",
@@ -1432,6 +1496,11 @@ def verify_daily_basic_exact_set_coverage(
     if not hmac.compare_digest(raw, _canonical_json(payload)):
         raise ValueError("daily_basic exact-set receipt canonical form rejected")
     _validate_receipt_payload(payload)
+    if not hmac.compare_digest(
+        payload["publication_capability_sha256"],
+        capability_sha256,
+    ):
+        raise ValueError("daily_basic exact-set publication capability rejected")
     refs = [
         {
             "collection_set_relative_path": item["collection_set_relative_path"],
@@ -1452,6 +1521,7 @@ def verify_daily_basic_exact_set_coverage(
         expected_security_code_transition_contract_sha256=(
             expected_security_code_transition_contract_sha256
         ),
+        publication_capability_sha256=capability_sha256,
     )
     if not hmac.compare_digest(_canonical_json(replay), _canonical_json(payload)):
         raise ValueError("daily_basic exact-set receipt replay descriptor mismatch")
