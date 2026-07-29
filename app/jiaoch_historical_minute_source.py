@@ -32,6 +32,7 @@ _HEX = frozenset("0123456789abcdef")
 _CLASSIFICATIONS = frozenset(
     {
         "PERMISSION_DENIED",
+        "RATE_LIMITED_CONCURRENCY",
         "SCHEMA_UNBOUND",
         "SOURCE_ERROR",
         "RESPONSE_REJECTED",
@@ -67,6 +68,22 @@ _UNSIGNED_FIELDS = frozenset(
         "production_recommendation_eligible",
     }
 )
+
+
+def _provider_classification(code: int, message: Any) -> str:
+    if code == 0:
+        return "SCHEMA_UNBOUND"
+    if code != -1 or not isinstance(message, str):
+        return "SOURCE_ERROR"
+    if "权限不足" in message or "鏉冮檺涓嶈冻" in message:
+        return "PERMISSION_DENIED"
+    if (
+        "并发请求过多" in message
+        and ("上限2个" in message or "上限 2 个" in message)
+        and ("秒后自动恢复" in message or "请稍后重试" in message)
+    ):
+        return "RATE_LIMITED_CONCURRENCY"
+    return "SOURCE_ERROR"
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -353,13 +370,7 @@ def _response_manifest(
             response_body_sha256=response_sha256,
             provider_code=None,
         )
-    message = envelope.get("msg")
-    if code == -1 and isinstance(message, str) and "权限不足" in message:
-        classification = "PERMISSION_DENIED"
-    elif code == 0:
-        classification = "SCHEMA_UNBOUND"
-    else:
-        classification = "SOURCE_ERROR"
+    classification = _provider_classification(code, envelope.get("msg"))
     return _base_manifest(
         request_semantics=request_semantics,
         retrieved_at=retrieved_at,
@@ -471,6 +482,8 @@ def verify_jiaoch_historical_minute_diagnostic(
     classification = payload["classification"]
     valid_entity = status == 200 and complete is True and within is True
     if classification == "PERMISSION_DENIED":
+        valid = valid_entity and code == -1 and body_sha is not None
+    elif classification == "RATE_LIMITED_CONCURRENCY":
         valid = valid_entity and code == -1 and body_sha is not None
     elif classification == "SCHEMA_UNBOUND":
         valid = valid_entity and code == 0 and body_sha is not None
