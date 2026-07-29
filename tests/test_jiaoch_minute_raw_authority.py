@@ -534,6 +534,36 @@ def test_offline_verifier_rejects_identity_swap_between_preflight_and_open(
     assert swapped is True
 
 
+def test_offline_verifier_rejects_hardlink_added_after_final_descriptor_stat(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    publication = _publish(tmp_path)
+    raw_path = (tmp_path / publication["raw_relative_path"]).resolve()
+    hardlink = tmp_path / "late-raw-hardlink.body"
+    original_fstat = os.fstat
+    target_fstats = 0
+
+    def linking_fstat(descriptor):
+        nonlocal target_fstats
+        metadata = original_fstat(descriptor)
+        if os.path.samestat(metadata, raw_path.lstat()):
+            target_fstats += 1
+            if target_fstats == 2:
+                os.link(raw_path, hardlink)
+        return metadata
+
+    monkeypatch.setattr(os, "fstat", linking_fstat)
+
+    with pytest.raises(ValueError, match="link|reparse"):
+        verify_jiaoch_minute_raw_attempt(
+            output_root=tmp_path,
+            attempt_relative_path=publication["attempt_relative_path"],
+            expected_attempt_sha256=publication["attempt_sha256"],
+        )
+    assert hardlink.exists()
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

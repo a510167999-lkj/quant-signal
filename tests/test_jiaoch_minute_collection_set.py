@@ -594,6 +594,36 @@ def test_offline_verifier_rejects_simulated_manifest_reparse(
         )
 
 
+def test_offline_verifier_rejects_manifest_hardlink_added_after_final_stat(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    publication, _, _, _ = _collect(tmp_path, monkeypatch)
+    manifest_path = (tmp_path / publication["collection_set_relative_path"]).resolve()
+    hardlink = tmp_path / "late-manifest-hardlink.json"
+    original_fstat = os.fstat
+    target_fstats = 0
+
+    def linking_fstat(descriptor):
+        nonlocal target_fstats
+        metadata = original_fstat(descriptor)
+        if os.path.samestat(metadata, manifest_path.lstat()):
+            target_fstats += 1
+            if target_fstats == 2:
+                os.link(manifest_path, hardlink)
+        return metadata
+
+    monkeypatch.setattr(os, "fstat", linking_fstat)
+
+    with pytest.raises(ValueError, match="link|reparse"):
+        verify_jiaoch_minute_collection_set(
+            output_root=tmp_path,
+            collection_set_relative_path=publication["collection_set_relative_path"],
+            expected_collection_set_sha256=publication["collection_set_sha256"],
+        )
+    assert hardlink.exists()
+
+
 def test_rehashed_attempt_request_swap_is_rejected_by_collection_verifier(
     tmp_path: Path,
     monkeypatch,
