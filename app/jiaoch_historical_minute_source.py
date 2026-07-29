@@ -28,6 +28,7 @@ _MAX_BODY_BYTES = 1024 * 1024
 _MAX_DIAGNOSTIC_BYTES = 128 * 1024
 _MAX_JSON_NESTING_DEPTH = 64
 _TS_CODE_PATTERN = re.compile(r"[0-9]{6}\.(?:SH|SZ)")
+_CONCURRENCY_LIMIT_PATTERN = re.compile(r"上限\s*2\s*个")
 _HEX = frozenset("0123456789abcdef")
 _CLASSIFICATIONS = frozenset(
     {
@@ -79,7 +80,7 @@ def _provider_classification(code: int, message: Any) -> str:
         return "PERMISSION_DENIED"
     if (
         "并发请求过多" in message
-        and ("上限2个" in message or "上限 2 个" in message)
+        and _CONCURRENCY_LIMIT_PATTERN.search(message) is not None
         and ("秒后自动恢复" in message or "请稍后重试" in message)
     ):
         return "RATE_LIMITED_CONCURRENCY"
