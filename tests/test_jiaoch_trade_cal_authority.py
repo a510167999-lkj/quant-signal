@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import uuid
 
 import pytest
 
@@ -316,7 +317,47 @@ def test_public_entrypoint_and_offline_verifier_have_no_secret_transport_or_cloc
         "output_root",
         "authority_manifest_relative_path",
         "expected_authority_manifest_sha256",
+        "publication_capability",
     }
+
+
+def test_only_returned_unpersisted_capability_promotes_candidate_to_authority(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    publication, _, _ = _collect(tmp_path, monkeypatch)
+    capability = publication["publication_capability"]
+    manifest = _manifest(tmp_path, publication)
+
+    assert publication["schema"] == "jiaoch-trade-cal-authority-publication/v1"
+    assert publication["publication_status"] == "DURABLE_POSTVERIFIED_AND_RETURNED"
+    assert publication["authority_manifest_relative_path"].startswith(
+        "trade_cal_manifest_candidates/sha256/"
+    )
+    assert manifest["calendar_authority_status"] == (
+        "NOT_GRANTED_WITHOUT_RETURNED_PUBLICATION_CAPABILITY"
+    )
+    assert (
+        manifest["publication_capability_sha256"] == hashlib.sha256(capability.encode()).hexdigest()
+    )
+    persisted = b"\n".join(path.read_bytes() for path in tmp_path.rglob("*") if path.is_file())
+    assert capability.encode() not in persisted
+    assert (
+        verify_jiaoch_trade_cal_authority(
+            output_root=tmp_path,
+            authority_manifest_relative_path=publication["authority_manifest_relative_path"],
+            expected_authority_manifest_sha256=publication["authority_manifest_sha256"],
+            publication_capability=capability,
+        )["calendar_authority_status"]
+        == "VERIFIED_SINGLE_SEALED_CALL"
+    )
+    with pytest.raises(ValueError, match="capability"):
+        verify_jiaoch_trade_cal_authority(
+            output_root=tmp_path,
+            authority_manifest_relative_path=publication["authority_manifest_relative_path"],
+            expected_authority_manifest_sha256=publication["authority_manifest_sha256"],
+            publication_capability=str(uuid.uuid4()),
+        )
 
 
 def test_internal_utc_clock_runs_once_before_transport_and_is_shared_by_all_artifacts(
