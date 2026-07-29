@@ -101,15 +101,18 @@ def _assert_public_descriptions_are_secret_free(
 def test_policy_is_one_deeply_immutable_versioned_routing_source() -> None:
     policy = jiaoch_credential_slots._POLICY
     assert policy.schema == "jiaoch-credential-routing-policy/v1"
-    assert tuple(
-        (
-            route.route_id,
-            route.credential_slot_id,
-            route.api_name,
-            route.purpose,
+    assert (
+        tuple(
+            (
+                route.route_id,
+                route.credential_slot_id,
+                route.api_name,
+                route.purpose,
+            )
+            for route in policy.routes
         )
-        for route in policy.routes
-    ) == ROUTE_MATRIX
+        == ROUTE_MATRIX
+    )
     assert jiaoch_credential_slots._POLICY_SHA256 == POLICY_SHA256
     assert jiaoch_credential_slots._ROUTES_BY_ID == {
         route.route_id: route for route in policy.routes
@@ -120,6 +123,8 @@ def test_policy_is_one_deeply_immutable_versioned_routing_source() -> None:
         policy.routes[0].api_name = "daily"
     with pytest.raises(TypeError):
         policy.routes[0] = policy.routes[1]
+    with pytest.raises(TypeError):
+        jiaoch_credential_slots._ROUTES_BY_ID["other"] = policy.routes[0]
 
 
 def test_factory_resolves_each_slot_once_and_public_surface_never_returns_credentials() -> None:
@@ -138,9 +143,7 @@ def test_factory_resolves_each_slot_once_and_public_surface_never_returns_creden
     live["historical-minute"] = "rotated-minute"
 
     assert calls == ["points-primary", "historical-minute"]
-    assert {name for name in dir(generation) if not name.startswith("_")} == {
-        "describe_slots"
-    }
+    assert {name for name in dir(generation) if not name.startswith("_")} == {"describe_slots"}
     assert not hasattr(generation, "credential_for_points_api")
     assert not hasattr(generation, "credential_for_historical_minute_api")
     assert not hasattr(generation, "credential_for_calibration_daily")
@@ -150,6 +153,19 @@ def test_factory_resolves_each_slot_once_and_public_surface_never_returns_creden
     assert inspect.signature(generation.describe_slots).parameters == {}
     _assert_public_descriptions_are_secret_free(generation)
     assert calls == ["points-primary", "historical-minute"]
+
+
+def test_private_route_hook_is_not_exported_and_rejects_external_capability() -> None:
+    assert "_credential_for_route" not in jiaoch_credential_slots.__all__
+    signature = inspect.signature(jiaoch_credential_slots._credential_for_route)
+    assert set(signature.parameters) == {"generation", "route_id", "capability"}
+    generation = create_jiaoch_credential_generation(environment_snapshot=_snapshot())
+    with pytest.raises(ValueError, match="private route capability"):
+        jiaoch_credential_slots._credential_for_route(
+            generation,
+            route_id="points-primary:daily_basic",
+            capability=object(),
+        )
 
 
 def test_environment_snapshot_is_copied_without_live_environment_access() -> None:
@@ -244,9 +260,7 @@ def test_source_failures_are_normalized_without_secret_exception_context(
     error = caught.value
     assert error.__context__ is None
     assert error.__cause__ is None
-    formatted = "".join(
-        traceback.format_exception(type(error), error, error.__traceback__)
-    )
+    formatted = "".join(traceback.format_exception(type(error), error, error.__traceback__))
     _assert_text_is_secret_free(error)
     _assert_text_is_secret_free(formatted)
 
