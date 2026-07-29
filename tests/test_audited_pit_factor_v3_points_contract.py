@@ -176,15 +176,15 @@ def test_contract_freezes_scope_lag_features_arms_and_safety_gate() -> None:
     assert FACTOR_V3_POINTS_CONTRACT["production_recommendation_eligible"] is False
     assert canonical_sha256(FACTOR_V3_POINTS_CONTRACT) == (FACTOR_V3_POINTS_CONTRACT_SHA256)
     assert FACTOR_V3_POINTS_PARENT_EXPECTATION_SHA256 == (
-        "5267707efcbee9088fd44ddc44f68bb686982d75b97514a091db79620e7b289f"
+        "25f2802cfa11fa61a3e08f44886141bd82c01c89e7d9ee01a3e882b8a3561c99"
     )
     assert FACTOR_V3_POINTS_CONTRACT_SHA256 == (
-        "ab34593e75abad87e41ab82b2961a4cb7177d4d3568cf605b7afa2d227699245"
+        "935567d770aa61491d0fbcac30646d2f608d733a172a8eb8d7b512549fc1c2a2"
     )
     assert dict(FACTOR_V3_POINTS_ARM_STRATEGY_SHA256) == {
-        "control": "f72026779fb336825ead11b10a0b8ea91e102ea667b9a5082d2c9c8b2c534483",
-        "turnover_level": "363a7e8a4a99aa8c3645bcba62dcd4c69da05c48b7fe365de88887dab813f7c8",
-        "abnormal_turnover": "87d75a57de221b2d66e52ab378da60ba270d348419a640eb6594a240837f5cc0",
+        "control": "89e073cf9563cba4182f417715d2a7e251634f349507deccf14fcfbfd93ead51",
+        "turnover_level": "1e07097c4bab1b30ba161a9d348d0a2b3bc7cb9116277edef1d6d3f528a79bd7",
+        "abnormal_turnover": "66426217dd68a4c9421d2970f1481fbed6247122c84b3e8df69a0fec1207b7c7",
     }
 
 

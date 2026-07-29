@@ -54,7 +54,7 @@ def canonical_sha256(value: Any) -> str:
 
 
 _FACTOR_V3_POINTS_PARENT_EXPECTATION = {
-    "schema_version": "audited-pit-factor-v3-points-parent-expectation/v1",
+    "schema_version": "audited-pit-factor-v3-points-parent-expectation/v2",
     "sample_reference": "factor_v2_development_4_common_eligible_sample",
     "factor_v2_parent_artifact_sha256": (
         "9cff7474222360ed830d0f24164864dcb946695464467c8be9ccc5dda2b33469"
@@ -62,18 +62,36 @@ _FACTOR_V3_POINTS_PARENT_EXPECTATION = {
     "factor_v2_parent_manifest_file_sha256": (
         "b8b0ef670b00742f5ccb9aaa5a7535b55590c22ecebc8fa70f82b6f12816d5b5"
     ),
+    "factor_v2_common_eligible_overlay_artifact_sha256": (
+        "abd4b2166da4520952d7bfc5c8a988bc0a8027dd576a90ae0fdda2560b3a02f8"
+    ),
+    "factor_v2_common_eligible_overlay_manifest_file_sha256": (
+        "9131f15e13f247a4663fae658af544b94bf2af01a3494b8eb0a3d0c095ee1312"
+    ),
     "factor_v2_points_predecessor_spec_sha256": (
         "685487c7159a6f0e9748bb46265b93d4c86f4a9dc7dc734beac2c267547a2cdf"
     ),
-    "parent_feature_row_count": 1_796_835,
-    "parent_feature_rows_sha256": (
+    "factor_v2_common_eligible_receipt_sha256": (
+        "86199759116362c6317db7ca73b78dc56c9adaada57c2661a4b33028be44db4d"
+    ),
+    "original_parent_feature_row_count": 1_796_835,
+    "original_parent_feature_rows_sha256": (
         "7cbd9bfe61052f87d736f6a7d14fdc1ad350ce66add98347ea36d9c2ed48b337"
+    ),
+    "all_candidate_keys_sha256": (
+        "ffed3b95e3b31803c7e993af06cf155e42c379590a41c919989e31d5cf374acd"
     ),
     "common_eligible_candidate_count": 1_796_834,
     "common_eligible_candidate_keys_sha256": (
         "ded45539b436764ee9c8bf45329105444a735e46f56fa90d7521a40ce9538544"
     ),
+    "common_eligible_source_feature_rows_sha256": (
+        "62f02c3d3b068f50b95d29a06a218e58dd72693113081570ded95ae73d7ec59f"
+    ),
     "preregistered_suspension_excluded_candidate_count": 1,
+    "preregistered_suspension_excluded_candidate_keys_sha256": (
+        "a2149f2a5de78780459652aaf64bcb940ab2ad7631dd3260007f1ad1ec1ab18a"
+    ),
     "sessions": {
         "count": 483,
         "start": "2024-07-05",
@@ -82,7 +100,7 @@ _FACTOR_V3_POINTS_PARENT_EXPECTATION = {
     },
 }
 FACTOR_V3_POINTS_PARENT_EXPECTATION_SHA256 = (
-    "5267707efcbee9088fd44ddc44f68bb686982d75b97514a091db79620e7b289f"
+    "25f2802cfa11fa61a3e08f44886141bd82c01c89e7d9ee01a3e882b8a3561c99"
 )
 if (
     canonical_sha256(_FACTOR_V3_POINTS_PARENT_EXPECTATION)
@@ -99,10 +117,53 @@ FACTOR_V3_POINTS_CONTRACT = {
     "preregistered_parent_expectation_sha256": (FACTOR_V3_POINTS_PARENT_EXPECTATION_SHA256),
     "formal_parent_sample_policy": {
         "identity_fields": ["candidate_key", "signal_date"],
-        "coverage": "exact_full_parent",
+        "source_sample_reference": "factor_v2_development_4_common_eligible_sample",
+        "source_candidate_count": 1_796_834,
+        "source_candidate_keys_sha256": (
+            "ded45539b436764ee9c8bf45329105444a735e46f56fa90d7521a40ce9538544"
+        ),
+        "source_feature_rows_sha256": (
+            "62f02c3d3b068f50b95d29a06a218e58dd72693113081570ded95ae73d7ec59f"
+        ),
+        "coverage": "deterministic_history_eligible_subset_of_common_eligible_parent",
+        "same_history_eligible_subset_for_all_arms": True,
         "arbitrary_row_drops_permitted": False,
-        "missing_points_history_policy": "fail_closed",
-        "output_identity_must_equal_parent_identity": True,
+        "silent_row_drops_permitted": False,
+        "zero_fill_permitted": False,
+        "missing_points_history_policy": (
+            "exclude_only_with_preregistered_reason_and_content_addressed_authority_evidence"
+        ),
+        "output_identity_must_equal_history_eligible_subset_identity": True,
+        "history_eligible_subset_policy": {
+            "schema_version": (
+                "audited-pit-factor-v3-points-history-eligible-subset-policy/v1"
+            ),
+            "selection": (
+                "deterministic_fail_closed_from_verified_source_bound_authorities"
+            ),
+            "minimum_prior_market_sessions": 250,
+            "latest_usable_source_session": "T-1",
+            "allowed_exclusion_reasons": [
+                "listing_history_less_than_250_authoritative_market_sessions",
+                "authoritative_suspension_in_required_history_window",
+                (
+                    "authoritative_daily_cross_section_row_missing_in_"
+                    "required_history_window"
+                ),
+            ],
+            "exclusion_record_identity_fields": [
+                "candidate_key",
+                "reason",
+                "authority_evidence_root_sha256",
+            ],
+            "excluded_candidate_count_required": True,
+            "excluded_candidate_keys_sha256_required": True,
+            "exclusion_reason_rows_sha256_required": True,
+            "eligible_candidate_count_required": True,
+            "eligible_candidate_keys_sha256_required": True,
+            "eligible_identity_rows_sha256_required": True,
+            "unrecognized_or_unproven_missingness_policy": "fail_closed",
+        },
     },
     "sources": {
         "daily_basic": {
@@ -220,16 +281,16 @@ FACTOR_V3_POINTS_CONTRACT = {
     "production_recommendation_eligible": False,
 }
 FACTOR_V3_POINTS_CONTRACT_SHA256 = (
-    "ab34593e75abad87e41ab82b2961a4cb7177d4d3568cf605b7afa2d227699245"
+    "935567d770aa61491d0fbcac30646d2f608d733a172a8eb8d7b512549fc1c2a2"
 )
 if canonical_sha256(FACTOR_V3_POINTS_CONTRACT) != FACTOR_V3_POINTS_CONTRACT_SHA256:
     raise RuntimeError("frozen factor-v3 points contract drifted")
 
 FACTOR_V3_POINTS_ARM_STRATEGY_SHA256: Mapping[str, str] = MappingProxyType(
     {
-        "control": ("f72026779fb336825ead11b10a0b8ea91e102ea667b9a5082d2c9c8b2c534483"),
-        "turnover_level": ("363a7e8a4a99aa8c3645bcba62dcd4c69da05c48b7fe365de88887dab813f7c8"),
-        "abnormal_turnover": ("87d75a57de221b2d66e52ab378da60ba270d348419a640eb6594a240837f5cc0"),
+        "control": ("89e073cf9563cba4182f417715d2a7e251634f349507deccf14fcfbfd93ead51"),
+        "turnover_level": ("1e07097c4bab1b30ba161a9d348d0a2b3bc7cb9116277edef1d6d3f528a79bd7"),
+        "abnormal_turnover": ("66426217dd68a4c9421d2970f1481fbed6247122c84b3e8df69a0fec1207b7c7"),
     }
 )
 
