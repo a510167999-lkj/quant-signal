@@ -4,6 +4,7 @@ from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
+import threading
 from typing import Any, Callable
 
 import pytest
@@ -411,6 +412,70 @@ def test_only_one_distinct_trial_and_same_key_reuses_exact_result(
             phase_two_runner=runner,
         )
     assert calls == ["run"]
+
+
+def test_concurrent_same_key_waits_and_reuses_without_rerunning_phase_two(
+    tmp_path: Path,
+) -> None:
+    descriptor, _, _ = _fixture(tmp_path / "receipt")
+    claims = tmp_path / "claims"
+    phase_two_started = threading.Event()
+    release_phase_two = threading.Event()
+    second_finished = threading.Event()
+    calls = 0
+    results: dict[str, dict[str, Any]] = {}
+    errors: dict[str, BaseException] = {}
+
+    def runner(
+        verified: dict[str, Any],
+        claim: dict[str, Any],
+    ) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        phase_two_started.set()
+        assert release_phase_two.wait(timeout=5)
+        return _safe_result(
+            claim_key=claim["claim_key"],
+            evaluation_artifact_sha256=verified[
+                "evaluation_artifact_sha256"
+            ],
+        )
+
+    def activate(name: str) -> None:
+        try:
+            results[name] = activate_low_rvol_overlay(
+                descriptor,
+                claim_directory=claims,
+                phase_two_runner=runner,
+            )
+        except BaseException as exc:
+            errors[name] = exc
+        finally:
+            if name == "second":
+                second_finished.set()
+
+    first = threading.Thread(target=activate, args=("first",))
+    second = threading.Thread(target=activate, args=("second",))
+    first.start()
+    assert phase_two_started.wait(timeout=5)
+    second.start()
+    try:
+        assert second_finished.wait(timeout=0.2) is False
+    finally:
+        release_phase_two.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+    assert first.is_alive() is False
+    assert second.is_alive() is False
+    assert errors == {}
+    assert calls == 1
+    assert results["first"]["reused"] is False
+    assert results["second"]["reused"] is True
+    assert results["second"]["result"] == results["first"]["result"]
+    assert results["second"]["result_sha256"] == (
+        results["first"]["result_sha256"]
+    )
 
 
 def test_fixed_formula_sorting_and_top3_use_original_low_vol_factor() -> None:
