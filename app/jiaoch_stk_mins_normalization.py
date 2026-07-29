@@ -44,7 +44,7 @@ _FIELDS = [
 _SUPPORTED_BOARD_PATTERNS = {
     "SSE_MAIN": re.compile(r"(?:600|601|603|605)[0-9]{3}\.SH"),
     "SZSE_MAIN": re.compile(r"(?:000|001|002|003)[0-9]{3}\.SZ"),
-    "SZSE_CHINEXT": re.compile(r"(?:300|301)[0-9]{3}\.SZ"),
+    "SZSE_CHINEXT": re.compile(r"(?:300|301|302)[0-9]{3}\.SZ"),
 }
 _MAX_RESPONSE_BYTES = 1024 * 1024
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
