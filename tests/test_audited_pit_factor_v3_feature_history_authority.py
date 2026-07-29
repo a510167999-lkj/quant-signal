@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 import sys
 from types import SimpleNamespace
@@ -25,7 +26,7 @@ from app.research_pit_collector import (
     HttpEntityResponse,
     build_bak_basic_specs,
 )
-from app.research_pit_store import NORMALIZED_FIELDS, PITReceiptStore
+from app.research_pit_store import PITReceiptStore
 from app.research_security_code_transition import (
     SECURITY_CODE_TRANSITION_CONTRACT_SHA256,
 )
@@ -446,10 +447,20 @@ def _independent_session_refs(
     return output
 
 
-def _finalize_store(store: PITReceiptStore) -> str:
+def _finalize_store(store: PITReceiptStore) -> tuple[PITReceiptStore, str]:
     with sqlite3.connect(store.database_path) as connection:
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    return _file_sha256(Path(store.database_path))
+    sealed_root = Path(store.root).with_name(f"{Path(store.root).name}-sealed")
+    shutil.copytree(
+        store.root,
+        sealed_root,
+        ignore=shutil.ignore_patterns("*-wal", "*-shm"),
+    )
+    sealed = PITReceiptStore.__new__(PITReceiptStore)
+    sealed.root = sealed_root
+    sealed.raw_root = sealed_root / "raw"
+    sealed.database_path = sealed_root / "metadata.sqlite3"
+    return sealed, _file_sha256(Path(sealed.database_path))
 
 
 def _real_store_fixture(
@@ -485,7 +496,8 @@ def _real_store_fixture(
                 vintage="historical_backfill",
             )
     refs = _independent_session_refs(store, reports, sessions)
-    return plan, publication, sessions, store, refs, _finalize_store(store)
+    sealed, database_sha256 = _finalize_store(store)
+    return plan, publication, sessions, sealed, refs, database_sha256
 
 
 def _verify_source_bound(
