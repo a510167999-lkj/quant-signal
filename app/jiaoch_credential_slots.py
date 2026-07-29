@@ -32,6 +32,7 @@ __all__ = (
     "POINTS_PRIMARY_ENV",
     "collect_jiaoch_historical_minute_collection_set",
     "collect_jiaoch_points_collection_set",
+    "collect_jiaoch_trade_cal_authority",
     "create_jiaoch_credential_generation",
 )
 
@@ -120,6 +121,38 @@ _POLICY_SHA256 = hashlib.sha256(
     ).encode("utf-8")
 ).hexdigest()
 
+_AUXILIARY_POLICY = _RoutingPolicy(
+    schema="jiaoch-credential-auxiliary-routing-policy/v1",
+    routes=(
+        _RoutePolicy(
+            route_id="auxiliary:points-primary:trade_cal",
+            credential_slot_id=_POINTS_PRIMARY_SLOT,
+            api_name="trade_cal",
+            purpose="exchange-calendar",
+        ),
+    ),
+)
+_AUXILIARY_ROUTES_BY_ID = MappingProxyType(
+    {route.route_id: route for route in _AUXILIARY_POLICY.routes}
+)
+_AUXILIARY_POLICY_SHA256 = hashlib.sha256(
+    json.dumps(
+        _policy_document(_AUXILIARY_POLICY),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+).hexdigest()
+
+
+def _auxiliary_policy_descriptor() -> dict[str, Any]:
+    return {
+        "document": _policy_document(_AUXILIARY_POLICY),
+        "schema": "jiaoch-credential-auxiliary-policy-descriptor/v1",
+        "sha256": _AUXILIARY_POLICY_SHA256,
+    }
+
 
 @dataclass(frozen=True, slots=True)
 class JiaochCredentialSlotDescription:
@@ -174,6 +207,7 @@ class JiaochCredentialGeneration:
 
 
 _ROUTE_CAPABILITY = object()
+_AUXILIARY_ROUTE_CAPABILITY = object()
 
 
 def _credential_for_route(
@@ -191,6 +225,26 @@ def _credential_for_route(
     if type(route_id) is not str or route_id not in _ROUTES_BY_ID:
         raise ValueError("Jiaoch credential route rejected")
     route = _ROUTES_BY_ID[route_id]
+    credentials = object.__getattribute__(
+        generation,
+        "_JiaochCredentialGeneration__credentials",
+    )
+    return credentials[_SLOT_ORDER.index(route.credential_slot_id)]
+
+
+def _credential_for_auxiliary_route(
+    generation: JiaochCredentialGeneration,
+    *,
+    route_id: str,
+    capability: object,
+) -> str:
+    if capability is not _AUXILIARY_ROUTE_CAPABILITY:
+        raise ValueError("Jiaoch private auxiliary route capability rejected")
+    if type(generation) is not JiaochCredentialGeneration:
+        raise ValueError("Jiaoch credential generation rejected")
+    if type(route_id) is not str or route_id not in _AUXILIARY_ROUTES_BY_ID:
+        raise ValueError("Jiaoch credential auxiliary route rejected")
+    route = _AUXILIARY_ROUTES_BY_ID[route_id]
     credentials = object.__getattribute__(
         generation,
         "_JiaochCredentialGeneration__credentials",
@@ -274,6 +328,47 @@ def create_jiaoch_credential_generation(
     if hmac.compare_digest(credentials[0].encode(), credentials[1].encode()):
         raise ValueError("distinct Jiaoch credentials are required")
     return _seal_generation(credentials)
+
+
+def collect_jiaoch_trade_cal_authority(
+    *,
+    generation: JiaochCredentialGeneration,
+    output_root: str | Path,
+    start_date: date,
+    end_date: date,
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Collect one sealed SSE trade-calendar window with the points credential."""
+
+    failed = object()
+    try:
+        credential = _credential_for_auxiliary_route(
+            generation,
+            route_id="auxiliary:points-primary:trade_cal",
+            capability=_AUXILIARY_ROUTE_CAPABILITY,
+        )
+        generation_id = object.__getattribute__(
+            generation,
+            "_JiaochCredentialGeneration__generation_id",
+        )
+        from app.jiaoch_trade_cal_authority import (
+            _collect_jiaoch_trade_cal_with_route_credential,
+        )
+
+        result = _collect_jiaoch_trade_cal_with_route_credential(
+            credential=credential,
+            generation_id=generation_id,
+            auxiliary_policy_descriptor=_auxiliary_policy_descriptor(),
+            output_root=output_root,
+            start_date=start_date,
+            end_date=end_date,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception:
+        result = failed
+    if result is failed:
+        raise ValueError("Jiaoch trade calendar collection failed") from None
+    return result
 
 
 def collect_jiaoch_points_collection_set(

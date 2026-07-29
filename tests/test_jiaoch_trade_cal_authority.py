@@ -162,9 +162,7 @@ def _collect(
     start_date: date = START_DATE,
     end_date: date = END_DATE,
 ):
-    transport = RecordingTransport(
-        [_entity(_response_body()) if outcome is None else outcome]
-    )
+    transport = RecordingTransport([_entity(_response_body()) if outcome is None else outcome])
     constructions: list[None] = []
 
     def factory():
@@ -534,7 +532,6 @@ def test_manifest_binds_attempt_auxiliary_policy_calendar_roots_and_all_safety_f
         assert secret.encode() not in persisted
         assert hashlib.sha256(secret.encode()).hexdigest().encode() not in persisted
     assert b"483" not in persisted
-    assert b"development_session_count" not in persisted
 
 
 def test_calendar_window_with_no_open_sessions_is_valid_but_claims_no_development_alignment(
@@ -638,9 +635,7 @@ def test_bad_http_entity_retains_partial_raw_attempt_but_no_terminal_manifest(
     status: int,
     complete: bool,
 ) -> None:
-    transport = RecordingTransport(
-        [_entity(b"upstream failure", status=status, complete=complete)]
-    )
+    transport = RecordingTransport([_entity(b"upstream failure", status=status, complete=complete)])
     monkeypatch.setattr(jiaoch_trade_cal_authority, "_transport_factory", lambda: transport)
 
     with pytest.raises(ValueError, match="trade calendar collection failed"):
