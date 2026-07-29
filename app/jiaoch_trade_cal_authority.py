@@ -8,8 +8,10 @@ import hashlib
 import hmac
 import json
 import math
+import os
 from pathlib import Path
 import re
+import stat
 from typing import Any, Mapping
 import uuid
 
@@ -970,17 +972,125 @@ def _verify_manifest_payload(*, root: Path, payload: Any) -> dict[str, Any]:
     return payload
 
 
-def _rollback_created_manifest(path: Path, expected_raw: bytes) -> None:
+def _rollback_owned_manifest(
+    path: Path,
+    *,
+    expected_identity: os.stat_result,
+    expected_raw: bytes,
+) -> None:
+    try:
+        before = path.lstat()
+    except OSError:
+        raise ValueError("Jiaoch trade calendar rollback identity rejected") from None
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or int(getattr(before, "st_nlink", 1)) != 1
+        or raw_authority._path_is_link_or_reparse(path)
+        or not os.path.samestat(expected_identity, before)
+    ):
+        raise ValueError("Jiaoch trade calendar rollback identity rejected")
     observed = raw_authority._read_safe_file(
         path,
         label="Jiaoch trade calendar rollback manifest",
         max_bytes=len(expected_raw),
         expected_size=len(expected_raw),
     )
-    if not hmac.compare_digest(observed, expected_raw):
+    try:
+        after = path.lstat()
+    except OSError:
+        raise ValueError("Jiaoch trade calendar rollback identity rejected") from None
+    if (
+        not hmac.compare_digest(observed, expected_raw)
+        or not os.path.samestat(expected_identity, after)
+        or not os.path.samestat(before, after)
+        or int(getattr(after, "st_nlink", 1)) != 1
+        or raw_authority._path_is_link_or_reparse(path)
+    ):
         raise ValueError("Jiaoch trade calendar rollback identity rejected")
     path.unlink()
     raw_authority.fsync_directory(path.parent)
+
+
+def _write_terminal_manifest_create_only(
+    path: Path,
+    raw: bytes,
+) -> os.stat_result:
+    parent = raw_authority._safe_existing_directory(
+        path.parent,
+        "Jiaoch trade calendar authority manifest parent",
+    )
+    if parent / path.name != path or type(raw) is not bytes:
+        raise ValueError("Jiaoch trade calendar authority manifest input rejected")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    descriptor: int | None = None
+    opened: os.stat_result | None = None
+    created = False
+    written = 0
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        created = True
+    except FileExistsError:
+        raw_authority._safe_existing_file(
+            path,
+            "Jiaoch trade calendar authority manifest",
+        )
+        raise ValueError(
+            "Jiaoch trade calendar authority manifest content-address conflict"
+        ) from None
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or int(getattr(opened, "st_nlink", 1)) != 1
+            or int(getattr(opened, "st_file_attributes", 0)) & raw_authority._REPARSE_ATTRIBUTE
+        ):
+            raise ValueError("Jiaoch trade calendar manifest identity rejected")
+        while written < len(raw):
+            count = os.write(descriptor, raw[written:])
+            if type(count) is not int or count <= 0:
+                raise OSError("Jiaoch trade calendar manifest write failed")
+            written += count
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        raw_authority.fsync_directory(parent)
+        return opened
+    except BaseException:
+        close_failed = False
+        if created and opened is None and descriptor is not None:
+            try:
+                recovered = os.fstat(descriptor)
+                if (
+                    stat.S_ISREG(recovered.st_mode)
+                    and int(getattr(recovered, "st_nlink", 1)) == 1
+                    and not (
+                        int(getattr(recovered, "st_file_attributes", 0))
+                        & raw_authority._REPARSE_ATTRIBUTE
+                    )
+                ):
+                    opened = recovered
+            except OSError:
+                pass
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                close_failed = True
+            descriptor = None
+        if opened is not None:
+            try:
+                _rollback_owned_manifest(
+                    path,
+                    expected_identity=opened,
+                    expected_raw=raw[:written],
+                )
+            except Exception:
+                raise ValueError("Jiaoch trade calendar manifest rollback failed") from None
+        if created and opened is None:
+            raise ValueError("Jiaoch trade calendar manifest rollback failed") from None
+        if close_failed:
+            raise ValueError("Jiaoch trade calendar manifest rollback failed") from None
+        raise
 
 
 def _collect_jiaoch_trade_cal_with_route_credential(
@@ -1113,13 +1223,11 @@ def _collect_jiaoch_trade_cal_with_route_credential(
     )
     path = directory / f"{digest}.json"
     relative_path = f"trade_cal_manifests/sha256/{digest[:2]}/{digest}.json"
-    created = False
+    created_identity: os.stat_result | None = None
     try:
-        created = raw_authority._write_create_only(
+        created_identity = _write_terminal_manifest_create_only(
             path,
             manifest_raw,
-            label="Jiaoch trade calendar authority manifest",
-            reuse_identical=False,
         )
         verify_jiaoch_trade_cal_authority(
             output_root=root,
@@ -1127,14 +1235,18 @@ def _collect_jiaoch_trade_cal_with_route_credential(
             expected_authority_manifest_sha256=digest,
         )
     except BaseException:
-        if created:
+        if created_identity is not None:
             try:
-                _rollback_created_manifest(path, manifest_raw)
+                _rollback_owned_manifest(
+                    path,
+                    expected_identity=created_identity,
+                    expected_raw=manifest_raw,
+                )
             except Exception:
                 raise ValueError("Jiaoch trade calendar manifest rollback failed") from None
         raise
     return {
-        "authority_manifest_created": created,
+        "authority_manifest_created": created_identity is not None,
         "authority_manifest_relative_path": relative_path,
         "authority_manifest_sha256": digest,
     }

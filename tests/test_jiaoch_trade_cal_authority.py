@@ -615,6 +615,51 @@ def test_exact_integer_and_string_is_open_wire_values_share_canonical_calendar(
     )["is_open_normalization_root_sha256"] == _normalization_root(rows)
 
 
+def test_target_calendar_window_full_manifest_fits_the_sealed_size_bound(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    start = date(2023, 6, 1)
+    end = date(2026, 7, 3)
+    cursor = start
+    last_open = "20230531"
+    rows = []
+    while cursor <= end:
+        cal_date = cursor.strftime("%Y%m%d")
+        wire_is_open = "1" if cursor.weekday() < 5 else "0"
+        rows.append(["SSE", cal_date, wire_is_open, last_open])
+        if wire_is_open == "1":
+            last_open = cal_date
+        cursor += timedelta(days=1)
+    transport = RecordingTransport([_entity(_response_body(rows=list(reversed(rows))))])
+    monkeypatch.setattr(
+        jiaoch_trade_cal_authority,
+        "_transport_factory",
+        lambda: transport,
+    )
+
+    publication = collect_jiaoch_trade_cal_authority(
+        generation=_generation(),
+        output_root=tmp_path,
+        start_date=start,
+        end_date=end,
+    )
+    manifest_path = tmp_path / publication["authority_manifest_relative_path"]
+    manifest = json.loads(manifest_path.read_bytes())
+
+    assert manifest["calendar_day_count"] == 1129
+    assert len(manifest["is_open_normalization_evidence"]["entries"]) == 1129
+    assert manifest_path.stat().st_size <= 128 * 1024
+    assert (
+        verify_jiaoch_trade_cal_authority(
+            output_root=tmp_path,
+            authority_manifest_relative_path=publication["authority_manifest_relative_path"],
+            expected_authority_manifest_sha256=publication["authority_manifest_sha256"],
+        )["verified"]
+        is True
+    )
+
+
 def test_calendar_window_with_no_open_sessions_is_valid_but_claims_no_development_alignment(
     tmp_path: Path,
     monkeypatch,
@@ -1018,24 +1063,20 @@ def test_manifest_content_address_conflict_does_not_delete_existing_target(
 ) -> None:
     sentinel = b"preexisting-content-address-conflict"
     conflicting_paths: list[Path] = []
-    original_writer = jiaoch_trade_cal_authority.raw_authority._write_create_only
+    original_open = jiaoch_trade_cal_authority.os.open
 
-    def conflicting_writer(path, raw, *, label, reuse_identical):
-        if label == "Jiaoch trade calendar authority manifest":
-            path.write_bytes(sentinel)
-            conflicting_paths.append(path)
-            raise ValueError("content-address conflict")
-        return original_writer(
-            path,
-            raw,
-            label=label,
-            reuse_identical=reuse_identical,
-        )
+    def conflicting_open(path, flags, *args, **kwargs):
+        candidate = Path(path)
+        if candidate.suffix == ".json" and "trade_cal_manifests" in candidate.parts:
+            candidate.write_bytes(sentinel)
+            conflicting_paths.append(candidate)
+            raise FileExistsError("content-address conflict")
+        return original_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(
-        jiaoch_trade_cal_authority.raw_authority,
-        "_write_create_only",
-        conflicting_writer,
+        jiaoch_trade_cal_authority.os,
+        "open",
+        conflicting_open,
     )
     monkeypatch.setattr(
         jiaoch_trade_cal_authority,
@@ -1097,6 +1138,85 @@ def test_terminal_directory_fsync_failure_rolls_back_new_manifest(
     assert injected == 1
     assert len(list((tmp_path / "trade_cal_raw").rglob("*.body"))) == 1
     assert len(list((tmp_path / "trade_cal_attempts").rglob("*.json"))) == 1
+    assert not list((tmp_path / "trade_cal_manifests").rglob("*.json"))
+
+
+def test_terminal_file_fsync_failure_rolls_back_new_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original_fsync = jiaoch_trade_cal_authority.os.fsync
+    injected = 0
+
+    def failing_terminal_file_fsync(descriptor):
+        nonlocal injected
+        metadata = os.fstat(descriptor)
+        if (
+            injected == 0
+            and jiaoch_trade_cal_authority.stat.S_ISREG(metadata.st_mode)
+            and list((tmp_path / "trade_cal_manifests").rglob("*.json"))
+        ):
+            injected += 1
+            raise OSError("injected terminal file fsync failure")
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(
+        jiaoch_trade_cal_authority.os,
+        "fsync",
+        failing_terminal_file_fsync,
+    )
+    monkeypatch.setattr(
+        jiaoch_trade_cal_authority,
+        "_transport_factory",
+        lambda: RecordingTransport([_entity(_response_body())]),
+    )
+
+    with pytest.raises(ValueError, match="trade calendar collection failed"):
+        collect_jiaoch_trade_cal_authority(
+            generation=_generation(),
+            output_root=tmp_path,
+            start_date=START_DATE,
+            end_date=END_DATE,
+        )
+
+    assert injected == 1
+    assert not list((tmp_path / "trade_cal_manifests").rglob("*.json"))
+
+
+def test_terminal_first_identity_read_failure_rolls_back_new_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original_fstat = jiaoch_trade_cal_authority.os.fstat
+    injected = 0
+
+    def failing_first_terminal_fstat(descriptor):
+        nonlocal injected
+        if injected == 0 and list((tmp_path / "trade_cal_manifests").rglob("*.json")):
+            injected += 1
+            raise OSError("injected first terminal identity read failure")
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(
+        jiaoch_trade_cal_authority.os,
+        "fstat",
+        failing_first_terminal_fstat,
+    )
+    monkeypatch.setattr(
+        jiaoch_trade_cal_authority,
+        "_transport_factory",
+        lambda: RecordingTransport([_entity(_response_body())]),
+    )
+
+    with pytest.raises(ValueError, match="trade calendar collection failed"):
+        collect_jiaoch_trade_cal_authority(
+            generation=_generation(),
+            output_root=tmp_path,
+            start_date=START_DATE,
+            end_date=END_DATE,
+        )
+
+    assert injected == 1
     assert not list((tmp_path / "trade_cal_manifests").rglob("*.json"))
 
 
