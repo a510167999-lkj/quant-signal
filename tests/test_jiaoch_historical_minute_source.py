@@ -238,6 +238,7 @@ def test_token_byte_or_semantic_echo_discards_response_body(
         _response(b'{"code":0}', status=302),
         _response(b'{"code":0}', complete=False),
         _response(b"x" * (1024 * 1024 + 1)),
+        _response(b"x" * (1024 * 1024 + 2)),
     ],
 )
 def test_http_incomplete_and_oversize_entities_are_rejected(
