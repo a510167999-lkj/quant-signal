@@ -17,11 +17,9 @@ from app.jiaoch_points_raw_authority import (
 
 TOKEN = "points-unit-secret/path"
 RETRIEVED_AT = "2026-07-29T17:30:00+08:00"
-PARAMS = {"trade_date": "20260728"}
+PARAMS = {"trade_date": "20260728", "ts_code": ""}
 DAILY_BASIC_FIELDS = (
-    "ts_code,trade_date,close,turnover_rate,turnover_rate_f,volume_ratio,"
-    "pe,pe_ttm,pb,ps,ps_ttm,dv_ratio,dv_ttm,total_share,float_share,"
-    "free_share,total_mv,circ_mv"
+    "ts_code,trade_date,turnover_rate,turnover_rate_f,free_share,float_share,total_mv,circ_mv"
 )
 MONEYFLOW_FIELDS = (
     "ts_code,trade_date,buy_sm_vol,buy_sm_amount,sell_sm_vol,sell_sm_amount,"
@@ -277,7 +275,8 @@ def test_non_200_or_incomplete_body_is_retained_but_never_grants_authority(
 @pytest.mark.parametrize(
     ("api_name", "params", "fields"),
     [
-        ("daily_basic", {"trade_date": "2026-07-28"}, DAILY_BASIC_FIELDS),
+        ("daily_basic", {"trade_date": "2026-07-28", "ts_code": ""}, DAILY_BASIC_FIELDS),
+        ("daily_basic", {"trade_date": "20260728"}, DAILY_BASIC_FIELDS),
         ("daily_basic", {"trade_date": "20260728", "ts_code": "600000.SH"}, DAILY_BASIC_FIELDS),
         ("daily_basic", {"start_date": "20260728", "end_date": "20260728"}, DAILY_BASIC_FIELDS),
         ("daily_basic", PARAMS, DAILY_BASIC_FIELDS.replace(",free_share", "")),
@@ -397,6 +396,32 @@ def test_existing_conflicting_or_oversized_raw_cas_is_rejected_without_overwrite
     assert not (tmp_path / "attempts").exists()
 
 
+def test_existing_oversized_raw_conflict_is_rejected_before_unbounded_read(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    digest = hashlib.sha256(RAW).hexdigest()
+    destination = tmp_path / "raw" / "sha256" / digest[:2] / f"{digest}.body"
+    destination.parent.mkdir(parents=True)
+    with destination.open("wb") as handle:
+        handle.seek(1024 * 1024)
+        handle.write(b"x")
+    original_read_bytes = Path.read_bytes
+
+    def guarded_read_bytes(path: Path) -> bytes:
+        if path == destination:
+            raise AssertionError("oversized raw object was read without a bound")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+
+    with pytest.raises(ValueError, match="raw content-addressed object.*size"):
+        _publish(tmp_path)
+
+    assert destination.stat().st_size == 1024 * 1024 + 1
+    assert not (tmp_path / "attempts").exists()
+
+
 def test_offline_verifier_recomputes_raw_hash_and_size(tmp_path: Path) -> None:
     publication = _publish(tmp_path)
     raw_path = tmp_path / publication["raw_relative_path"]
@@ -437,6 +462,25 @@ def test_offline_verifier_rejects_identity_swap_between_preflight_and_open(
             expected_attempt_sha256=publication["attempt_sha256"],
         )
     assert swapped is True
+
+
+@pytest.mark.parametrize("kind", ["raw", "attempt"])
+def test_offline_verifier_rejects_hardlinked_objects(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    publication = _publish(tmp_path)
+    relative_key = "raw_relative_path" if kind == "raw" else "attempt_relative_path"
+    target = tmp_path / publication[relative_key]
+    alias = tmp_path / f"{kind}-hardlink"
+    os.link(target, alias)
+
+    with pytest.raises(ValueError, match="link|reparse"):
+        verify_jiaoch_points_raw_attempt(
+            output_root=tmp_path,
+            attempt_relative_path=publication["attempt_relative_path"],
+            expected_attempt_sha256=publication["attempt_sha256"],
+        )
 
 
 @pytest.mark.parametrize(
