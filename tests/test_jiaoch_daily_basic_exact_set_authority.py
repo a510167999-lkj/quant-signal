@@ -184,6 +184,7 @@ def _daily_basic_partition(
         attempt_sha256=attempt,
         raw_relative_path=f"raw/sha256/{raw[:2]}/{raw}.body",
         raw_sha256=raw,
+        source_normalization_rows_sha256=_sha(f"source-normalization:{trade_date}"),
         canonical_rows_sha256=canonical_rows_sha256,
         normalization_receipt_sha256=_sha(f"normalization-receipt:{trade_date}"),
         rows=rows,

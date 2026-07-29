@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime
 import hashlib
 import hmac
@@ -103,6 +103,7 @@ _PER_DATE_FIELDS = frozenset(
         "daily_basic_raw_segment_counts",
         "daily_basic_raw_sha256",
         "daily_basic_resolved_identities_sha256",
+        "daily_basic_source_normalization_rows_sha256",
         "daily_basic_transition_excluded_codes_sha256",
         "daily_basic_transition_excluded_row_count",
         "daily_basic_transition_overlap_comparison_fields",
@@ -220,6 +221,7 @@ class DailyBasicPartition:
     attempt_sha256: str
     raw_relative_path: str
     raw_sha256: str
+    source_normalization_rows_sha256: str
     canonical_rows_sha256: str
     normalization_receipt_sha256: str
     rows: tuple[NormalizedDailyBasicRow, ...]
@@ -551,6 +553,10 @@ def _validate_daily_basic_partition(
         ("daily_basic collection set sha256", value.collection_set_sha256),
         ("daily_basic attempt sha256", value.attempt_sha256),
         ("daily_basic raw sha256", value.raw_sha256),
+        (
+            "daily_basic source normalization rows sha256",
+            value.source_normalization_rows_sha256,
+        ),
         ("daily_basic canonical rows sha256", value.canonical_rows_sha256),
         ("daily_basic normalization receipt sha256", value.normalization_receipt_sha256),
     ):
@@ -810,6 +816,9 @@ def _derive_receipt(
             "daily_basic_raw_segment_counts": _segment_counts(basic_raw_codes),
             "daily_basic_raw_sha256": daily_basic.raw_sha256,
             "daily_basic_resolved_identities_sha256": _canonical_sha256(list(basic_identities)),
+            "daily_basic_source_normalization_rows_sha256": (
+                daily_basic.source_normalization_rows_sha256
+            ),
             "daily_basic_transition_excluded_codes_sha256": _canonical_sha256(list(basic_excluded)),
             "daily_basic_transition_excluded_row_count": len(basic_excluded),
             "daily_basic_transition_overlap_comparison_fields": list(_OVERLAP_FIELDS),
@@ -839,6 +848,7 @@ def _derive_receipt(
                 "canonical_rows_sha256": daily_basic.canonical_rows_sha256,
                 "collection_set_sha256": daily_basic.collection_set_sha256,
                 "raw_sha256": daily_basic.raw_sha256,
+                "source_normalization_rows_sha256": (daily_basic.source_normalization_rows_sha256),
                 "trade_date": session,
             }
         )
@@ -1053,7 +1063,7 @@ def _load_daily_basic_partition(
     preview = normalize_jiaoch_points_response_preview(
         response_body=raw,
         expected_api_name="daily_basic",
-        expected_trade_date=collection_ref["trade_date"],
+        expected_trade_date=collection_ref["trade_date"].replace("-", ""),
         expected_raw_sha256=str(attempt["raw_sha256"]),
     )
     if (
@@ -1067,17 +1077,21 @@ def _load_daily_basic_partition(
         or preview.production_recommendation_eligible is not False
     ):
         raise ValueError("daily_basic normalization preview semantics rejected")
+    normalized_rows = tuple(
+        replace(row, trade_date=collection_ref["trade_date"]) for row in preview.rows
+    )
     result = DailyBasicPartition(
-        trade_date=preview.trade_date,
+        trade_date=collection_ref["trade_date"],
         collection_set_relative_path=collection_ref["collection_set_relative_path"],
         collection_set_sha256=collection_ref["collection_set_sha256"],
         attempt_relative_path=str(attempt["attempt_relative_path"]),
         attempt_sha256=str(attempt["attempt_sha256"]),
         raw_relative_path=str(attempt["raw_relative_path"]),
         raw_sha256=str(attempt["raw_sha256"]),
-        canonical_rows_sha256=preview.canonical_rows_sha256,
+        source_normalization_rows_sha256=preview.canonical_rows_sha256,
+        canonical_rows_sha256=_canonical_sha256([asdict(row) for row in normalized_rows]),
         normalization_receipt_sha256=preview.preview_receipt_sha256,
-        rows=tuple(preview.rows),
+        rows=normalized_rows,
     )
     _validate_daily_basic_partition(result, collection_ref=collection_ref)
     return result
