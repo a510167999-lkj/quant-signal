@@ -3,12 +3,14 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import os
 from pathlib import Path
 import threading
 from typing import Any, Callable
 
 import pytest
 
+from app import factor_v2_low_rvol_overlay_activator as activator
 from app.factor_v2_low_rvol_overlay_activator import (
     EXPECTED_PREREGISTRATION_INTRODUCING_COMMIT,
     EXPECTED_PREREGISTRATION_RAW_SHA256,
@@ -226,6 +228,37 @@ def _candidate(
     }
 
 
+def _symlink_or_skip(
+    target: Path,
+    link: Path,
+    *,
+    target_is_directory: bool = False,
+) -> None:
+    try:
+        link.symlink_to(
+            target.resolve(),
+            target_is_directory=target_is_directory,
+        )
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+
+
+def _activate_safe(
+    descriptor: dict[str, Any],
+    claim_directory: Path,
+) -> dict[str, Any]:
+    return activate_low_rvol_overlay(
+        descriptor,
+        claim_directory=claim_directory,
+        phase_two_runner=lambda verified, claim: _safe_result(
+            claim_key=claim["claim_key"],
+            evaluation_artifact_sha256=verified[
+                "evaluation_artifact_sha256"
+            ],
+        ),
+    )
+
+
 def test_phase_one_is_anchored_receipt_only_and_all_red(tmp_path: Path) -> None:
     assert EXPECTED_PREREGISTRATION_RAW_SHA256 == PREREG_SHA
     assert EXPECTED_PREREGISTRATION_INTRODUCING_COMMIT == PREREG_COMMIT
@@ -244,6 +277,22 @@ def test_phase_one_is_anchored_receipt_only_and_all_red(tmp_path: Path) -> None:
     assert verified == expected
     assert set(verified) == RECEIPT_FIELDS
     assert reads == [Path(descriptor["path"])]
+
+
+def test_phase_one_rejects_non_content_addressed_or_linked_receipt(
+    tmp_path: Path,
+) -> None:
+    descriptor, _, raw = _fixture(tmp_path / "receipt")
+    for name in ("receipt.json", descriptor["raw_file_sha256"] + ".json"):
+        unsafe = tmp_path / name
+        if name == "receipt.json":
+            unsafe.write_bytes(raw)
+        else:
+            _symlink_or_skip(Path(descriptor["path"]), unsafe)
+        with pytest.raises(RuntimeError, match="content|basename|link|reparse"):
+            verify_phase_one_decision_receipt(
+                {**descriptor, "path": str(unsafe)}
+            )
 
 
 @pytest.mark.parametrize(
@@ -476,6 +525,258 @@ def test_concurrent_same_key_waits_and_reuses_without_rerunning_phase_two(
     assert results["second"]["result_sha256"] == (
         results["first"]["result_sha256"]
     )
+
+
+@pytest.mark.parametrize("component", ["claim", "pointer", "result"])
+def test_same_key_reuse_rejects_linked_artifact_chain(
+    tmp_path: Path,
+    component: str,
+) -> None:
+    descriptor, _, _ = _fixture(tmp_path / "receipt")
+    seed = tmp_path / "seed"
+    published = _activate_safe(descriptor, seed)
+    claim_key = published["claim_key"]
+    names = {
+        "claim": "low_rvol20_rank_overlay_20.claim.json",
+        "pointer": f"{claim_key}.result-pointer.json",
+        "result": f"{published['result_sha256']}.json",
+    }
+    unsafe = tmp_path / f"unsafe-{component}"
+    unsafe.mkdir()
+    for name, filename in names.items():
+        destination = unsafe / filename
+        source = seed / filename
+        if name == component:
+            _symlink_or_skip(source, destination)
+        else:
+            destination.write_bytes(source.read_bytes())
+
+    with pytest.raises(RuntimeError, match="link|reparse|unsafe"):
+        activate_low_rvol_overlay(
+            descriptor,
+            claim_directory=unsafe,
+            phase_two_runner=lambda *_: pytest.fail(
+                "same-key reuse must not rerun phase two"
+            ),
+        )
+
+
+def test_claim_directory_link_or_reparse_ancestor_is_rejected_without_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor, _, _ = _fixture(tmp_path / "receipt")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = tmp_path / "linked-claims"
+    _symlink_or_skip(outside, linked, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="link|reparse|unsafe"):
+        _activate_safe(descriptor, linked)
+    assert list(outside.iterdir()) == []
+
+    ancestor = tmp_path / "reparse-ancestor"
+    ancestor.mkdir()
+    claims = ancestor / "claims"
+    original = getattr(
+        activator,
+        "_path_is_link_or_reparse",
+        lambda _path: False,
+    )
+
+    def simulated_reparse(path: Path) -> bool:
+        return Path(path).resolve() == ancestor.resolve() or original(
+            Path(path)
+        )
+
+    monkeypatch.setattr(
+        activator,
+        "_path_is_link_or_reparse",
+        simulated_reparse,
+        raising=False,
+    )
+    with pytest.raises(RuntimeError, match="link|reparse|unsafe"):
+        _activate_safe(descriptor, claims)
+    assert claims.exists() is False
+
+
+def test_claim_is_directory_durable_before_phase_two(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor, _, _ = _fixture(tmp_path / "receipt")
+    claims = tmp_path / "claims"
+    durable_directories: list[Path] = []
+    monkeypatch.setattr(
+        activator,
+        "fsync_directory",
+        lambda path: durable_directories.append(Path(path).resolve()),
+        raising=False,
+    )
+
+    def runner(
+        verified: dict[str, Any],
+        claim: dict[str, Any],
+    ) -> dict[str, Any]:
+        assert claims.resolve() in durable_directories
+        return _safe_result(
+            claim_key=claim["claim_key"],
+            evaluation_artifact_sha256=verified[
+                "evaluation_artifact_sha256"
+            ],
+        )
+
+    activate_low_rvol_overlay(
+        descriptor,
+        claim_directory=claims,
+        phase_two_runner=runner,
+    )
+
+
+def test_directory_fsync_failure_stops_before_phase_two(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor, _, _ = _fixture(tmp_path / "receipt")
+    runner_calls = 0
+
+    def unavailable(_path: Path) -> None:
+        raise OSError("directory fsync unavailable")
+
+    def runner(*_args: Any) -> dict[str, Any]:
+        nonlocal runner_calls
+        runner_calls += 1
+        return _safe_result()
+
+    monkeypatch.setattr(
+        activator,
+        "fsync_directory",
+        unavailable,
+        raising=False,
+    )
+    with pytest.raises(OSError, match="directory fsync unavailable"):
+        activate_low_rvol_overlay(
+            descriptor,
+            claim_directory=tmp_path / "claims",
+            phase_two_runner=runner,
+        )
+    assert runner_calls == 0
+
+
+def test_result_is_durable_before_atomic_pointer_and_orphan_is_recovered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor, _, _ = _fixture(tmp_path / "receipt")
+    claims = tmp_path / "claims"
+    directory_syncs: list[Path] = []
+    pointer_links = 0
+    phase_result: dict[str, Any] = {}
+    real_link = activator.os.link
+
+    monkeypatch.setattr(
+        activator,
+        "fsync_directory",
+        lambda path: directory_syncs.append(Path(path).resolve()),
+        raising=False,
+    )
+
+    def runner(
+        verified: dict[str, Any],
+        claim: dict[str, Any],
+    ) -> dict[str, Any]:
+        phase_result.update(
+            _safe_result(
+                claim_key=claim["claim_key"],
+                evaluation_artifact_sha256=verified[
+                    "evaluation_artifact_sha256"
+                ],
+            )
+        )
+        return phase_result
+
+    def crash_before_pointer(source: Path, destination: Path) -> None:
+        nonlocal pointer_links
+        destination = Path(destination)
+        if destination.name.endswith(".result-pointer.json"):
+            pointer_links += 1
+            result_sha256 = hashlib.sha256(
+                _canonical_bytes(phase_result)
+            ).hexdigest()
+            assert (claims / f"{result_sha256}.json").is_file()
+            assert directory_syncs.count(claims.resolve()) >= 2
+            assert os.path.lexists(destination) is False
+            raise OSError("simulated pointer publish crash")
+        real_link(source, destination)
+
+    monkeypatch.setattr(activator.os, "link", crash_before_pointer)
+    with pytest.raises(OSError, match="simulated pointer publish crash"):
+        activate_low_rvol_overlay(
+            descriptor,
+            claim_directory=claims,
+            phase_two_runner=runner,
+        )
+    assert pointer_links == 1
+
+    monkeypatch.setattr(activator.os, "link", real_link)
+    monkeypatch.setattr(
+        activator,
+        "_SAME_KEY_REUSE_WAIT_SECONDS",
+        0.02,
+    )
+    recovered = activate_low_rvol_overlay(
+        descriptor,
+        claim_directory=claims,
+        phase_two_runner=lambda *_: pytest.fail(
+            "complete orphan result must be reused"
+        ),
+    )
+    assert recovered["reused"] is True
+    assert recovered["result"] == phase_result
+    assert (
+        claims
+        / f"{recovered['claim_key']}.result-pointer.json"
+    ).is_file()
+
+
+def test_failed_owner_without_complete_result_is_permanently_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor, _, _ = _fixture(tmp_path / "receipt")
+    claims = tmp_path / "claims"
+    runner_calls = 0
+
+    def failed_owner(*_args: Any) -> dict[str, Any]:
+        nonlocal runner_calls
+        runner_calls += 1
+        raise RuntimeError("owner failed")
+
+    with pytest.raises(RuntimeError, match="owner failed"):
+        activate_low_rvol_overlay(
+            descriptor,
+            claim_directory=claims,
+            phase_two_runner=failed_owner,
+        )
+    (claims / f"{'0' * 64}.json").write_bytes(b"{")
+    monkeypatch.setattr(
+        activator,
+        "_SAME_KEY_REUSE_WAIT_SECONDS",
+        0.02,
+    )
+    monkeypatch.setattr(activator, "_REUSE_POLL_SECONDS", 0.001)
+
+    for _ in range(2):
+        with pytest.raises(
+            RuntimeError,
+            match="progress|complete|orphan|result",
+        ):
+            activate_low_rvol_overlay(
+                descriptor,
+                claim_directory=claims,
+                phase_two_runner=failed_owner,
+            )
+    assert runner_calls == 1
 
 
 def test_fixed_formula_sorting_and_top3_use_original_low_vol_factor() -> None:
