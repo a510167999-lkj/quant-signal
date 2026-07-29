@@ -542,9 +542,17 @@ def test_legacy_public_raw_publisher_remains_v1_unbound(
 
     assert attempt["schema"] == "jiaoch-points-raw-attempt/v1"
     assert "collection_binding" not in attempt
-    assert verification["collection_binding"] is None
-    assert verification["authority_status"] == "UNBOUND"
-    assert verification["row_authority_status"] == "NOT_GRANTED"
+    assert verification == {
+        "attempt_id": publication["attempt_id"],
+        "attempt_sha256": publication["attempt_sha256"],
+        "authority_status": "UNBOUND",
+        "embargo_consumed": False,
+        "final_oos_consumed": False,
+        "production_recommendation_eligible": False,
+        "raw_bytes": len(_response_body(api_name="daily_basic")),
+        "raw_sha256": publication["raw_sha256"],
+        "row_authority_status": "NOT_GRANTED",
+    }
 
 
 @pytest.mark.parametrize(
@@ -667,9 +675,7 @@ def test_provider_status_interface_schema_or_row_integrity_failure_keeps_no_mani
     monkeypatch,
     bad_body: bytes,
 ) -> None:
-    transport = RecordingTransport(
-        [_entity(_response_bodies()[0]), _entity(bad_body)]
-    )
+    transport = RecordingTransport([_entity(_response_bodies()[0]), _entity(bad_body)])
     monkeypatch.setattr(jiaoch_points_collection_set, "_transport_factory", lambda: transport)
 
     with pytest.raises(ValueError, match="collection failed"):

@@ -31,6 +31,7 @@ __all__ = (
     "JiaochCredentialSlotDescription",
     "POINTS_PRIMARY_ENV",
     "collect_jiaoch_historical_minute_collection_set",
+    "collect_jiaoch_points_collection_set",
     "create_jiaoch_credential_generation",
 )
 
@@ -273,6 +274,53 @@ def create_jiaoch_credential_generation(
     if hmac.compare_digest(credentials[0].encode(), credentials[1].encode()):
         raise ValueError("distinct Jiaoch credentials are required")
     return _seal_generation(credentials)
+
+
+def collect_jiaoch_points_collection_set(
+    *,
+    generation: JiaochCredentialGeneration,
+    output_root: str | Path,
+    trade_date: date,
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Issue the closed daily-basic and moneyflow collection with one sealed slot."""
+
+    failed = object()
+    try:
+        daily_basic_credential = _credential_for_route(
+            generation,
+            route_id="points-primary:daily_basic",
+            capability=_ROUTE_CAPABILITY,
+        )
+        moneyflow_credential = _credential_for_route(
+            generation,
+            route_id="points-primary:moneyflow",
+            capability=_ROUTE_CAPABILITY,
+        )
+        if not hmac.compare_digest(
+            daily_basic_credential.encode("utf-8"),
+            moneyflow_credential.encode("utf-8"),
+        ):
+            raise ValueError("Jiaoch points route mapping rejected")
+        descriptions = {item.credential_slot_id: item for item in generation.describe_slots()}
+        descriptor = descriptions[_POINTS_PRIMARY_SLOT]
+        from app.jiaoch_points_collection_set import (
+            _collect_jiaoch_points_collection_set_with_route_credential,
+        )
+
+        result = _collect_jiaoch_points_collection_set_with_route_credential(
+            credential=daily_basic_credential,
+            generation_id=descriptor.generation_id,
+            policy_sha256=descriptor.policy_sha256,
+            output_root=output_root,
+            trade_date=trade_date,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception:
+        result = failed
+    if result is failed:
+        raise ValueError("Jiaoch points collection failed") from None
+    return result
 
 
 def collect_jiaoch_historical_minute_collection_set(
