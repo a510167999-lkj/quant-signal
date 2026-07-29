@@ -647,6 +647,138 @@ def test_final_manifest_verification_failure_rolls_back_manifest_only(
     assert not list((tmp_path / "points_collection_sets").rglob("*.json"))
 
 
+def test_producer_drift_is_rejected_before_manifest_create(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    stable_binding = jiaoch_points_collection_set._producer_binding()
+    producer_calls = 0
+
+    def drifting_binding():
+        nonlocal producer_calls
+        producer_calls += 1
+        if producer_calls <= 2:
+            return stable_binding
+        return {**stable_binding, "root_sha256": "0" * 64}
+
+    write_labels = []
+    original_writer = jiaoch_points_collection_set.raw_authority._write_create_only
+
+    def recording_writer(path, raw, *, label, reuse_identical):
+        write_labels.append(label)
+        return original_writer(
+            path,
+            raw,
+            label=label,
+            reuse_identical=reuse_identical,
+        )
+
+    monkeypatch.setattr(
+        jiaoch_points_collection_set,
+        "_producer_binding",
+        drifting_binding,
+    )
+    monkeypatch.setattr(
+        jiaoch_points_collection_set.raw_authority,
+        "_write_create_only",
+        recording_writer,
+    )
+    monkeypatch.setattr(
+        jiaoch_points_collection_set,
+        "_transport_factory",
+        lambda: RecordingTransport([_entity(body) for body in _response_bodies()]),
+    )
+
+    with pytest.raises(ValueError, match="collection failed"):
+        collect_jiaoch_points_collection_set(
+            generation=_generation(),
+            output_root=tmp_path,
+            trade_date=TRADE_DATE,
+        )
+
+    assert producer_calls == 3
+    assert "Jiaoch points collection set" not in write_labels
+    assert not list((tmp_path / "points_collection_sets").rglob("*.json"))
+
+
+def test_manifest_content_address_conflict_does_not_delete_existing_target(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    sentinel = b"preexisting-content-address-conflict"
+    conflicting_paths: list[Path] = []
+    original_writer = jiaoch_points_collection_set.raw_authority._write_create_only
+
+    def conflicting_writer(path, raw, *, label, reuse_identical):
+        if label == "Jiaoch points collection set":
+            path.write_bytes(sentinel)
+            conflicting_paths.append(path)
+            raise ValueError("content-address conflict")
+        return original_writer(
+            path,
+            raw,
+            label=label,
+            reuse_identical=reuse_identical,
+        )
+
+    monkeypatch.setattr(
+        jiaoch_points_collection_set.raw_authority,
+        "_write_create_only",
+        conflicting_writer,
+    )
+    monkeypatch.setattr(
+        jiaoch_points_collection_set,
+        "_transport_factory",
+        lambda: RecordingTransport([_entity(body) for body in _response_bodies()]),
+    )
+
+    with pytest.raises(ValueError, match="collection failed"):
+        collect_jiaoch_points_collection_set(
+            generation=_generation(),
+            output_root=tmp_path,
+            trade_date=TRADE_DATE,
+        )
+
+    assert len(conflicting_paths) == 1
+    assert conflicting_paths[0].read_bytes() == sentinel
+
+
+def test_rollback_refuses_to_delete_identity_drifted_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    sentinel = b"identity-drifted-after-create"
+    replaced_paths: list[Path] = []
+    monkeypatch.setattr(
+        jiaoch_points_collection_set,
+        "_transport_factory",
+        lambda: RecordingTransport([_entity(body) for body in _response_bodies()]),
+    )
+
+    def replacing_verifier(**kwargs):
+        path = Path(kwargs["output_root"]) / kwargs["collection_set_relative_path"]
+        path.unlink()
+        path.write_bytes(sentinel)
+        replaced_paths.append(path)
+        raise ValueError("verification failed after identity drift")
+
+    monkeypatch.setattr(
+        jiaoch_points_collection_set,
+        "verify_jiaoch_points_collection_set",
+        replacing_verifier,
+    )
+
+    with pytest.raises(ValueError, match="collection failed"):
+        collect_jiaoch_points_collection_set(
+            generation=_generation(),
+            output_root=tmp_path,
+            trade_date=TRADE_DATE,
+        )
+
+    assert len(replaced_paths) == 1
+    assert replaced_paths[0].read_bytes() == sentinel
+
+
 def test_credential_echo_on_second_response_is_rejected_before_attempt_write(
     tmp_path: Path,
     monkeypatch,
