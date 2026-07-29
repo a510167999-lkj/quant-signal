@@ -316,6 +316,16 @@ def test_manifest_binds_attempts_generation_and_producer_without_claiming_creden
         "daily-calibration",
     ]
     assert len({item["attempt_sha256"] for item in manifest["attempts"]}) == 3
+    for item in manifest["attempts"]:
+        attempt = json.loads((tmp_path / item["attempt_relative_path"]).read_bytes())
+        assert attempt["schema"] == "jiaoch-minute-raw-attempt/v2"
+        assert attempt["collection_binding"] == {
+            "collection_call_id": manifest["collection_call_id"],
+            "generation_id": manifest["runtime_mapping_descriptor"]["generation_id"],
+            "policy_sha256": manifest["runtime_mapping_descriptor"]["policy_sha256"],
+            "producer_root_sha256": manifest["producer_binding"]["root_sha256"],
+            "schema": "jiaoch-minute-raw-collection-binding/v1",
+        }
     assert verified["verified"] is True
     assert verified["collection_set_sha256"] == publication["collection_set_sha256"]
     assert verified["credential_slot_id"] == "historical-minute"
@@ -660,11 +670,7 @@ def test_attempt_from_another_runtime_call_cannot_be_spliced_into_manifest(
     monkeypatch,
 ) -> None:
     first, _, _, _ = _collect(tmp_path, monkeypatch)
-    second, _, _, _ = _collect(
-        tmp_path,
-        monkeypatch,
-        retrieved_at="2026-07-29T19:31:00+08:00",
-    )
+    second, _, _, _ = _collect(tmp_path, monkeypatch)
     forged_manifest = _manifest(tmp_path, first)
     second_manifest = _manifest(tmp_path, second)
     forged_manifest["attempts"][1] = second_manifest["attempts"][1]
@@ -682,6 +688,36 @@ def test_attempt_from_another_runtime_call_cannot_be_spliced_into_manifest(
     path.write_bytes(forged)
 
     with pytest.raises(ValueError, match="attempt"):
+        verify_jiaoch_minute_collection_set(
+            output_root=tmp_path,
+            collection_set_relative_path=relative,
+            expected_collection_set_sha256=digest,
+        )
+
+
+def test_rehashed_runtime_generation_id_drift_is_rejected(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    publication, _, _, _ = _collect(tmp_path, monkeypatch)
+    forged_manifest = _manifest(tmp_path, publication)
+    forged_manifest["runtime_mapping_descriptor"]["generation_id"] = (
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    )
+    forged = json.dumps(
+        forged_manifest,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    digest = hashlib.sha256(forged).hexdigest()
+    relative = f"collection_sets/sha256/{digest[:2]}/{digest}.json"
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(forged)
+
+    with pytest.raises(ValueError, match="attempt|generation"):
         verify_jiaoch_minute_collection_set(
             output_root=tmp_path,
             collection_set_relative_path=relative,
