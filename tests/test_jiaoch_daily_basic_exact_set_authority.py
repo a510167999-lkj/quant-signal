@@ -734,6 +734,45 @@ def test_transition_overlap_factor_conflict_fails_closed(
     assert not list(kwargs["output_root"].rglob("*.json"))
 
 
+def test_transition_overlap_large_value_near_conflict_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    daily = _daily_authority()
+    first = daily.partitions[0]
+    first_with_backfill = replace(
+        first,
+        ts_codes=tuple(sorted((*first.ts_codes, "302132.SZ"))),
+    )
+    daily = replace(
+        daily,
+        daily_table_rows=9,
+        partitions=(first_with_backfill, daily.partitions[1]),
+    )
+    partitions = {item.trade_date: _daily_basic_partition(item) for item in daily.partitions}
+    first_basic = partitions[first.trade_date]
+    rows = tuple(
+        replace(row, total_mv=1_000_000_000_000.0)
+        if row.ts_code == "300114.SZ"
+        else replace(row, total_mv=1_000_000_000_000.5)
+        if row.ts_code == "302132.SZ"
+        else row
+        for row in first_basic.rows
+    )
+    partitions[first.trade_date] = _replace_partition_rows(first_basic, rows)
+    _install_authorities(
+        monkeypatch,
+        daily=daily,
+        daily_basic_by_date=partitions,
+    )
+    kwargs = _kwargs(tmp_path, daily)
+
+    with pytest.raises(ValueError, match="total_mv"):
+        authority.publish_daily_basic_exact_set_coverage(**kwargs)
+
+    assert not list(kwargs["output_root"].rglob("*.json"))
+
+
 def test_transition_boundary_session_cannot_be_missing_from_full_date_sequence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
