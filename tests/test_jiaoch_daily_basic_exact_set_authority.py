@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import json
 from pathlib import Path
+import sqlite3
 from typing import Any
 
 import pytest
@@ -114,6 +115,29 @@ def _daily_authority() -> authority.AuditedDailyAuthority:
         daily_table_sha256=_sha("daily-table"),
         market_generation_count=2,
         market_generation_root_sha256=_canonical_sha(market_generation_refs),
+        partitions=partitions,
+    )
+
+
+def _replace_daily_partitions(
+    daily: authority.AuditedDailyAuthority,
+    partitions: tuple[authority.AuthoritativeDailyPartition, ...],
+) -> authority.AuditedDailyAuthority:
+    refs = [
+        {
+            "generation_id": item.generation_id,
+            "lineage_sha256": item.generation_lineage_sha256,
+            "manifest_sha256": item.generation_manifest_sha256,
+            "trade_date": item.trade_date,
+            "vintage": item.vintage,
+        }
+        for item in partitions
+    ]
+    return replace(
+        daily,
+        daily_table_rows=sum(len(item.ts_codes) for item in partitions),
+        market_generation_count=len(partitions),
+        market_generation_root_sha256=_canonical_sha(refs),
         partitions=partitions,
     )
 
@@ -381,6 +405,163 @@ def test_daily_basic_loader_converts_source_date_and_binds_both_normalized_roots
     ]
 
 
+def test_audited_daily_loader_binds_every_manifest_generation_ref(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = tmp_path / "audited-bundle"
+    bundle.mkdir()
+    database_path = bundle / "metadata.sqlite3"
+    database_path.write_bytes(b"test-placeholder")
+    manifest_raw = b'{"fixture":"audited-manifest"}'
+    (bundle / "manifest.json").write_bytes(manifest_raw)
+    refs = [
+        {
+            "generation_id": _sha("loader-generation-1"),
+            "lineage_sha256": _sha("loader-lineage-1"),
+            "manifest_sha256": _sha("loader-manifest-1"),
+            "trade_date": "2025-02-14",
+            "vintage": "2025-02-14T16:00:00+08:00",
+        },
+        {
+            "generation_id": _sha("loader-generation-2"),
+            "lineage_sha256": _sha("loader-lineage-2"),
+            "manifest_sha256": _sha("loader-manifest-2"),
+            "trade_date": "2025-02-17",
+            "vintage": "2025-02-17T16:00:00+08:00",
+        },
+    ]
+    rows = [
+        ("2025-02-14", refs[0]["generation_id"], "300114.SZ"),
+        ("2025-02-14", refs[0]["generation_id"], "302132.SZ"),
+        ("2025-02-14", refs[0]["generation_id"], "430001.BJ"),
+        ("2025-02-17", refs[1]["generation_id"], "302132.SZ"),
+        ("2025-02-17", refs[1]["generation_id"], "688001.SH"),
+    ]
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        """
+        CREATE TABLE market_session_generation_rows_daily (
+            trade_date TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            ts_code TEXT NOT NULL
+        )
+        """
+    )
+    connection.executemany(
+        "INSERT INTO market_session_generation_rows_daily VALUES (?, ?, ?)",
+        rows,
+    )
+    manifest = {
+        "artifact_root_sha256": _sha("loader-artifact"),
+        "bundle_sha256": _sha("loader-bundle"),
+        "coverage_audit_sha256": _sha("loader-coverage"),
+        "manifest_sha256": _sha("loader-manifest"),
+        "market_generations": {
+            "count": len(refs),
+            "refs": refs,
+            "root_sha256": _canonical_sha(refs),
+        },
+        "sqlite": {"sha256": _sha("loader-sqlite")},
+        "tables": {
+            "market_session_generation_rows_daily": {
+                "rows": len(rows),
+                "sha256": _sha("loader-daily-table"),
+            }
+        },
+        "temporal_binding": {
+            "contract_sha256": _sha("loader-temporal"),
+            "role": "development",
+        },
+    }
+
+    class FakeUniverse:
+        def __init__(self) -> None:
+            self.database_path = database_path
+            self.manifest = manifest
+
+        def __enter__(self) -> "FakeUniverse":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def _require_open(self) -> sqlite3.Connection:
+            return connection
+
+    captured: dict[str, Any] = {}
+
+    def from_file(
+        _cls: type,
+        path: str,
+        **kwargs: Any,
+    ) -> FakeUniverse:
+        captured.update({"path": path, **kwargs})
+        return FakeUniverse()
+
+    monkeypatch.setattr(
+        authority.AuditedPointInTimeUniverse,
+        "from_file",
+        classmethod(from_file),
+    )
+
+    loaded = authority._load_audited_daily_authority(
+        audited_universe_sqlite_path=database_path,
+        expected_coverage_audit_sha256=manifest["coverage_audit_sha256"],
+        expected_artifact_root_sha256=manifest["artifact_root_sha256"],
+        expected_temporal_contract_sha256=manifest["temporal_binding"]["contract_sha256"],
+        expected_temporal_role="development",
+    )
+
+    assert captured["path"] == str(database_path)
+    assert loaded.manifest_file_sha256 == hashlib.sha256(manifest_raw).hexdigest()
+    assert loaded.market_generation_root_sha256 == _canonical_sha(refs)
+    assert [partition.trade_date for partition in loaded.partitions] == [
+        "2025-02-14",
+        "2025-02-17",
+    ]
+    assert loaded.partitions[0].ts_codes == (
+        "300114.SZ",
+        "302132.SZ",
+        "430001.BJ",
+    )
+    assert loaded.partitions[1].ts_codes == ("302132.SZ", "688001.SH")
+
+
+def test_transition_loader_binds_frozen_contract_and_evidence_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = authority.code_transition.SECURITY_CODE_TRANSITION_CONTRACT
+    contract_sha256 = authority.code_transition.SECURITY_CODE_TRANSITION_CONTRACT_SHA256
+    evidence_receipts = [{"raw_sha256": _sha("transition-pdf")}]
+    receipt_identity = {
+        "schema_version": "security-code-transition-evidence-load/v1",
+        "contract_sha256": contract_sha256,
+        "evidence_receipts": evidence_receipts,
+    }
+    monkeypatch.setattr(
+        authority.code_transition,
+        "load_security_code_transition_evidence",
+        lambda *_args, **_kwargs: {
+            **receipt_identity,
+            "contract": contract,
+            "receipt_sha256": authority.code_transition.canonical_sha256(receipt_identity),
+        },
+    )
+
+    loaded = authority._load_transition_authority(
+        security_code_transition_evidence_root=tmp_path,
+        expected_security_code_transition_contract_sha256=contract_sha256,
+    )
+
+    assert loaded.contract_sha256 == contract_sha256
+    assert loaded.transition_count == 1
+    assert set(loaded.transitions_by_code) == {"300114.SZ", "302132.SZ"}
+    assert loaded.transitions_by_code["302132.SZ"]["effective_date"] == "2025-02-17"
+
+
 def test_publishes_full_market_exact_set_then_derives_target_scope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -535,6 +716,62 @@ def test_transition_overlap_factor_conflict_fails_closed(
     kwargs = _kwargs(tmp_path, daily)
 
     with pytest.raises(ValueError, match=field):
+        authority.publish_daily_basic_exact_set_coverage(**kwargs)
+
+    assert not list(kwargs["output_root"].rglob("*.json"))
+
+
+def test_transition_boundary_session_cannot_be_missing_from_full_date_sequence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    daily = _daily_authority()
+    second = replace(
+        daily.partitions[1],
+        trade_date="2025-02-18",
+        vintage="2025-02-18T16:00:00+08:00",
+    )
+    daily = _replace_daily_partitions(
+        daily,
+        (daily.partitions[0], second),
+    )
+    _install_authorities(monkeypatch, daily=daily)
+    kwargs = _kwargs(tmp_path, daily)
+
+    with pytest.raises(ValueError, match="transition boundary session"):
+        authority.publish_daily_basic_exact_set_coverage(**kwargs)
+
+    assert not list(kwargs["output_root"].rglob("*.json"))
+
+
+@pytest.mark.parametrize(
+    ("partition_index", "missing_role"),
+    [(0, "predecessor"), (1, "successor")],
+)
+def test_transition_boundary_requires_both_authoritative_codes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    partition_index: int,
+    missing_role: str,
+) -> None:
+    daily = _daily_authority()
+    partitions = list(daily.partitions)
+    target = partitions[partition_index]
+    transition_code = "300114.SZ" if partition_index == 0 else "302132.SZ"
+    partitions[partition_index] = replace(
+        target,
+        ts_codes=tuple(
+            sorted("300001.SZ" if code == transition_code else code for code in target.ts_codes)
+        ),
+    )
+    daily = _replace_daily_partitions(daily, tuple(partitions))
+    _install_authorities(monkeypatch, daily=daily)
+    kwargs = _kwargs(tmp_path, daily)
+
+    with pytest.raises(
+        ValueError,
+        match=f"transition boundary {missing_role}",
+    ):
         authority.publish_daily_basic_exact_set_coverage(**kwargs)
 
     assert not list(kwargs["output_root"].rglob("*.json"))
