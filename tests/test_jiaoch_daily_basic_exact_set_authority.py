@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 import inspect
 import json
@@ -145,6 +145,15 @@ def _daily_basic_partition(
     attempt = _sha(f"attempt:{trade_date}")
     raw = _sha(f"raw:{trade_date}")
     rows = tuple(_row(code, trade_date) for code in daily_partition.ts_codes)
+    canonical_rows_sha256 = hashlib.sha256(
+        json.dumps(
+            [asdict(row) for row in rows],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
     return authority.DailyBasicPartition(
         trade_date=trade_date,
         collection_set_relative_path=collection["collection_set_relative_path"],
@@ -153,7 +162,7 @@ def _daily_basic_partition(
         attempt_sha256=attempt,
         raw_relative_path=f"raw/sha256/{raw[:2]}/{raw}.body",
         raw_sha256=raw,
-        canonical_rows_sha256=_sha(f"normalized:{trade_date}"),
+        canonical_rows_sha256=canonical_rows_sha256,
         normalization_receipt_sha256=_sha(f"normalization-receipt:{trade_date}"),
         rows=rows,
     )
