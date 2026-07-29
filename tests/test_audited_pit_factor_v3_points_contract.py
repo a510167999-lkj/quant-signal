@@ -198,12 +198,12 @@ def test_contract_freezes_scope_lag_features_arms_and_safety_gate() -> None:
         "25f2802cfa11fa61a3e08f44886141bd82c01c89e7d9ee01a3e882b8a3561c99"
     )
     assert FACTOR_V3_POINTS_CONTRACT_SHA256 == (
-        "699bfb91aeed1523168ac1604f4fc920e21723fcbefbcdb868b390394f2e17b2"
+        "d69750969b8ebf9c9f87da58abcaf9d604f2143c23903221f714b76599f0384b"
     )
     assert dict(FACTOR_V3_POINTS_ARM_STRATEGY_SHA256) == {
-        "control": "36b47deda4ca4b300b090586a3f69147939c34148ac764fea04463bae3e7adfc",
-        "turnover_level": "c4291b2d0e52cad77e7338032d6fde2a7b9b5ce7f813e6594516752f23df2b98",
-        "abnormal_turnover": "1e64701d826492af3043b0846b445597d2678c91070de2a1559f1c3003b3fb8a",
+        "control": "c2653ba44498a1a330074e0f209b9931b58b0da800245e1d845b49fd18f63ee1",
+        "turnover_level": "39216a4e248f5dce791ce9e9f65b833f8233ef17ac82339d46c13dcf59d7cffa",
+        "abnormal_turnover": "557588cbeca6ce5b4718bd430d31cdc0d6f4ee204673da604a2055f7d41e0047",
     }
 
 
