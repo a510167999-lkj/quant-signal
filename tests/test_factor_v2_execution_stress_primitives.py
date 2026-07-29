@@ -142,15 +142,9 @@ def test_cash_costs_apply_each_leg_minimum_tax_other_fees_and_slippage() -> None
 
     scenario = scenarios[0]
     assert [leg.side for leg in scenario.legs] == ["buy", "sell", "sell"]
-    assert [leg.commission_cash_cny for leg in scenario.legs] == pytest.approx(
-        [5.0, 5.0, 5.0]
-    )
-    assert [leg.stamp_duty_cash_cny for leg in scenario.legs] == pytest.approx(
-        [0.0, 0.20, 0.35]
-    )
-    assert [leg.other_fee_cash_cny for leg in scenario.legs] == pytest.approx(
-        [0.10, 0.08, 0.14]
-    )
+    assert [leg.commission_cash_cny for leg in scenario.legs] == pytest.approx([5.0, 5.0, 5.0])
+    assert [leg.stamp_duty_cash_cny for leg in scenario.legs] == pytest.approx([0.0, 0.20, 0.35])
+    assert [leg.other_fee_cash_cny for leg in scenario.legs] == pytest.approx([0.10, 0.08, 0.14])
     assert scenario.actual_explicit_fee_cash_cny == pytest.approx(15.87)
     assert scenario.explicit_fee_floor_cash_cny == pytest.approx(2.50)
     assert scenario.charged_explicit_fee_cash_cny == pytest.approx(15.87)
