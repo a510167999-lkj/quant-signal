@@ -123,6 +123,7 @@ def _selector_receipt() -> dict[str, Any]:
             ),
             "source_decision_receipt_raw_file_sha256": "1" * 64,
             "source_decision_receipt_sha256": "8" * 64,
+            "evaluation_artifact_sha256": "a" * 64,
             "verified": True,
             "embargo_consumed": False,
             "final_oos_consumed": False,
@@ -352,6 +353,9 @@ def test_all_bound_green_gates_emit_content_addressed_safe_green() -> None:
     assert result["source_decision_receipt_sha256"] == (
         receipts["branch_selector_receipt"]["source_decision_receipt_sha256"]
     )
+    assert result["evaluation_artifact_sha256"] == (
+        receipts["branch_selector_receipt"]["evaluation_artifact_sha256"]
+    )
     assert result["gate_receipt_sha256s"] == {
         "cost": receipts["cost_gate_receipt"]["receipt_sha256"],
         "capacity": receipts["capacity_gate_receipt"]["receipt_sha256"],
@@ -473,6 +477,7 @@ def test_rejects_selector_drift_or_manually_selected_later_green(
     [
         "source_decision_receipt_raw_file_sha256",
         "source_decision_receipt_sha256",
+        "evaluation_artifact_sha256",
     ],
 )
 def test_selector_requires_decision_minimal_raw_and_self_hashes(
