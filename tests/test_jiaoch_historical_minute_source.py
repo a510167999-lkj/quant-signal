@@ -187,6 +187,7 @@ def test_code_zero_remains_schema_unbound_without_real_success_contract(
     [
         b'{"code":0,"code":0,"data":{}}',
         b'{"code":0,"msg":NaN,"data":{}}',
+        b'{"code":0,"msg":1e999,"data":{}}',
         b'{"code":true,"data":{}}',
         b'{"code":"0","data":{}}',
         b'["not-an-envelope"]',
