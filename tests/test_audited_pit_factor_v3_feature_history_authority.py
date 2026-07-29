@@ -105,6 +105,17 @@ def _development_refs(development: list[str]) -> list[dict[str, str]]:
     return [{"trade_date": value} for value in development]
 
 
+def _refresh_open_sessions_root(manifest: dict[str, object]) -> None:
+    descriptor = {
+        "end_date": str(manifest["end_date"]).replace("-", ""),
+        "exchange": "SSE",
+        "open_sessions": manifest["open_sessions"],
+        "schema": "jiaoch-trade-cal-open-sessions/v1",
+        "start_date": str(manifest["start_date"]).replace("-", ""),
+    }
+    manifest["open_sessions_root_sha256"] = hashlib.sha256(_canonical_bytes(descriptor)).hexdigest()
+
+
 def _install_synthetic_calendar(
     monkeypatch: pytest.MonkeyPatch,
     manifest: dict[str, object],
@@ -372,7 +383,7 @@ def test_prewindow_start_is_derived_not_a_frozen_or_caller_selected_date(
         value.replace("-", "") if "-" in value else value for value in changed_open
     ]
     changed_manifest["start_date"] = earlier
-    changed_manifest["open_sessions_root_sha256"] = SHA_C
+    _refresh_open_sessions_root(changed_manifest)
     _install_synthetic_calendar(monkeypatch, changed_manifest, development)
     changed = history_authority.build_factor_v3_feature_history_collection_plan(
         trade_cal_output_root=Path("synthetic-trade-cal-root"),
@@ -424,6 +435,7 @@ def test_plan_rejects_insufficient_history_and_development_alignment_drift(
     short = deepcopy(manifest)
     short["open_sessions"] = short["open_sessions"][1:]
     short["open_session_count"] -= 1
+    _refresh_open_sessions_root(short)
     _install_synthetic_calendar(monkeypatch, short, development)
     with pytest.raises(ValueError, match="250"):
         history_authority.build_factor_v3_feature_history_collection_plan(
@@ -440,6 +452,7 @@ def test_plan_rejects_insufficient_history_and_development_alignment_drift(
     injected = (date.fromisoformat(development[10]) + timedelta(days=1)).strftime("%Y%m%d")
     misaligned["open_sessions"].insert(250 + 11, injected)
     misaligned["open_session_count"] += 1
+    _refresh_open_sessions_root(misaligned)
     _install_synthetic_calendar(monkeypatch, misaligned, development)
     with pytest.raises(ValueError, match="development"):
         history_authority.build_factor_v3_feature_history_collection_plan(
