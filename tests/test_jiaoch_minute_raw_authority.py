@@ -555,7 +555,7 @@ def test_offline_verifier_rejects_hardlink_added_after_final_descriptor_stat(
 
     monkeypatch.setattr(os, "fstat", linking_fstat)
 
-    with pytest.raises(ValueError, match="link|reparse"):
+    with pytest.raises(ValueError, match="link|reparse|identity"):
         verify_jiaoch_minute_raw_attempt(
             output_root=tmp_path,
             attempt_relative_path=publication["attempt_relative_path"],

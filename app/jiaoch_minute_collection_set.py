@@ -420,6 +420,7 @@ def _read_safe_file(
         if (
             not os.path.samestat(opened, after)
             or not os.path.samestat(after, path_after)
+            or int(getattr(path_after, "st_nlink", 1)) != 1
             or _path_is_link_or_reparse(candidate)
         ):
             raise ValueError(f"{label} identity rejected")

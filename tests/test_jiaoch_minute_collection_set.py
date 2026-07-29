@@ -565,7 +565,7 @@ def test_offline_verifier_rejects_manifest_tamper_path_traversal_and_hardlink(
         os.link(hardlink_source, manifest_path)
     except OSError:
         pytest.skip("filesystem does not support hard links")
-    with pytest.raises(ValueError, match="link|reparse"):
+    with pytest.raises(ValueError, match="link|reparse|identity"):
         verify_jiaoch_minute_collection_set(
             output_root=tmp_path,
             collection_set_relative_path=publication["collection_set_relative_path"],
@@ -586,7 +586,7 @@ def test_offline_verifier_rejects_simulated_manifest_reparse(
         lambda path: Path(path).resolve() == manifest_path or original(path),
     )
 
-    with pytest.raises(ValueError, match="link|reparse"):
+    with pytest.raises(ValueError, match="link|reparse|identity"):
         verify_jiaoch_minute_collection_set(
             output_root=tmp_path,
             collection_set_relative_path=publication["collection_set_relative_path"],
@@ -615,7 +615,7 @@ def test_offline_verifier_rejects_manifest_hardlink_added_after_final_stat(
 
     monkeypatch.setattr(os, "fstat", linking_fstat)
 
-    with pytest.raises(ValueError, match="link|reparse"):
+    with pytest.raises(ValueError, match="link|reparse|identity"):
         verify_jiaoch_minute_collection_set(
             output_root=tmp_path,
             collection_set_relative_path=publication["collection_set_relative_path"],

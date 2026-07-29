@@ -388,6 +388,7 @@ def _read_safe_file(
             raise ValueError(f"{label} identity rejected") from None
         if (
             not stat.S_ISREG(path_after_read.st_mode)
+            or int(getattr(path_after_read, "st_nlink", 1)) != 1
             or int(getattr(path_after_read, "st_file_attributes", 0)) & _REPARSE_ATTRIBUTE
             or not os.path.samestat(after_read, path_after_read)
         ):
