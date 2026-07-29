@@ -400,6 +400,14 @@ def _attempt_binding(spec: Mapping[str, Any], publication: Mapping[str, Any]) ->
     }
 
 
+def _rollback_created_manifest(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    raw_authority.fsync_directory(path.parent)
+
+
 def _collect_jiaoch_points_collection_set_with_route_credential(
     *,
     credential: str,
@@ -513,18 +521,24 @@ def _collect_jiaoch_points_collection_set_with_route_credential(
         digest,
     )
     path = directory / f"{digest}.json"
-    created = raw_authority._write_create_only(
-        path,
-        manifest_raw,
-        label="Jiaoch points collection set",
-        reuse_identical=False,
-    )
     relative_path = f"points_collection_sets/sha256/{digest[:2]}/{digest}.json"
-    verify_jiaoch_points_collection_set(
-        output_root=root,
-        collection_set_relative_path=relative_path,
-        expected_collection_set_sha256=digest,
-    )
+    created = False
+    try:
+        created = raw_authority._write_create_only(
+            path,
+            manifest_raw,
+            label="Jiaoch points collection set",
+            reuse_identical=False,
+        )
+        verify_jiaoch_points_collection_set(
+            output_root=root,
+            collection_set_relative_path=relative_path,
+            expected_collection_set_sha256=digest,
+        )
+    except BaseException:
+        if created:
+            _rollback_created_manifest(path)
+        raise
     return {
         "collection_set_created": created,
         "collection_set_relative_path": relative_path,
