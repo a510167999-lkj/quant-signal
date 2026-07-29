@@ -711,12 +711,20 @@ def verify_jiaoch_minute_raw_attempt(
     if not hmac.compare_digest(_sha256(raw_body), raw_object["sha256"]):
         raise ValueError("Jiaoch raw object verification rejected")
     return {
+        "api_name": payload["api_name"],
         "attempt_id": payload["attempt_id"],
         "attempt_sha256": expected_attempt_sha256,
         "authority_status": "UNBOUND",
+        "body_complete": payload["body_complete"],
+        "credential_slot_id": payload["credential_slot_id"],
         "embargo_consumed": False,
         "final_oos_consumed": False,
+        "http_status": payload["http_status"],
+        "network_route": payload["route"]["network_route"],
         "production_recommendation_eligible": False,
         "raw_bytes": len(raw_body),
+        "raw_relative_path": raw_object["relative_path"],
         "raw_sha256": raw_object["sha256"],
+        "retrieved_at": payload["retrieved_at"],
+        "request_semantics": dict(payload["request_semantics"]),
     }

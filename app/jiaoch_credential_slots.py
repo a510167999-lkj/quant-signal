@@ -19,6 +19,8 @@ import json
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
@@ -28,6 +30,7 @@ __all__ = (
     "JiaochCredentialGeneration",
     "JiaochCredentialSlotDescription",
     "POINTS_PRIMARY_ENV",
+    "collect_jiaoch_historical_minute_collection_set",
     "create_jiaoch_credential_generation",
 )
 
@@ -270,3 +273,54 @@ def create_jiaoch_credential_generation(
     if hmac.compare_digest(credentials[0].encode(), credentials[1].encode()):
         raise ValueError("distinct Jiaoch credentials are required")
     return _seal_generation(credentials)
+
+
+def collect_jiaoch_historical_minute_collection_set(
+    *,
+    generation: JiaochCredentialGeneration,
+    output_root: str | Path,
+    requested_ts_code: str,
+    execution_session: date,
+    retrieved_at: str,
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Issue the closed 1m, 5m and daily collection with one sealed slot."""
+
+    failed = object()
+    try:
+        minute_credential = _credential_for_route(
+            generation,
+            route_id="historical-minute:stk_mins",
+            capability=_ROUTE_CAPABILITY,
+        )
+        daily_credential = _credential_for_route(
+            generation,
+            route_id="historical-minute:calibration-daily",
+            capability=_ROUTE_CAPABILITY,
+        )
+        if not hmac.compare_digest(
+            minute_credential.encode("utf-8"),
+            daily_credential.encode("utf-8"),
+        ):
+            raise ValueError("Jiaoch historical-minute route mapping rejected")
+        descriptions = {item.credential_slot_id: item for item in generation.describe_slots()}
+        descriptor = descriptions[_HISTORICAL_MINUTE_SLOT]
+        from app.jiaoch_minute_collection_set import (
+            _collect_jiaoch_minute_collection_set_with_route_credential,
+        )
+
+        result = _collect_jiaoch_minute_collection_set_with_route_credential(
+            credential=minute_credential,
+            generation_id=descriptor.generation_id,
+            policy_sha256=descriptor.policy_sha256,
+            output_root=output_root,
+            requested_ts_code=requested_ts_code,
+            execution_session=execution_session,
+            retrieved_at=retrieved_at,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception:
+        result = failed
+    if result is failed:
+        raise ValueError("Jiaoch historical-minute collection failed") from None
+    return result

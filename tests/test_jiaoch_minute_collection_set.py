@@ -111,8 +111,7 @@ def _response_bodies(*, ts_code: str = TS_CODE) -> tuple[bytes, bytes, bytes]:
         "data": {
             "fields": MINUTE_FIELDS,
             "items": [
-                [ts_code, label, 10.0, 10.0, 10.1, 9.9, 100, 1000.0]
-                for label in _minute_labels()
+                [ts_code, label, 10.0, 10.0, 10.1, 9.9, 100, 1000.0] for label in _minute_labels()
             ],
         },
         "msg": "success",
@@ -179,6 +178,7 @@ def _collect(
     *,
     outcomes: list[HttpEntityResponse | Exception] | None = None,
     ts_code: str = TS_CODE,
+    retrieved_at: str = RETRIEVED_AT,
 ):
     bodies = _response_bodies(ts_code=ts_code)
     transport = RecordingTransport(
@@ -196,7 +196,7 @@ def _collect(
         output_root=tmp_path,
         requested_ts_code=ts_code,
         execution_session=SESSION,
-        retrieved_at=RETRIEVED_AT,
+        retrieved_at=retrieved_at,
         timeout_seconds=7.5,
     )
     return publication, transport, constructions, bodies
@@ -207,9 +207,7 @@ def _manifest(root: Path, publication: dict) -> dict:
 
 
 def test_public_collection_surface_accepts_generation_but_no_secret_or_transport() -> None:
-    assert set(
-        inspect.signature(collect_jiaoch_historical_minute_collection_set).parameters
-    ) == {
+    assert set(inspect.signature(collect_jiaoch_historical_minute_collection_set).parameters) == {
         "generation",
         "output_root",
         "requested_ts_code",
@@ -218,9 +216,10 @@ def test_public_collection_surface_accepts_generation_but_no_secret_or_transport
         "timeout_seconds",
     }
     for forbidden in ("token", "credential", "transport", "callback", "fallback", "source"):
-        assert forbidden not in inspect.signature(
-            collect_jiaoch_historical_minute_collection_set
-        ).parameters
+        assert (
+            forbidden
+            not in inspect.signature(collect_jiaoch_historical_minute_collection_set).parameters
+        )
     assert set(inspect.signature(verify_jiaoch_minute_collection_set).parameters) == {
         "output_root",
         "collection_set_relative_path",
@@ -426,6 +425,68 @@ def test_credential_echo_on_second_response_is_rejected_before_its_attempt_write
     assert MINUTE_TOKEN.encode() not in persisted
 
 
+@pytest.mark.parametrize(
+    "bad_body",
+    [
+        json.dumps(
+            {"code": -1, "data": None, "msg": "permission denied"},
+            separators=(",", ":"),
+        ).encode(),
+        json.dumps(
+            {
+                "code": 0,
+                "data": {"fields": list(reversed(MINUTE_FIELDS)), "items": []},
+                "msg": "success",
+            },
+            separators=(",", ":"),
+        ).encode(),
+    ],
+)
+def test_provider_status_or_interface_identity_failure_retains_attempt_but_no_manifest(
+    tmp_path: Path,
+    monkeypatch,
+    bad_body: bytes,
+) -> None:
+    bodies = _response_bodies()
+    transport = RecordingTransport([_entity(bodies[0]), _entity(bad_body)])
+    monkeypatch.setattr(jiaoch_minute_collection_set, "_transport_factory", lambda: transport)
+
+    with pytest.raises(ValueError, match="collection failed"):
+        collect_jiaoch_historical_minute_collection_set(
+            generation=_generation(),
+            output_root=tmp_path,
+            requested_ts_code=TS_CODE,
+            execution_session=SESSION,
+            retrieved_at=RETRIEVED_AT,
+        )
+
+    assert len(transport.calls) == 2
+    assert len(list((tmp_path / "attempts").rglob("*.json"))) == 2
+    assert not (tmp_path / "collection_sets").exists()
+
+
+def test_oversized_response_is_bounded_before_raw_attempt_or_manifest_write(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    transport = RecordingTransport([_entity(b"x" * (1024 * 1024 + 1))])
+    monkeypatch.setattr(jiaoch_minute_collection_set, "_transport_factory", lambda: transport)
+
+    with pytest.raises(ValueError, match="collection failed"):
+        collect_jiaoch_historical_minute_collection_set(
+            generation=_generation(),
+            output_root=tmp_path,
+            requested_ts_code=TS_CODE,
+            execution_session=SESSION,
+            retrieved_at=RETRIEVED_AT,
+        )
+
+    assert len(transport.calls) == 1
+    assert not (tmp_path / "raw").exists()
+    assert not (tmp_path / "attempts").exists()
+    assert not (tmp_path / "collection_sets").exists()
+
+
 @pytest.mark.parametrize("ts_code", ["688001.SH", "830001.BJ", "510300.SH"])
 def test_star_bse_and_fund_codes_reject_before_transport_construction(
     tmp_path: Path,
@@ -545,6 +606,40 @@ def test_rehashed_attempt_request_swap_is_rejected_by_collection_verifier(
     )
     forged = json.dumps(
         manifest,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    digest = hashlib.sha256(forged).hexdigest()
+    relative = f"collection_sets/sha256/{digest[:2]}/{digest}.json"
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(forged)
+
+    with pytest.raises(ValueError, match="attempt"):
+        verify_jiaoch_minute_collection_set(
+            output_root=tmp_path,
+            collection_set_relative_path=relative,
+            expected_collection_set_sha256=digest,
+        )
+
+
+def test_attempt_from_another_runtime_call_cannot_be_spliced_into_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    first, _, _, _ = _collect(tmp_path, monkeypatch)
+    second, _, _, _ = _collect(
+        tmp_path,
+        monkeypatch,
+        retrieved_at="2026-07-29T19:31:00+08:00",
+    )
+    forged_manifest = _manifest(tmp_path, first)
+    second_manifest = _manifest(tmp_path, second)
+    forged_manifest["attempts"][1] = second_manifest["attempts"][1]
+    forged = json.dumps(
+        forged_manifest,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
