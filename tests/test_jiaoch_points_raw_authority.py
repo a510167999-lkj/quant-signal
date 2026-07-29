@@ -387,8 +387,13 @@ def test_credential_echo_is_rejected_before_any_write(
         hashlib.sha256(TOKEN.encode("utf-8")).hexdigest(),
         hashlib.sha256(TOKEN.encode("utf-8")).hexdigest().upper(),
         quote(TOKEN, safe=""),
+        quote(TOKEN, safe="").replace("%2F", "%2f"),
         base64.b64encode(TOKEN.encode("utf-8")).decode("ascii"),
         base64.urlsafe_b64encode(TOKEN.encode("utf-8")).decode("ascii").rstrip("="),
+        base64.b64encode(hashlib.sha256(TOKEN.encode("utf-8")).digest()).decode("ascii"),
+        base64.urlsafe_b64encode(hashlib.sha256(TOKEN.encode("utf-8")).digest())
+        .decode("ascii")
+        .rstrip("="),
     ],
 )
 def test_credential_derived_representation_is_rejected_before_any_write(

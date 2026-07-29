@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote, quote_plus, unquote, unquote_plus
 
 from app.durable_io import fsync_directory
 
@@ -236,16 +236,28 @@ def _closed_cross_section_params(
 
 def _credential_representations(credential: str) -> tuple[bytes, ...]:
     raw = credential.encode("utf-8")
-    sha256 = hashlib.sha256(raw).hexdigest()
+    sha256_digest = hashlib.sha256(raw).digest()
+    sha256 = sha256_digest.hex()
+    percent_encoded = quote(credential, safe="")
+    lower_percent_hex = re.sub(
+        r"%[0-9A-F]{2}",
+        lambda match: match.group(0).lower(),
+        percent_encoded,
+    )
     encoded = {
         raw,
         json.dumps(credential, ensure_ascii=True)[1:-1].encode("ascii"),
-        quote(credential, safe="").encode("ascii"),
+        percent_encoded.encode("ascii"),
+        lower_percent_hex.encode("ascii"),
         quote_plus(credential, safe="").encode("ascii"),
         base64.b64encode(raw),
         base64.urlsafe_b64encode(raw),
         base64.b64encode(raw).rstrip(b"="),
         base64.urlsafe_b64encode(raw).rstrip(b"="),
+        base64.b64encode(sha256_digest),
+        base64.urlsafe_b64encode(sha256_digest),
+        base64.b64encode(sha256_digest).rstrip(b"="),
+        base64.urlsafe_b64encode(sha256_digest).rstrip(b"="),
         sha256.encode("ascii"),
         sha256.upper().encode("ascii"),
     }
@@ -269,7 +281,11 @@ def _json_semantically_echoes_credential(raw: bytes, credential: str) -> bool:
         if depth > _MAX_ECHO_SCAN_DEPTH:
             raise ValueError("Jiaoch points raw response credential echo scan rejected")
         if isinstance(value, str):
-            if credential in value:
+            if (
+                credential in value
+                or credential in unquote(value)
+                or credential in unquote_plus(value)
+            ):
                 return True
         elif isinstance(value, _JsonObjectPairs):
             for key, nested in value:
