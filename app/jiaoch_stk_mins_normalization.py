@@ -24,6 +24,7 @@ __all__ = [
     "JiaochStkMinsNormalizationReceipt",
     "NormalizedStkMinsMinute",
     "OpeningSpecialUnresolved",
+    "VwapOhlcQualityDiagnostic",
     "normalize_jiaoch_stk_mins_success_response",
 ]
 
@@ -48,6 +49,8 @@ _SUPPORTED_BOARD_PATTERNS = {
 _MAX_RESPONSE_BYTES = 1024 * 1024
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _HEX = frozenset("0123456789abcdef")
+_VWAP_UNIT_COMPATIBILITY_MIN_RATIO = 0.1
+_VWAP_UNIT_COMPATIBILITY_MAX_RATIO = 10.0
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,17 @@ class NormalizedStkMinsMinute:
 
 
 @dataclass(frozen=True)
+class VwapOhlcQualityDiagnostic:
+    check_id: str
+    tolerance_cny: float
+    schema_acceptance_effect: str
+    evaluated_positive_volume_rows: int
+    passed: bool
+    violation_count: int
+    max_outside_cny: float
+
+
+@dataclass(frozen=True)
 class JiaochStkMinsNormalizationReceipt:
     schema: str
     source_interface: str
@@ -95,6 +109,7 @@ class JiaochStkMinsNormalizationReceipt:
     source_row_count: int
     opening_special_unresolved: OpeningSpecialUnresolved
     normalized_minutes: tuple[NormalizedStkMinsMinute, ...]
+    vwap_ohlc_quality_diagnostic: VwapOhlcQualityDiagnostic
     source_authority_status: str
     minute_amount_authority_status: str
     verification_status: str
@@ -243,12 +258,11 @@ def _validated_source_bar(
             vwap = amount / volume
         except OverflowError as exc:
             raise ValueError(f"items[{row_index}] VWAP rejected") from exc
-        if not (
-            low_price - VWAP_ABSOLUTE_TOLERANCE_CNY
-            <= vwap
-            <= high_price + VWAP_ABSOLUTE_TOLERANCE_CNY
+        if (
+            vwap < low_price * _VWAP_UNIT_COMPATIBILITY_MIN_RATIO
+            or vwap > high_price * _VWAP_UNIT_COMPATIBILITY_MAX_RATIO
         ):
-            raise ValueError(f"items[{row_index}] VWAP falls outside OHLC")
+            raise ValueError(f"items[{row_index}] amount/volume unit compatibility rejected")
     return _SourceBar(
         ts_code=ts_code,
         source_label_at=label,
@@ -351,6 +365,35 @@ def _normalized_minute(
     )
 
 
+def _vwap_ohlc_quality_diagnostic(
+    bars: tuple[_SourceBar, ...],
+) -> VwapOhlcQualityDiagnostic:
+    outside_distances = []
+    for bar in bars:
+        if bar.volume_shares == 0:
+            continue
+        implied_vwap = bar.amount_cny / bar.volume_shares
+        outside_distances.append(
+            max(
+                bar.low_price_cny - implied_vwap,
+                implied_vwap - bar.high_price_cny,
+                0.0,
+            )
+        )
+    violations = [
+        distance for distance in outside_distances if distance > VWAP_ABSOLUTE_TOLERANCE_CNY
+    ]
+    return VwapOhlcQualityDiagnostic(
+        check_id="implied_vwap_within_minute_ohlc",
+        tolerance_cny=VWAP_ABSOLUTE_TOLERANCE_CNY,
+        schema_acceptance_effect="DIAGNOSTIC_ONLY",
+        evaluated_positive_volume_rows=len(outside_distances),
+        passed=not violations,
+        violation_count=len(violations),
+        max_outside_cny=max(outside_distances, default=0.0),
+    )
+
+
 def normalize_jiaoch_stk_mins_success_response(
     *,
     response_body: bytes,
@@ -410,6 +453,7 @@ def normalize_jiaoch_stk_mins_success_response(
         source_row_count=len(bars),
         opening_special_unresolved=opening,
         normalized_minutes=normalized_minutes,
+        vwap_ohlc_quality_diagnostic=_vwap_ohlc_quality_diagnostic(bars),
         source_authority_status="UNBOUND",
         minute_amount_authority_status="UNBOUND",
         verification_status="SCHEMA_NORMALIZED_NOT_SOURCE_VERIFIED",
