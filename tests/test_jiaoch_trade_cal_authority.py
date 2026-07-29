@@ -1055,6 +1055,98 @@ def test_manifest_content_address_conflict_does_not_delete_existing_target(
     assert conflicting_paths[0].read_bytes() == sentinel
 
 
+def test_terminal_directory_fsync_failure_rolls_back_new_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original_fsync = jiaoch_trade_cal_authority.raw_authority.fsync_directory
+    injected = 0
+
+    def failing_terminal_fsync(directory):
+        nonlocal injected
+        path = Path(directory)
+        if (
+            injected == 0
+            and path.parent.name == "sha256"
+            and path.parent.parent.name == "trade_cal_manifests"
+            and list(path.glob("*.json"))
+        ):
+            injected += 1
+            raise OSError("injected terminal directory fsync failure")
+        return original_fsync(path)
+
+    monkeypatch.setattr(
+        jiaoch_trade_cal_authority.raw_authority,
+        "fsync_directory",
+        failing_terminal_fsync,
+    )
+    monkeypatch.setattr(
+        jiaoch_trade_cal_authority,
+        "_transport_factory",
+        lambda: RecordingTransport([_entity(_response_body())]),
+    )
+
+    with pytest.raises(ValueError, match="trade calendar collection failed"):
+        collect_jiaoch_trade_cal_authority(
+            generation=_generation(),
+            output_root=tmp_path,
+            start_date=START_DATE,
+            end_date=END_DATE,
+        )
+
+    assert injected == 1
+    assert len(list((tmp_path / "trade_cal_raw").rglob("*.body"))) == 1
+    assert len(list((tmp_path / "trade_cal_attempts").rglob("*.json"))) == 1
+    assert not list((tmp_path / "trade_cal_manifests").rglob("*.json"))
+
+
+def test_terminal_fsync_cleanup_refuses_to_delete_replacement(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    sentinel = b"replacement-during-terminal-fsync-failure"
+    original_fsync = jiaoch_trade_cal_authority.raw_authority.fsync_directory
+    replaced_paths: list[Path] = []
+
+    def replacing_terminal_fsync(directory):
+        path = Path(directory)
+        manifests = list(path.glob("*.json"))
+        if (
+            not replaced_paths
+            and path.parent.name == "sha256"
+            and path.parent.parent.name == "trade_cal_manifests"
+            and manifests
+        ):
+            target = manifests[0]
+            target.unlink()
+            target.write_bytes(sentinel)
+            replaced_paths.append(target)
+            raise OSError("injected replacement before directory fsync failure")
+        return original_fsync(path)
+
+    monkeypatch.setattr(
+        jiaoch_trade_cal_authority.raw_authority,
+        "fsync_directory",
+        replacing_terminal_fsync,
+    )
+    monkeypatch.setattr(
+        jiaoch_trade_cal_authority,
+        "_transport_factory",
+        lambda: RecordingTransport([_entity(_response_body())]),
+    )
+
+    with pytest.raises(ValueError, match="trade calendar collection failed"):
+        collect_jiaoch_trade_cal_authority(
+            generation=_generation(),
+            output_root=tmp_path,
+            start_date=START_DATE,
+            end_date=END_DATE,
+        )
+
+    assert len(replaced_paths) == 1
+    assert replaced_paths[0].read_bytes() == sentinel
+
+
 def test_rollback_refuses_to_delete_identity_drifted_manifest(
     tmp_path: Path,
     monkeypatch,
