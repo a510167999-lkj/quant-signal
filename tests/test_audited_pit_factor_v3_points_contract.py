@@ -178,6 +178,11 @@ def test_contract_freezes_scope_lag_features_arms_and_safety_gate() -> None:
     }
     preview_policy = FACTOR_V3_POINTS_CONTRACT["preview_policy"]
     assert preview_policy["authority_status"] == "UNBOUND_PREVIEW_ONLY"
+    assert preview_policy["math_semantics"] == (
+        "strict_complete_250_row_synthetic_diagnostic_not_formal_eligibility"
+    )
+    assert preview_policy["exact_250_observed_rows_required_by_preview_only"] is True
+    assert preview_policy["formal_history_eligibility_implemented"] is False
     assert preview_policy["parent_authority_verified"] is False
     assert preview_policy["session_calendar_authority_verified"] is False
     assert preview_policy["daily_basic_row_authority_verified"] is False
@@ -268,8 +273,12 @@ def test_formal_policy_preregisters_one_fail_closed_history_subset_for_all_arms(
         "ipo_age_less_than_6_calendar_months",
         "observed_trading_records_less_than_15_in_20_market_session_window",
         "observed_trading_records_less_than_120_in_250_market_session_window",
-        "authoritative_daily_cross_section_row_missing_in_required_history_window",
         "unresolved_authoritative_security_code_transition",
+    ]
+    assert subset["formal_materialization_blocking_conditions"] == [
+        "authoritative_daily_cross_section_exact_set_coverage_failed",
+        "daily_basic_missing_for_authoritatively_traded_security",
+        "unaccounted_or_unproven_source_missingness",
     ]
     assert subset["exact_250_observed_rows_required"] is False
     assert subset["missing_observation_fill"] == "none"
