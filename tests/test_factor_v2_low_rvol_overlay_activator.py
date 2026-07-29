@@ -561,9 +561,8 @@ def test_same_key_reuse_rejects_linked_artifact_chain(
         )
 
 
-def test_claim_directory_link_or_reparse_ancestor_is_rejected_without_writes(
+def test_claim_directory_link_is_rejected_without_writes(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     descriptor, _, _ = _fixture(tmp_path / "receipt")
     outside = tmp_path / "outside"
@@ -575,6 +574,12 @@ def test_claim_directory_link_or_reparse_ancestor_is_rejected_without_writes(
         _activate_safe(descriptor, linked)
     assert list(outside.iterdir()) == []
 
+
+def test_claim_directory_reparse_ancestor_is_rejected_without_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor, _, _ = _fixture(tmp_path / "receipt")
     ancestor = tmp_path / "reparse-ancestor"
     ancestor.mkdir()
     claims = ancestor / "claims"
@@ -669,7 +674,7 @@ def test_result_is_durable_before_atomic_pointer_and_orphan_is_recovered(
 ) -> None:
     descriptor, _, _ = _fixture(tmp_path / "receipt")
     claims = tmp_path / "claims"
-    directory_syncs: list[Path] = []
+    publication_events: list[tuple[str, str]] = []
     pointer_links = 0
     phase_result: dict[str, Any] = {}
     real_link = activator.os.link
@@ -677,7 +682,9 @@ def test_result_is_durable_before_atomic_pointer_and_orphan_is_recovered(
     monkeypatch.setattr(
         activator,
         "fsync_directory",
-        lambda path: directory_syncs.append(Path(path).resolve()),
+        lambda path: publication_events.append(
+            ("dir_fsync", str(Path(path).resolve()))
+        ),
         raising=False,
     )
 
@@ -698,13 +705,21 @@ def test_result_is_durable_before_atomic_pointer_and_orphan_is_recovered(
     def crash_before_pointer(source: Path, destination: Path) -> None:
         nonlocal pointer_links
         destination = Path(destination)
+        publication_events.append(("link", destination.name))
         if destination.name.endswith(".result-pointer.json"):
             pointer_links += 1
             result_sha256 = hashlib.sha256(
                 _canonical_bytes(phase_result)
             ).hexdigest()
             assert (claims / f"{result_sha256}.json").is_file()
-            assert directory_syncs.count(claims.resolve()) >= 2
+            result_link = publication_events.index(
+                ("link", f"{result_sha256}.json")
+            )
+            pointer_link = len(publication_events) - 1
+            assert any(
+                event == ("dir_fsync", str(claims.resolve()))
+                for event in publication_events[result_link + 1 : pointer_link]
+            )
             assert os.path.lexists(destination) is False
             raise OSError("simulated pointer publish crash")
         real_link(source, destination)
