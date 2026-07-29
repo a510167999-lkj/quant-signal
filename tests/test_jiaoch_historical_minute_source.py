@@ -132,6 +132,14 @@ def test_permission_denied_is_terminal_single_request_and_fixed_stk_mins_post(
     assert manifest["request_count"] == 1
     assert manifest["retry_count"] == 0
     assert manifest["fallback_used"] is False
+    assert manifest["transport_binding"] == {
+        "implementation": "app.research_pit_transport.UrllibTushareTransport",
+        "collector_post_invocations": 1,
+        "collector_http_retries": 0,
+        "collector_fallbacks": 0,
+        "redirect_policy": "refuse",
+        "network_route": "direct",
+    }
     _assert_unbound(manifest)
     assert len(transport.calls) == 1
     call = transport.calls[0]
