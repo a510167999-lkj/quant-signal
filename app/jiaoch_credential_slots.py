@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -30,6 +31,8 @@ __all__ = (
     "JiaochCredentialGeneration",
     "JiaochCredentialSlotDescription",
     "POINTS_PRIMARY_ENV",
+    "collect_jiaoch_feature_history_collection_set",
+    "collect_jiaoch_feature_history_from_environment",
     "collect_jiaoch_historical_minute_collection_set",
     "collect_jiaoch_points_collection_set",
     "collect_jiaoch_trade_cal_authority",
@@ -145,12 +148,46 @@ _AUXILIARY_POLICY_SHA256 = hashlib.sha256(
     ).encode("utf-8")
 ).hexdigest()
 
+_FEATURE_HISTORY_POLICY = _RoutingPolicy(
+    schema="jiaoch-credential-feature-history-routing-policy/v1",
+    routes=tuple(
+        _RoutePolicy(
+            route_id=f"feature-history:points-primary:{api_name}",
+            credential_slot_id=_POINTS_PRIMARY_SLOT,
+            api_name=api_name,
+            purpose="factor-v3-feature-history",
+        )
+        for api_name in ("bak_basic", "daily", "adj_factor", "stk_limit", "suspend_d")
+    ),
+)
+_FEATURE_HISTORY_ROUTES_BY_ID = MappingProxyType(
+    {route.route_id: route for route in _FEATURE_HISTORY_POLICY.routes}
+)
+_FEATURE_HISTORY_POLICY_SHA256 = hashlib.sha256(
+    json.dumps(
+        _policy_document(_FEATURE_HISTORY_POLICY),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+).hexdigest()
+
 
 def _auxiliary_policy_descriptor() -> dict[str, Any]:
     return {
         "document": _policy_document(_AUXILIARY_POLICY),
         "schema": "jiaoch-credential-auxiliary-policy-descriptor/v1",
         "sha256": _AUXILIARY_POLICY_SHA256,
+    }
+
+
+def _feature_history_policy_descriptor() -> dict[str, Any]:
+    return {
+        "credential_proof_claimed": False,
+        "document": _policy_document(_FEATURE_HISTORY_POLICY),
+        "schema": "jiaoch-credential-feature-history-policy-descriptor/v1",
+        "sha256": _FEATURE_HISTORY_POLICY_SHA256,
     }
 
 
@@ -206,8 +243,55 @@ class JiaochCredentialGeneration:
         )
 
 
+class _FeatureHistoryCredentialGeneration:
+    """One-slot sealed generation reserved for feature-history collection."""
+
+    __slots__ = ("__credential", "__generation_id")
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> _FeatureHistoryCredentialGeneration:
+        raise TypeError("Jiaoch feature-history generation must be created by its factory")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("Jiaoch feature-history generation is immutable")
+
+    def __dir__(self) -> list[str]:
+        return ["describe_slots"]
+
+    def __repr__(self) -> str:
+        return f"JiaochFeatureHistoryCredentialGeneration(slots={self.describe_slots()!r})"
+
+    def __copy__(self) -> None:
+        raise TypeError("Jiaoch feature-history generation cannot be copied or serialized")
+
+    def __deepcopy__(self, memo: object) -> None:
+        raise TypeError("Jiaoch feature-history generation cannot be copied or serialized")
+
+    def __reduce__(self) -> None:
+        raise TypeError("Jiaoch feature-history generation cannot be copied or serialized")
+
+    def __reduce_ex__(self, protocol: int) -> None:
+        raise TypeError("Jiaoch feature-history generation cannot be copied or serialized")
+
+    def __getstate__(self) -> None:
+        raise TypeError("Jiaoch feature-history generation cannot be copied or serialized")
+
+    def describe_slots(self) -> tuple[JiaochCredentialSlotDescription, ...]:
+        generation_id = object.__getattribute__(
+            self,
+            "_FeatureHistoryCredentialGeneration__generation_id",
+        )
+        return (
+            JiaochCredentialSlotDescription(
+                credential_slot_id=_POINTS_PRIMARY_SLOT,
+                generation_id=generation_id,
+                policy_sha256=_FEATURE_HISTORY_POLICY_SHA256,
+            ),
+        )
+
+
 _ROUTE_CAPABILITY = object()
 _AUXILIARY_ROUTE_CAPABILITY = object()
+_FEATURE_HISTORY_ROUTE_CAPABILITY = object()
 
 
 def _credential_for_route(
@@ -250,6 +334,27 @@ def _credential_for_auxiliary_route(
         "_JiaochCredentialGeneration__credentials",
     )
     return credentials[_SLOT_ORDER.index(route.credential_slot_id)]
+
+
+def _credential_for_feature_history_route(
+    generation: _FeatureHistoryCredentialGeneration,
+    *,
+    route_id: str,
+    capability: object,
+) -> str:
+    if capability is not _FEATURE_HISTORY_ROUTE_CAPABILITY:
+        raise ValueError("Jiaoch private feature-history route capability rejected")
+    if type(generation) is not _FeatureHistoryCredentialGeneration:
+        raise ValueError("Jiaoch feature-history credential generation rejected")
+    if type(route_id) is not str or route_id not in _FEATURE_HISTORY_ROUTES_BY_ID:
+        raise ValueError("Jiaoch feature-history credential route rejected")
+    route = _FEATURE_HISTORY_ROUTES_BY_ID[route_id]
+    if route.credential_slot_id != _POINTS_PRIMARY_SLOT:
+        raise ValueError("Jiaoch feature-history credential route rejected")
+    return object.__getattribute__(
+        generation,
+        "_FeatureHistoryCredentialGeneration__credential",
+    )
 
 
 _RESOLUTION_FAILED = object()
@@ -303,6 +408,29 @@ def _seal_generation(credentials: tuple[str, ...]) -> JiaochCredentialGeneration
     return generation
 
 
+def _create_feature_history_generation(
+    *, credential_resolver: Callable[[str], str]
+) -> _FeatureHistoryCredentialGeneration:
+    if not callable(credential_resolver):
+        raise ValueError("Jiaoch feature-history credential resolution rejected")
+    try:
+        credential = _credential(credential_resolver(_POINTS_PRIMARY_SLOT))
+    except Exception as exc:
+        raise ValueError("Jiaoch feature-history credential resolution rejected") from exc
+    generation = object.__new__(_FeatureHistoryCredentialGeneration)
+    object.__setattr__(
+        generation,
+        "_FeatureHistoryCredentialGeneration__credential",
+        credential,
+    )
+    object.__setattr__(
+        generation,
+        "_FeatureHistoryCredentialGeneration__generation_id",
+        str(uuid.uuid4()),
+    )
+    return generation
+
+
 def create_jiaoch_credential_generation(
     *,
     credential_resolver: Callable[[str], str] | None = None,
@@ -328,6 +456,62 @@ def create_jiaoch_credential_generation(
     if hmac.compare_digest(credentials[0].encode(), credentials[1].encode()):
         raise ValueError("distinct Jiaoch credentials are required")
     return _seal_generation(credentials)
+
+
+def collect_jiaoch_feature_history_collection_set(
+    *,
+    generation: _FeatureHistoryCredentialGeneration,
+    run_spec_path: str | Path,
+    run_root: str | Path,
+) -> dict[str, Any]:
+    """Run the closed five-route feature-history collector with one points slot."""
+
+    credentials = [
+        _credential_for_feature_history_route(
+            generation,
+            route_id=route.route_id,
+            capability=_FEATURE_HISTORY_ROUTE_CAPABILITY,
+        )
+        for route in _FEATURE_HISTORY_POLICY.routes
+    ]
+    if not credentials or any(
+        not hmac.compare_digest(credentials[0].encode("utf-8"), credential.encode("utf-8"))
+        for credential in credentials[1:]
+    ):
+        raise ValueError("Jiaoch feature-history route mapping rejected")
+    descriptions = generation.describe_slots()
+    if (
+        len(descriptions) != 1
+        or descriptions[0].credential_slot_id != _POINTS_PRIMARY_SLOT
+        or descriptions[0].policy_sha256 != _FEATURE_HISTORY_POLICY_SHA256
+    ):
+        raise ValueError("Jiaoch feature-history points slot rejected")
+    from app.factor_v3_feature_history_runner import (
+        _run_factor_v3_feature_history_collection_with_route_credential,
+    )
+
+    return _run_factor_v3_feature_history_collection_with_route_credential(
+        run_spec_path=run_spec_path,
+        run_root=run_root,
+        credential=credentials[0],
+        source_generation_id=descriptions[0].generation_id,
+        feature_history_policy_descriptor=_feature_history_policy_descriptor(),
+    )
+
+
+def collect_jiaoch_feature_history_from_environment(
+    *, run_spec_path: str | Path, run_root: str | Path
+) -> dict[str, Any]:
+    """Resolve sealed credentials only inside this module, then run the closed set."""
+
+    generation = _create_feature_history_generation(
+        credential_resolver=lambda slot_id: str(os.getenv(_ENV_BY_SLOT[slot_id]) or "")
+    )
+    return collect_jiaoch_feature_history_collection_set(
+        generation=generation,
+        run_spec_path=run_spec_path,
+        run_root=run_root,
+    )
 
 
 def collect_jiaoch_trade_cal_authority(

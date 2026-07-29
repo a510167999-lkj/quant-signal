@@ -12,6 +12,7 @@ from collections.abc import Mapping
 import pytest
 
 from app import jiaoch_credential_slots
+from app import factor_v3_feature_history_runner
 from app.jiaoch_credential_slots import (
     HISTORICAL_MINUTE_ENV,
     POINTS_PRIMARY_ENV,
@@ -197,6 +198,109 @@ def test_private_route_hook_follows_the_exact_policy_matrix() -> None:
             route_id="points-primary:daily_basic",
             capability=jiaoch_credential_slots._ROUTE_CAPABILITY,
         )
+
+
+def test_feature_history_route_capability_is_private_and_binds_five_points_routes() -> None:
+    assert "_credential_for_feature_history_route" not in jiaoch_credential_slots.__all__
+    assert "_FEATURE_HISTORY_ROUTE_CAPABILITY" not in jiaoch_credential_slots.__all__
+    generation = jiaoch_credential_slots._create_feature_history_generation(
+        credential_resolver=lambda _slot_id: POINTS_TOKEN
+    )
+    descriptor = jiaoch_credential_slots._feature_history_policy_descriptor()
+
+    assert descriptor == (
+        factor_v3_feature_history_runner.FACTOR_V3_FEATURE_HISTORY_COLLECTION_POLICY_DESCRIPTOR
+    )
+    assert [route.api_name for route in jiaoch_credential_slots._FEATURE_HISTORY_POLICY.routes] == [
+        "bak_basic",
+        "daily",
+        "adj_factor",
+        "stk_limit",
+        "suspend_d",
+    ]
+    for route in jiaoch_credential_slots._FEATURE_HISTORY_POLICY.routes:
+        assert route.credential_slot_id == "points-primary"
+        assert route.purpose == "factor-v3-feature-history"
+        assert (
+            jiaoch_credential_slots._credential_for_feature_history_route(
+                generation,
+                route_id=route.route_id,
+                capability=jiaoch_credential_slots._FEATURE_HISTORY_ROUTE_CAPABILITY,
+            )
+            == POINTS_TOKEN
+        )
+    with pytest.raises(ValueError, match="feature-history route capability"):
+        jiaoch_credential_slots._credential_for_feature_history_route(
+            generation,
+            route_id="feature-history:points-primary:daily",
+            capability=object(),
+        )
+
+
+def test_feature_history_collection_set_passes_one_sealed_points_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = jiaoch_credential_slots._create_feature_history_generation(
+        credential_resolver=lambda _slot_id: POINTS_TOKEN
+    )
+    calls: list[dict[str, object]] = []
+
+    def run_closed(**kwargs: object) -> dict[str, object]:
+        calls.append(dict(kwargs))
+        return {"status": "verified", "token_exposed": False}
+
+    monkeypatch.setattr(
+        factor_v3_feature_history_runner,
+        "_run_factor_v3_feature_history_collection_with_route_credential",
+        run_closed,
+    )
+    result = jiaoch_credential_slots.collect_jiaoch_feature_history_collection_set(
+        generation=generation,
+        run_spec_path="C:/safe/run-spec.json",
+        run_root="C:/safe/run",
+    )
+
+    assert result == {"status": "verified", "token_exposed": False}
+    assert len(calls) == 1
+    assert calls[0]["credential"] == POINTS_TOKEN
+    assert calls[0]["feature_history_policy_descriptor"] == (
+        factor_v3_feature_history_runner.FACTOR_V3_FEATURE_HISTORY_COLLECTION_POLICY_DESCRIPTOR
+    )
+    assert calls[0]["source_generation_id"] == generation.describe_slots()[0].generation_id
+    _assert_text_is_secret_free(result)
+
+
+def test_feature_history_environment_entry_reads_only_points_primary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+    environment_reads: list[str] = []
+
+    def getenv(name: str) -> str:
+        environment_reads.append(name)
+        if name == POINTS_PRIMARY_ENV:
+            return POINTS_TOKEN
+        pytest.fail("feature-history must not read the minute credential")
+
+    def run_closed(**kwargs: object) -> dict[str, object]:
+        calls.append(dict(kwargs))
+        return {"status": "verified"}
+
+    monkeypatch.setattr(jiaoch_credential_slots.os, "getenv", getenv)
+    monkeypatch.setattr(
+        factor_v3_feature_history_runner,
+        "_run_factor_v3_feature_history_collection_with_route_credential",
+        run_closed,
+    )
+
+    result = jiaoch_credential_slots.collect_jiaoch_feature_history_from_environment(
+        run_spec_path="C:/safe/run-spec.json",
+        run_root="C:/safe/run",
+    )
+
+    assert result == {"status": "verified"}
+    assert environment_reads == [POINTS_PRIMARY_ENV]
+    assert calls[0]["credential"] == POINTS_TOKEN
 
 
 def test_environment_snapshot_is_copied_without_live_environment_access() -> None:
