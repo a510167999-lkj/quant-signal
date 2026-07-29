@@ -189,6 +189,27 @@ def _manifest(root: Path, publication: dict) -> dict:
     return json.loads((root / publication["authority_manifest_relative_path"]).read_bytes())
 
 
+def _verify_publication(
+    root: Path,
+    publication: dict,
+    *,
+    relative_path: str | None = None,
+    digest: str | None = None,
+) -> dict:
+    return verify_jiaoch_trade_cal_authority(
+        output_root=root,
+        authority_manifest_relative_path=(
+            publication["authority_manifest_relative_path"]
+            if relative_path is None
+            else relative_path
+        ),
+        expected_authority_manifest_sha256=(
+            publication["authority_manifest_sha256"] if digest is None else digest
+        ),
+        publication_capability=publication["publication_capability"],
+    )
+
+
 def _canonical_bytes(value: object) -> bytes:
     return json.dumps(
         value,
@@ -202,7 +223,7 @@ def _canonical_bytes(value: object) -> bytes:
 def _write_forged_manifest(root: Path, payload: dict) -> tuple[str, str]:
     raw = _canonical_bytes(payload)
     digest = hashlib.sha256(raw).hexdigest()
-    relative = f"trade_cal_manifests/sha256/{digest[:2]}/{digest}.json"
+    relative = f"trade_cal_manifest_candidates/sha256/{digest[:2]}/{digest}.json"
     path = root / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(raw)
@@ -525,16 +546,14 @@ def test_manifest_binds_attempt_auxiliary_policy_calendar_roots_and_all_safety_f
     publication, _, _ = _collect(tmp_path, monkeypatch)
     manifest = _manifest(tmp_path, publication)
     attempt = json.loads((tmp_path / manifest["attempt"]["attempt_relative_path"]).read_bytes())
-    verified = verify_jiaoch_trade_cal_authority(
-        output_root=tmp_path,
-        authority_manifest_relative_path=publication["authority_manifest_relative_path"],
-        expected_authority_manifest_sha256=publication["authority_manifest_sha256"],
-    )
+    verified = _verify_publication(tmp_path, publication)
 
     assert manifest["schema"] == "jiaoch-trade-cal-authority/v1"
     assert manifest["source_id"] == "jiaoch"
     assert manifest["credential_slot_id"] == "points-primary"
-    assert manifest["calendar_authority_status"] == "VERIFIED_SINGLE_SEALED_CALL"
+    assert manifest["calendar_authority_status"] == (
+        "NOT_GRANTED_WITHOUT_RETURNED_PUBLICATION_CAPABILITY"
+    )
     assert manifest["exchange"] == "SSE"
     assert manifest["start_date"] == "2026-07-20"
     assert manifest["end_date"] == "2026-07-26"
@@ -615,7 +634,8 @@ def test_manifest_binds_attempt_auxiliary_policy_calendar_roots_and_all_safety_f
     for secret in (POINTS_TOKEN, MINUTE_TOKEN):
         assert secret.encode() not in persisted
         assert hashlib.sha256(secret.encode()).hexdigest().encode() not in persisted
-    assert b"483" not in persisted
+    assert b'"development_session_count":483' not in persisted
+    assert b'"development_session_count_claimed":483' not in persisted
 
 
 def test_exact_integer_and_string_is_open_wire_values_share_canonical_calendar(
@@ -649,11 +669,9 @@ def test_exact_integer_and_string_is_open_wire_values_share_canonical_calendar(
     assert manifest["open_sessions"] == OPEN_SESSIONS
     assert manifest["is_open_normalization_evidence"] == _normalization_evidence(rows)
     assert manifest["is_open_normalization_root_sha256"] == _normalization_root(rows)
-    assert verify_jiaoch_trade_cal_authority(
-        output_root=tmp_path,
-        authority_manifest_relative_path=publication["authority_manifest_relative_path"],
-        expected_authority_manifest_sha256=publication["authority_manifest_sha256"],
-    )["is_open_normalization_root_sha256"] == _normalization_root(rows)
+    assert _verify_publication(tmp_path, publication)[
+        "is_open_normalization_root_sha256"
+    ] == _normalization_root(rows)
 
 
 def test_target_calendar_window_full_manifest_fits_the_sealed_size_bound(
@@ -691,14 +709,7 @@ def test_target_calendar_window_full_manifest_fits_the_sealed_size_bound(
     assert manifest["calendar_day_count"] == 1129
     assert len(manifest["is_open_normalization_evidence"]["entries"]) == 1129
     assert manifest_path.stat().st_size <= 128 * 1024
-    assert (
-        verify_jiaoch_trade_cal_authority(
-            output_root=tmp_path,
-            authority_manifest_relative_path=publication["authority_manifest_relative_path"],
-            expected_authority_manifest_sha256=publication["authority_manifest_sha256"],
-        )["verified"]
-        is True
-    )
+    assert _verify_publication(tmp_path, publication)["verified"] is True
 
 
 def test_calendar_window_with_no_open_sessions_is_valid_but_claims_no_development_alignment(
@@ -763,7 +774,7 @@ def test_natural_day_identity_exchange_open_flag_and_pretrade_chain_fail_closed(
 
     assert len(transport.calls) == 1
     assert len(list((tmp_path / "trade_cal_attempts").rglob("*.json"))) == 1
-    assert not list((tmp_path / "trade_cal_manifests").rglob("*.json"))
+    assert not list((tmp_path / "trade_cal_manifest_candidates").rglob("*.json"))
 
 
 @pytest.mark.parametrize(
@@ -793,7 +804,7 @@ def test_provider_envelope_fields_width_or_duplicate_json_retains_attempt_withou
 
     assert len(list((tmp_path / "trade_cal_raw").rglob("*.body"))) == 1
     assert len(list((tmp_path / "trade_cal_attempts").rglob("*.json"))) == 1
-    assert not list((tmp_path / "trade_cal_manifests").rglob("*.json"))
+    assert not list((tmp_path / "trade_cal_manifest_candidates").rglob("*.json"))
 
 
 @pytest.mark.parametrize(
@@ -820,7 +831,7 @@ def test_bad_http_entity_retains_partial_raw_attempt_but_no_terminal_manifest(
     assert len(transport.calls) == 1
     assert len(list((tmp_path / "trade_cal_raw").rglob("*.body"))) == 1
     assert len(list((tmp_path / "trade_cal_attempts").rglob("*.json"))) == 1
-    assert not list((tmp_path / "trade_cal_manifests").rglob("*.json"))
+    assert not list((tmp_path / "trade_cal_manifest_candidates").rglob("*.json"))
 
 
 def test_transport_failure_has_no_retry_fallback_or_secret_exception_context(
@@ -843,7 +854,7 @@ def test_transport_failure_has_no_retry_fallback_or_secret_exception_context(
     assert len(transport.calls) == 1
     assert not (tmp_path / "trade_cal_raw").exists()
     assert not (tmp_path / "trade_cal_attempts").exists()
-    assert not (tmp_path / "trade_cal_manifests").exists()
+    assert not (tmp_path / "trade_cal_manifest_candidates").exists()
 
 
 def test_credential_echo_is_rejected_before_any_artifact_write(
@@ -882,7 +893,7 @@ def test_response_above_32_mib_is_rejected_before_artifact_write(
 
     assert not (tmp_path / "trade_cal_raw").exists()
     assert not (tmp_path / "trade_cal_attempts").exists()
-    assert not (tmp_path / "trade_cal_manifests").exists()
+    assert not (tmp_path / "trade_cal_manifest_candidates").exists()
 
 
 def test_offline_verifier_never_constructs_transport(
@@ -896,14 +907,7 @@ def test_offline_verifier_never_constructs_transport(
         lambda: pytest.fail("offline verifier attempted network"),
     )
 
-    assert (
-        verify_jiaoch_trade_cal_authority(
-            output_root=tmp_path,
-            authority_manifest_relative_path=publication["authority_manifest_relative_path"],
-            expected_authority_manifest_sha256=publication["authority_manifest_sha256"],
-        )["verified"]
-        is True
-    )
+    assert _verify_publication(tmp_path, publication)["verified"] is True
 
 
 def test_manifest_tamper_path_traversal_hardlink_and_reparse_are_rejected(
@@ -916,18 +920,14 @@ def test_manifest_tamper_path_traversal_hardlink_and_reparse_are_rejected(
 
     manifest_path.write_bytes(original + b"\n")
     with pytest.raises(ValueError):
-        verify_jiaoch_trade_cal_authority(
-            output_root=tmp_path,
-            authority_manifest_relative_path=publication["authority_manifest_relative_path"],
-            expected_authority_manifest_sha256=publication["authority_manifest_sha256"],
-        )
+        _verify_publication(tmp_path, publication)
     manifest_path.write_bytes(original)
 
     with pytest.raises(ValueError, match="path"):
-        verify_jiaoch_trade_cal_authority(
-            output_root=tmp_path,
-            authority_manifest_relative_path=f"../{publication['authority_manifest_relative_path']}",
-            expected_authority_manifest_sha256=publication["authority_manifest_sha256"],
+        _verify_publication(
+            tmp_path,
+            publication,
+            relative_path=f"../{publication['authority_manifest_relative_path']}",
         )
 
     hardlink_source = tmp_path / "manifest-hardlink-source"
@@ -938,11 +938,7 @@ def test_manifest_tamper_path_traversal_hardlink_and_reparse_are_rejected(
     except OSError:
         pytest.skip("filesystem does not support hard links")
     with pytest.raises(ValueError, match="link|reparse|identity"):
-        verify_jiaoch_trade_cal_authority(
-            output_root=tmp_path,
-            authority_manifest_relative_path=publication["authority_manifest_relative_path"],
-            expected_authority_manifest_sha256=publication["authority_manifest_sha256"],
-        )
+        _verify_publication(tmp_path, publication)
 
 
 @pytest.mark.parametrize("kind", ["raw", "attempt"])
@@ -964,11 +960,7 @@ def test_offline_verifier_rejects_hardlinked_raw_or_attempt(
         pytest.skip("filesystem does not support hard links")
 
     with pytest.raises(ValueError, match="link|reparse|identity"):
-        verify_jiaoch_trade_cal_authority(
-            output_root=tmp_path,
-            authority_manifest_relative_path=publication["authority_manifest_relative_path"],
-            expected_authority_manifest_sha256=publication["authority_manifest_sha256"],
-        )
+        _verify_publication(tmp_path, publication)
 
 
 def test_attempt_from_another_sealed_call_cannot_be_spliced_into_rehashed_manifest(
@@ -982,10 +974,11 @@ def test_attempt_from_another_sealed_call_cannot_be_spliced_into_rehashed_manife
     relative, digest = _write_forged_manifest(tmp_path, forged)
 
     with pytest.raises(ValueError, match="attempt|binding"):
-        verify_jiaoch_trade_cal_authority(
-            output_root=tmp_path,
-            authority_manifest_relative_path=relative,
-            expected_authority_manifest_sha256=digest,
+        _verify_publication(
+            tmp_path,
+            first,
+            relative_path=relative,
+            digest=digest,
         )
 
 
@@ -1003,10 +996,11 @@ def test_rehashed_auxiliary_policy_or_open_sessions_drift_is_rejected(
         relative, digest = _write_forged_manifest(tmp_path, forged)
 
         with pytest.raises(ValueError, match="policy|session|attempt|root"):
-            verify_jiaoch_trade_cal_authority(
-                output_root=tmp_path,
-                authority_manifest_relative_path=relative,
-                expected_authority_manifest_sha256=digest,
+            _verify_publication(
+                tmp_path,
+                publication,
+                relative_path=relative,
+                digest=digest,
             )
 
 
@@ -1036,10 +1030,11 @@ def test_rehashed_is_open_normalization_drift_is_rejected_offline(
     relative, digest = _write_forged_manifest(tmp_path, forged)
 
     with pytest.raises(ValueError, match="normalization|evidence|root|producer"):
-        verify_jiaoch_trade_cal_authority(
-            output_root=tmp_path,
-            authority_manifest_relative_path=relative,
-            expected_authority_manifest_sha256=digest,
+        _verify_publication(
+            tmp_path,
+            publication,
+            relative_path=relative,
+            digest=digest,
         )
 
 
@@ -1057,17 +1052,12 @@ def test_producer_drift_is_rejected_before_manifest_create(
             return stable_binding
         return {**stable_binding, "root_sha256": "0" * 64}
 
-    write_labels = []
-    original_writer = jiaoch_trade_cal_authority.raw_authority._write_create_only
+    candidate_writes = []
+    original_writer = jiaoch_trade_cal_authority._write_manifest_candidate_create_only
 
-    def recording_writer(path, raw, *, label, reuse_identical):
-        write_labels.append(label)
-        return original_writer(
-            path,
-            raw,
-            label=label,
-            reuse_identical=reuse_identical,
-        )
+    def recording_writer(path, raw):
+        candidate_writes.append(path)
+        return original_writer(path, raw)
 
     monkeypatch.setattr(
         jiaoch_trade_cal_authority,
@@ -1075,8 +1065,8 @@ def test_producer_drift_is_rejected_before_manifest_create(
         drifting_binding,
     )
     monkeypatch.setattr(
-        jiaoch_trade_cal_authority.raw_authority,
-        "_write_create_only",
+        jiaoch_trade_cal_authority,
+        "_write_manifest_candidate_create_only",
         recording_writer,
     )
     monkeypatch.setattr(
@@ -1094,8 +1084,8 @@ def test_producer_drift_is_rejected_before_manifest_create(
         )
 
     assert producer_calls == 3
-    assert "Jiaoch trade calendar authority manifest" not in write_labels
-    assert not list((tmp_path / "trade_cal_manifests").rglob("*.json"))
+    assert candidate_writes == []
+    assert not list((tmp_path / "trade_cal_manifest_candidates").rglob("*.json"))
 
 
 def test_manifest_content_address_conflict_does_not_delete_existing_target(
@@ -1108,7 +1098,7 @@ def test_manifest_content_address_conflict_does_not_delete_existing_target(
 
     def conflicting_open(path, flags, *args, **kwargs):
         candidate = Path(path)
-        if candidate.suffix == ".json" and "trade_cal_manifests" in candidate.parts:
+        if candidate.suffix == ".json" and "trade_cal_manifest_candidates" in candidate.parts:
             candidate.write_bytes(sentinel)
             conflicting_paths.append(candidate)
             raise FileExistsError("content-address conflict")
@@ -1137,7 +1127,7 @@ def test_manifest_content_address_conflict_does_not_delete_existing_target(
     assert conflicting_paths[0].read_bytes() == sentinel
 
 
-def test_terminal_directory_fsync_failure_rolls_back_new_manifest(
+def test_candidate_directory_fsync_failure_leaves_unreferenced_orphan(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1150,7 +1140,7 @@ def test_terminal_directory_fsync_failure_rolls_back_new_manifest(
         if (
             injected == 0
             and path.parent.name == "sha256"
-            and path.parent.parent.name == "trade_cal_manifests"
+            and path.parent.parent.name == "trade_cal_manifest_candidates"
             and list(path.glob("*.json"))
         ):
             injected += 1
@@ -1179,89 +1169,22 @@ def test_terminal_directory_fsync_failure_rolls_back_new_manifest(
     assert injected == 1
     assert len(list((tmp_path / "trade_cal_raw").rglob("*.body"))) == 1
     assert len(list((tmp_path / "trade_cal_attempts").rglob("*.json"))) == 1
-    assert not list((tmp_path / "trade_cal_manifests").rglob("*.json"))
-
-
-def test_terminal_file_fsync_failure_rolls_back_new_manifest(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    original_fsync = jiaoch_trade_cal_authority.os.fsync
-    injected = 0
-
-    def failing_terminal_file_fsync(descriptor):
-        nonlocal injected
-        metadata = os.fstat(descriptor)
-        if (
-            injected == 0
-            and jiaoch_trade_cal_authority.stat.S_ISREG(metadata.st_mode)
-            and list((tmp_path / "trade_cal_manifests").rglob("*.json"))
-        ):
-            injected += 1
-            raise OSError("injected terminal file fsync failure")
-        return original_fsync(descriptor)
-
-    monkeypatch.setattr(
-        jiaoch_trade_cal_authority.os,
-        "fsync",
-        failing_terminal_file_fsync,
+    orphans = list((tmp_path / "trade_cal_manifest_candidates").rglob("*.json"))
+    assert len(orphans) == 1
+    orphan = json.loads(orphans[0].read_bytes())
+    assert orphan["calendar_authority_status"] == (
+        "NOT_GRANTED_WITHOUT_RETURNED_PUBLICATION_CAPABILITY"
     )
-    monkeypatch.setattr(
-        jiaoch_trade_cal_authority,
-        "_transport_factory",
-        lambda: RecordingTransport([_entity(_response_body())]),
-    )
-
-    with pytest.raises(ValueError, match="trade calendar collection failed"):
-        collect_jiaoch_trade_cal_authority(
-            generation=_generation(),
+    with pytest.raises(ValueError, match="capability"):
+        verify_jiaoch_trade_cal_authority(
             output_root=tmp_path,
-            start_date=START_DATE,
-            end_date=END_DATE,
+            authority_manifest_relative_path=orphans[0].relative_to(tmp_path).as_posix(),
+            expected_authority_manifest_sha256=hashlib.sha256(orphans[0].read_bytes()).hexdigest(),
+            publication_capability=str(uuid.uuid4()),
         )
 
-    assert injected == 1
-    assert not list((tmp_path / "trade_cal_manifests").rglob("*.json"))
 
-
-def test_terminal_first_identity_read_failure_rolls_back_new_manifest(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    original_fstat = jiaoch_trade_cal_authority.os.fstat
-    injected = 0
-
-    def failing_first_terminal_fstat(descriptor):
-        nonlocal injected
-        if injected == 0 and list((tmp_path / "trade_cal_manifests").rglob("*.json")):
-            injected += 1
-            raise OSError("injected first terminal identity read failure")
-        return original_fstat(descriptor)
-
-    monkeypatch.setattr(
-        jiaoch_trade_cal_authority.os,
-        "fstat",
-        failing_first_terminal_fstat,
-    )
-    monkeypatch.setattr(
-        jiaoch_trade_cal_authority,
-        "_transport_factory",
-        lambda: RecordingTransport([_entity(_response_body())]),
-    )
-
-    with pytest.raises(ValueError, match="trade calendar collection failed"):
-        collect_jiaoch_trade_cal_authority(
-            generation=_generation(),
-            output_root=tmp_path,
-            start_date=START_DATE,
-            end_date=END_DATE,
-        )
-
-    assert injected == 1
-    assert not list((tmp_path / "trade_cal_manifests").rglob("*.json"))
-
-
-def test_terminal_fsync_cleanup_refuses_to_delete_replacement(
+def test_candidate_fsync_failure_never_deletes_foreign_replacement(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1275,7 +1198,7 @@ def test_terminal_fsync_cleanup_refuses_to_delete_replacement(
         if (
             not replaced_paths
             and path.parent.name == "sha256"
-            and path.parent.parent.name == "trade_cal_manifests"
+            and path.parent.parent.name == "trade_cal_manifest_candidates"
             and manifests
         ):
             target = manifests[0]
@@ -1308,7 +1231,7 @@ def test_terminal_fsync_cleanup_refuses_to_delete_replacement(
     assert replaced_paths[0].read_bytes() == sentinel
 
 
-def test_rollback_refuses_to_delete_identity_drifted_manifest(
+def test_post_verifier_failure_never_deletes_foreign_replacement(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1345,7 +1268,7 @@ def test_rollback_refuses_to_delete_identity_drifted_manifest(
     assert replaced_paths[0].read_bytes() == sentinel
 
 
-def test_final_verifier_failure_rolls_back_only_new_terminal_manifest(
+def test_final_verifier_failure_leaves_only_unreferenced_candidate(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1373,4 +1296,9 @@ def test_final_verifier_failure_rolls_back_only_new_terminal_manifest(
     assert POINTS_TOKEN not in str(caught.value)
     assert len(list((tmp_path / "trade_cal_raw").rglob("*.body"))) == 1
     assert len(list((tmp_path / "trade_cal_attempts").rglob("*.json"))) == 1
-    assert not list((tmp_path / "trade_cal_manifests").rglob("*.json"))
+    candidates = list((tmp_path / "trade_cal_manifest_candidates").rglob("*.json"))
+    assert len(candidates) == 1
+    assert (
+        json.loads(candidates[0].read_bytes())["calendar_authority_status"]
+        == "NOT_GRANTED_WITHOUT_RETURNED_PUBLICATION_CAPABILITY"
+    )
