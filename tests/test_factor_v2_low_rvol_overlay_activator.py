@@ -27,6 +27,9 @@ EVALUATION_PRODUCER_ROOT = (
     "926b9229a2e6e47ae24f3b590fab46ded2244e757fbe92fc6bbf0dd3de1dd938"
 )
 VERIFIER_ROOT = "3b4c62fa4a02ced6a2f271af74deb75b3234298fe61ae21fc120fd59f2bca55f"
+SELECTION_CONTRACT_SHA = (
+    "ec7b0b455e6ed7ec53f81ef5696d9717136a5a6fe106dca1bf587f4f48cfa788"
+)
 ARM_ORDER = ["v2_control", "overnight_20", "intraday_20"]
 RECEIPT_SCHEMA = "factor-v2-development-evaluation-decision-verification-receipt/v1"
 SOURCE_IDENTITY = {
@@ -72,6 +75,26 @@ FORBIDDEN_FLAGS = (
     "model_rescored",
     "trade_deleted",
 )
+PHASE_TWO_RESULT_FIELDS = {
+    "schema_version",
+    "overlay_id",
+    "decision",
+    "claim_key",
+    "evaluation_artifact_sha256",
+    "preregistration_raw_sha256",
+    "selection_contract_sha256",
+    "source_replay_receipt_sha256",
+    "selection_receipt_sha256",
+    "control_trade_keys_sha256",
+    "overlay_trade_keys_sha256",
+    "source_decision_receipt_sha256",
+    "overlay_evaluation_receipt_sha256",
+    "execution_stress_receipt_sha256",
+    "evidence_complete",
+    *SAFETY_FLAGS,
+    *FORBIDDEN_FLAGS,
+    "result_sha256",
+}
 
 
 def _canonical_bytes(value: dict[str, Any]) -> bytes:
@@ -137,15 +160,48 @@ def _fixture(
     )
 
 
-def _safe_result(**overrides: Any) -> dict[str, Any]:
-    result = {
+def _safe_result(
+    *,
+    decision: str = "RED",
+    claim_key: str | None = None,
+    evaluation_artifact_sha256: str = "a" * 64,
+    **overrides: Any,
+) -> dict[str, Any]:
+    unsigned = {
         "schema_version": "factor-v2-low-rvol-overlay-result/v1",
         "overlay_id": "low_rvol20_rank_overlay_20",
-        "decision": "RED",
+        "decision": decision,
+        "claim_key": claim_key
+        or compute_overlay_claim_key(evaluation_artifact_sha256),
+        "evaluation_artifact_sha256": evaluation_artifact_sha256,
+        "preregistration_raw_sha256": PREREG_SHA,
+        "selection_contract_sha256": SELECTION_CONTRACT_SHA,
+        "source_replay_receipt_sha256": "c" * 64,
+        "selection_receipt_sha256": "d" * 64,
+        "control_trade_keys_sha256": "e" * 64,
+        "overlay_trade_keys_sha256": "f" * 64,
+        "source_decision_receipt_sha256": _receipt(
+            evaluation_artifact_sha256
+        )["receipt_sha256"],
+        "overlay_evaluation_receipt_sha256": (
+            None
+            if decision == "RED_NO_INCREMENT_WITHOUT_STRESS"
+            else "8" * 64
+        ),
+        "execution_stress_receipt_sha256": (
+            None
+            if decision == "RED_NO_INCREMENT_WITHOUT_STRESS"
+            else "9" * 64
+        ),
+        "evidence_complete": True,
         **{flag: False for flag in SAFETY_FLAGS + FORBIDDEN_FLAGS},
     }
-    result.update(overrides)
-    return result
+    supplied_hash = overrides.pop("result_sha256", None)
+    unsigned.update(overrides)
+    return {
+        **unsigned,
+        "result_sha256": supplied_hash or canonical_sha256(unsigned),
+    }
 
 
 def _candidate(
@@ -154,9 +210,13 @@ def _candidate(
     volatility_rank: float,
     amount: float,
     signal_date: str = "2026-01-05",
+    exit_date: str | None = None,
+    signal_industry: str | None = None,
 ) -> dict[str, Any]:
     return {
         "signal_date": signal_date,
+        "exit_date": exit_date or signal_date,
+        "signal_industry": signal_industry or f"industry-{security_id}",
         "stable_security_id": security_id,
         "trade_key": f"{signal_date}|{security_id}",
         "predicted_positive_utility_probability": p_base,
@@ -327,7 +387,7 @@ def test_only_one_distinct_trial_and_same_key_reuses_exact_result(
 
     def runner(*_args: Any) -> dict[str, Any]:
         calls.append("run")
-        return _safe_result(decision="RED_GATE_FAILURE")
+        return _safe_result(decision="RED")
 
     initial = activate_low_rvol_overlay(
         first,
@@ -405,6 +465,116 @@ def test_rank_ties_use_amount_then_stable_id_and_missing_factor_fails_arm() -> N
         build_low_rvol_selection(invalid)
 
 
+def test_selection_inherits_frozen_portfolio_constraints_across_days() -> None:
+    rows = [
+        _candidate("A", 0.90, 0.0, 100, exit_date="2026-01-07", signal_industry="I1"),
+        _candidate("B", 0.80, 0.0, 90, signal_industry="I1"),
+        _candidate("C", 0.70, 0.0, 80, exit_date="2026-01-06", signal_industry="I2"),
+        _candidate("D", 0.60, 0.0, 70, signal_industry="I3"),
+        _candidate(
+            "A",
+            0.99,
+            0.0,
+            120,
+            signal_date="2026-01-06",
+            signal_industry="IX",
+        ),
+        _candidate(
+            "E",
+            0.95,
+            0.0,
+            110,
+            signal_date="2026-01-06",
+            signal_industry="I1",
+        ),
+        _candidate(
+            "F",
+            0.90,
+            0.0,
+            100,
+            signal_date="2026-01-06",
+            exit_date="2026-01-08",
+            signal_industry="I2",
+        ),
+        _candidate(
+            "G",
+            0.85,
+            0.0,
+            90,
+            signal_date="2026-01-06",
+            exit_date="2026-01-08",
+            signal_industry="I3",
+        ),
+        _candidate(
+            "H",
+            0.80,
+            0.0,
+            80,
+            signal_date="2026-01-06",
+            signal_industry="I4",
+        ),
+        _candidate(
+            "A",
+            0.99,
+            0.0,
+            130,
+            signal_date="2026-01-07",
+            signal_industry="I1",
+        ),
+    ]
+
+    result = build_low_rvol_selection(rows)
+
+    assert result["selection_contract"] == {
+        "selection_contract_sha256": SELECTION_CONTRACT_SHA,
+        "top_n": 3,
+        "max_active_positions": 3,
+        "same_security_exclusion": True,
+        "one_position_per_signal_industry": True,
+        "same_day_exit_before_selection": True,
+    }
+    selection_receipt = result["selection_receipt"]
+    unsigned_selection = dict(selection_receipt)
+    selection_receipt_sha256 = unsigned_selection.pop("receipt_sha256")
+    assert selection_receipt_sha256 == canonical_sha256(
+        unsigned_selection
+    )
+    assert selection_receipt["selection_contract_sha256"] == (
+        SELECTION_CONTRACT_SHA
+    )
+    assert selection_receipt["selected_trade_keys"] == [
+        "2026-01-05|A",
+        "2026-01-05|C",
+        "2026-01-05|D",
+        "2026-01-06|F",
+        "2026-01-06|G",
+        "2026-01-07|A",
+    ]
+    assert [row["trade_key"] for row in result["selected_rows"]] == [
+        "2026-01-05|A",
+        "2026-01-05|C",
+        "2026-01-05|D",
+        "2026-01-06|F",
+        "2026-01-06|G",
+        "2026-01-07|A",
+    ]
+
+
+@pytest.mark.parametrize("failure", ["exit_date", "signal_industry", "duplicate"])
+def test_selection_requires_frozen_identity_and_unique_trade_keys(
+    failure: str,
+) -> None:
+    first = _candidate("A", 0.9, 0.0, 100)
+    second = _candidate("B", 0.8, 0.0, 90)
+    if failure == "duplicate":
+        second["trade_key"] = first["trade_key"]
+    else:
+        first.pop(failure)
+
+    with pytest.raises(RuntimeError, match=failure.replace("_", ".?") + "|trade.key"):
+        build_low_rvol_selection([first, second])
+
+
 def test_equal_trade_keys_red_without_metrics_or_stress() -> None:
     calls: list[str] = []
 
@@ -458,6 +628,180 @@ def test_trade_key_uniqueness_precedes_metrics_and_increment_runs_one_stress() -
     )
     assert calls == ["metrics", "stress"]
     assert result["decision"] == "RED"
+
+
+def test_stress_cannot_overwrite_trade_key_comparison_evidence() -> None:
+    control = ["a", "b"]
+    overlay = ["a", "b", "c"]
+
+    def malicious_stress(_metrics: Any) -> dict[str, Any]:
+        return {
+            "decision": "RED",
+            "ordered_control_trade_keys": ["forged"],
+            "ordered_overlay_trade_keys": ["forged"],
+            "control_trade_keys_sha256": "0" * 64,
+            "overlay_trade_keys_sha256": "0" * 64,
+        }
+
+    with pytest.raises(RuntimeError, match="reserved|overlap"):
+        adjudicate_trade_key_increment(
+            control_trade_keys=control,
+            overlay_trade_keys=overlay,
+            read_performance_metrics=lambda: {},
+            run_execution_stress=malicious_stress,
+        )
+
+
+def test_phase_two_result_is_exact_self_hashed_and_bound_to_the_claim(
+    tmp_path: Path,
+) -> None:
+    descriptor, receipt, _ = _fixture(tmp_path / "receipt")
+
+    def runner(
+        verified: dict[str, Any],
+        claim: dict[str, Any],
+    ) -> dict[str, Any]:
+        return _safe_result(
+            claim_key=claim["claim_key"],
+            evaluation_artifact_sha256=verified[
+                "evaluation_artifact_sha256"
+            ],
+        )
+
+    activated = activate_low_rvol_overlay(
+        descriptor,
+        claim_directory=tmp_path / "claims",
+        phase_two_runner=runner,
+    )
+    result = activated["result"]
+    unsigned = dict(result)
+    result_sha256 = unsigned.pop("result_sha256")
+
+    assert set(result) == PHASE_TWO_RESULT_FIELDS
+    assert result_sha256 == canonical_sha256(unsigned)
+    assert result["claim_key"] == activated["claim_key"]
+    assert result["evaluation_artifact_sha256"] == receipt[
+        "evaluation_artifact_sha256"
+    ]
+    assert result["source_decision_receipt_sha256"] == receipt[
+        "receipt_sha256"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "resign", "message"),
+    [
+        (lambda value: value.update({"extra": True}), True, "extra|field|schema"),
+        (lambda value: value.pop("selection_receipt_sha256"), True, "missing|field|schema"),
+        (lambda value: value.update({"decision": "ARBITRARY"}), True, "decision"),
+        (lambda value: value.update({"result_sha256": "0" * 64}), False, "self|hash"),
+        (lambda value: value.update({"claim_key": "0" * 64}), True, "claim"),
+        (
+            lambda value: value.update({"evaluation_artifact_sha256": "0" * 64}),
+            True,
+            "evaluation|artifact",
+        ),
+        (
+            lambda value: value.update({"preregistration_raw_sha256": "0" * 64}),
+            True,
+            "preregistration",
+        ),
+        (
+            lambda value: value.update({"selection_contract_sha256": "0" * 64}),
+            True,
+            "selection|contract",
+        ),
+        (
+            lambda value: value.update({"source_replay_receipt_sha256": "invalid"}),
+            True,
+            "source|receipt|SHA",
+        ),
+        (
+            lambda value: value.update({"selection_receipt_sha256": "invalid"}),
+            True,
+            "selection|receipt|SHA",
+        ),
+        (
+            lambda value: value.update({"control_trade_keys_sha256": "invalid"}),
+            True,
+            "control|trade|SHA",
+        ),
+        (
+            lambda value: value.update(
+                {"source_decision_receipt_sha256": "0" * 64}
+            ),
+            True,
+            "source|decision|receipt",
+        ),
+        (
+            lambda value: value.update(
+                {"overlay_evaluation_receipt_sha256": "invalid"}
+            ),
+            True,
+            "overlay|evaluation|receipt|SHA",
+        ),
+        (
+            lambda value: value.update(
+                {"execution_stress_receipt_sha256": "invalid"}
+            ),
+            True,
+            "execution|stress|receipt|SHA",
+        ),
+    ],
+)
+def test_phase_two_result_fails_closed_on_schema_hash_or_binding_drift(
+    tmp_path: Path,
+    mutation: Callable[[dict[str, Any]], None],
+    resign: bool,
+    message: str,
+) -> None:
+    descriptor, _, _ = _fixture(tmp_path / "receipt")
+
+    def runner(
+        verified: dict[str, Any],
+        claim: dict[str, Any],
+    ) -> dict[str, Any]:
+        result = _safe_result(
+            claim_key=claim["claim_key"],
+            evaluation_artifact_sha256=verified[
+                "evaluation_artifact_sha256"
+            ],
+        )
+        mutation(result)
+        if resign:
+            result.pop("result_sha256", None)
+            result["result_sha256"] = canonical_sha256(result)
+        return result
+
+    with pytest.raises(RuntimeError, match=message):
+        activate_low_rvol_overlay(
+            descriptor,
+            claim_directory=tmp_path / "claims",
+            phase_two_runner=runner,
+        )
+
+
+def test_no_increment_result_cannot_claim_execution_stress_ran(
+    tmp_path: Path,
+) -> None:
+    descriptor, receipt, _ = _fixture(tmp_path / "receipt")
+
+    with pytest.raises(RuntimeError, match="stress|increment"):
+        activate_low_rvol_overlay(
+            descriptor,
+            claim_directory=tmp_path / "claims",
+            phase_two_runner=lambda _verified, claim: _safe_result(
+                decision="RED_NO_INCREMENT_WITHOUT_STRESS",
+                claim_key=claim["claim_key"],
+                evaluation_artifact_sha256=receipt[
+                    "evaluation_artifact_sha256"
+                ],
+                control_trade_keys_sha256="e" * 64,
+                overlay_trade_keys_sha256="e" * 64,
+                overlay_evaluation_receipt_sha256="8" * 64,
+                execution_stress_receipt_sha256="9" * 64,
+            ),
+        )
 
 
 @pytest.mark.parametrize("flag", SAFETY_FLAGS + FORBIDDEN_FLAGS)
