@@ -202,12 +202,8 @@ def test_contract_freezes_scope_lag_features_arms_and_safety_gate() -> None:
 def test_formal_parent_expectation_binds_common_eligible_overlay() -> None:
     parent = FACTOR_V3_POINTS_CONTRACT["preregistered_parent_expectation"]
 
-    assert parent["schema_version"] == (
-        "audited-pit-factor-v3-points-parent-expectation/v2"
-    )
-    assert parent["sample_reference"] == (
-        "factor_v2_development_4_common_eligible_sample"
-    )
+    assert parent["schema_version"] == ("audited-pit-factor-v3-points-parent-expectation/v2")
+    assert parent["sample_reference"] == ("factor_v2_development_4_common_eligible_sample")
     assert parent["factor_v2_common_eligible_overlay_artifact_sha256"] == (
         "abd4b2166da4520952d7bfc5c8a988bc0a8027dd576a90ae0fdda2560b3a02f8"
     )
@@ -239,16 +235,12 @@ def test_formal_parent_expectation_binds_common_eligible_overlay() -> None:
 def test_formal_policy_preregisters_one_fail_closed_history_subset_for_all_arms() -> None:
     policy = FACTOR_V3_POINTS_CONTRACT["formal_parent_sample_policy"]
 
-    assert policy["source_sample_reference"] == (
-        "factor_v2_development_4_common_eligible_sample"
-    )
+    assert policy["source_sample_reference"] == ("factor_v2_development_4_common_eligible_sample")
     assert policy["source_candidate_count"] == 1_796_834
     assert policy["source_candidate_keys_sha256"] == (
         "ded45539b436764ee9c8bf45329105444a735e46f56fa90d7521a40ce9538544"
     )
-    assert policy["coverage"] == (
-        "deterministic_history_eligible_subset_of_common_eligible_parent"
-    )
+    assert policy["coverage"] == ("deterministic_history_eligible_subset_of_common_eligible_parent")
     assert policy["same_history_eligible_subset_for_all_arms"] is True
     assert policy["arbitrary_row_drops_permitted"] is False
     assert policy["silent_row_drops_permitted"] is False
@@ -294,8 +286,7 @@ def test_formal_policy_preregisters_one_fail_closed_history_subset_for_all_arms(
 
     sample_policy_sha256 = canonical_sha256(policy)
     assert {
-        factor_v3_points_arm_contract(arm)["sample_policy_sha256"]
-        for arm in FACTOR_V3_POINTS_ARMS
+        factor_v3_points_arm_contract(arm)["sample_policy_sha256"] for arm in FACTOR_V3_POINTS_ARMS
     } == {sample_policy_sha256}
 
 

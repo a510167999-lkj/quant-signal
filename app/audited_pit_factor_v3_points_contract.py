@@ -135,12 +135,8 @@ FACTOR_V3_POINTS_CONTRACT = {
         ),
         "output_identity_must_equal_history_eligible_subset_identity": True,
         "history_eligible_subset_policy": {
-            "schema_version": (
-                "audited-pit-factor-v3-points-history-eligible-subset-policy/v1"
-            ),
-            "selection": (
-                "deterministic_fail_closed_from_verified_source_bound_authorities"
-            ),
+            "schema_version": ("audited-pit-factor-v3-points-history-eligible-subset-policy/v1"),
+            "selection": ("deterministic_fail_closed_from_verified_source_bound_authorities"),
             "window_market_sessions": {
                 "short": 20,
                 "long": 250,
@@ -153,18 +149,9 @@ FACTOR_V3_POINTS_CONTRACT = {
             "latest_usable_source_session": "T-1",
             "allowed_exclusion_reasons": [
                 "ipo_age_less_than_6_calendar_months",
-                (
-                    "observed_trading_records_less_than_15_in_"
-                    "20_market_session_window"
-                ),
-                (
-                    "observed_trading_records_less_than_120_in_"
-                    "250_market_session_window"
-                ),
-                (
-                    "authoritative_daily_cross_section_row_missing_in_"
-                    "required_history_window"
-                ),
+                ("observed_trading_records_less_than_15_in_20_market_session_window"),
+                ("observed_trading_records_less_than_120_in_250_market_session_window"),
+                ("authoritative_daily_cross_section_row_missing_in_required_history_window"),
                 "unresolved_authoritative_security_code_transition",
             ],
             "observed_trading_record_definition": (
