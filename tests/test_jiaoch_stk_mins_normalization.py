@@ -461,6 +461,7 @@ def test_accepts_only_supported_a_share_board_and_code_pairs() -> None:
         ("SSE_MAIN", "600000.SH"),
         ("SZSE_MAIN", "000001.SZ"),
         ("SZSE_CHINEXT", "300001.SZ"),
+        ("SZSE_CHINEXT", "302001.SZ"),
     )
     for board, ts_code in cases:
         receipt = _normalize(
