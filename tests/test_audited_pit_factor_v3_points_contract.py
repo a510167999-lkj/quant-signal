@@ -128,10 +128,9 @@ def test_contract_freezes_scope_lag_features_arms_and_safety_gate() -> None:
     assert abnormal["variant"] == "free_float_turnover_rate_f"
     assert abnormal["paper_original_turnover_denominator"] == "total_shares"
     assert abnormal["project_turnover_denominator"] == "free_float_shares"
-    assert {
-        feature["scope"]
-        for feature in FACTOR_V3_POINTS_CONTRACT["features"].values()
-    } == {"same_signal_date_exact_history_eligible_common_subset"}
+    assert {feature["scope"] for feature in FACTOR_V3_POINTS_CONTRACT["features"].values()} == {
+        "same_signal_date_exact_history_eligible_common_subset"
+    }
 
     warnings = FACTOR_V3_POINTS_CONTRACT["research_warnings"]
     assert warnings["china_anomaly_replication_insignificant_pct"] == 83.37
@@ -194,12 +193,12 @@ def test_contract_freezes_scope_lag_features_arms_and_safety_gate() -> None:
         "25f2802cfa11fa61a3e08f44886141bd82c01c89e7d9ee01a3e882b8a3561c99"
     )
     assert FACTOR_V3_POINTS_CONTRACT_SHA256 == (
-        "1346bc1f2f46193e22cf22efc608cd30c98e3e2c3b7264b3d2612b858892aecc"
+        "699bfb91aeed1523168ac1604f4fc920e21723fcbefbcdb868b390394f2e17b2"
     )
     assert dict(FACTOR_V3_POINTS_ARM_STRATEGY_SHA256) == {
-        "control": "5e5d112984d57f0f3e6b0ba31b34f26b4b2d495f9211b41c27bc8fd29f4b9f3d",
-        "turnover_level": "cebb81dbebd8e6c030140283f1adbf7a3232d11aece78dfd68fb883f6382150a",
-        "abnormal_turnover": "3079c907297f7fcb65808c87e720329294d250bf1302afd9686f20114e7b5265",
+        "control": "36b47deda4ca4b300b090586a3f69147939c34148ac764fea04463bae3e7adfc",
+        "turnover_level": "c4291b2d0e52cad77e7338032d6fde2a7b9b5ce7f813e6594516752f23df2b98",
+        "abnormal_turnover": "1e64701d826492af3043b0846b445597d2678c91070de2a1559f1c3003b3fb8a",
     }
 
 
