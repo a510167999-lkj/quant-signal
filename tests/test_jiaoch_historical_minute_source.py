@@ -271,6 +271,65 @@ def test_strict_response_rejects_duplicate_nonfinite_and_non_integer_code(
     assert len(transport.calls) == 1
 
 
+def test_deep_bounded_response_is_stably_rejected_without_rows_or_authority(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    depth = 600
+    raw = (
+        b'{"code":0,"msg":'
+        + b"[" * depth
+        + b'"safe"'
+        + b"]" * depth
+        + b',"data":{}}'
+    )
+    assert len(raw) < 1024 * 1024
+    transport = RecordingTransport(_response(raw))
+
+    publication, manifest = _collect(tmp_path, transport, monkeypatch)
+
+    assert manifest["classification"] == "RESPONSE_REJECTED"
+    assert manifest["provider_code"] is None
+    _assert_unbound(manifest)
+    assert len(transport.calls) == 1
+    assert len(list(tmp_path.glob("*.json"))) == 1
+    assert Path(publication["path"]).is_file()
+
+
+def test_loader_maps_deep_descriptor_to_stable_public_value_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    transport = RecordingTransport(
+        _response(
+            '{"code":-1,"msg":"权限不足: stk_mins 未授权","data":null}'.encode("utf-8")
+        )
+    )
+    _, manifest = _collect(tmp_path / "seed", transport, monkeypatch)
+    manifest["request_semantics"] = "__DEEP__"
+    serialized = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    depth = 1_200
+    serialized = serialized.replace(
+        '"__DEEP__"',
+        "[" * depth + "null" + "]" * depth,
+    )
+    path = tmp_path / "deep.json"
+    path.write_text(serialized, encoding="utf-8")
+    assert path.stat().st_size < 1024 * 1024
+
+    with pytest.raises(
+        ValueError,
+        match="Jiaoch historical-minute diagnostic descriptor rejected",
+    ):
+        load_jiaoch_historical_minute_diagnostic(path)
+
+
 @pytest.mark.parametrize(
     ("token", "raw"),
     [
