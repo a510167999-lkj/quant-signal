@@ -168,6 +168,37 @@ def test_private_route_hook_is_not_exported_and_rejects_external_capability() ->
         )
 
 
+def test_private_route_hook_follows_the_exact_policy_matrix() -> None:
+    generation = create_jiaoch_credential_generation(environment_snapshot=_snapshot())
+    expected_by_route = {
+        "points-primary:daily_basic": POINTS_TOKEN,
+        "points-primary:moneyflow": POINTS_TOKEN,
+        "historical-minute:stk_mins": MINUTE_TOKEN,
+        "historical-minute:calibration-daily": MINUTE_TOKEN,
+    }
+    for route_id, expected in expected_by_route.items():
+        assert (
+            jiaoch_credential_slots._credential_for_route(
+                generation,
+                route_id=route_id,
+                capability=jiaoch_credential_slots._ROUTE_CAPABILITY,
+            )
+            == expected
+        )
+    with pytest.raises(ValueError, match="route rejected"):
+        jiaoch_credential_slots._credential_for_route(
+            generation,
+            route_id="historical-minute:daily",
+            capability=jiaoch_credential_slots._ROUTE_CAPABILITY,
+        )
+    with pytest.raises(ValueError, match="generation rejected"):
+        jiaoch_credential_slots._credential_for_route(
+            object(),
+            route_id="points-primary:daily_basic",
+            capability=jiaoch_credential_slots._ROUTE_CAPABILITY,
+        )
+
+
 def test_environment_snapshot_is_copied_without_live_environment_access() -> None:
     snapshot = _snapshot()
     generation = create_jiaoch_credential_generation(environment_snapshot=snapshot)
@@ -263,6 +294,36 @@ def test_source_failures_are_normalized_without_secret_exception_context(
     formatted = "".join(traceback.format_exception(type(error), error, error.__traceback__))
     _assert_text_is_secret_free(error)
     _assert_text_is_secret_free(formatted)
+
+
+@pytest.mark.parametrize("source_kind", ["resolver", "snapshot"])
+def test_surrogate_credentials_are_rejected_without_unicode_error_leak(
+    source_kind: str,
+) -> None:
+    surrogate_secret = "bad\ud800token"
+
+    def resolver(slot_id: str) -> str:
+        return surrogate_secret if slot_id == "points-primary" else MINUTE_TOKEN
+
+    kwargs = (
+        {"credential_resolver": resolver}
+        if source_kind == "resolver"
+        else {
+            "environment_snapshot": _snapshot(
+                points_token=surrogate_secret,
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="credential rejected") as caught:
+        create_jiaoch_credential_generation(**kwargs)
+
+    error = caught.value
+    assert error.__context__ is None
+    assert error.__cause__ is None
+    formatted = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    assert surrogate_secret not in str(error)
+    assert surrogate_secret not in repr(error)
+    assert surrogate_secret not in formatted
 
 
 @pytest.mark.parametrize(
