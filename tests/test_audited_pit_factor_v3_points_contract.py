@@ -113,10 +113,21 @@ def test_contract_freezes_scope_lag_features_arms_and_safety_gate() -> None:
 
     abnormal = FACTOR_V3_POINTS_CONTRACT["features"]["abnormal_turnover_rate_f_20_to_250_rank"]
     assert abnormal["raw_formula"] == "log(mean_20/mean_250)"
-    assert abnormal["minimum_history_market_sessions"] == 250
+    assert abnormal["window_market_sessions"] == {
+        "short": 20,
+        "long": 250,
+    }
+    assert abnormal["minimum_observed_trading_records"] == {
+        "short_window": 15,
+        "long_window": 120,
+    }
+    assert abnormal["minimum_ipo_age_calendar_months"] == 6
+    assert abnormal["missing_observation_fill"] == "none"
     assert abnormal["latest_source_session"] == "T-1"
     assert abnormal["literature_replication_claimed"] is False
     assert abnormal["variant"] == "free_float_turnover_rate_f"
+    assert abnormal["paper_original_turnover_denominator"] == "total_shares"
+    assert abnormal["project_turnover_denominator"] == "free_float_shares"
 
     warnings = FACTOR_V3_POINTS_CONTRACT["research_warnings"]
     assert warnings["china_anomaly_replication_insignificant_pct"] == 83.37
@@ -248,13 +259,26 @@ def test_formal_policy_preregisters_one_fail_closed_history_subset_for_all_arms(
     assert subset["schema_version"] == (
         "audited-pit-factor-v3-points-history-eligible-subset-policy/v1"
     )
-    assert subset["minimum_prior_market_sessions"] == 250
+    assert subset["window_market_sessions"] == {
+        "short": 20,
+        "long": 250,
+    }
+    assert subset["minimum_observed_trading_records"] == {
+        "short_window": 15,
+        "long_window": 120,
+    }
+    assert subset["minimum_ipo_age_calendar_months"] == 6
     assert subset["latest_usable_source_session"] == "T-1"
     assert subset["allowed_exclusion_reasons"] == [
-        "listing_history_less_than_250_authoritative_market_sessions",
-        "authoritative_suspension_in_required_history_window",
+        "ipo_age_less_than_6_calendar_months",
+        "observed_trading_records_less_than_15_in_20_market_session_window",
+        "observed_trading_records_less_than_120_in_250_market_session_window",
         "authoritative_daily_cross_section_row_missing_in_required_history_window",
+        "unresolved_authoritative_security_code_transition",
     ]
+    assert subset["exact_250_observed_rows_required"] is False
+    assert subset["missing_observation_fill"] == "none"
+    assert subset["authoritative_suspension_rows_count_as_observed"] is False
     assert subset["exclusion_record_identity_fields"] == [
         "candidate_key",
         "reason",
