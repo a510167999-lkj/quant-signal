@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 import hashlib
 import inspect
 import json
@@ -28,7 +28,8 @@ POINTS_TOKEN = "points-secret-value"
 MINUTE_TOKEN = "minute-secret-value"
 SESSION = date(2026, 7, 28)
 TS_CODE = "600000.SH"
-RETRIEVED_AT = "2026-07-29T19:30:00+08:00"
+UTC_NOW = datetime(2026, 7, 29, 11, 30, 0, 123456, tzinfo=timezone.utc)
+RETRIEVED_AT = UTC_NOW.isoformat()
 MINUTE_FIELDS = [
     "ts_code",
     "trade_time",
@@ -66,6 +67,16 @@ class RecordingTransport:
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+@pytest.fixture(autouse=True)
+def _fixed_private_utc_clock(monkeypatch) -> None:
+    monkeypatch.setattr(
+        jiaoch_minute_collection_set,
+        "_utc_now",
+        lambda: UTC_NOW,
+        raising=False,
+    )
 
 
 def _generation():
@@ -178,7 +189,6 @@ def _collect(
     *,
     outcomes: list[HttpEntityResponse | Exception] | None = None,
     ts_code: str = TS_CODE,
-    retrieved_at: str = RETRIEVED_AT,
 ):
     bodies = _response_bodies(ts_code=ts_code)
     transport = RecordingTransport(
@@ -196,7 +206,6 @@ def _collect(
         output_root=tmp_path,
         requested_ts_code=ts_code,
         execution_session=SESSION,
-        retrieved_at=retrieved_at,
         timeout_seconds=7.5,
     )
     return publication, transport, constructions, bodies
@@ -212,10 +221,18 @@ def test_public_collection_surface_accepts_generation_but_no_secret_or_transport
         "output_root",
         "requested_ts_code",
         "execution_session",
-        "retrieved_at",
         "timeout_seconds",
     }
-    for forbidden in ("token", "credential", "transport", "callback", "fallback", "source"):
+    for forbidden in (
+        "token",
+        "credential",
+        "transport",
+        "callback",
+        "fallback",
+        "source",
+        "retrieved_at",
+        "clock",
+    ):
         assert (
             forbidden
             not in inspect.signature(collect_jiaoch_historical_minute_collection_set).parameters
@@ -225,6 +242,98 @@ def test_public_collection_surface_accepts_generation_but_no_secret_or_transport
         "collection_set_relative_path",
         "expected_collection_set_sha256",
     }
+    private_parameters = inspect.signature(
+        jiaoch_minute_collection_set._collect_jiaoch_minute_collection_set_with_route_credential
+    ).parameters
+    assert "retrieved_at" not in private_parameters
+    assert "clock" not in private_parameters
+    assert "callback" not in private_parameters
+
+
+def test_private_utc_clock_is_called_once_before_transport_and_shared_by_all_artifacts(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    bodies = _response_bodies()
+    transport = RecordingTransport([_entity(body) for body in bodies])
+    events: list[str] = []
+
+    def clock() -> datetime:
+        events.append("clock")
+        return UTC_NOW
+
+    def factory() -> RecordingTransport:
+        events.append("transport")
+        return transport
+
+    monkeypatch.setattr(jiaoch_minute_collection_set, "_utc_now", clock)
+    monkeypatch.setattr(jiaoch_minute_collection_set, "_transport_factory", factory)
+    publication = collect_jiaoch_historical_minute_collection_set(
+        generation=_generation(),
+        output_root=tmp_path,
+        requested_ts_code=TS_CODE,
+        execution_session=SESSION,
+    )
+    manifest = _manifest(tmp_path, publication)
+
+    assert events == ["clock", "transport"]
+    assert manifest["retrieved_at"] == RETRIEVED_AT
+    for binding in manifest["attempts"]:
+        attempt = json.loads((tmp_path / binding["attempt_relative_path"]).read_bytes())
+        assert attempt["retrieved_at"] == RETRIEVED_AT
+
+
+class _DerivedDatetime(datetime):
+    pass
+
+
+@pytest.mark.parametrize(
+    "invalid_now",
+    [
+        date(2026, 7, 29),
+        datetime(2026, 7, 29, 11, 30),
+        datetime(
+            2026,
+            7,
+            29,
+            19,
+            30,
+            tzinfo=timezone(timedelta(hours=8)),
+        ),
+        _DerivedDatetime(2026, 7, 29, 11, 30, tzinfo=timezone.utc),
+    ],
+)
+def test_invalid_private_clock_fails_before_transport_construction(
+    tmp_path: Path,
+    monkeypatch,
+    invalid_now: object,
+) -> None:
+    clock_calls = 0
+    constructions = []
+
+    def clock():
+        nonlocal clock_calls
+        clock_calls += 1
+        return invalid_now
+
+    monkeypatch.setattr(jiaoch_minute_collection_set, "_utc_now", clock)
+    monkeypatch.setattr(
+        jiaoch_minute_collection_set,
+        "_transport_factory",
+        lambda: constructions.append(True),
+    )
+
+    with pytest.raises(ValueError, match="collection failed"):
+        collect_jiaoch_historical_minute_collection_set(
+            generation=_generation(),
+            output_root=tmp_path,
+            requested_ts_code=TS_CODE,
+            execution_session=SESSION,
+        )
+
+    assert clock_calls == 1
+    assert constructions == []
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_closed_collection_uses_one_transport_one_minute_token_and_exactly_three_posts(
@@ -371,7 +480,6 @@ def test_second_or_third_bad_http_entity_leaves_partial_attempts_without_manifes
             output_root=tmp_path,
             requested_ts_code=TS_CODE,
             execution_session=SESSION,
-            retrieved_at=RETRIEVED_AT,
         )
 
     assert caught.value.__context__ is None
@@ -396,7 +504,6 @@ def test_transport_failure_has_no_retry_or_fallback_and_no_secret_exception_cont
             output_root=tmp_path,
             requested_ts_code=TS_CODE,
             execution_session=SESSION,
-            retrieved_at=RETRIEVED_AT,
         )
 
     assert caught.value.__context__ is None
@@ -425,7 +532,6 @@ def test_credential_echo_on_second_response_is_rejected_before_its_attempt_write
             output_root=tmp_path,
             requested_ts_code=TS_CODE,
             execution_session=SESSION,
-            retrieved_at=RETRIEVED_AT,
         )
 
     assert len(transport.calls) == 2
@@ -467,7 +573,6 @@ def test_provider_status_or_interface_identity_failure_retains_attempt_but_no_ma
             output_root=tmp_path,
             requested_ts_code=TS_CODE,
             execution_session=SESSION,
-            retrieved_at=RETRIEVED_AT,
         )
 
     assert len(transport.calls) == 2
@@ -488,7 +593,6 @@ def test_oversized_response_is_bounded_before_raw_attempt_or_manifest_write(
             output_root=tmp_path,
             requested_ts_code=TS_CODE,
             execution_session=SESSION,
-            retrieved_at=RETRIEVED_AT,
         )
 
     assert len(transport.calls) == 1
@@ -516,7 +620,6 @@ def test_star_bse_and_fund_codes_reject_before_transport_construction(
             output_root=tmp_path,
             requested_ts_code=ts_code,
             execution_session=SESSION,
-            retrieved_at=RETRIEVED_AT,
         )
 
     assert constructions == []
