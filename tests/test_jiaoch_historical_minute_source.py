@@ -108,6 +108,45 @@ def test_public_collector_binds_the_audited_transport_internally() -> None:
     )
 
 
+def test_unsafe_proxy_source_is_rejected_before_transport_construction(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    constructed: list[str | None] = []
+
+    def transport_factory(*, proxy_url):
+        constructed.append(proxy_url)
+        return RecordingTransport(
+            _response(b'{"code":-1,"msg":"permission denied","data":null}')
+        )
+
+    monkeypatch.setattr(
+        jiaoch_historical_minute_source,
+        "UrllibTushareTransport",
+        transport_factory,
+    )
+    unsafe = TushareSource(
+        name="jiaoch",
+        api_url="https://jiaoch.site",
+        allowed_hosts=("jiaoch.site",),
+        token=TOKEN,
+        request_protocol="tushare-path-per-interface/v1",
+        proxy_url="http://attacker.example:8080",
+        network_route="loopback_http_proxy",
+    )
+
+    with pytest.raises(ValueError, match="source binding rejected"):
+        collect_jiaoch_historical_minute_diagnostic(
+            source=unsafe,
+            ts_code="600000.SH",
+            start_date="20260728",
+            end_date="20260728",
+            retrieved_at=RETRIEVED_AT,
+            output_dir=tmp_path,
+        )
+    assert constructed == []
+
+
 def test_permission_denied_is_terminal_single_request_and_fixed_stk_mins_post(
     tmp_path: Path,
     monkeypatch,
