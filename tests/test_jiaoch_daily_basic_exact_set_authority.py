@@ -314,6 +314,72 @@ def test_public_entrypoints_are_offline_and_do_not_accept_credentials() -> None:
     }
 
 
+def test_daily_basic_loader_converts_source_date_and_binds_both_normalized_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    points_root = tmp_path / "points"
+    points_root.mkdir()
+    fields = authority.raw_authority._FIELDS_BY_API["daily_basic"].split(",")
+    body = json.dumps(
+        {
+            "code": 0,
+            "data": {
+                "fields": fields,
+                "items": [
+                    ["600001.SH", "20250214", 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    ["688001.SH", "20250214", 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    ["430001.BJ", "20250214", 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                ],
+            },
+            "msg": "success",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    raw_sha256 = hashlib.sha256(body).hexdigest()
+    raw_relative_path = f"raw/sha256/{raw_sha256[:2]}/{raw_sha256}.body"
+    raw_path = points_root / Path(*raw_relative_path.split("/"))
+    raw_path.parent.mkdir(parents=True)
+    raw_path.write_bytes(body)
+    collection_ref = _collection_ref("2025-02-14")
+    attempt_sha256 = _sha("real-normalization-attempt")
+    monkeypatch.setattr(
+        authority.points_collection,
+        "_verify_and_load_collection_set",
+        lambda **_kwargs: {
+            "attempts": [
+                {
+                    "api_name": "daily_basic",
+                    "attempt_relative_path": (
+                        f"attempts/sha256/{attempt_sha256[:2]}/{attempt_sha256}.json"
+                    ),
+                    "attempt_sha256": attempt_sha256,
+                    "raw_relative_path": raw_relative_path,
+                    "raw_sha256": raw_sha256,
+                }
+            ],
+            "trade_date": "2025-02-14",
+        },
+    )
+
+    loaded = authority._load_daily_basic_partition(
+        points_output_root=points_root,
+        collection_ref=collection_ref,
+    )
+
+    assert loaded.trade_date == "2025-02-14"
+    assert {row.trade_date for row in loaded.rows} == {"2025-02-14"}
+    assert loaded.source_normalization_rows_sha256 != loaded.canonical_rows_sha256
+    assert loaded.canonical_rows_sha256 == _canonical_sha([asdict(row) for row in loaded.rows])
+    assert [row.market_segment for row in loaded.rows] == [
+        "BSE",
+        "SSE_MAIN",
+        "SSE_STAR",
+    ]
+
+
 def test_publishes_full_market_exact_set_then_derives_target_scope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
