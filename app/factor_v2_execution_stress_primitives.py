@@ -557,6 +557,17 @@ def aggregate_planned_legs(
             )
         )
 
+    sides_by_trade_key: dict[str, set[str]] = {}
+    for leg in normalized:
+        sides_by_trade_key.setdefault(leg.trade_key, set()).add(leg.side)
+    incomplete_trade_keys = sorted(
+        trade_key for trade_key, sides in sides_by_trade_key.items() if sides != {"buy", "sell"}
+    )
+    if incomplete_trade_keys:
+        raise ValueError(
+            "each trade_key must include buy and sell legs: " + ",".join(incomplete_trade_keys)
+        )
+
     grouped: dict[
         tuple[str, str, date, str],
         list[PlannedLeg],
@@ -811,6 +822,8 @@ def evaluate_capacity_scenarios(
         tuple[str, str, date, str],
         AggregatedPlannedLeg,
     ] = {}
+    observed_order_keys: set[str] = set()
+    sides_by_trade_key: dict[str, set[str]] = {}
     for index, leg in enumerate(planned_legs):
         if not isinstance(leg, AggregatedPlannedLeg):
             raise ValueError(f"planned_legs[{index}] must be AggregatedPlannedLeg")
@@ -833,12 +846,22 @@ def evaluate_capacity_scenarios(
             raise ValueError("aggregated planned leg has no trade/order keys")
         normalized_pairs: list[tuple[str, str]] = []
         for trade_key, order_key in leg.trade_and_order_keys:
-            normalized_pairs.append(
-                (
-                    _nonempty_text(trade_key, field="trade_key"),
-                    _nonempty_text(order_key, field="order_key"),
-                )
+            normalized_trade_key = _nonempty_text(
+                trade_key,
+                field="trade_key",
             )
+            normalized_order_key = _nonempty_text(
+                order_key,
+                field="order_key",
+            )
+            if normalized_order_key in observed_order_keys:
+                raise ValueError("duplicate order_key")
+            observed_order_keys.add(normalized_order_key)
+            sides_by_trade_key.setdefault(
+                normalized_trade_key,
+                set(),
+            ).add(side)
+            normalized_pairs.append((normalized_trade_key, normalized_order_key))
         if tuple(sorted(normalized_pairs)) != tuple(normalized_pairs):
             raise ValueError("trade/order keys must use stable sorted order")
         normalized = AggregatedPlannedLeg(
@@ -857,6 +880,13 @@ def evaluate_capacity_scenarios(
             ),
         )
         planned_by_key[key] = normalized
+    incomplete_trade_keys = sorted(
+        trade_key for trade_key, sides in sides_by_trade_key.items() if sides != {"buy", "sell"}
+    )
+    if incomplete_trade_keys:
+        raise ValueError(
+            "each trade_key must include buy and sell legs: " + ",".join(incomplete_trade_keys)
+        )
     if {key[1] for key in planned_by_key} != {"buy", "sell"}:
         raise ValueError("planned legs must include both buy and sell sides")
 
