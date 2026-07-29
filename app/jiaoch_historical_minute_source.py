@@ -273,8 +273,8 @@ def _response_manifest(
             provider_code=None,
         )
 
-    response_bytes = len(body) if body_is_bytes else None
-    response_sha256 = hashlib.sha256(body).hexdigest() if body_is_bytes else None
+    response_bytes = len(body) if within_limit is True else None
+    response_sha256 = hashlib.sha256(body).hexdigest() if within_limit is True else None
     if not valid_status or status != 200 or complete is not True or within_limit is not True:
         return _base_manifest(
             request_semantics=request_semantics,
@@ -420,7 +420,7 @@ def verify_jiaoch_historical_minute_diagnostic(
         or (within is not None and type(within) is not bool)
         or (
             body_bytes is not None
-            and (type(body_bytes) is not int or not 0 <= body_bytes <= _MAX_BODY_BYTES + 1)
+            and (type(body_bytes) is not int or not 0 <= body_bytes <= _MAX_BODY_BYTES)
         )
         or ((body_sha is None) != (body_bytes is None))
         or (body_sha is not None and not _valid_sha256(body_sha))
