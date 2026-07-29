@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from pathlib import Path
 
 import pytest
 
+from app import jiaoch_historical_minute_source
 from app.jiaoch_historical_minute_source import (
     collect_jiaoch_historical_minute_diagnostic,
     load_jiaoch_historical_minute_diagnostic,
@@ -58,12 +60,17 @@ def _response(raw: bytes, *, status: int = 200, complete: bool = True) -> HttpEn
 def _collect(
     tmp_path: Path,
     transport: RecordingTransport,
+    monkeypatch,
     *,
     token: str = TOKEN,
 ) -> tuple[dict, dict]:
+    monkeypatch.setattr(
+        jiaoch_historical_minute_source,
+        "UrllibTushareTransport",
+        lambda *, proxy_url: transport,
+    )
     publication = collect_jiaoch_historical_minute_diagnostic(
         source=_source(token),
-        transport=transport,
         ts_code="600000.SH",
         start_date="20260728",
         end_date="20260728",
@@ -95,8 +102,15 @@ def _assert_unbound(manifest: dict) -> None:
     assert "MinuteAmount" not in _all_keys(manifest)
 
 
+def test_public_collector_binds_the_audited_transport_internally() -> None:
+    assert "transport" not in inspect.signature(
+        collect_jiaoch_historical_minute_diagnostic
+    ).parameters
+
+
 def test_permission_denied_is_terminal_single_request_and_fixed_stk_mins_post(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     raw = json.dumps(
         {
@@ -111,7 +125,7 @@ def test_permission_denied_is_terminal_single_request_and_fixed_stk_mins_post(
     ).encode("utf-8")
     transport = RecordingTransport(_response(raw))
 
-    _, manifest = _collect(tmp_path, transport)
+    publication, manifest = _collect(tmp_path, transport, monkeypatch)
 
     assert manifest["classification"] == "PERMISSION_DENIED"
     assert manifest["provider_code"] == -1
@@ -148,9 +162,10 @@ def test_permission_denied_is_terminal_single_request_and_fixed_stk_mins_post(
         separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")
+    assert b"999999999" not in Path(publication["path"]).read_bytes()
 
 
-def test_any_nonzero_code_rejects_fake_rows(tmp_path: Path) -> None:
+def test_any_nonzero_code_rejects_fake_rows(tmp_path: Path, monkeypatch) -> None:
     transport = RecordingTransport(
         _response(
             b'{"code":40203,"msg":"denied","data":'
@@ -158,15 +173,17 @@ def test_any_nonzero_code_rejects_fake_rows(tmp_path: Path) -> None:
         )
     )
 
-    _, manifest = _collect(tmp_path, transport)
+    publication, manifest = _collect(tmp_path, transport, monkeypatch)
 
     assert manifest["classification"] == "SOURCE_ERROR"
     assert manifest["provider_code"] == 40203
     _assert_unbound(manifest)
+    assert b'"fake"' not in Path(publication["path"]).read_bytes()
 
 
 def test_code_zero_remains_schema_unbound_without_real_success_contract(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     transport = RecordingTransport(
         _response(
@@ -175,11 +192,12 @@ def test_code_zero_remains_schema_unbound_without_real_success_contract(
         )
     )
 
-    _, manifest = _collect(tmp_path, transport)
+    publication, manifest = _collect(tmp_path, transport, monkeypatch)
 
     assert manifest["classification"] == "SCHEMA_UNBOUND"
     assert manifest["provider_code"] == 0
     _assert_unbound(manifest)
+    assert b"123456.7" not in Path(publication["path"]).read_bytes()
 
 
 @pytest.mark.parametrize(
@@ -196,10 +214,11 @@ def test_code_zero_remains_schema_unbound_without_real_success_contract(
 def test_strict_response_rejects_duplicate_nonfinite_and_non_integer_code(
     tmp_path: Path,
     raw: bytes,
+    monkeypatch,
 ) -> None:
     transport = RecordingTransport(_response(raw))
 
-    _, manifest = _collect(tmp_path, transport)
+    _, manifest = _collect(tmp_path, transport, monkeypatch)
 
     assert manifest["classification"] == "RESPONSE_REJECTED"
     assert manifest["provider_code"] is None
@@ -218,10 +237,11 @@ def test_token_byte_or_semantic_echo_discards_response_body(
     tmp_path: Path,
     token: str,
     raw: bytes,
+    monkeypatch,
 ) -> None:
     transport = RecordingTransport(_response(raw))
 
-    publication, manifest = _collect(tmp_path, transport, token=token)
+    publication, manifest = _collect(tmp_path, transport, monkeypatch, token=token)
 
     assert manifest["classification"] == "CREDENTIAL_ECHO_REJECTED"
     assert manifest["response_body_bytes"] is None
@@ -244,10 +264,11 @@ def test_token_byte_or_semantic_echo_discards_response_body(
 def test_http_incomplete_and_oversize_entities_are_rejected(
     tmp_path: Path,
     response: HttpEntityResponse,
+    monkeypatch,
 ) -> None:
     transport = RecordingTransport(response)
 
-    _, manifest = _collect(tmp_path, transport)
+    _, manifest = _collect(tmp_path, transport, monkeypatch)
 
     assert manifest["classification"] == "TRANSPORT_REJECTED"
     _assert_unbound(manifest)
@@ -256,10 +277,11 @@ def test_http_incomplete_and_oversize_entities_are_rejected(
 
 def test_transport_redirect_error_is_terminal_without_retry_or_fallback(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     transport = RecordingTransport(error=PITCollectionError("redirect refused"))
 
-    _, manifest = _collect(tmp_path, transport)
+    _, manifest = _collect(tmp_path, transport, monkeypatch)
 
     assert manifest["classification"] == "TRANSPORT_ERROR"
     assert manifest["request_count"] == 1
@@ -271,12 +293,13 @@ def test_transport_redirect_error_is_terminal_without_retry_or_fallback(
 
 def test_failure_diagnostic_is_content_addressed_and_tamper_rejected(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     transport = RecordingTransport(
         _response('{"code":-1,"msg":"权限不足: stk_mins 未授权","data":null}'.encode("utf-8"))
     )
 
-    publication, manifest = _collect(tmp_path, transport)
+    publication, manifest = _collect(tmp_path, transport, monkeypatch)
 
     path = Path(publication["path"])
     assert path.name == f"{manifest['descriptor_sha256']}.json"
@@ -295,5 +318,47 @@ def test_failure_diagnostic_is_content_addressed_and_tamper_rejected(
     tampered = dict(manifest)
     tampered["classification"] = "SCHEMA_UNBOUND"
     path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(ValueError, match="diagnostic descriptor rejected"):
+        load_jiaoch_historical_minute_diagnostic(path)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda value: value.update(authority_status="BOUND"),
+        lambda value: value.update(evidence_complete=True),
+        lambda value: value.update(verified=True),
+        lambda value: value.update(rows_published=True),
+        lambda value: value.update(minute_amount_authority_status="BOUND"),
+        lambda value: value.update(rows=[{"MinuteAmount": 123.0}]),
+    ],
+)
+def test_resigned_and_renamed_manifest_cannot_forge_bound_evidence_or_rows(
+    tmp_path: Path,
+    monkeypatch,
+    mutation,
+) -> None:
+    transport = RecordingTransport(
+        _response(
+            '{"code":-1,"msg":"权限不足: stk_mins 未授权","data":null}'.encode("utf-8")
+        )
+    )
+    _, manifest = _collect(tmp_path, transport, monkeypatch)
+    forged = dict(manifest)
+    mutation(forged)
+    forged.pop("descriptor_sha256")
+    digest = hashlib.sha256(
+        json.dumps(
+            forged,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    forged["descriptor_sha256"] = digest
+    path = tmp_path / f"{digest}.json"
+    path.write_text(json.dumps(forged), encoding="utf-8")
+
     with pytest.raises(ValueError, match="diagnostic descriptor rejected"):
         load_jiaoch_historical_minute_diagnostic(path)
