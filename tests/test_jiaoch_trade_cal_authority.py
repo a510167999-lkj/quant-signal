@@ -9,7 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from app import jiaoch_credential_slots, jiaoch_trade_cal_authority
+from app import (
+    jiaoch_credential_slots,
+    jiaoch_trade_cal_authority,
+    research_provider_pit_tail_v2,
+)
 from app.jiaoch_credential_slots import (
     HISTORICAL_MINUTE_ENV,
     POINTS_PRIMARY_ENV,
@@ -229,6 +233,34 @@ def _calendar_rows_root() -> str:
         "schema": "jiaoch-trade-cal-normalized-rows/v1",
     }
     return hashlib.sha256(_canonical_bytes(descriptor)).hexdigest()
+
+
+def _normalization_evidence(rows: list[list]) -> dict:
+    entries = []
+    for row in sorted(rows, key=lambda item: item[1]):
+        wire_value = row[2]
+        entries.append(
+            {
+                "cal_date": row[1],
+                "canonical_value": int(wire_value),
+                "wire_type": "integer" if type(wire_value) is int else "string",
+                "wire_value": wire_value,
+            }
+        )
+    return {
+        "contract_canonical_sha256": (
+            research_provider_pit_tail_v2.IS_OPEN_NORMALIZATION_CONTRACT_SHA256
+        ),
+        "endpoint": "trade_cal",
+        "entries": entries,
+        "field": "is_open",
+        "raw_wire_preserved": True,
+        "schema": "provider-trade-cal-is-open-normalization/v1",
+    }
+
+
+def _normalization_root(rows: list[list]) -> str:
+    return hashlib.sha256(_canonical_bytes(_normalization_evidence(rows))).hexdigest()
 
 
 def test_legacy_policy_document_digest_routes_and_descriptions_remain_exact() -> None:
@@ -471,6 +503,13 @@ def test_manifest_binds_attempt_auxiliary_policy_calendar_roots_and_all_safety_f
     assert manifest["open_session_count"] == 5
     assert manifest["open_sessions_root_sha256"] == _open_sessions_root()
     assert manifest["pretrade_anchor_date"] == "20260717"
+    assert manifest["is_open_normalization_contract"] == {
+        "document": research_provider_pit_tail_v2.IS_OPEN_NORMALIZATION_CONTRACT,
+        "schema": "jiaoch-trade-cal-is-open-normalization-contract-descriptor/v1",
+        "sha256": research_provider_pit_tail_v2.IS_OPEN_NORMALIZATION_CONTRACT_SHA256,
+    }
+    assert manifest["is_open_normalization_evidence"] == _normalization_evidence(CALENDAR_ROWS)
+    assert manifest["is_open_normalization_root_sha256"] == _normalization_root(CALENDAR_ROWS)
     assert manifest["natural_day_coverage_verified"] is True
     assert manifest["pretrade_chain_verified"] is True
     assert manifest["open_sessions_sorted"] is True
@@ -487,6 +526,9 @@ def test_manifest_binds_attempt_auxiliary_policy_calendar_roots_and_all_safety_f
         "same_runtime_credential_used": True,
     }
     assert manifest["producer_binding"]["schema"] == "jiaoch-trade-cal-producer/v1"
+    assert "app/research_provider_pit_tail_v2.py" in {
+        entry["path"] for entry in manifest["producer_binding"]["entries"]
+    }
     assert attempt["schema"] == "jiaoch-trade-cal-raw-attempt/v1"
     assert attempt["authority_status"] == "UNBOUND"
     assert attempt["calendar_authority_status"] == "NOT_GRANTED"
@@ -506,6 +548,7 @@ def test_manifest_binds_attempt_auxiliary_policy_calendar_roots_and_all_safety_f
         "end_date": "2026-07-26",
         "exchange": "SSE",
         "final_oos_consumed": False,
+        "is_open_normalization_root_sha256": _normalization_root(CALENDAR_ROWS),
         "open_session_count": 5,
         "open_sessions_root_sha256": _open_sessions_root(),
         "production_profile_registered": False,
@@ -532,6 +575,44 @@ def test_manifest_binds_attempt_auxiliary_policy_calendar_roots_and_all_safety_f
         assert secret.encode() not in persisted
         assert hashlib.sha256(secret.encode()).hexdigest().encode() not in persisted
     assert b"483" not in persisted
+
+
+def test_exact_integer_and_string_is_open_wire_values_share_canonical_calendar(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    rows = [
+        ["SSE", "20260720", "1", "20260717"],
+        ["SSE", "20260721", 1, "20260720"],
+        ["SSE", "20260722", "1", "20260721"],
+        ["SSE", "20260723", 1, "20260722"],
+        ["SSE", "20260724", "1", "20260723"],
+        ["SSE", "20260725", "0", "20260724"],
+        ["SSE", "20260726", 0, "20260724"],
+    ]
+    body = _response_body(rows=list(reversed(rows)))
+    transport = RecordingTransport([_entity(body)])
+    monkeypatch.setattr(jiaoch_trade_cal_authority, "_transport_factory", lambda: transport)
+
+    publication = collect_jiaoch_trade_cal_authority(
+        generation=_generation(),
+        output_root=tmp_path,
+        start_date=START_DATE,
+        end_date=END_DATE,
+    )
+    manifest = _manifest(tmp_path, publication)
+    raw_path = tmp_path / manifest["attempt"]["raw_relative_path"]
+
+    assert raw_path.read_bytes() == body
+    assert manifest["calendar_rows_root_sha256"] == _calendar_rows_root()
+    assert manifest["open_sessions"] == OPEN_SESSIONS
+    assert manifest["is_open_normalization_evidence"] == _normalization_evidence(rows)
+    assert manifest["is_open_normalization_root_sha256"] == _normalization_root(rows)
+    assert verify_jiaoch_trade_cal_authority(
+        output_root=tmp_path,
+        authority_manifest_relative_path=publication["authority_manifest_relative_path"],
+        expected_authority_manifest_sha256=publication["authority_manifest_sha256"],
+    )["is_open_normalization_root_sha256"] == _normalization_root(rows)
 
 
 def test_calendar_window_with_no_open_sessions_is_valid_but_claims_no_development_alignment(
@@ -567,7 +648,11 @@ def test_calendar_window_with_no_open_sessions_is_valid_but_claims_no_developmen
         [["SZSE", *row[1:]] for row in CALENDAR_ROWS],
         [[*row[:2], True, row[3]] for row in CALENDAR_ROWS],
         [[*row[:2], 2, row[3]] for row in CALENDAR_ROWS],
-        [[*row[:2], "1", row[3]] for row in CALENDAR_ROWS],
+        [[*row[:2], 1.0, row[3]] for row in CALENDAR_ROWS],
+        [[*row[:2], None, row[3]] for row in CALENDAR_ROWS],
+        [[*row[:2], "01", row[3]] for row in CALENDAR_ROWS],
+        [[*row[:2], " 1", row[3]] for row in CALENDAR_ROWS],
+        [[*row[:2], "2", row[3]] for row in CALENDAR_ROWS],
         [[*CALENDAR_ROWS[0][:3], "20260720"], *CALENDAR_ROWS[1:]],
         [CALENDAR_ROWS[0], [*CALENDAR_ROWS[1][:3], "20260717"], *CALENDAR_ROWS[2:]],
         [[*CALENDAR_ROWS[0][:3], "2026-07-17"], *CALENDAR_ROWS[1:]],
@@ -837,6 +922,39 @@ def test_rehashed_auxiliary_policy_or_open_sessions_drift_is_rejected(
                 authority_manifest_relative_path=relative,
                 expected_authority_manifest_sha256=digest,
             )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["contract", "entry", "root"],
+)
+def test_rehashed_is_open_normalization_drift_is_rejected_offline(
+    tmp_path: Path,
+    monkeypatch,
+    mutation: str,
+) -> None:
+    publication, _, _ = _collect(tmp_path, monkeypatch)
+    forged = _manifest(tmp_path, publication)
+    if mutation == "contract":
+        forged["is_open_normalization_contract"]["document"]["bool_allowed"] = True
+        forged["is_open_normalization_contract"]["sha256"] = hashlib.sha256(
+            _canonical_bytes(forged["is_open_normalization_contract"]["document"])
+        ).hexdigest()
+    elif mutation == "entry":
+        forged["is_open_normalization_evidence"]["entries"][0]["wire_type"] = "string"
+        forged["is_open_normalization_root_sha256"] = hashlib.sha256(
+            _canonical_bytes(forged["is_open_normalization_evidence"])
+        ).hexdigest()
+    else:
+        forged["is_open_normalization_root_sha256"] = "0" * 64
+    relative, digest = _write_forged_manifest(tmp_path, forged)
+
+    with pytest.raises(ValueError, match="normalization|evidence|root|producer"):
+        verify_jiaoch_trade_cal_authority(
+            output_root=tmp_path,
+            authority_manifest_relative_path=relative,
+            expected_authority_manifest_sha256=digest,
+        )
 
 
 def test_producer_drift_is_rejected_before_manifest_create(
