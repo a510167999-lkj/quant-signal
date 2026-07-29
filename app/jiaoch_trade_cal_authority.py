@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import hmac
@@ -13,6 +14,7 @@ from typing import Any, Mapping
 import uuid
 
 from app import jiaoch_points_raw_authority as raw_authority
+from app import research_provider_pit_tail_v2 as normalization_authority
 from app.research_pit_transport import UrllibTushareTransport
 
 
@@ -35,6 +37,9 @@ _MAX_BODY_BYTES = 32 * 1024 * 1024
 _MAX_ATTEMPT_BYTES = 64 * 1024
 _MAX_MANIFEST_BYTES = 128 * 1024
 _MAX_PRODUCER_SOURCE_BYTES = 4 * 1024 * 1024
+_EXPECTED_IS_OPEN_NORMALIZATION_CONTRACT_SHA256 = (
+    "0630c7d0695645fc3178ebd94d80797e0b8db10740a54387043ba15c49693ed5"
+)
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _UUID4_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 _DATE_PATTERN = re.compile(r"[0-9]{8}")
@@ -114,6 +119,9 @@ _MANIFEST_FIELDS = frozenset(
         "experiment_launch_eligible",
         "final_oos_consumed",
         "formal_materialization_eligible",
+        "is_open_normalization_contract",
+        "is_open_normalization_evidence",
+        "is_open_normalization_root_sha256",
         "natural_day_coverage_verified",
         "open_session_count",
         "open_sessions",
@@ -137,6 +145,7 @@ _PRODUCER_FILES = (
     "jiaoch_credential_slots.py",
     "jiaoch_points_raw_authority.py",
     "jiaoch_trade_cal_authority.py",
+    "research_provider_pit_tail_v2.py",
     "research_pit_transport.py",
 )
 
@@ -276,6 +285,58 @@ def _auxiliary_policy_descriptor(value: Any) -> dict[str, Any]:
     ):
         raise ValueError("Jiaoch trade calendar auxiliary policy rejected")
     return value
+
+
+def _current_normalization_contract_descriptor() -> dict[str, Any]:
+    document = copy.deepcopy(normalization_authority.IS_OPEN_NORMALIZATION_CONTRACT)
+    digest = normalization_authority.IS_OPEN_NORMALIZATION_CONTRACT_SHA256
+    if (
+        type(document) is not dict
+        or not hmac.compare_digest(
+            _sha256_text(
+                digest,
+                label="Jiaoch trade calendar normalization contract sha256",
+            ),
+            _EXPECTED_IS_OPEN_NORMALIZATION_CONTRACT_SHA256,
+        )
+        or not hmac.compare_digest(_sha256(_canonical_json(document)), digest)
+    ):
+        raise ValueError("Jiaoch trade calendar normalization contract rejected")
+    return {
+        "document": document,
+        "schema": "jiaoch-trade-cal-is-open-normalization-contract-descriptor/v1",
+        "sha256": digest,
+    }
+
+
+def _normalization_contract_descriptor(value: Any) -> dict[str, Any]:
+    current = _current_normalization_contract_descriptor()
+    if type(value) is not dict or value != current:
+        raise ValueError("Jiaoch trade calendar normalization contract rejected")
+    return value
+
+
+def _normalize_is_open_wire(
+    value: Any,
+    *,
+    contract_document: Mapping[str, Any],
+) -> tuple[int, str]:
+    if type(value) is int:
+        wire_type = "integer"
+    elif type(value) is str:
+        wire_type = "string"
+    else:
+        raise ValueError("Jiaoch trade calendar is_open normalization rejected")
+    for mapping in contract_document["mappings"]:
+        if (
+            mapping["wire_type"] == wire_type
+            and type(mapping["wire_value"]) is type(value)
+            and mapping["wire_value"] == value
+            and type(mapping["canonical_value"]) is int
+            and mapping["canonical_value"] in {0, 1}
+        ):
+            return mapping["canonical_value"], wire_type
+    raise ValueError("Jiaoch trade calendar is_open normalization rejected")
 
 
 def _request_semantics(start: date, end: date) -> dict[str, Any]:
@@ -662,6 +723,7 @@ def _calendar_evidence(
     expected_start: date,
     expected_end: date,
 ) -> dict[str, Any]:
+    normalization_contract = _current_normalization_contract_descriptor()
     payload = _strict_json_loads(raw, label="Jiaoch trade calendar response")
     if (
         type(payload) is not dict
@@ -684,14 +746,12 @@ def _calendar_evidence(
     rows = []
     identities = set()
     for item in data["items"]:
-        if (
-            type(item) is not list
-            or len(item) != len(_FIELDS)
-            or item[0] != _EXCHANGE
-            or type(item[2]) is not int
-            or item[2] not in {0, 1}
-        ):
+        if type(item) is not list or len(item) != len(_FIELDS) or item[0] != _EXCHANGE:
             raise ValueError("Jiaoch trade calendar row rejected")
+        canonical_is_open, wire_type = _normalize_is_open_wire(
+            item[2],
+            contract_document=normalization_contract["document"],
+        )
         cal_date = _yyyymmdd(item[1], label="Jiaoch trade calendar cal_date")
         pretrade_date = _yyyymmdd(
             item[3],
@@ -704,7 +764,9 @@ def _calendar_evidence(
             {
                 "cal_date": item[1],
                 "exchange": item[0],
-                "is_open": item[2],
+                "is_open": canonical_is_open,
+                "is_open_wire_type": wire_type,
+                "is_open_wire_value": item[2],
                 "pretrade_date": item[3],
                 "_cal_date": cal_date,
                 "_pretrade_date": pretrade_date,
@@ -724,6 +786,7 @@ def _calendar_evidence(
     last_open = anchor.strftime("%Y%m%d")
     open_sessions = []
     normalized_rows = []
+    normalization_entries = []
     for row in rows:
         if row["pretrade_date"] != last_open:
             raise ValueError("Jiaoch trade calendar pretrade chain rejected")
@@ -733,6 +796,14 @@ def _calendar_evidence(
                 "exchange": row["exchange"],
                 "is_open": row["is_open"],
                 "pretrade_date": row["pretrade_date"],
+            }
+        )
+        normalization_entries.append(
+            {
+                "cal_date": row["cal_date"],
+                "canonical_value": row["is_open"],
+                "wire_type": row["is_open_wire_type"],
+                "wire_value": row["is_open_wire_value"],
             }
         )
         if row["is_open"] == 1:
@@ -749,9 +820,20 @@ def _calendar_evidence(
         "schema": "jiaoch-trade-cal-open-sessions/v1",
         "start_date": expected_start.strftime("%Y%m%d"),
     }
+    normalization_evidence = {
+        "contract_canonical_sha256": normalization_contract["sha256"],
+        "endpoint": _API_NAME,
+        "entries": normalization_entries,
+        "field": "is_open",
+        "raw_wire_preserved": True,
+        "schema": normalization_contract["document"]["schema"],
+    }
     return {
         "calendar_day_count": len(normalized_rows),
         "calendar_rows_root_sha256": _sha256(_canonical_json(rows_descriptor)),
+        "is_open_normalization_contract": normalization_contract,
+        "is_open_normalization_evidence": normalization_evidence,
+        "is_open_normalization_root_sha256": _sha256(_canonical_json(normalization_evidence)),
         "open_session_count": len(open_sessions),
         "open_sessions": open_sessions,
         "open_sessions_root_sha256": _sha256(_canonical_json(sessions_descriptor)),
@@ -763,6 +845,9 @@ def _manifest_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "calendar_day_count": payload["calendar_day_count"],
         "calendar_rows_root_sha256": payload["calendar_rows_root_sha256"],
+        "is_open_normalization_contract": payload["is_open_normalization_contract"],
+        "is_open_normalization_evidence": payload["is_open_normalization_evidence"],
+        "is_open_normalization_root_sha256": payload["is_open_normalization_root_sha256"],
         "open_session_count": payload["open_session_count"],
         "open_sessions": payload["open_sessions"],
         "open_sessions_root_sha256": payload["open_sessions_root_sha256"],
@@ -815,6 +900,7 @@ def _verify_manifest_payload(*, root: Path, payload: Any) -> dict[str, Any]:
         raise ValueError("Jiaoch trade calendar manifest date rejected")
     _date_window(start, end)
     auxiliary = _auxiliary_policy_descriptor(payload.get("auxiliary_policy_descriptor"))
+    _normalization_contract_descriptor(payload.get("is_open_normalization_contract"))
     runtime = payload.get("runtime_mapping_descriptor")
     if (
         type(runtime) is not dict
@@ -991,6 +1077,9 @@ def _collect_jiaoch_trade_cal_with_route_credential(
         "experiment_launch_eligible": False,
         "final_oos_consumed": False,
         "formal_materialization_eligible": False,
+        "is_open_normalization_contract": evidence["is_open_normalization_contract"],
+        "is_open_normalization_evidence": evidence["is_open_normalization_evidence"],
+        "is_open_normalization_root_sha256": evidence["is_open_normalization_root_sha256"],
         "natural_day_coverage_verified": True,
         "open_session_count": evidence["open_session_count"],
         "open_sessions": evidence["open_sessions"],
@@ -1108,6 +1197,7 @@ def verify_jiaoch_trade_cal_authority(
         "end_date": payload["end_date"],
         "exchange": _EXCHANGE,
         "final_oos_consumed": False,
+        "is_open_normalization_root_sha256": payload["is_open_normalization_root_sha256"],
         "open_session_count": payload["open_session_count"],
         "open_sessions_root_sha256": payload["open_sessions_root_sha256"],
         "production_profile_registered": False,
