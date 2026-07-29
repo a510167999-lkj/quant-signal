@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 import sqlite3
@@ -73,25 +72,6 @@ def _write_spec(tmp_path: Path, spec: dict[str, object]) -> Path:
     path = tmp_path / "run-spec.json"
     path.write_bytes(runner._canonical_bytes(spec))
     return path
-
-
-def _v1_state(
-    *,
-    run_spec_sha256: str,
-    status: str,
-    completed_session_count: int,
-    collection_publication: dict[str, object] | None = None,
-    receipt: dict[str, object] | None = None,
-) -> dict[str, object]:
-    unsigned = {
-        "schema": runner._RUN_STATE_V1_SCHEMA,
-        "run_spec_sha256": run_spec_sha256,
-        "status": status,
-        "completed_session_count": completed_session_count,
-        "collection_publication": collection_publication,
-        "receipt": receipt,
-    }
-    return {**unsigned, "state_sha256": runner._canonical_sha256(unsigned)}
 
 
 def _run_with_synthetic_route(*, run_spec_path: Path, run_root: Path) -> dict[str, object]:
@@ -172,13 +152,8 @@ def test_public_run_delegates_credential_resolution_to_slots(
 
     monkeypatch.setattr(
         jiaoch_credential_slots,
-        "_collect_jiaoch_feature_history_from_environment_for_run",
+        "collect_jiaoch_feature_history_from_environment",
         collect_from_environment,
-    )
-    monkeypatch.setattr(
-        runner,
-        "_run_credential_generation_id",
-        lambda **_kwargs: SOURCE_GENERATION_ID,
     )
     result = runner.run_factor_v3_feature_history_collection(
         run_spec_path=spec_path,
@@ -186,13 +161,7 @@ def test_public_run_delegates_credential_resolution_to_slots(
     )
 
     assert result == {"status": "verified", "credential_exposed": False}
-    assert calls == [
-        {
-            "run_spec_path": spec_path,
-            "run_root": tmp_path / "run",
-            "source_generation_id": SOURCE_GENERATION_ID,
-        }
-    ]
+    assert calls == [{"run_spec_path": spec_path, "run_root": tmp_path / "run"}]
 
 
 def test_run_uses_only_five_frozen_interfaces_and_two_sequential_collectors(
@@ -269,6 +238,7 @@ def test_run_uses_only_five_frozen_interfaces_and_two_sequential_collectors(
         collection_publication_output_root: object,
         collection_plan: object,
         development_session_refs: object,
+        pit_store_root: object,
         temporal_partition_contract: object,
         trade_cal_output_root: object,
         trade_cal_publication: object,
@@ -279,6 +249,7 @@ def test_run_uses_only_five_frozen_interfaces_and_two_sequential_collectors(
                 "collection_publication_output_root": collection_publication_output_root,
                 "collection_plan": collection_plan,
                 "development_session_refs": development_session_refs,
+                "pit_store_root": pit_store_root,
                 "temporal_partition_contract": temporal_partition_contract,
                 "trade_cal_output_root": trade_cal_output_root,
                 "trade_cal_publication": trade_cal_publication,
@@ -338,7 +309,7 @@ def test_run_uses_only_five_frozen_interfaces_and_two_sequential_collectors(
     assert len(verifier_calls) == 1
     assert "collection_publication_output_root" in verifier_calls[0]
     assert "collection_publication" in verifier_calls[0]
-    assert "pit_store_root" not in verifier_calls[0]
+    assert "pit_store_root" in verifier_calls[0]
     assert "expected_pit_store_database_sha256" not in verifier_calls[0]
     assert "session_authority_refs" not in verifier_calls[0]
     for path in (tmp_path / "run" / "run-spec.json", tmp_path / "run" / "state.json"):
@@ -455,7 +426,6 @@ def test_resume_keeps_monotonic_completed_session_progress(
     )
     assert failed_state["status"] == "failed"
     assert failed_state["completed_session_count"] == 2
-    assert failed_state["credential_generation_id"] == SOURCE_GENERATION_ID
 
     fail_once["enabled"] = False
     result = _run_with_synthetic_route(
@@ -470,131 +440,6 @@ def test_resume_keeps_monotonic_completed_session_progress(
     assert market_sessions.count(development[1]) == 1
     assert market_sessions.count(development[2]) == 2
     assert market_sessions[-1] == diagnostic[0]
-
-
-def test_run_scoped_credential_generation_id_is_durable_across_restarts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    spec_path = _write_spec(tmp_path, _run_spec(tmp_path))
-    monkeypatch.setattr(runner, "_verify_plan", lambda _spec: None)
-
-    first = runner._run_credential_generation_id(
-        run_spec_path=spec_path,
-        run_root=tmp_path / "generation-run",
-    )
-    second = runner._run_credential_generation_id(
-        run_spec_path=spec_path,
-        run_root=tmp_path / "generation-run",
-    )
-
-    assert first == second
-    state = runner._read_json_file(
-        tmp_path / "generation-run" / "state.json",
-        label="run state",
-        max_bytes=runner._MAX_STATE_BYTES,
-    )
-    assert state["credential_generation_id"] == first
-
-
-def test_v1_zero_progress_state_migrates_to_v2_before_generation_is_issued(
-    tmp_path: Path,
-) -> None:
-    spec = _run_spec(tmp_path)
-    paths = runner._run_paths(tmp_path / "v1-zero-run", create=True)
-    runner._load_or_initialize_run(paths, spec, allow_initialize=True)
-    runner._atomic_json(
-        paths["state"],
-        _v1_state(
-            run_spec_sha256=spec["run_spec_sha256"],
-            status="initialized",
-            completed_session_count=0,
-        ),
-    )
-
-    migrated = runner._load_or_initialize_run(paths, spec, allow_initialize=True)
-
-    assert migrated["schema"] == runner._RUN_STATE_SCHEMA
-    assert migrated["credential_generation_id"] is None
-
-
-def test_v1_partial_state_migrates_only_a_single_persisted_generation(
-    tmp_path: Path,
-) -> None:
-    spec = _run_spec(tmp_path)
-    paths = runner._run_paths(tmp_path / "v1-partial-run", create=True)
-    runner._load_or_initialize_run(paths, spec, allow_initialize=True)
-    store = runner._safe_directory(paths["store"], label="PIT store", create=True)
-    with sqlite3.connect(store / "metadata.sqlite3") as connection:
-        connection.execute("CREATE TABLE fetch_attempts (request_semantics_json TEXT NOT NULL)")
-        connection.execute(
-            "INSERT INTO fetch_attempts VALUES (?)",
-            (runner._canonical_bytes({"credential_generation_id": SOURCE_GENERATION_ID}).decode(),),
-        )
-        connection.commit()
-    runner._atomic_json(
-        paths["state"],
-        _v1_state(
-            run_spec_sha256=spec["run_spec_sha256"],
-            status="collecting",
-            completed_session_count=1,
-        ),
-    )
-
-    migrated = runner._load_or_initialize_run(paths, spec, allow_initialize=True)
-
-    assert migrated["schema"] == runner._RUN_STATE_SCHEMA
-    assert migrated["credential_generation_id"] == SOURCE_GENERATION_ID
-
-
-def test_v1_collecting_zero_progress_state_becomes_restartable_v2_failure(
-    tmp_path: Path,
-) -> None:
-    spec = _run_spec(tmp_path)
-    paths = runner._run_paths(tmp_path / "v1-collecting-zero-run", create=True)
-    runner._load_or_initialize_run(paths, spec, allow_initialize=True)
-    runner._atomic_json(
-        paths["state"],
-        _v1_state(
-            run_spec_sha256=spec["run_spec_sha256"],
-            status="collecting",
-            completed_session_count=0,
-        ),
-    )
-
-    migrated = runner._load_or_initialize_run(paths, spec, allow_initialize=True)
-
-    assert migrated["status"] == "failed"
-    assert migrated["credential_generation_id"] is None
-
-
-def test_partial_resume_rejects_a_different_credential_generation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    spec = _run_spec(tmp_path)
-    spec_path = _write_spec(tmp_path, spec)
-    paths = runner._run_paths(tmp_path / "generation-drift-run", create=True)
-    runner._load_or_initialize_run(paths, spec, allow_initialize=True)
-    runner._atomic_json(
-        paths["state"],
-        runner._state_payload(
-            run_spec_sha256=spec["run_spec_sha256"],
-            status="collecting",
-            completed_session_count=1,
-            credential_generation_id=SOURCE_GENERATION_ID,
-        ),
-    )
-    monkeypatch.setattr(runner, "_verify_plan", lambda _spec: None)
-
-    with pytest.raises(runner.FactorV3FeatureHistoryRunnerError, match="generation drifted"):
-        runner._run_factor_v3_feature_history_collection_with_route_credential(
-            run_spec_path=spec_path,
-            run_root=tmp_path / "generation-drift-run",
-            credential="synthetic-token",
-            source_generation_id="8a879340-f696-472d-8f44-bf840e71e0fc",
-            feature_history_policy_descriptor=(
-                runner.FACTOR_V3_FEATURE_HISTORY_COLLECTION_POLICY_DESCRIPTOR
-            ),
-        )
 
 
 def test_resume_reverifies_published_candidate_without_recollecting_or_republishing(
@@ -613,7 +458,6 @@ def test_resume_reverifies_published_candidate_without_recollecting_or_republish
             run_spec_sha256=spec["run_spec_sha256"],
             status="published",
             completed_session_count=250,
-            credential_generation_id=SOURCE_GENERATION_ID,
             collection_publication=PUBLICATION,
         ),
     )
@@ -697,52 +541,6 @@ def test_run_rejects_nonfrozen_jiaoch_source_before_creating_collector(
     assert collector_created == []
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("token", ""),
-        ("generation_id", "not-a-uuid"),
-        ("row_cap_overrides", ()),
-        ("api_url", "https://other.example.test"),
-        ("allowed_hosts", ("other.example.test",)),
-        ("request_protocol", "tushare-root-post/v1"),
-        ("network_route", "loopback_http_proxy"),
-        ("proxy_url", "http://127.0.0.1:8080"),
-    ],
-)
-def test_frozen_jiaoch_source_guard_rejects_each_authority_field(
-    field: str,
-    value: object,
-) -> None:
-    source = replace(
-        runner._fixed_jiaoch_source(
-            credential="synthetic-token",
-            source_generation_id=SOURCE_GENERATION_ID,
-        ),
-        **{field: value},
-    )
-
-    with pytest.raises(runner.FactorV3FeatureHistoryRunnerError, match="Jiaoch source"):
-        runner._validated_frozen_jiaoch_source(source)
-
-
-def test_frozen_jiaoch_source_guard_requires_exact_source_type() -> None:
-    source = SimpleNamespace(
-        token="synthetic-token",
-        generation_id=SOURCE_GENERATION_ID,
-        name="jiaoch",
-        api_url="https://jiaoch.site",
-        allowed_hosts=("jiaoch.site",),
-        request_protocol="tushare-path-per-interface/v1",
-        row_cap_overrides=(("stk_limit", 10_000),),
-        network_route="direct",
-        proxy_url=None,
-    )
-
-    with pytest.raises(runner.FactorV3FeatureHistoryRunnerError, match="Jiaoch source"):
-        runner._validated_frozen_jiaoch_source(source)
-
-
 def test_verify_does_not_initialize_an_absent_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -760,67 +558,6 @@ def test_verify_does_not_initialize_an_absent_run(
     assert {path.name for path in run_root.iterdir()} == {
         ".factor-v3-feature-history-runner.lock"
     }
-
-
-def test_run_lock_rejects_a_symlink_target(tmp_path: Path) -> None:
-    target = tmp_path / "other.lock"
-    target.write_bytes(b"\0")
-    link = tmp_path / "runner.lock"
-    try:
-        link.symlink_to(target)
-    except OSError:
-        pytest.skip("symlink creation is unavailable")
-
-    with pytest.raises(runner.FactorV3FeatureHistoryRunnerError, match="lock unavailable"):
-        with runner._run_lock(link):
-            pytest.fail("symlink lock must not be acquired")
-
-
-def test_run_lock_rejects_opened_file_identity_drift(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    expected = tmp_path / "runner.lock"
-    expected.write_bytes(b"\0")
-    substitute = tmp_path / "substitute.lock"
-    substitute.write_bytes(b"\0")
-    real_open = runner.os.open
-
-    def open_substitute(path: str, flags: int, mode: int) -> int:
-        assert Path(path) == expected
-        return real_open(str(substitute), flags, mode)
-
-    monkeypatch.setattr(runner.os, "open", open_substitute)
-    with pytest.raises(runner.FactorV3FeatureHistoryRunnerError, match="lock unavailable"):
-        with runner._run_lock(expected):
-            pytest.fail("drifted lock identity must not be acquired")
-
-
-def test_run_lock_rejects_a_hardlink_target(tmp_path: Path) -> None:
-    target = tmp_path / "other.lock"
-    target.write_bytes(b"\0")
-    link = tmp_path / "runner.lock"
-    try:
-        runner.os.link(target, link)
-    except OSError:
-        pytest.skip("hardlink creation is unavailable")
-
-    with pytest.raises(runner.FactorV3FeatureHistoryRunnerError, match="lock unavailable"):
-        with runner._run_lock(link):
-            pytest.fail("hardlink lock must not be acquired")
-
-
-def test_run_lock_rejects_a_reparse_parent(tmp_path: Path) -> None:
-    target = tmp_path / "real-root"
-    target.mkdir()
-    link = tmp_path / "linked-root"
-    try:
-        link.symlink_to(target, target_is_directory=True)
-    except OSError:
-        pytest.skip("directory symlink creation is unavailable")
-
-    with pytest.raises(runner.FactorV3FeatureHistoryRunnerError, match="lock unavailable"):
-        with runner._run_lock(link / "runner.lock"):
-            pytest.fail("lock beneath a reparse parent must not be acquired")
 
 
 def test_cli_has_only_run_and_verify_commands() -> None:

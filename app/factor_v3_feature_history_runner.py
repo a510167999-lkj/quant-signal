@@ -55,8 +55,7 @@ __all__ = (
 
 
 _RUN_SPEC_SCHEMA = "factor-v3-feature-history-run-spec/v1"
-_RUN_STATE_SCHEMA = "factor-v3-feature-history-run-state/v2"
-_RUN_STATE_V1_SCHEMA = "factor-v3-feature-history-run-state/v1"
+_RUN_STATE_SCHEMA = "factor-v3-feature-history-run-state/v1"
 _POLICY_SCHEMA = "jiaoch-credential-feature-history-policy-descriptor/v1"
 _POLICY_DOCUMENT_SCHEMA = "jiaoch-credential-feature-history-routing-policy/v1"
 _MARKET_SESSION_VINTAGE = "historical_backfill"
@@ -88,7 +87,6 @@ _STATE_FIELDS = frozenset(
     {
         "collection_publication",
         "completed_session_count",
-        "credential_generation_id",
         "receipt",
         "run_spec_sha256",
         "schema",
@@ -96,7 +94,6 @@ _STATE_FIELDS = frozenset(
         "state_sha256",
     }
 )
-_STATE_V1_FIELDS = _STATE_FIELDS - {"credential_generation_id"}
 _ALLOWED_DATASETS = ("bak_basic", "daily", "adj_factor", "stk_limit", "suspend_d")
 _MAX_RUN_SPEC_BYTES = 4 * 1024 * 1024
 _MAX_STATE_BYTES = 512 * 1024
@@ -218,20 +215,6 @@ def _require_sha256(value: Any, *, label: str) -> str:
             f"factor-v3 feature-history {label} rejected"
         ) from exc
     if value.lower() != value:
-        raise FactorV3FeatureHistoryRunnerError(f"factor-v3 feature-history {label} rejected")
-    return value
-
-
-def _validated_uuid4(value: Any, *, label: str) -> str:
-    if type(value) is not str:
-        raise FactorV3FeatureHistoryRunnerError(f"factor-v3 feature-history {label} rejected")
-    try:
-        parsed = uuid.UUID(value)
-    except ValueError as exc:
-        raise FactorV3FeatureHistoryRunnerError(
-            f"factor-v3 feature-history {label} rejected"
-        ) from exc
-    if parsed.version != 4 or str(parsed) != value:
         raise FactorV3FeatureHistoryRunnerError(f"factor-v3 feature-history {label} rejected")
     return value
 
@@ -478,7 +461,6 @@ def _state_payload(
     run_spec_sha256: str,
     status: str,
     completed_session_count: int,
-    credential_generation_id: str | None = None,
     collection_publication: Mapping[str, Any] | None = None,
     receipt: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -488,7 +470,6 @@ def _state_payload(
         isinstance(completed_session_count, bool)
         or not isinstance(completed_session_count, int)
         or not 0 <= completed_session_count <= 250
-        or (credential_generation_id is not None and type(credential_generation_id) is not str)
         or (collection_publication is not None and type(collection_publication) is not dict)
         or (receipt is not None and type(receipt) is not dict)
     ):
@@ -499,19 +480,6 @@ def _state_payload(
         raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history state rejected")
     if status == "initialized" and completed_session_count != 0:
         raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history state rejected")
-    if credential_generation_id is not None:
-        _validated_uuid4(
-            credential_generation_id,
-            label="credential generation",
-        )
-    if status in {"collecting", "collected", "published", "verified"} and credential_generation_id is None:
-        raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history state rejected")
-    if (
-        status == "failed"
-        and (completed_session_count != 0 or collection_publication is not None)
-        and credential_generation_id is None
-    ):
-        raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history state rejected")
     if status in {"collected", "published", "verified"} and completed_session_count != 250:
         raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history state rejected")
     unsigned = {
@@ -519,7 +487,6 @@ def _state_payload(
         "run_spec_sha256": run_spec_sha256,
         "status": status,
         "completed_session_count": completed_session_count,
-        "credential_generation_id": credential_generation_id,
         "collection_publication": (
             None if collection_publication is None else json.loads(_canonical_bytes(dict(collection_publication)))
         ),
@@ -540,117 +507,8 @@ def _validated_state(value: Any, *, run_spec_sha256: str) -> dict[str, Any]:
         run_spec_sha256=run_spec_sha256,
         status=value["status"],
         completed_session_count=value["completed_session_count"],
-        credential_generation_id=value["credential_generation_id"],
         collection_publication=value["collection_publication"],
         receipt=value["receipt"],
-    )
-
-
-def _validated_v1_state(value: Any, *, run_spec_sha256: str) -> dict[str, Any]:
-    if type(value) is not dict or set(value) != _STATE_V1_FIELDS:
-        raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history legacy state rejected")
-    if value.get("schema") != _RUN_STATE_V1_SCHEMA or value.get("run_spec_sha256") != run_spec_sha256:
-        raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history legacy state rejected")
-    unsigned = {key: item for key, item in value.items() if key != "state_sha256"}
-    if value.get("state_sha256") != _canonical_sha256(unsigned):
-        raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history legacy state rejected")
-    status = value.get("status")
-    completed = value.get("completed_session_count")
-    publication = value.get("collection_publication")
-    receipt = value.get("receipt")
-    if (
-        status not in {"initialized", "collecting", "collected", "published", "verified", "failed"}
-        or isinstance(completed, bool)
-        or not isinstance(completed, int)
-        or not 0 <= completed <= 250
-        or (publication is not None and type(publication) is not dict)
-        or (receipt is not None and type(receipt) is not dict)
-        or (status == "initialized" and completed != 0)
-        or (status == "published" and publication is None)
-        or (status == "verified" and (publication is None or receipt is None))
-        or (status in {"collected", "published", "verified"} and completed != 250)
-    ):
-        raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history legacy state rejected")
-    return {
-        "status": status,
-        "completed_session_count": completed,
-        "collection_publication": publication,
-        "receipt": receipt,
-    }
-
-
-def _legacy_store_generation_id(store_root: Path, *, required: bool) -> str | None:
-    database_path = store_root / "metadata.sqlite3"
-    if not database_path.exists():
-        if required:
-            raise FactorV3FeatureHistoryRunnerError(
-                "factor-v3 feature-history legacy state cannot migrate"
-            )
-        return None
-    _require_regular_file(
-        database_path,
-        label="legacy PIT database",
-        max_bytes=2**63 - 1,
-    )
-    try:
-        connection = sqlite3.connect(str(database_path), timeout=30)
-        try:
-            connection.execute("PRAGMA query_only=ON")
-            rows = connection.execute(
-                "SELECT request_semantics_json FROM fetch_attempts"
-            ).fetchall()
-        finally:
-            connection.close()
-    except sqlite3.DatabaseError as exc:
-        raise FactorV3FeatureHistoryRunnerError(
-            "factor-v3 feature-history legacy state cannot migrate"
-        ) from exc
-    generation_ids: set[str] = set()
-    try:
-        for (raw_semantics,) in rows:
-            semantics = json.loads(raw_semantics)
-            if type(semantics) is not dict:
-                raise ValueError
-            generation_ids.add(
-                _validated_uuid4(
-                    semantics.get("credential_generation_id"),
-                    label="legacy credential generation",
-                )
-            )
-    except (TypeError, ValueError, FactorV3FeatureHistoryRunnerError) as exc:
-        raise FactorV3FeatureHistoryRunnerError(
-            "factor-v3 feature-history legacy state cannot migrate"
-        ) from exc
-    if len(generation_ids) == 1:
-        return next(iter(generation_ids))
-    if not generation_ids and not required:
-        return None
-    raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history legacy state cannot migrate")
-
-
-def _migrate_v1_state(
-    value: Any,
-    *,
-    run_spec_sha256: str,
-    store_root: Path,
-) -> dict[str, Any]:
-    legacy = _validated_v1_state(value, run_spec_sha256=run_spec_sha256)
-    needs_generation = (
-        legacy["completed_session_count"] != 0
-        or legacy["collection_publication"] is not None
-        or legacy["receipt"] is not None
-    )
-    generation_id = _legacy_store_generation_id(store_root, required=needs_generation)
-    status = legacy["status"]
-    if status == "collecting" and generation_id is None:
-        status = "failed"
-    return _state_payload(
-        run_spec_sha256=run_spec_sha256,
-        status=status,
-        completed_session_count=legacy["completed_session_count"],
-        credential_generation_id=generation_id,
-        collection_publication=legacy["collection_publication"],
-        receipt=legacy["receipt"],
     )
 
 
@@ -676,116 +534,19 @@ def _load_or_initialize_run(
     persisted_spec = _read_json_file(spec_path, label="run spec snapshot", max_bytes=_MAX_RUN_SPEC_BYTES)
     if persisted_spec != spec or _canonical_bytes(persisted_spec) + b"\n" != canonical_spec:
         raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history run spec drifted")
-    persisted_state = _read_json_file(state_path, label="run state", max_bytes=_MAX_STATE_BYTES)
-    if persisted_state.get("schema") == _RUN_STATE_V1_SCHEMA:
-        migrated = _migrate_v1_state(
-            persisted_state,
-            run_spec_sha256=spec["run_spec_sha256"],
-            store_root=paths["store"],
-        )
-        _atomic_json(state_path, migrated)
-        return migrated
-    return _validated_state(persisted_state, run_spec_sha256=spec["run_spec_sha256"])
-
-
-def _run_credential_generation_id(
-    *, run_spec_path: str | Path, run_root: str | Path
-) -> str:
-    """Return the run-scoped generation ID before resolving a credential slot.
-
-    A restart may resolve the same points slot again, but its request lineage
-    must retain the generation already sealed in the run state.
-    """
-
-    spec = load_factor_v3_feature_history_run_spec(run_spec_path)
-    _verify_plan(spec)
-    paths = _run_paths(run_root, create=True)
-    with _run_lock(paths["lock"]):
-        state = _load_or_initialize_run(paths, spec, allow_initialize=True)
-        generation_id = state["credential_generation_id"]
-        if generation_id is not None:
-            return _validated_uuid4(generation_id, label="credential generation")
-        if (
-            state["completed_session_count"] != 0
-            or state["collection_publication"] is not None
-            or state["receipt"] is not None
-        ):
-            raise FactorV3FeatureHistoryRunnerError(
-                "factor-v3 feature-history credential generation is unavailable"
-            )
-        generation_id = str(uuid.uuid4())
-        _atomic_json(
-            paths["state"],
-            _state_payload(
-                run_spec_sha256=spec["run_spec_sha256"],
-                status=state["status"],
-                completed_session_count=0,
-                credential_generation_id=generation_id,
-                collection_publication=state["collection_publication"],
-                receipt=state["receipt"],
-            ),
-        )
-        return generation_id
-
-
-def _validate_open_lock_identity(path: Path, descriptor: int) -> None:
-    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    try:
-        parent_stat = path.parent.lstat()
-        descriptor_stat = os.fstat(descriptor)
-        path_stat = path.lstat()
-        if (
-            path.parent.is_symlink()
-            or not stat.S_ISDIR(parent_stat.st_mode)
-            or getattr(parent_stat, "st_file_attributes", 0) & reparse_flag
-            or path.is_symlink()
-            or not stat.S_ISREG(descriptor_stat.st_mode)
-            or not stat.S_ISREG(path_stat.st_mode)
-            or descriptor_stat.st_nlink != 1
-            or path_stat.st_nlink != 1
-            or getattr(descriptor_stat, "st_file_attributes", 0) & reparse_flag
-            or getattr(path_stat, "st_file_attributes", 0) & reparse_flag
-            or (descriptor_stat.st_dev, descriptor_stat.st_ino)
-            != (path_stat.st_dev, path_stat.st_ino)
-        ):
-            raise OSError
-    except OSError as exc:
-        raise FactorV3FeatureHistoryRunnerError(
-            "factor-v3 feature-history lock unavailable"
-        ) from exc
+    return _validated_state(
+        _read_json_file(state_path, label="run state", max_bytes=_MAX_STATE_BYTES),
+        run_spec_sha256=spec["run_spec_sha256"],
+    )
 
 
 @contextmanager
 def _run_lock(path: Path) -> Iterator[None]:
-    flags = (
-        os.O_RDWR
-        | os.O_CREAT
-        | getattr(os, "O_BINARY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    try:
-        parent_stat = path.parent.lstat()
-        if (
-            path.parent.is_symlink()
-            or not stat.S_ISDIR(parent_stat.st_mode)
-            or getattr(parent_stat, "st_file_attributes", 0)
-            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-            or path.is_symlink()
-        ):
-            raise OSError
-    except OSError as exc:
-        raise FactorV3FeatureHistoryRunnerError(
-            "factor-v3 feature-history lock unavailable"
-        ) from exc
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
     try:
         descriptor = os.open(str(path), flags, 0o600)
     except OSError as exc:
         raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history lock unavailable") from exc
-    try:
-        _validate_open_lock_identity(path, descriptor)
-    except FactorV3FeatureHistoryRunnerError:
-        os.close(descriptor)
-        raise
     try:
         if _fcntl is not None:
             _fcntl.flock(descriptor, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
@@ -799,7 +560,6 @@ def _run_lock(path: Path) -> Iterator[None]:
             raise FactorV3FeatureHistoryRunnerError(
                 "factor-v3 feature-history advisory locking is unavailable"
             )
-        _validate_open_lock_identity(path, descriptor)
     except (OSError, FactorV3FeatureHistoryRunnerError) as exc:
         os.close(descriptor)
         raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history run is already locked") from exc
@@ -874,7 +634,14 @@ def _fixed_jiaoch_source(*, credential: Any, source_generation_id: Any) -> _Froz
         or type(source_generation_id) is not str
     ):
         raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history Jiaoch source rejected")
-    _validated_uuid4(source_generation_id, label="Jiaoch source")
+    try:
+        parsed_generation = uuid.UUID(source_generation_id)
+    except ValueError as exc:
+        raise FactorV3FeatureHistoryRunnerError(
+            "factor-v3 feature-history Jiaoch source rejected"
+        ) from exc
+    if parsed_generation.version != 4 or str(parsed_generation) != source_generation_id:
+        raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history Jiaoch source rejected")
     return _FrozenJiaochSource(token=credential, generation_id=source_generation_id)
 
 
@@ -1047,6 +814,7 @@ def _verify_collection_authority(
     *,
     publication_root: Path,
     publication: Mapping[str, Any],
+    store_root: Path,
     spec: Mapping[str, Any],
 ) -> dict[str, Any]:
     receipt = history_authority.verify_factor_v3_feature_history_collection_authority(
@@ -1055,6 +823,7 @@ def _verify_collection_authority(
         trade_cal_publication=spec["trade_cal_publication"],
         development_session_refs=spec["development_session_refs"],
         temporal_partition_contract=spec["temporal_partition_contract"],
+        pit_store_root=store_root,
         collection_publication_output_root=publication_root,
         collection_publication=publication,
     )
@@ -1081,18 +850,20 @@ def _verify_existing_publication(
     state: Mapping[str, Any],
 ) -> dict[str, Any]:
     publication = _validated_publication(state["collection_publication"])
+    store_root = _safe_directory(paths["store"], label="PIT store", create=False)
+    _assert_no_partial_store_artifacts(store_root, sessions)
     receipt = _verify_collection_authority(
         publication_root=_safe_directory(
             paths["publication_root"], label="publication root", create=False
         ),
         publication=publication,
+        store_root=store_root,
         spec=spec,
     )
     verified = _state_payload(
         run_spec_sha256=spec["run_spec_sha256"],
         status="verified",
         completed_session_count=len(sessions),
-        credential_generation_id=state["credential_generation_id"],
         collection_publication=publication,
         receipt=receipt,
     )
@@ -1131,28 +902,12 @@ def _run_factor_v3_feature_history_collection_with_route_credential(
                     spec=spec,
                     state=state,
                 )
-            persisted_generation_id = state["credential_generation_id"]
-            if persisted_generation_id is None:
-                active_generation_id = _validated_uuid4(
-                    source_generation_id,
-                    label="credential generation",
-                )
-            else:
-                active_generation_id = _validated_uuid4(
-                    persisted_generation_id,
-                    label="credential generation",
-                )
-                if source_generation_id != active_generation_id:
-                    raise FactorV3FeatureHistoryRunnerError(
-                        "factor-v3 feature-history credential generation drifted"
-                    )
             _atomic_json(
                 paths["state"],
                 _state_payload(
                     run_spec_sha256=spec["run_spec_sha256"],
                     status="collecting",
                     completed_session_count=state["completed_session_count"],
-                    credential_generation_id=active_generation_id,
                     collection_publication=state["collection_publication"],
                     receipt=state["receipt"],
                 ),
@@ -1162,7 +917,7 @@ def _run_factor_v3_feature_history_collection_with_route_credential(
             source = _validated_frozen_jiaoch_source(
                 _fixed_jiaoch_source(
                     credential=credential,
-                    source_generation_id=active_generation_id,
+                    source_generation_id=source_generation_id,
                 )
             )
             completed = state["completed_session_count"]
@@ -1197,7 +952,6 @@ def _run_factor_v3_feature_history_collection_with_route_credential(
                             run_spec_sha256=spec["run_spec_sha256"],
                             status="collecting",
                             completed_session_count=completed,
-                            credential_generation_id=active_generation_id,
                         ),
                     )
                 session_offset += len(segment["sessions"])
@@ -1206,7 +960,6 @@ def _run_factor_v3_feature_history_collection_with_route_credential(
                 run_spec_sha256=spec["run_spec_sha256"],
                 status="collected",
                 completed_session_count=len(sessions),
-                credential_generation_id=active_generation_id,
             )
             _atomic_json(paths["state"], collected)
             publication_root = _safe_directory(
@@ -1221,20 +974,19 @@ def _run_factor_v3_feature_history_collection_with_route_credential(
                 run_spec_sha256=spec["run_spec_sha256"],
                 status="published",
                 completed_session_count=len(sessions),
-                credential_generation_id=active_generation_id,
                 collection_publication=publication,
             )
             _atomic_json(paths["state"], published)
             receipt = _verify_collection_authority(
                 publication_root=publication_root,
                 publication=publication,
+                store_root=store_root,
                 spec=spec,
             )
             verified = _state_payload(
                 run_spec_sha256=spec["run_spec_sha256"],
                 status="verified",
                 completed_session_count=len(sessions),
-                credential_generation_id=active_generation_id,
                 collection_publication=publication,
                 receipt=receipt,
             )
@@ -1246,7 +998,6 @@ def _run_factor_v3_feature_history_collection_with_route_credential(
                 run_spec_sha256=spec["run_spec_sha256"],
                 status="failed",
                 completed_session_count=int(previous.get("completed_session_count") or 0),
-                credential_generation_id=previous.get("credential_generation_id"),
                 collection_publication=previous.get("collection_publication"),
                 receipt=previous.get("receipt"),
             )
@@ -1259,17 +1010,11 @@ def run_factor_v3_feature_history_collection(
 ) -> dict[str, Any]:
     """Resolve a sealed Jiaoch generation, then run the closed five-route set."""
 
-    from app.jiaoch_credential_slots import (
-        _collect_jiaoch_feature_history_from_environment_for_run,
-    )
+    from app.jiaoch_credential_slots import collect_jiaoch_feature_history_from_environment
 
-    return _collect_jiaoch_feature_history_from_environment_for_run(
+    return collect_jiaoch_feature_history_from_environment(
         run_spec_path=run_spec_path,
         run_root=run_root,
-        source_generation_id=_run_credential_generation_id(
-            run_spec_path=run_spec_path,
-            run_root=run_root,
-        ),
     )
 
 

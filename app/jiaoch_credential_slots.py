@@ -173,30 +173,6 @@ _FEATURE_HISTORY_POLICY_SHA256 = hashlib.sha256(
     ).encode("utf-8")
 ).hexdigest()
 
-_FACTOR_V3_DAILY_BASIC_POLICY = _RoutingPolicy(
-    schema="jiaoch-credential-factor-v3-daily-basic-routing-policy/v1",
-    routes=(
-        _RoutePolicy(
-            route_id="factor-v3-daily-basic:points-primary:daily_basic",
-            credential_slot_id=_POINTS_PRIMARY_SLOT,
-            api_name="daily_basic",
-            purpose="factor-v3-daily-basic",
-        ),
-    ),
-)
-_FACTOR_V3_DAILY_BASIC_ROUTES_BY_ID = MappingProxyType(
-    {route.route_id: route for route in _FACTOR_V3_DAILY_BASIC_POLICY.routes}
-)
-_FACTOR_V3_DAILY_BASIC_POLICY_SHA256 = hashlib.sha256(
-    json.dumps(
-        _policy_document(_FACTOR_V3_DAILY_BASIC_POLICY),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-).hexdigest()
-
 
 def _auxiliary_policy_descriptor() -> dict[str, Any]:
     return {
@@ -212,15 +188,6 @@ def _feature_history_policy_descriptor() -> dict[str, Any]:
         "document": _policy_document(_FEATURE_HISTORY_POLICY),
         "schema": "jiaoch-credential-feature-history-policy-descriptor/v1",
         "sha256": _FEATURE_HISTORY_POLICY_SHA256,
-    }
-
-
-def _factor_v3_daily_basic_policy_descriptor() -> dict[str, Any]:
-    return {
-        "credential_proof_claimed": False,
-        "document": _policy_document(_FACTOR_V3_DAILY_BASIC_POLICY),
-        "schema": "jiaoch-credential-factor-v3-daily-basic-policy-descriptor/v1",
-        "sha256": _FACTOR_V3_DAILY_BASIC_POLICY_SHA256,
     }
 
 
@@ -322,55 +289,9 @@ class _FeatureHistoryCredentialGeneration:
         )
 
 
-class _FactorV3DailyBasicCredentialGeneration:
-    """One-slot sealed generation reserved for Factor V3 daily_basic only."""
-
-    __slots__ = ("__credential", "__generation_id")
-
-    def __new__(cls, *args: Any, **kwargs: Any) -> _FactorV3DailyBasicCredentialGeneration:
-        raise TypeError("Jiaoch factor-v3 daily-basic generation must be created by its factory")
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        raise AttributeError("Jiaoch factor-v3 daily-basic generation is immutable")
-
-    def __dir__(self) -> list[str]:
-        return ["describe_slots"]
-
-    def __repr__(self) -> str:
-        return f"JiaochFactorV3DailyBasicCredentialGeneration(slots={self.describe_slots()!r})"
-
-    def __copy__(self) -> None:
-        raise TypeError("Jiaoch factor-v3 daily-basic generation cannot be copied")
-
-    def __deepcopy__(self, memo: object) -> None:
-        raise TypeError("Jiaoch factor-v3 daily-basic generation cannot be copied")
-
-    def __reduce__(self) -> None:
-        raise TypeError("Jiaoch factor-v3 daily-basic generation cannot be serialized")
-
-    def __reduce_ex__(self, protocol: int) -> None:
-        raise TypeError("Jiaoch factor-v3 daily-basic generation cannot be serialized")
-
-    def __getstate__(self) -> None:
-        raise TypeError("Jiaoch factor-v3 daily-basic generation cannot be serialized")
-
-    def describe_slots(self) -> tuple[JiaochCredentialSlotDescription, ...]:
-        generation_id = object.__getattribute__(
-            self, "_FactorV3DailyBasicCredentialGeneration__generation_id"
-        )
-        return (
-            JiaochCredentialSlotDescription(
-                credential_slot_id=_POINTS_PRIMARY_SLOT,
-                generation_id=generation_id,
-                policy_sha256=_FACTOR_V3_DAILY_BASIC_POLICY_SHA256,
-            ),
-        )
-
-
 _ROUTE_CAPABILITY = object()
 _AUXILIARY_ROUTE_CAPABILITY = object()
 _FEATURE_HISTORY_ROUTE_CAPABILITY = object()
-_FACTOR_V3_DAILY_BASIC_ROUTE_CAPABILITY = object()
 
 
 def _credential_for_route(
@@ -436,24 +357,6 @@ def _credential_for_feature_history_route(
     )
 
 
-def _credential_for_factor_v3_daily_basic_route(
-    generation: _FactorV3DailyBasicCredentialGeneration,
-    *,
-    route_id: str,
-    capability: object,
-) -> str:
-    if capability is not _FACTOR_V3_DAILY_BASIC_ROUTE_CAPABILITY:
-        raise ValueError("Jiaoch factor-v3 daily-basic private route capability rejected")
-    if type(generation) is not _FactorV3DailyBasicCredentialGeneration:
-        raise ValueError("Jiaoch factor-v3 daily-basic generation rejected")
-    if type(route_id) is not str or route_id not in _FACTOR_V3_DAILY_BASIC_ROUTES_BY_ID:
-        raise ValueError("Jiaoch factor-v3 daily-basic route rejected")
-    return object.__getattribute__(
-        generation,
-        "_FactorV3DailyBasicCredentialGeneration__credential",
-    )
-
-
 _RESOLUTION_FAILED = object()
 
 
@@ -490,18 +393,6 @@ def _credential(value: Any) -> str:
     return value
 
 
-def _credential_generation_id(value: Any) -> str:
-    if type(value) is not str:
-        raise ValueError("Jiaoch credential generation rejected")
-    try:
-        parsed = uuid.UUID(value)
-    except ValueError as exc:
-        raise ValueError("Jiaoch credential generation rejected") from exc
-    if parsed.version != 4 or str(parsed) != value:
-        raise ValueError("Jiaoch credential generation rejected")
-    return value
-
-
 def _seal_generation(credentials: tuple[str, ...]) -> JiaochCredentialGeneration:
     generation = object.__new__(JiaochCredentialGeneration)
     object.__setattr__(
@@ -518,9 +409,7 @@ def _seal_generation(credentials: tuple[str, ...]) -> JiaochCredentialGeneration
 
 
 def _create_feature_history_generation(
-    *,
-    credential_resolver: Callable[[str], str],
-    source_generation_id: str | None = None,
+    *, credential_resolver: Callable[[str], str]
 ) -> _FeatureHistoryCredentialGeneration:
     if not callable(credential_resolver):
         raise ValueError("Jiaoch feature-history credential resolution rejected")
@@ -537,38 +426,7 @@ def _create_feature_history_generation(
     object.__setattr__(
         generation,
         "_FeatureHistoryCredentialGeneration__generation_id",
-        (
-            str(uuid.uuid4())
-            if source_generation_id is None
-            else _credential_generation_id(source_generation_id)
-        ),
-    )
-    return generation
-
-
-def _create_factor_v3_daily_basic_generation(
-    *,
-    credential_resolver: Callable[[str], str],
-    source_generation_id: str | None = None,
-) -> _FactorV3DailyBasicCredentialGeneration:
-    if not callable(credential_resolver):
-        raise ValueError("Jiaoch factor-v3 daily-basic credential resolution rejected")
-    try:
-        credential = _credential(credential_resolver(_POINTS_PRIMARY_SLOT))
-    except Exception as exc:
-        raise ValueError("Jiaoch factor-v3 daily-basic credential resolution rejected") from exc
-    generation = object.__new__(_FactorV3DailyBasicCredentialGeneration)
-    object.__setattr__(
-        generation,
-        "_FactorV3DailyBasicCredentialGeneration__credential",
-        credential,
-    )
-    object.__setattr__(
-        generation,
-        "_FactorV3DailyBasicCredentialGeneration__generation_id",
-        str(uuid.uuid4())
-        if source_generation_id is None
-        else _credential_generation_id(source_generation_id),
+        str(uuid.uuid4()),
     )
     return generation
 
@@ -641,76 +499,18 @@ def collect_jiaoch_feature_history_collection_set(
     )
 
 
-def _collect_jiaoch_feature_history_from_environment_for_run(
-    *,
-    run_spec_path: str | Path,
-    run_root: str | Path,
-    source_generation_id: str,
+def collect_jiaoch_feature_history_from_environment(
+    *, run_spec_path: str | Path, run_root: str | Path
 ) -> dict[str, Any]:
-    """Private runner bridge for a run-scoped generation identifier."""
+    """Resolve sealed credentials only inside this module, then run the closed set."""
 
     generation = _create_feature_history_generation(
-        credential_resolver=lambda slot_id: str(os.getenv(_ENV_BY_SLOT[slot_id]) or ""),
-        source_generation_id=source_generation_id,
+        credential_resolver=lambda slot_id: str(os.getenv(_ENV_BY_SLOT[slot_id]) or "")
     )
     return collect_jiaoch_feature_history_collection_set(
         generation=generation,
         run_spec_path=run_spec_path,
         run_root=run_root,
-    )
-
-
-def _collect_jiaoch_factor_v3_daily_basic_from_environment_for_run(
-    *,
-    run_spec_path: str | Path,
-    run_root: str | Path,
-    source_generation_id: str,
-) -> dict[str, Any]:
-    """Private bridge that resolves the one points-primary daily_basic route."""
-
-    generation = _create_factor_v3_daily_basic_generation(
-        credential_resolver=lambda _slot_id: str(os.getenv(POINTS_PRIMARY_ENV) or ""),
-        source_generation_id=source_generation_id,
-    )
-    descriptor = generation.describe_slots()
-    if (
-        len(descriptor) != 1
-        or descriptor[0].credential_slot_id != _POINTS_PRIMARY_SLOT
-        or descriptor[0].policy_sha256 != _FACTOR_V3_DAILY_BASIC_POLICY_SHA256
-    ):
-        raise ValueError("Jiaoch factor-v3 daily-basic points slot rejected")
-    credential = _credential_for_factor_v3_daily_basic_route(
-        generation,
-        route_id="factor-v3-daily-basic:points-primary:daily_basic",
-        capability=_FACTOR_V3_DAILY_BASIC_ROUTE_CAPABILITY,
-    )
-    from app.factor_v3_daily_basic_runner import (
-        _run_factor_v3_daily_basic_collection_with_route_credential,
-    )
-
-    return _run_factor_v3_daily_basic_collection_with_route_credential(
-        run_spec_path=run_spec_path,
-        run_root=run_root,
-        credential=credential,
-        source_generation_id=descriptor[0].generation_id,
-        daily_basic_policy_descriptor=_factor_v3_daily_basic_policy_descriptor(),
-    )
-
-
-def collect_jiaoch_feature_history_from_environment(
-    *, run_spec_path: str | Path, run_root: str | Path
-) -> dict[str, Any]:
-    """Resolve the points slot only, without exposing credential provenance control."""
-
-    from app.factor_v3_feature_history_runner import _run_credential_generation_id
-
-    return _collect_jiaoch_feature_history_from_environment_for_run(
-        run_spec_path=run_spec_path,
-        run_root=run_root,
-        source_generation_id=_run_credential_generation_id(
-            run_spec_path=run_spec_path,
-            run_root=run_root,
-        ),
     )
 
 
