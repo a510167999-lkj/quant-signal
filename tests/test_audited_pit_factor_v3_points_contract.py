@@ -188,6 +188,93 @@ def test_contract_freezes_scope_lag_features_arms_and_safety_gate() -> None:
     }
 
 
+def test_formal_parent_expectation_binds_common_eligible_overlay() -> None:
+    parent = FACTOR_V3_POINTS_CONTRACT["preregistered_parent_expectation"]
+
+    assert parent["schema_version"] == (
+        "audited-pit-factor-v3-points-parent-expectation/v2"
+    )
+    assert parent["sample_reference"] == (
+        "factor_v2_development_4_common_eligible_sample"
+    )
+    assert parent["factor_v2_common_eligible_overlay_artifact_sha256"] == (
+        "abd4b2166da4520952d7bfc5c8a988bc0a8027dd576a90ae0fdda2560b3a02f8"
+    )
+    assert parent["factor_v2_common_eligible_overlay_manifest_file_sha256"] == (
+        "9131f15e13f247a4663fae658af544b94bf2af01a3494b8eb0a3d0c095ee1312"
+    )
+    assert parent["factor_v2_common_eligible_receipt_sha256"] == (
+        "86199759116362c6317db7ca73b78dc56c9adaada57c2661a4b33028be44db4d"
+    )
+    assert parent["original_parent_feature_row_count"] == 1_796_835
+    assert parent["original_parent_feature_rows_sha256"] == (
+        "7cbd9bfe61052f87d736f6a7d14fdc1ad350ce66add98347ea36d9c2ed48b337"
+    )
+    assert parent["common_eligible_candidate_count"] == 1_796_834
+    assert parent["common_eligible_candidate_keys_sha256"] == (
+        "ded45539b436764ee9c8bf45329105444a735e46f56fa90d7521a40ce9538544"
+    )
+    assert parent["common_eligible_source_feature_rows_sha256"] == (
+        "62f02c3d3b068f50b95d29a06a218e58dd72693113081570ded95ae73d7ec59f"
+    )
+    assert parent["preregistered_suspension_excluded_candidate_count"] == 1
+    assert parent["preregistered_suspension_excluded_candidate_keys_sha256"] == (
+        "a2149f2a5de78780459652aaf64bcb940ab2ad7631dd3260007f1ad1ec1ab18a"
+    )
+    assert "parent_feature_row_count" not in parent
+    assert "parent_feature_rows_sha256" not in parent
+
+
+def test_formal_policy_preregisters_one_fail_closed_history_subset_for_all_arms() -> None:
+    policy = FACTOR_V3_POINTS_CONTRACT["formal_parent_sample_policy"]
+
+    assert policy["source_sample_reference"] == (
+        "factor_v2_development_4_common_eligible_sample"
+    )
+    assert policy["source_candidate_count"] == 1_796_834
+    assert policy["source_candidate_keys_sha256"] == (
+        "ded45539b436764ee9c8bf45329105444a735e46f56fa90d7521a40ce9538544"
+    )
+    assert policy["coverage"] == (
+        "deterministic_history_eligible_subset_of_common_eligible_parent"
+    )
+    assert policy["same_history_eligible_subset_for_all_arms"] is True
+    assert policy["arbitrary_row_drops_permitted"] is False
+    assert policy["silent_row_drops_permitted"] is False
+    assert policy["zero_fill_permitted"] is False
+    assert policy["output_identity_must_equal_history_eligible_subset_identity"] is True
+
+    subset = policy["history_eligible_subset_policy"]
+    assert subset["schema_version"] == (
+        "audited-pit-factor-v3-points-history-eligible-subset-policy/v1"
+    )
+    assert subset["minimum_prior_market_sessions"] == 250
+    assert subset["latest_usable_source_session"] == "T-1"
+    assert subset["allowed_exclusion_reasons"] == [
+        "listing_history_less_than_250_authoritative_market_sessions",
+        "authoritative_suspension_in_required_history_window",
+        "authoritative_daily_cross_section_row_missing_in_required_history_window",
+    ]
+    assert subset["exclusion_record_identity_fields"] == [
+        "candidate_key",
+        "reason",
+        "authority_evidence_root_sha256",
+    ]
+    assert subset["excluded_candidate_count_required"] is True
+    assert subset["excluded_candidate_keys_sha256_required"] is True
+    assert subset["exclusion_reason_rows_sha256_required"] is True
+    assert subset["eligible_candidate_count_required"] is True
+    assert subset["eligible_candidate_keys_sha256_required"] is True
+    assert subset["eligible_identity_rows_sha256_required"] is True
+    assert subset["unrecognized_or_unproven_missingness_policy"] == "fail_closed"
+
+    sample_policy_sha256 = canonical_sha256(policy)
+    assert {
+        factor_v3_points_arm_contract(arm)["sample_policy_sha256"]
+        for arm in FACTOR_V3_POINTS_ARMS
+    } == {sample_policy_sha256}
+
+
 def test_arm_contracts_are_individually_content_addressed() -> None:
     contracts = {arm: factor_v3_points_arm_contract(arm) for arm in FACTOR_V3_POINTS_ARMS}
     for arm, contract in contracts.items():
