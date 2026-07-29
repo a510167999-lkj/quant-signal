@@ -103,9 +103,9 @@ def _assert_unbound(manifest: dict) -> None:
 
 
 def test_public_collector_binds_the_audited_transport_internally() -> None:
-    assert "transport" not in inspect.signature(
-        collect_jiaoch_historical_minute_diagnostic
-    ).parameters
+    assert (
+        "transport" not in inspect.signature(collect_jiaoch_historical_minute_diagnostic).parameters
+    )
 
 
 def test_permission_denied_is_terminal_single_request_and_fixed_stk_mins_post(
@@ -347,9 +347,7 @@ def test_resigned_and_renamed_manifest_cannot_forge_bound_evidence_or_rows(
     mutation,
 ) -> None:
     transport = RecordingTransport(
-        _response(
-            '{"code":-1,"msg":"权限不足: stk_mins 未授权","data":null}'.encode("utf-8")
-        )
+        _response('{"code":-1,"msg":"权限不足: stk_mins 未授权","data":null}'.encode("utf-8"))
     )
     _, manifest = _collect(tmp_path, transport, monkeypatch)
     forged = dict(manifest)

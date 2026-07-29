@@ -15,7 +15,7 @@ from typing import Any
 
 from app.durable_io import fsync_directory
 from app.research_pit_sources import TushareSource
-from app.research_pit_transport import TushareTransport
+from app.research_pit_transport import UrllibTushareTransport
 
 
 SCHEMA_VERSION = "jiaoch-historical-minute-source-diagnostic/v1"
@@ -53,6 +53,7 @@ _UNSIGNED_FIELDS = frozenset(
         "response_body_sha256",
         "provider_code",
         "classification",
+        "transport_binding",
         "request_count",
         "retry_count",
         "fallback_used",
@@ -407,6 +408,21 @@ def verify_jiaoch_historical_minute_diagnostic(
         or payload.get("production_recommendation_eligible") is not False
     ):
         raise ValueError("Jiaoch historical-minute diagnostic descriptor rejected")
+    transport_binding = payload.get("transport_binding")
+    if transport_binding != {
+        "implementation": "app.research_pit_transport.UrllibTushareTransport",
+        "collector_post_invocations": 1,
+        "collector_http_retries": 0,
+        "collector_fallbacks": 0,
+        "redirect_policy": "refuse",
+        "network_route": transport_binding.get("network_route")
+        if isinstance(transport_binding, Mapping)
+        else None,
+    } or transport_binding.get("network_route") not in {
+        "direct",
+        "loopback_http_proxy",
+    }:
+        raise ValueError("Jiaoch historical-minute diagnostic descriptor rejected")
 
     status = payload.get("http_status")
     complete = payload.get("body_complete")
@@ -537,7 +553,6 @@ def load_jiaoch_historical_minute_diagnostic(
 def collect_jiaoch_historical_minute_diagnostic(
     *,
     source: TushareSource,
-    transport: TushareTransport,
     ts_code: str,
     start_date: str,
     end_date: str,
@@ -569,6 +584,7 @@ def collect_jiaoch_historical_minute_diagnostic(
             "fields": "",
         }
     )
+    transport = UrllibTushareTransport(proxy_url=source.proxy_url)
     try:
         response = transport.post(
             url=f"{source.api_url.rstrip('/')}{_PATH}",
@@ -597,4 +613,12 @@ def collect_jiaoch_historical_minute_diagnostic(
             body=getattr(response, "body", None),
             token=source.token,
         )
+    manifest["transport_binding"] = {
+        "implementation": "app.research_pit_transport.UrllibTushareTransport",
+        "collector_post_invocations": 1,
+        "collector_http_retries": 0,
+        "collector_fallbacks": 0,
+        "redirect_policy": "refuse",
+        "network_route": source.network_route,
+    }
     return _write_content_addressed(output_dir, manifest, token=source.token)
