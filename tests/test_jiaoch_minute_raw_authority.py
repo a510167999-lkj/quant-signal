@@ -284,6 +284,11 @@ def test_publisher_strictly_rejects_invalid_body_slot_api_route_or_http_metadata
             "",
         ),
         (
+            "stk_mins",
+            {**PARAMS, "start_date": "2026-7-28 09:00:00"},
+            "",
+        ),
+        (
             "daily",
             {"ts_code": "600000.SH", "trade_date": "20260728"},
             "ts_code,trade_date,open,high,low,close,vol,amount",
