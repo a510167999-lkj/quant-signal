@@ -153,6 +153,8 @@ _RECEIPT_FIELDS = frozenset(
         "trade_date_count",
         "trade_dates",
         "trade_dates_sha256",
+        "transition_boundary_authority_root_sha256",
+        "transition_boundary_count",
         "transition_overlap_authority_root_sha256",
         "transition_resolved_identity_exact_set_verified",
     }
@@ -674,6 +676,52 @@ def _transition_filter_codes(
     )
 
 
+def _validate_transition_boundaries(
+    *,
+    trade_dates: Sequence[str],
+    filtered_codes_by_date: Mapping[str, Sequence[str]],
+    transitions_by_code: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    proofs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    first = trade_dates[0]
+    last = trade_dates[-1]
+    for descriptor in transitions_by_code.values():
+        transition_id = str(descriptor["transition_id"])
+        if transition_id in seen:
+            continue
+        seen.add(transition_id)
+        effective = str(descriptor["effective_date"])
+        predecessor = str(descriptor["predecessor_ts_code"])
+        successor = str(descriptor["successor_ts_code"])
+        predecessor_boundary: str | None = None
+        if first < effective <= last:
+            if effective not in filtered_codes_by_date:
+                raise ValueError("security-code transition boundary session is missing")
+            index = list(trade_dates).index(effective)
+            predecessor_boundary = trade_dates[index - 1]
+            if predecessor not in filtered_codes_by_date[predecessor_boundary]:
+                raise ValueError("security-code transition boundary predecessor is missing")
+            if successor not in filtered_codes_by_date[effective]:
+                raise ValueError("security-code transition boundary successor is missing")
+        elif first == effective:
+            if successor not in filtered_codes_by_date[effective]:
+                raise ValueError("security-code transition boundary successor is missing")
+        else:
+            continue
+        proofs.append(
+            {
+                "effective_date": effective,
+                "predecessor_boundary_date": predecessor_boundary,
+                "predecessor_ts_code": predecessor,
+                "security_id": descriptor["security_id"],
+                "successor_ts_code": successor,
+                "transition_id": transition_id,
+            }
+        )
+    return sorted(proofs, key=lambda item: str(item["transition_id"]))
+
+
 def _authority_descriptors(
     daily: AuditedDailyAuthority,
     transition: TransitionAuthority,
@@ -739,6 +787,7 @@ def _derive_receipt(
     normalized_authority_rows: list[dict[str, Any]] = []
     overlap_authority_rows: list[dict[str, Any]] = []
     daily_identity_rows: list[dict[str, Any]] = []
+    filtered_codes_by_date: dict[str, tuple[str, ...]] = {}
     target_total = 0
     for daily_partition, collection_ref in zip(partitions, refs, strict=True):
         session = daily_partition.trade_date
@@ -782,6 +831,7 @@ def _derive_receipt(
         target_codes = [code for code, _identity in target_pairs]
         target_identities = [identity for _code, identity in target_pairs]
         target_total += len(target_pairs)
+        filtered_codes_by_date[session] = daily_filtered
         overlap_root = _canonical_sha256(overlap_proofs)
         stats = {
             "authoritative_daily_filtered_codes_sha256": _canonical_sha256(list(daily_filtered)),
@@ -868,6 +918,12 @@ def _derive_receipt(
             }
         )
 
+    boundary_proofs = _validate_transition_boundaries(
+        trade_dates=trade_dates,
+        filtered_codes_by_date=filtered_codes_by_date,
+        transitions_by_code=transitions_by_code,
+    )
+    boundary_root = _canonical_sha256(boundary_proofs)
     daily_descriptor, transition_descriptor = _authority_descriptors(
         daily,
         transition,
@@ -884,6 +940,7 @@ def _derive_receipt(
         "producer_root_sha256": producer["root_sha256"],
         "security_code_transition_authority": transition_descriptor,
         "trade_dates_sha256": trade_dates_sha256,
+        "transition_boundary_authority_root_sha256": boundary_root,
     }
     unsigned = {
         "all_supported_segments_compared_before_scope_filter": True,
@@ -929,6 +986,8 @@ def _derive_receipt(
         "trade_date_count": len(trade_dates),
         "trade_dates": trade_dates,
         "trade_dates_sha256": trade_dates_sha256,
+        "transition_boundary_authority_root_sha256": boundary_root,
+        "transition_boundary_count": len(boundary_proofs),
         "transition_overlap_authority_root_sha256": overlap_root,
         "transition_resolved_identity_exact_set_verified": True,
     }
@@ -951,6 +1010,7 @@ def _load_audited_daily_authority(
         expected_temporal_contract_sha256=expected_temporal_contract_sha256,
         expected_temporal_role=expected_temporal_role,
     ) as universe:
+        database_path = universe.database_path
         manifest = universe.manifest
         refs = manifest["market_generations"]["refs"]
         by_date = {str(ref["trade_date"]): ref for ref in refs}
