@@ -18,6 +18,7 @@ from app.durable_io import fsync_directory
 
 
 ATTEMPT_SCHEMA = "jiaoch-minute-raw-attempt/v1"
+COLLECTION_ATTEMPT_SCHEMA = "jiaoch-minute-raw-attempt/v2"
 COLLECTOR_VERSION = "app.jiaoch_minute_raw_authority/1"
 _SOURCE_ID = "jiaoch"
 _API_ENDPOINTS = {
@@ -40,6 +41,7 @@ _ATTEMPT_ID_PATTERN = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 )
 _ATTEMPT_PATH_PATTERN = re.compile(r"attempts/sha256/([0-9a-f]{2})/([0-9a-f]{64})\.json")
+_COLLECTION_BINDING_SCHEMA = "jiaoch-minute-raw-collection-binding/v1"
 _SECRET_PARAM_KEYS = frozenset(
     {
         "apikey",
@@ -73,6 +75,16 @@ _ATTEMPT_FIELDS = frozenset(
         "rows_published",
         "schema",
         "source_id",
+    }
+)
+_COLLECTION_ATTEMPT_FIELDS = _ATTEMPT_FIELDS | {"collection_binding"}
+_COLLECTION_BINDING_FIELDS = frozenset(
+    {
+        "collection_call_id",
+        "generation_id",
+        "policy_sha256",
+        "producer_root_sha256",
+        "schema",
     }
 )
 
@@ -450,6 +462,33 @@ def _attempt_relative_path(digest: str) -> str:
     return f"attempts/sha256/{digest[:2]}/{digest}.json"
 
 
+def _collection_binding(
+    *,
+    collection_call_id: str,
+    generation_id: str,
+    policy_sha256: str,
+    producer_root_sha256: str,
+) -> dict[str, str]:
+    if (
+        type(collection_call_id) is not str
+        or _ATTEMPT_ID_PATTERN.fullmatch(collection_call_id) is None
+        or type(generation_id) is not str
+        or _ATTEMPT_ID_PATTERN.fullmatch(generation_id) is None
+        or type(policy_sha256) is not str
+        or _SHA256_PATTERN.fullmatch(policy_sha256) is None
+        or type(producer_root_sha256) is not str
+        or _SHA256_PATTERN.fullmatch(producer_root_sha256) is None
+    ):
+        raise ValueError("Jiaoch raw collection binding rejected")
+    return {
+        "collection_call_id": collection_call_id,
+        "generation_id": generation_id,
+        "policy_sha256": policy_sha256,
+        "producer_root_sha256": producer_root_sha256,
+        "schema": _COLLECTION_BINDING_SCHEMA,
+    }
+
+
 def publish_jiaoch_minute_raw_attempt(
     *,
     output_root: str | Path,
@@ -466,6 +505,79 @@ def publish_jiaoch_minute_raw_attempt(
 ) -> dict[str, Any]:
     """Persist one raw response and one independent, always-unbound attempt."""
 
+    return _publish_jiaoch_minute_raw_attempt(
+        output_root=output_root,
+        raw_body=raw_body,
+        credential=credential,
+        credential_slot_id=credential_slot_id,
+        api_name=api_name,
+        params=params,
+        fields=fields,
+        retrieved_at=retrieved_at,
+        network_route=network_route,
+        http_status=http_status,
+        body_complete=body_complete,
+        collection_binding=None,
+    )
+
+
+def _publish_jiaoch_minute_raw_attempt_for_collection(
+    *,
+    output_root: str | Path,
+    raw_body: bytes,
+    credential: str,
+    credential_slot_id: str,
+    api_name: str,
+    params: Mapping[str, str],
+    fields: str,
+    retrieved_at: str,
+    network_route: str,
+    http_status: int,
+    body_complete: bool,
+    collection_call_id: str,
+    generation_id: str,
+    policy_sha256: str,
+    producer_root_sha256: str,
+) -> dict[str, Any]:
+    """Private collection publisher that binds one attempt to its sealed call."""
+
+    binding = _collection_binding(
+        collection_call_id=collection_call_id,
+        generation_id=generation_id,
+        policy_sha256=policy_sha256,
+        producer_root_sha256=producer_root_sha256,
+    )
+    return _publish_jiaoch_minute_raw_attempt(
+        output_root=output_root,
+        raw_body=raw_body,
+        credential=credential,
+        credential_slot_id=credential_slot_id,
+        api_name=api_name,
+        params=params,
+        fields=fields,
+        retrieved_at=retrieved_at,
+        network_route=network_route,
+        http_status=http_status,
+        body_complete=body_complete,
+        collection_binding=binding,
+    )
+
+
+def _publish_jiaoch_minute_raw_attempt(
+    *,
+    output_root: str | Path,
+    raw_body: bytes,
+    credential: str,
+    credential_slot_id: str,
+    api_name: str,
+    params: Mapping[str, str],
+    fields: str,
+    retrieved_at: str,
+    network_route: str,
+    http_status: int,
+    body_complete: bool,
+    collection_binding: Mapping[str, str] | None,
+) -> dict[str, Any]:
     if (
         type(raw_body) is not bytes
         or len(raw_body) > _MAX_RAW_BYTES
@@ -536,9 +648,11 @@ def publish_jiaoch_minute_raw_attempt(
             "transport": _TRANSPORT,
         },
         "rows_published": False,
-        "schema": ATTEMPT_SCHEMA,
+        "schema": (COLLECTION_ATTEMPT_SCHEMA if collection_binding is not None else ATTEMPT_SCHEMA),
         "source_id": _SOURCE_ID,
     }
+    if collection_binding is not None:
+        attempt["collection_binding"] = dict(collection_binding)
     attempt_raw = _canonical_json(attempt)
     if len(attempt_raw) > _MAX_ATTEMPT_BYTES:
         raise ValueError("Jiaoch raw attempt size rejected")
@@ -594,10 +708,18 @@ def _validated_attempt_path(
 
 
 def _verify_attempt_payload(payload: Any) -> None:
+    schema = payload.get("schema") if isinstance(payload, Mapping) else None
+    expected_fields = (
+        _ATTEMPT_FIELDS
+        if schema == ATTEMPT_SCHEMA
+        else _COLLECTION_ATTEMPT_FIELDS
+        if schema == COLLECTION_ATTEMPT_SCHEMA
+        else None
+    )
     if (
         not isinstance(payload, Mapping)
-        or set(payload) != _ATTEMPT_FIELDS
-        or payload.get("schema") != ATTEMPT_SCHEMA
+        or expected_fields is None
+        or set(payload) != expected_fields
         or payload.get("source_id") != _SOURCE_ID
         or payload.get("collector_version") != COLLECTOR_VERSION
         or payload.get("credential_echo_check") != "PASSED_AT_COLLECTION_NOT_OFFLINE_REPRODUCIBLE"
@@ -610,6 +732,20 @@ def _verify_attempt_payload(payload: Any) -> None:
         or payload.get("rows_published") is not False
     ):
         raise ValueError("Jiaoch raw attempt descriptor rejected")
+    if schema == COLLECTION_ATTEMPT_SCHEMA:
+        binding = payload.get("collection_binding")
+        if (
+            not isinstance(binding, Mapping)
+            or set(binding) != _COLLECTION_BINDING_FIELDS
+            or binding.get("schema") != _COLLECTION_BINDING_SCHEMA
+        ):
+            raise ValueError("Jiaoch raw collection binding rejected")
+        _collection_binding(
+            collection_call_id=binding.get("collection_call_id"),
+            generation_id=binding.get("generation_id"),
+            policy_sha256=binding.get("policy_sha256"),
+            producer_root_sha256=binding.get("producer_root_sha256"),
+        )
     if (
         not isinstance(payload.get("attempt_id"), str)
         or _ATTEMPT_ID_PATTERN.fullmatch(payload["attempt_id"]) is None
@@ -718,6 +854,11 @@ def verify_jiaoch_minute_raw_attempt(
         "authority_status": "UNBOUND",
         "body_complete": payload["body_complete"],
         "credential_slot_id": payload["credential_slot_id"],
+        "collection_binding": (
+            dict(payload["collection_binding"])
+            if payload["schema"] == COLLECTION_ATTEMPT_SCHEMA
+            else None
+        ),
         "embargo_consumed": False,
         "final_oos_consumed": False,
         "http_status": payload["http_status"],

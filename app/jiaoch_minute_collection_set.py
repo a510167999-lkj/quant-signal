@@ -17,7 +17,7 @@ import uuid
 
 from app import jiaoch_minute_raw_authority as raw_authority
 from app.jiaoch_minute_raw_authority import (
-    publish_jiaoch_minute_raw_attempt,
+    _publish_jiaoch_minute_raw_attempt_for_collection,
     verify_jiaoch_minute_raw_attempt,
 )
 from app.jiaoch_minute_reconciliation import (
@@ -480,6 +480,8 @@ def _collect_jiaoch_minute_collection_set_with_route_credential(
     timestamp = _aware_timestamp(retrieved_at)
     timeout = _timeout_seconds(timeout_seconds)
     specs = _request_specs(ts_code, session)
+    collection_call_id = str(uuid.uuid4())
+    producer_binding = _producer_binding()
     transport = _transport_factory()
     attempts = []
     for spec in specs:
@@ -501,7 +503,7 @@ def _collect_jiaoch_minute_collection_set_with_route_credential(
         raw_body = getattr(response, "body", None)
         http_status = getattr(response, "status", None)
         body_complete = getattr(response, "body_complete", None)
-        publication = publish_jiaoch_minute_raw_attempt(
+        publication = _publish_jiaoch_minute_raw_attempt_for_collection(
             output_root=root,
             raw_body=raw_body,
             credential=credential,
@@ -513,6 +515,10 @@ def _collect_jiaoch_minute_collection_set_with_route_credential(
             network_route="direct",
             http_status=http_status,
             body_complete=body_complete,
+            collection_call_id=collection_call_id,
+            generation_id=generation,
+            policy_sha256=policy,
+            producer_root_sha256=producer_binding["root_sha256"],
         )
         if http_status != 200 or body_complete is not True:
             raise ValueError(f"Jiaoch {spec['role']} HTTP entity rejected")
@@ -523,11 +529,13 @@ def _collect_jiaoch_minute_collection_set_with_route_credential(
         )
         attempts.append(_attempt_binding(spec, publication))
 
+    if _producer_binding() != producer_binding:
+        raise ValueError("Jiaoch minute collection producer drift rejected")
     manifest = {
         "attempts": attempts,
         "authority_scope": _AUTHORITY_SCOPE,
         "collection_binding_status": "BOUND_TO_SINGLE_CLOSED_RUNTIME_CALL",
-        "collection_call_id": str(uuid.uuid4()),
+        "collection_call_id": collection_call_id,
         "collector_version": COLLECTOR_VERSION,
         "credential_binding": {
             "basis": "ONE_SEALED_ENTRYPOINT_INVOCATION",
@@ -539,7 +547,7 @@ def _collect_jiaoch_minute_collection_set_with_route_credential(
         "evidence_complete": True,
         "execution_session": session.isoformat(),
         "final_oos_consumed": False,
-        "producer_binding": _producer_binding(),
+        "producer_binding": producer_binding,
         "production_profile_registered": False,
         "production_recommendation_eligible": False,
         "requested_ts_code": ts_code,
@@ -602,6 +610,7 @@ def _verified_raw_body(
     binding: Mapping[str, Any],
     expected_spec: Mapping[str, Any],
     expected_retrieved_at: str,
+    expected_collection_binding: Mapping[str, str],
 ) -> bytes:
     verification = verify_jiaoch_minute_raw_attempt(
         output_root=root,
@@ -611,6 +620,7 @@ def _verified_raw_body(
     expected_summary = {
         "api_name": expected_spec["api_name"],
         "body_complete": True,
+        "collection_binding": dict(expected_collection_binding),
         "credential_slot_id": _CREDENTIAL_SLOT_ID,
         "http_status": 200,
         "network_route": "direct",
@@ -718,8 +728,16 @@ def _verify_and_load_collection_set(
         "same_runtime_credential_used": True,
     }:
         raise ValueError("Jiaoch minute credential binding rejected")
-    if payload.get("producer_binding") != _producer_binding():
+    producer_binding = payload.get("producer_binding")
+    if producer_binding != _producer_binding():
         raise ValueError("Jiaoch minute collection producer binding rejected")
+    expected_collection_binding = {
+        "collection_call_id": payload["collection_call_id"],
+        "generation_id": runtime["generation_id"],
+        "policy_sha256": runtime["policy_sha256"],
+        "producer_root_sha256": producer_binding["root_sha256"],
+        "schema": "jiaoch-minute-raw-collection-binding/v1",
+    }
 
     attempts = payload.get("attempts")
     specs = _request_specs(ts_code, session)
@@ -750,6 +768,7 @@ def _verify_and_load_collection_set(
             binding=binding,
             expected_spec=spec,
             expected_retrieved_at=timestamp,
+            expected_collection_binding=expected_collection_binding,
         )
     if len(attempt_ids) != 3 or len(attempt_digests) != 3:
         raise ValueError("Jiaoch minute collection attempts rejected")
