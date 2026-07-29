@@ -281,7 +281,6 @@ def collect_jiaoch_historical_minute_collection_set(
     output_root: str | Path,
     requested_ts_code: str,
     execution_session: date,
-    retrieved_at: str,
     timeout_seconds: float = 30.0,
 ) -> dict[str, Any]:
     """Issue the closed 1m, 5m and daily collection with one sealed slot."""
@@ -316,7 +315,6 @@ def collect_jiaoch_historical_minute_collection_set(
             output_root=output_root,
             requested_ts_code=requested_ts_code,
             execution_session=execution_session,
-            retrieved_at=retrieved_at,
             timeout_seconds=timeout_seconds,
         )
     except Exception:

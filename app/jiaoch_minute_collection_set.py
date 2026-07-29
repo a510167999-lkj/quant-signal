@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -123,6 +123,10 @@ def _transport_factory() -> UrllibTushareTransport:
     return UrllibTushareTransport(proxy_url=None)
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _canonical_json(value: Any) -> bytes:
     try:
         return json.dumps(
@@ -174,16 +178,31 @@ def _ts_code(value: Any) -> str:
     return value
 
 
-def _aware_timestamp(value: Any) -> str:
+def _utc_timestamp(value: Any, *, label: str) -> str:
     if type(value) is not str:
-        raise ValueError("Jiaoch minute collection retrieved_at rejected")
+        raise ValueError(f"{label} rejected")
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value)
     except ValueError:
-        raise ValueError("Jiaoch minute collection retrieved_at rejected") from None
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("Jiaoch minute collection retrieved_at rejected")
-    return parsed.isoformat()
+        raise ValueError(f"{label} rejected") from None
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() != timedelta(0)
+        or parsed.astimezone(timezone.utc).isoformat() != value
+    ):
+        raise ValueError(f"{label} rejected")
+    return value
+
+
+def _trusted_utc_timestamp() -> str:
+    observed = _utc_now()
+    if (
+        type(observed) is not datetime
+        or observed.tzinfo is None
+        or observed.utcoffset() != timedelta(0)
+    ):
+        raise ValueError("Jiaoch minute collection private UTC clock rejected")
+    return observed.astimezone(timezone.utc).isoformat()
 
 
 def _timeout_seconds(value: Any) -> float:
@@ -463,7 +482,6 @@ def _collect_jiaoch_minute_collection_set_with_route_credential(
     output_root: str | Path,
     requested_ts_code: str,
     execution_session: date,
-    retrieved_at: str,
     timeout_seconds: float,
 ) -> dict[str, Any]:
     """Private implementation called only by the sealed credential entrypoint."""
@@ -477,8 +495,8 @@ def _collect_jiaoch_minute_collection_set_with_route_credential(
     root = _safe_existing_directory(Path(output_root), "Jiaoch minute collection root")
     ts_code = _ts_code(requested_ts_code)
     session = _execution_session(execution_session)
-    timestamp = _aware_timestamp(retrieved_at)
     timeout = _timeout_seconds(timeout_seconds)
+    timestamp = _trusted_utc_timestamp()
     specs = _request_specs(ts_code, session)
     collection_call_id = str(uuid.uuid4())
     producer_binding = _producer_binding()
@@ -696,7 +714,10 @@ def _verify_and_load_collection_set(
     ):
         raise ValueError("Jiaoch minute collection set descriptor rejected")
     _uuid4_text(payload.get("collection_call_id"), label="Jiaoch collection_call_id")
-    timestamp = _aware_timestamp(payload.get("retrieved_at"))
+    timestamp = _utc_timestamp(
+        payload.get("retrieved_at"),
+        label="Jiaoch minute collection retrieved_at",
+    )
     session_raw = payload.get("execution_session")
     if type(session_raw) is not str:
         raise ValueError("Jiaoch minute collection execution_session rejected")
