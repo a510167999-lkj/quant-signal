@@ -182,9 +182,7 @@ def test_daily_basic_normalizes_official_fields_units_and_unbound_receipt() -> N
         market_segment="SSE_MAIN",
         research_scope_mainboard_chinext=True,
     )
-    assert receipt.raw_response_sha256 == hashlib.sha256(
-        _raw(_payload("daily_basic"))
-    ).hexdigest()
+    assert receipt.raw_response_sha256 == hashlib.sha256(_raw(_payload("daily_basic"))).hexdigest()
     assert len(receipt.canonical_rows_sha256) == 64
     assert len(receipt.preview_receipt_sha256) == 64
 
@@ -443,16 +441,18 @@ def test_daily_basic_accepts_json_integer_numbers_and_normalizes_to_float() -> N
     receipt = _normalize(
         payload=_payload(
             "daily_basic",
-            [[
-                "600000.SH",
-                TRADE_DATE,
-                1,
-                2,
-                120_000,
-                150_000,
-                2_000_000,
-                1_500_000,
-            ]],
+            [
+                [
+                    "600000.SH",
+                    TRADE_DATE,
+                    1,
+                    2,
+                    120_000,
+                    150_000,
+                    2_000_000,
+                    1_500_000,
+                ]
+            ],
         )
     )
 

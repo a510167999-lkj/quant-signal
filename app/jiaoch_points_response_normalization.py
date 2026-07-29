@@ -369,10 +369,7 @@ def _normalized_rows(
     if type(items) is not list:
         raise ValueError("Jiaoch points response items rejected")
     normalize_row = _daily_basic_row if api_name == "daily_basic" else _moneyflow_row
-    rows = tuple(
-        normalize_row(row, expected_trade_date=trade_date)
-        for row in items
-    )
+    rows = tuple(normalize_row(row, expected_trade_date=trade_date) for row in items)
     identities = [(row.ts_code, row.trade_date) for row in rows]
     if len(identities) != len(set(identities)):
         raise ValueError("Jiaoch points response duplicate row identity rejected")
