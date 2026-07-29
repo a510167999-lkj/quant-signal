@@ -6,19 +6,18 @@ import math
 
 import pytest
 
+from app import audited_pit_factor_v3_points_contract as points_contract_module
 from app.audited_pit_factor_v3_points_contract import (
     FACTOR_V3_POINTS_ARMS,
     FACTOR_V3_POINTS_ARM_STRATEGY_SHA256,
     FACTOR_V3_POINTS_CONTRACT,
     FACTOR_V3_POINTS_CONTRACT_SHA256,
     FACTOR_V3_POINTS_FEATURE_NAMES,
-    FACTOR_V3_POINTS_PARENT_BINDING_ROOT_SHA256,
     canonical_sha256,
     compute_abnormal_turnover_rate_f_20_to_250,
-    factor_v3_parent_identity_root,
     factor_v3_points_arm_contract,
-    materialize_factor_v3_points_rows,
     parse_strict_factor_v3_json,
+    preview_factor_v3_points_rows_unbound,
 )
 
 
@@ -68,17 +67,15 @@ def _fixture() -> tuple[
     return sessions, parents, daily_basic
 
 
-def _materialize(
+def _preview(
     sessions: list[dict[str, object]],
     parents: list[dict[str, object]],
     daily_basic: list[dict[str, object]],
 ) -> dict[str, object]:
-    return materialize_factor_v3_points_rows(
+    return preview_factor_v3_points_rows_unbound(
         sessions=sessions,
         parent_rows=parents,
         daily_basic_rows=daily_basic,
-        parent_binding_root_sha256=(FACTOR_V3_POINTS_PARENT_BINDING_ROOT_SHA256),
-        expected_parent_identity_root_sha256=(factor_v3_parent_identity_root(parents)),
     )
 
 
@@ -141,22 +138,37 @@ def test_contract_freezes_scope_lag_features_arms_and_safety_gate() -> None:
     assert gate["factor_v2_verified_terminal_decision_required"] is True
     assert gate["factor_v2_verified_terminal_decision_present"] is False
     assert gate["experiment_launch_eligible"] is False
+    prerequisites = FACTOR_V3_POINTS_CONTRACT["formal_materialization_prerequisites"]
+    assert prerequisites == {
+        "verified_factor_v2_parent_descriptor": {
+            "required": True,
+            "present": False,
+        },
+        "authoritative_extended_trading_calendar_descriptor": {
+            "required": True,
+            "present": False,
+        },
+        "verified_jiaoch_points_collection_and_normalized_row_authority": {
+            "required": True,
+            "present": False,
+            "source_bound_context_required": True,
+        },
+        "all_present": False,
+        "formal_materializer_implemented": False,
+    }
+    preview_policy = FACTOR_V3_POINTS_CONTRACT["preview_policy"]
+    assert preview_policy["authority_status"] == "UNBOUND_PREVIEW_ONLY"
+    assert preview_policy["parent_authority_verified"] is False
+    assert preview_policy["session_calendar_authority_verified"] is False
+    assert preview_policy["daily_basic_row_authority_verified"] is False
+    assert preview_policy["formal_materialization_performed"] is False
+    assert preview_policy["ordered_date_labels_are_market_sessions"] is False
+    assert preview_policy["pit_claimed"] is False
     assert FACTOR_V3_POINTS_CONTRACT["embargo_consumed"] is False
     assert FACTOR_V3_POINTS_CONTRACT["final_oos_consumed"] is False
     assert FACTOR_V3_POINTS_CONTRACT["production_profile_registered"] is False
     assert FACTOR_V3_POINTS_CONTRACT["production_recommendation_eligible"] is False
     assert canonical_sha256(FACTOR_V3_POINTS_CONTRACT) == (FACTOR_V3_POINTS_CONTRACT_SHA256)
-    assert FACTOR_V3_POINTS_PARENT_BINDING_ROOT_SHA256 == (
-        "de7c9a3715631d186e730d775673df1ed753717be44029b6c12dba34e56a5ef5"
-    )
-    assert FACTOR_V3_POINTS_CONTRACT_SHA256 == (
-        "791ca95296969424f0255ef7aeb011e98b4051e0e2b62dbdac12213716b3448b"
-    )
-    assert dict(FACTOR_V3_POINTS_ARM_STRATEGY_SHA256) == {
-        "control": "cd6e0e40954c5ad7f956b10b9426d3e40ce07e7e3cd6292baa7a4a32620259f9",
-        "turnover_level": "0d9bd4d0801e0f6a71e8c9d509cb3cb417efa8ad895c152d9363dff43a93459a",
-        "abnormal_turnover": "a0754536544368a9b3743f5b6f7a0ced62529a2bbbae85f0f6aa0d4f828028b9",
-    }
 
 
 def test_arm_contracts_are_individually_content_addressed() -> None:
@@ -197,39 +209,52 @@ def test_abnormal_turnover_rejects_invalid_history(
         compute_abnormal_turnover_rate_f_20_to_250(history)
 
 
-def test_materialization_uses_t_minus_1_and_deterministic_midranks() -> None:
+def test_unbound_preview_uses_last_input_label_and_deterministic_midranks() -> None:
     sessions, parents, daily_basic = _fixture()
     original = deepcopy((sessions, parents, daily_basic))
 
-    result = _materialize(sessions, parents, daily_basic)
+    result = _preview(sessions, parents, daily_basic)
 
     assert (sessions, parents, daily_basic) == original
-    rows = result["rows"]
+    assert set(result) == {"preview_rows", "unbound_preview_receipt"}
+    rows = result["preview_rows"]
     assert [row["candidate_key"] for row in rows] == [
         parents[0]["candidate_key"],
         parents[1]["candidate_key"],
         parents[2]["candidate_key"],
     ]
-    assert {row["source_session"] for row in rows} == {sessions[-2]["trade_date"]}
+    assert {row["source_input_date_label"] for row in rows} == {sessions[-2]["trade_date"]}
     assert [row["turnover_rate_f_rank"] for row in rows] == pytest.approx([-0.5, 0.0, 0.5])
     assert [row["abnormal_turnover_rate_f_20_to_250_rank"] for row in rows] == pytest.approx(
         [-0.25, -0.25, 0.5]
     )
-    receipt = result["receipt"]
-    assert receipt["parent_row_count"] == len(parents)
-    assert receipt["output_row_count"] == len(parents)
-    assert receipt["dropped_parent_row_count"] == 0
-    assert receipt["parent_identity_root_sha256"] == (factor_v3_parent_identity_root(parents))
-    assert receipt["output_identity_root_sha256"] == (receipt["parent_identity_root_sha256"])
+    receipt = result["unbound_preview_receipt"]
+    assert receipt["schema_version"] == ("audited-pit-factor-v3-points-unbound-preview/v1")
+    assert receipt["authority_status"] == "UNBOUND_PREVIEW_ONLY"
+    assert receipt["parent_input_row_count"] == len(parents)
+    assert receipt["preview_output_row_count"] == len(parents)
+    assert receipt["preview_dropped_input_row_count"] == 0
+    assert receipt["parent_authority_verified"] is False
+    assert receipt["session_calendar_authority_verified"] is False
+    assert receipt["daily_basic_row_authority_verified"] is False
+    assert receipt["formal_materialization_performed"] is False
+    assert receipt["experiment_launch_eligible"] is False
+    assert receipt["embargo_consumed"] is False
+    assert receipt["final_oos_consumed"] is False
+    assert receipt["production_profile_registered"] is False
+    assert receipt["production_recommendation_eligible"] is False
+    assert "parent_binding_root_sha256" not in receipt
+    assert "parent_identity_root_sha256" not in receipt
+    assert "output_identity_root_sha256" not in receipt
     assert receipt["receipt_sha256"] == canonical_sha256(
         {key: value for key, value in receipt.items() if key != "receipt_sha256"}
     )
 
 
-def test_materialization_requires_full_exact_daily_basic_source_union() -> None:
+def test_unbound_preview_requires_full_exact_local_source_union() -> None:
     sessions, parents, daily_basic = _fixture()
     with pytest.raises(ValueError, match="missing"):
-        _materialize(sessions, parents, daily_basic[:-1])
+        _preview(sessions, parents, daily_basic[:-1])
 
     extra = {
         "ts_code": "000001.SZ",
@@ -237,35 +262,38 @@ def test_materialization_requires_full_exact_daily_basic_source_union() -> None:
         "turnover_rate_f": 999.0,
     }
     with pytest.raises(ValueError, match="unused"):
-        _materialize(sessions, parents, [*daily_basic, extra])
+        _preview(sessions, parents, [*daily_basic, extra])
 
 
-def test_materialization_rejects_parent_root_drift() -> None:
+def test_old_formal_materializer_name_is_not_public() -> None:
+    assert not hasattr(
+        points_contract_module,
+        "materialize_factor_v3_points_rows",
+    )
+
+
+def test_natural_dates_and_arbitrary_subsample_remain_unbound_preview() -> None:
     sessions, parents, daily_basic = _fixture()
-    with pytest.raises(ValueError, match="parent binding"):
-        materialize_factor_v3_points_rows(
-            sessions=sessions,
-            parent_rows=parents,
-            daily_basic_rows=daily_basic,
-            parent_binding_root_sha256="0" * 64,
-            expected_parent_identity_root_sha256=(factor_v3_parent_identity_root(parents)),
-        )
-    with pytest.raises(ValueError, match="parent identity"):
-        materialize_factor_v3_points_rows(
-            sessions=sessions,
-            parent_rows=parents,
-            daily_basic_rows=daily_basic,
-            parent_binding_root_sha256=(FACTOR_V3_POINTS_PARENT_BINDING_ROOT_SHA256),
-            expected_parent_identity_root_sha256="0" * 64,
-        )
+    one_parent = parents[:1]
+    one_symbol_rows = [row for row in daily_basic if row["ts_code"] == one_parent[0]["ts_code"]]
+
+    result = _preview(sessions, one_parent, one_symbol_rows)
+
+    assert len(result["preview_rows"]) == 1
+    receipt = result["unbound_preview_receipt"]
+    assert receipt["authority_status"] == "UNBOUND_PREVIEW_ONLY"
+    assert receipt["parent_authority_verified"] is False
+    assert receipt["session_calendar_authority_verified"] is False
+    assert receipt["daily_basic_row_authority_verified"] is False
+    assert receipt["formal_materialization_performed"] is False
 
 
 @pytest.mark.parametrize("ts_code", ["688001.SH", "920001.BJ", "430001.BJ"])
-def test_materialization_rejects_excluded_boards(ts_code: str) -> None:
+def test_preview_rejects_excluded_boards(ts_code: str) -> None:
     sessions, parents, daily_basic = _fixture()
     parents[0]["ts_code"] = ts_code
     with pytest.raises(ValueError, match="scope"):
-        factor_v3_parent_identity_root(parents)
+        _preview(sessions, parents, daily_basic)
 
 
 @pytest.mark.parametrize(
@@ -276,7 +304,7 @@ def test_materialization_rejects_excluded_boards(ts_code: str) -> None:
         ("daily", "unexpected"),
     ],
 )
-def test_materialization_rejects_unknown_fields(
+def test_preview_rejects_unknown_fields(
     target: str,
     field: str,
 ) -> None:
@@ -288,48 +316,48 @@ def test_materialization_rejects_unknown_fields(
     }[target]
     values[0][field] = "not permitted"
     with pytest.raises(ValueError, match="fields"):
-        _materialize(sessions, parents, daily_basic)
+        _preview(sessions, parents, daily_basic)
 
 
-def test_materialization_rejects_bool_nan_and_duplicates() -> None:
+def test_preview_rejects_bool_nan_and_duplicates() -> None:
     sessions, parents, daily_basic = _fixture()
     daily_basic[0]["turnover_rate_f"] = True
     with pytest.raises(ValueError, match="bool"):
-        _materialize(sessions, parents, daily_basic)
+        _preview(sessions, parents, daily_basic)
 
     sessions, parents, daily_basic = _fixture()
     daily_basic[0]["turnover_rate_f"] = float("nan")
     with pytest.raises(ValueError, match="finite"):
-        _materialize(sessions, parents, daily_basic)
+        _preview(sessions, parents, daily_basic)
 
     sessions, parents, daily_basic = _fixture()
     with pytest.raises(ValueError, match="duplicate parent"):
-        _materialize(sessions, [*parents, dict(parents[0])], daily_basic)
+        _preview(sessions, [*parents, dict(parents[0])], daily_basic)
 
     sessions, parents, daily_basic = _fixture()
     with pytest.raises(ValueError, match="duplicate daily_basic"):
-        _materialize(
+        _preview(
             sessions,
             parents,
             [*daily_basic, dict(daily_basic[0])],
         )
 
 
-def test_sessions_must_have_consecutive_positions_unique_ordered_dates() -> None:
+def test_input_labels_must_have_consecutive_positions_unique_ordered_dates() -> None:
     sessions, parents, daily_basic = _fixture()
     sessions[10]["session_position"] = 11
     with pytest.raises(ValueError, match="consecutive"):
-        _materialize(sessions, parents, daily_basic)
+        _preview(sessions, parents, daily_basic)
 
     sessions, parents, daily_basic = _fixture()
     sessions[10]["trade_date"] = sessions[9]["trade_date"]
     with pytest.raises(ValueError, match="ordered and unique"):
-        _materialize(sessions, parents, daily_basic)
+        _preview(sessions, parents, daily_basic)
 
     sessions, parents, daily_basic = _fixture()
     sessions[10]["session_position"] = True
     with pytest.raises(ValueError, match="bool"):
-        _materialize(sessions, parents, daily_basic)
+        _preview(sessions, parents, daily_basic)
 
 
 def test_strict_json_rejects_duplicate_keys_nan_and_non_object() -> None:
