@@ -178,6 +178,233 @@ def test_attempt_schema_binds_request_route_raw_object_and_all_safety_false(
     assert hashlib.sha256(TOKEN.encode("utf-8")).hexdigest().encode("ascii") not in persisted
 
 
+def test_daily_endpoint_is_derived_internally_for_the_same_minute_slot(
+    tmp_path: Path,
+) -> None:
+    publication = publish_jiaoch_minute_raw_attempt(
+        output_root=tmp_path,
+        raw_body=b'{"code":0,"msg":"ok","data":{"fields":[],"items":[]}}',
+        credential=TOKEN,
+        credential_slot_id="historical-minute",
+        api_name="daily",
+        params={"ts_code": "600000.SH", "trade_date": "20260728"},
+        fields="ts_code,trade_date,open,high,low,close,vol,amount,ah_vol,ah_amount",
+        retrieved_at=RETRIEVED_AT,
+        network_route="direct",
+        http_status=200,
+        body_complete=True,
+    )
+
+    attempt = _load_attempt(tmp_path, publication)
+    assert attempt["endpoint"] == "https://jiaoch.site/daily"
+    assert attempt["request_semantics"]["endpoint"] == "https://jiaoch.site/daily"
+    assert "endpoint" not in inspect.signature(publish_jiaoch_minute_raw_attempt).parameters
+    assert (
+        verify_jiaoch_minute_raw_attempt(
+            output_root=tmp_path,
+            attempt_relative_path=publication["attempt_relative_path"],
+            expected_attempt_sha256=publication["attempt_sha256"],
+        )["authority_status"]
+        == "UNBOUND"
+    )
+
+
+def test_non_200_incomplete_response_is_preserved_as_unbound_attempt(
+    tmp_path: Path,
+) -> None:
+    publication = publish_jiaoch_minute_raw_attempt(
+        output_root=tmp_path,
+        raw_body=b"gateway timeout",
+        credential=TOKEN,
+        credential_slot_id="historical-minute",
+        api_name="stk_mins",
+        params=PARAMS,
+        fields="",
+        retrieved_at=RETRIEVED_AT,
+        network_route="direct",
+        http_status=503,
+        body_complete=False,
+    )
+
+    attempt = _load_attempt(tmp_path, publication)
+    assert attempt["http_status"] == 503
+    assert attempt["body_complete"] is False
+    assert attempt["authority_status"] == "UNBOUND"
+    assert (tmp_path / publication["raw_relative_path"]).read_bytes() == b"gateway timeout"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"raw_body": bytearray(RAW)},
+        {"raw_body": b"x" * (1024 * 1024 + 1)},
+        {"credential_slot_id": "../minute"},
+        {"api_name": "stk_auction_o"},
+        {"network_route": "automatic-fallback"},
+        {"http_status": True},
+        {"http_status": 99},
+        {"http_status": 600},
+        {"body_complete": 1},
+    ],
+)
+def test_publisher_strictly_rejects_invalid_body_slot_api_route_or_http_metadata(
+    tmp_path: Path,
+    overrides: dict,
+) -> None:
+    arguments = {
+        "output_root": tmp_path,
+        "raw_body": RAW,
+        "credential": TOKEN,
+        "credential_slot_id": "historical-minute",
+        "api_name": "stk_mins",
+        "params": PARAMS,
+        "fields": "",
+        "retrieved_at": RETRIEVED_AT,
+        "network_route": "direct",
+        "http_status": 200,
+        "body_complete": True,
+    }
+    arguments.update(overrides)
+
+    with pytest.raises(ValueError):
+        publish_jiaoch_minute_raw_attempt(**arguments)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("api_name", "params", "fields"),
+    [
+        ("stk_mins", {**PARAMS, "freq": "15min"}, ""),
+        ("stk_mins", {**PARAMS, "ts_code": "688001.SH"}, ""),
+        ("stk_mins", {**PARAMS, "unexpected": "value"}, ""),
+        (
+            "stk_mins",
+            {**PARAMS, "start_date": "20260728", "end_date": "20260728"},
+            "",
+        ),
+        (
+            "daily",
+            {"ts_code": "600000.SH", "trade_date": "20260728"},
+            "ts_code,trade_date,open,high,low,close,vol,amount",
+        ),
+        (
+            "daily",
+            {"ts_code": "600000.SH", "trade_date": "2026-07-28"},
+            "ts_code,trade_date,open,high,low,close,vol,amount,ah_vol,ah_amount",
+        ),
+        (
+            "daily",
+            {"ts_code": "600000.SH", "trade_date": "20260728", "extra": "value"},
+            "ts_code,trade_date,open,high,low,close,vol,amount,ah_vol,ah_amount",
+        ),
+    ],
+)
+def test_request_semantics_are_closed_for_minute_and_daily_calibration(
+    tmp_path: Path,
+    api_name: str,
+    params: dict[str, str],
+    fields: str,
+) -> None:
+    with pytest.raises(ValueError, match="request"):
+        publish_jiaoch_minute_raw_attempt(
+            output_root=tmp_path,
+            raw_body=RAW,
+            credential=TOKEN,
+            credential_slot_id="historical-minute",
+            api_name=api_name,
+            params=params,
+            fields=fields,
+            retrieved_at=RETRIEVED_AT,
+            network_route="direct",
+            http_status=200,
+            body_complete=True,
+        )
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_made_up_credential_slot_is_rejected_before_writes(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="slot"):
+        publish_jiaoch_minute_raw_attempt(
+            output_root=tmp_path,
+            raw_body=RAW,
+            credential=TOKEN,
+            credential_slot_id="made-up-slot",
+            api_name="stk_mins",
+            params=PARAMS,
+            fields="",
+            retrieved_at=RETRIEVED_AT,
+            network_route="direct",
+            http_status=200,
+            body_complete=True,
+        )
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_attempt_size_is_checked_before_attempt_write(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(jiaoch_minute_raw_authority, "_MAX_ATTEMPT_BYTES", 1)
+
+    with pytest.raises(ValueError, match="attempt.*size"):
+        _publish(tmp_path)
+
+    assert not (tmp_path / "attempts").exists()
+
+
+def test_publisher_reopens_with_the_offline_verifier_before_return(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls: list[dict] = []
+    original = verify_jiaoch_minute_raw_attempt
+
+    def recording_verifier(**kwargs):
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        jiaoch_minute_raw_authority,
+        "verify_jiaoch_minute_raw_attempt",
+        recording_verifier,
+    )
+
+    publication = _publish(tmp_path)
+
+    assert calls == [
+        {
+            "output_root": tmp_path.resolve(),
+            "attempt_relative_path": publication["attempt_relative_path"],
+            "expected_attempt_sha256": publication["attempt_sha256"],
+        }
+    ]
+
+
+def test_json_equivalent_escaped_credential_echo_is_rejected_before_writes(
+    tmp_path: Path,
+) -> None:
+    raw = b'{"echo":"unit-secret\\/path"}'
+
+    with pytest.raises(ValueError, match="credential echo"):
+        _publish(tmp_path, raw=raw)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_excessively_deep_json_is_rejected_by_bounded_echo_scan_before_writes(
+    tmp_path: Path,
+) -> None:
+    raw = b"[" * 1500 + b"0" + b"]" * 1500
+
+    with pytest.raises(ValueError, match="credential echo scan"):
+        _publish(tmp_path, raw=raw)
+
+    assert list(tmp_path.iterdir()) == []
+
+
 @pytest.mark.parametrize(
     ("token", "raw"),
     [
@@ -264,7 +491,7 @@ def test_rehashed_attempt_with_extra_tampered_or_unsafe_fields_is_rejected(
     mutation(forged)
     relative, digest = _write_forged_attempt(tmp_path, forged)
 
-    with pytest.raises(ValueError, match="attempt"):
+    with pytest.raises(ValueError, match="attempt|raw object"):
         verify_jiaoch_minute_raw_attempt(
             output_root=tmp_path,
             attempt_relative_path=relative,
