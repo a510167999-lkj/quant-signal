@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import inspect
 import json
 import os
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -221,6 +223,14 @@ def test_official_points_and_interface_semantics_are_frozen_without_overclaiming
             "documented_update_window": "15:00-17:00",
             "timezone": "Asia/Shanghai",
         },
+        "field_units": {
+            "circ_mv": "ten_thousand_cny",
+            "float_share": "ten_thousand_shares",
+            "free_share": "ten_thousand_shares",
+            "total_mv": "ten_thousand_cny",
+            "turnover_rate": "percent",
+            "turnover_rate_f": "percent",
+        },
         "minimum_points": 2000,
         "permission_model": "points-interface",
     }
@@ -371,6 +381,44 @@ def test_credential_echo_is_rejected_before_any_write(
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    "derived",
+    [
+        hashlib.sha256(TOKEN.encode("utf-8")).hexdigest(),
+        hashlib.sha256(TOKEN.encode("utf-8")).hexdigest().upper(),
+        quote(TOKEN, safe=""),
+        base64.b64encode(TOKEN.encode("utf-8")).decode("ascii"),
+        base64.urlsafe_b64encode(TOKEN.encode("utf-8")).decode("ascii").rstrip("="),
+    ],
+)
+def test_credential_derived_representation_is_rejected_before_any_write(
+    tmp_path: Path,
+    derived: str,
+) -> None:
+    raw = json.dumps({"echo": derived}).encode("utf-8")
+
+    with pytest.raises(ValueError, match="credential echo"):
+        _publish(tmp_path, raw=raw)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["token_hash", "credentialFingerprint", "api_key_hash", "secret-fingerprint"],
+)
+def test_credential_derived_field_is_rejected_before_any_write(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    raw = json.dumps({field: "opaque"}).encode("utf-8")
+
+    with pytest.raises(ValueError, match="credential echo"):
+        _publish(tmp_path, raw=raw)
+
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_full_market_raw_body_at_32_mib_bound_is_persisted_and_verified(
     tmp_path: Path,
 ) -> None:
@@ -480,6 +528,38 @@ def test_offline_verifier_rejects_identity_swap_between_preflight_and_open(
             expected_attempt_sha256=publication["attempt_sha256"],
         )
     assert swapped is True
+
+
+def test_offline_verifier_rejects_hardlink_added_after_final_fstat(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    publication = _publish(tmp_path)
+    raw_path = os.path.abspath(tmp_path / publication["raw_relative_path"])
+    alias = tmp_path / "late-raw-hardlink"
+    original_lstat = Path.lstat
+    raw_lstat_calls = 0
+    linked = False
+
+    def linking_lstat(path: Path, *args, **kwargs):
+        nonlocal linked, raw_lstat_calls
+        if os.path.abspath(path) == raw_path:
+            raw_lstat_calls += 1
+            if raw_lstat_calls == 4:
+                os.link(raw_path, alias)
+                linked = True
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", linking_lstat)
+
+    with pytest.raises(ValueError, match="link|reparse"):
+        verify_jiaoch_points_raw_attempt(
+            output_root=tmp_path,
+            attempt_relative_path=publication["attempt_relative_path"],
+            expected_attempt_sha256=publication["attempt_sha256"],
+        )
+    assert linked is True
+    assert alias.exists()
 
 
 @pytest.mark.parametrize("kind", ["raw", "attempt"])

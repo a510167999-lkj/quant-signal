@@ -1,7 +1,13 @@
-"""Content-addressed raw Jiaoch points-interface attempts without row authority."""
+"""Content-addressed raw Jiaoch points-interface attempts without row authority.
+
+The store rejects links and identity drift at each operation, but it assumes
+the output root is ACL-protected from hostile concurrent local writers. Every
+consumer must reopen and verify content addresses immediately before use.
+"""
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -13,6 +19,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, quote_plus
 
 from app.durable_io import fsync_directory
 
@@ -41,6 +48,14 @@ _SOURCE_SEMANTICS_BY_API = {
             "documented_update_window": "15:00-17:00",
             "timezone": "Asia/Shanghai",
         },
+        "field_units": {
+            "circ_mv": "ten_thousand_cny",
+            "float_share": "ten_thousand_shares",
+            "free_share": "ten_thousand_shares",
+            "total_mv": "ten_thousand_cny",
+            "turnover_rate": "percent",
+            "turnover_rate_f": "percent",
+        },
         "minimum_points": 2000,
         "permission_model": "points-interface",
     },
@@ -54,7 +69,7 @@ _SOURCE_SEMANTICS_BY_API = {
 }
 _REQUEST_PROTOCOL = "tushare-path-per-interface/v1"
 _TRANSPORT = "app.research_pit_transport.UrllibTushareTransport"
-_MAX_RAW_BYTES = 1024 * 1024
+_MAX_RAW_BYTES = 32 * 1024 * 1024
 _MAX_ATTEMPT_BYTES = 64 * 1024
 _MAX_ECHO_SCAN_DEPTH = 64
 _REPARSE_ATTRIBUTE = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
@@ -72,6 +87,18 @@ _SECRET_PARAM_KEYS = frozenset(
         "credential",
         "secret",
         "token",
+    }
+)
+_SECRET_DERIVED_FIELD_KEYS = frozenset(
+    {
+        "apikeyfingerprint",
+        "apikeyhash",
+        "credentialfingerprint",
+        "credentialhash",
+        "secretfingerprint",
+        "secrethash",
+        "tokenfingerprint",
+        "tokenhash",
     }
 )
 _ATTEMPT_FIELDS = frozenset(
@@ -207,6 +234,24 @@ def _closed_cross_section_params(
     return result
 
 
+def _credential_representations(credential: str) -> tuple[bytes, ...]:
+    raw = credential.encode("utf-8")
+    sha256 = hashlib.sha256(raw).hexdigest()
+    encoded = {
+        raw,
+        json.dumps(credential, ensure_ascii=True)[1:-1].encode("ascii"),
+        quote(credential, safe="").encode("ascii"),
+        quote_plus(credential, safe="").encode("ascii"),
+        base64.b64encode(raw),
+        base64.urlsafe_b64encode(raw),
+        base64.b64encode(raw).rstrip(b"="),
+        base64.urlsafe_b64encode(raw).rstrip(b"="),
+        sha256.encode("ascii"),
+        sha256.upper().encode("ascii"),
+    }
+    return tuple(value for value in encoded if value)
+
+
 def _json_semantically_echoes_credential(raw: bytes, credential: str) -> bool:
     try:
         parsed = json.loads(
@@ -228,6 +273,11 @@ def _json_semantically_echoes_credential(raw: bytes, credential: str) -> bool:
                 return True
         elif isinstance(value, _JsonObjectPairs):
             for key, nested in value:
+                if (
+                    isinstance(key, str)
+                    and _normalized_secret_key(key) in _SECRET_DERIVED_FIELD_KEYS
+                ):
+                    return True
                 stack.append((nested, depth + 1))
                 stack.append((key, depth + 1))
         elif isinstance(value, list):
@@ -237,9 +287,9 @@ def _json_semantically_echoes_credential(raw: bytes, credential: str) -> bool:
 
 
 def _credential_echoes(raw: bytes, credential: str) -> bool:
-    direct = credential.encode("utf-8")
-    escaped = json.dumps(credential, ensure_ascii=True)[1:-1].encode("ascii")
-    return direct in raw or escaped in raw or _json_semantically_echoes_credential(raw, credential)
+    return any(value in raw for value in _credential_representations(credential)) or (
+        _json_semantically_echoes_credential(raw, credential)
+    )
 
 
 def _request_semantics(
@@ -395,11 +445,13 @@ def _read_safe_file(
             path_after_read = candidate.lstat()
         except FileNotFoundError:
             raise ValueError(f"{label} identity rejected") from None
-        if (
-            not stat.S_ISREG(path_after_read.st_mode)
-            or int(getattr(path_after_read, "st_file_attributes", 0)) & _REPARSE_ATTRIBUTE
-            or not os.path.samestat(after_read, path_after_read)
-        ):
+        _validate_open_file_metadata(
+            path_after_read,
+            label=label,
+            max_bytes=max_bytes,
+            expected_size=expected_size,
+        )
+        if not os.path.samestat(after_read, path_after_read):
             raise ValueError(f"{label} identity rejected")
         return b"".join(chunks)
     finally:
