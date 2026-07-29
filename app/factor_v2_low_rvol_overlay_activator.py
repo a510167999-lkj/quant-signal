@@ -4,10 +4,18 @@ import hashlib
 import json
 import math
 import os
+import stat
+import tempfile
 import time
 from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
+
+from app.current_pool_offline_replay import (
+    _path_is_link_or_reparse,
+    _read_regular_snapshot,
+)
+from app.durable_io import fsync_directory
 
 
 EXPECTED_PREREGISTRATION_RAW_SHA256 = (
@@ -117,6 +125,7 @@ _SELECTION_CONTRACT = {
 _SAME_KEY_REUSE_WAIT_SECONDS = 30.0
 _RESULT_POINTER_STABILIZE_SECONDS = 1.0
 _REUSE_POLL_SECONDS = 0.01
+_MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -171,6 +180,121 @@ def _is_sha256(value: Any) -> bool:
     )
 
 
+def _absolute_path(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _plain_directory_identities(
+    directory: Path,
+    label: str,
+) -> list[tuple[Path, int, int]]:
+    absolute = _absolute_path(directory)
+    identities: list[tuple[Path, int, int]] = []
+    for current in (*reversed(absolute.parents), absolute):
+        if not os.path.lexists(current):
+            raise RuntimeError(f"{label} directory ancestor is missing")
+        if _path_is_link_or_reparse(current):
+            raise RuntimeError(f"{label} directory contains a link or reparse point")
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise RuntimeError(f"{label} directory cannot be inspected safely") from exc
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError(f"{label} directory ancestor is unsafe")
+        identities.append((current, metadata.st_dev, metadata.st_ino))
+    return identities
+
+
+def _assert_plain_directory_identities(
+    identities: Sequence[tuple[Path, int, int]],
+    label: str,
+) -> None:
+    for path, device, inode in identities:
+        if _path_is_link_or_reparse(path):
+            raise RuntimeError(f"{label} directory contains a link or reparse point")
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise RuntimeError(f"{label} directory identity changed") from exc
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_dev != device
+            or metadata.st_ino != inode
+        ):
+            raise RuntimeError(f"{label} directory identity changed")
+
+
+def _prepare_plain_directory(directory: Path, label: str) -> Path:
+    absolute = _absolute_path(directory)
+    identities: list[tuple[Path, int, int]] = []
+    for current in (*reversed(absolute.parents), absolute):
+        if not os.path.lexists(current):
+            if not identities:
+                raise RuntimeError(f"{label} has no safe existing ancestor")
+            try:
+                os.mkdir(current)
+            except FileExistsError:
+                pass
+            fsync_directory(current.parent)
+            _assert_plain_directory_identities(identities, label)
+        if _path_is_link_or_reparse(current):
+            raise RuntimeError(f"{label} contains a link or reparse point")
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise RuntimeError(f"{label} cannot be inspected safely") from exc
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError(f"{label} contains an unsafe ancestor")
+        identities.append((current, metadata.st_dev, metadata.st_ino))
+    _assert_plain_directory_identities(identities, label)
+    return absolute
+
+
+def _read_safe_bytes(
+    path: Path,
+    label: str,
+    *,
+    reader: Callable[[Path], bytes] | None = None,
+) -> bytes:
+    absolute = _absolute_path(path)
+    identities = _plain_directory_identities(absolute.parent, label)
+    if _path_is_link_or_reparse(absolute):
+        raise RuntimeError(f"{label} path is a link or reparse point")
+    try:
+        before = absolute.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"{label} cannot be read") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise RuntimeError(f"{label} path is not a safe regular file")
+    try:
+        if reader is None:
+            raw = _read_regular_snapshot(
+                absolute,
+                max_bytes=_MAX_ARTIFACT_BYTES,
+            )
+        else:
+            raw = reader(absolute)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"{label} cannot be read safely: {exc}") from exc
+    if type(raw) is not bytes:
+        raise RuntimeError(f"{label} reader must return bytes")
+    try:
+        after = absolute.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"{label} changed while being read") from exc
+    if (
+        _path_is_link_or_reparse(absolute)
+        or not stat.S_ISREG(after.st_mode)
+        or after.st_dev != before.st_dev
+        or after.st_ino != before.st_ino
+        or after.st_size != before.st_size
+        or after.st_mtime_ns != before.st_mtime_ns
+    ):
+        raise RuntimeError(f"{label} changed while being read")
+    _assert_plain_directory_identities(identities, label)
+    return raw
+
+
 def verify_phase_one_decision_receipt(
     descriptor: Mapping[str, Any],
     *,
@@ -190,13 +314,11 @@ def verify_phase_one_decision_receipt(
         raise RuntimeError("decision receipt descriptor schema drifted")
 
     path = Path(frozen_descriptor["path"])
-    reader = read_receipt_bytes or Path.read_bytes
-    try:
-        raw = reader(path)
-    except OSError as exc:
-        raise RuntimeError("decision receipt cannot be read") from exc
-    if type(raw) is not bytes:
-        raise RuntimeError("decision receipt reader must return bytes")
+    raw = _read_safe_bytes(
+        path,
+        "decision receipt",
+        reader=read_receipt_bytes,
+    )
     if (
         len(raw) != frozen_descriptor["size_bytes"]
         or hashlib.sha256(raw).hexdigest() != frozen_descriptor["raw_file_sha256"]
@@ -217,6 +339,8 @@ def verify_phase_one_decision_receipt(
         or frozen_descriptor["receipt_sha256"] != receipt_sha256
     ):
         raise RuntimeError("decision receipt self hash or descriptor hash drifted")
+    if path.name != f"{frozen_descriptor['raw_file_sha256']}.json":
+        raise RuntimeError("decision receipt content-addressed basename drifted")
     if receipt["schema_version"] != DECISION_RECEIPT_SCHEMA_VERSION:
         raise RuntimeError("decision receipt schema version drifted")
     if (
@@ -470,27 +594,49 @@ def adjudicate_trade_key_increment(
     return {**comparison, **stress_result}
 
 
-def _write_exclusive(path: Path, content: bytes) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    flags |= getattr(os, "O_BINARY", 0)
-    descriptor = os.open(path, flags, 0o600)
+def _atomic_publish_new(path: Path, content: bytes) -> bool:
+    directory = path.parent
+    identities = _plain_directory_identities(directory, "artifact publication")
+    if os.path.lexists(path):
+        return False
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f"{path.name}.",
+        suffix=".tmp",
+        dir=str(directory),
+    )
+    temporary = Path(temporary_name)
+    published = False
     try:
-        offset = 0
-        while offset < len(content):
-            written = os.write(descriptor, content[offset:])
-            if written <= 0:
-                raise OSError("exclusive write made no forward progress")
-            offset += written
-        os.fsync(descriptor)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _assert_plain_directory_identities(
+            identities,
+            "artifact publication",
+        )
+        try:
+            os.link(temporary, path)
+        except OSError:
+            if not os.path.lexists(path):
+                raise
+            return False
+        published = True
+        fsync_directory(directory)
+        _assert_plain_directory_identities(
+            identities,
+            "artifact publication",
+        )
+        return True
     finally:
-        os.close(descriptor)
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+            if published:
+                fsync_directory(directory)
 
 
 def _read_strict_file(path: Path, label: str) -> tuple[dict[str, Any], bytes]:
-    try:
-        raw = path.read_bytes()
-    except OSError as exc:
-        raise RuntimeError(f"{label} cannot be read") from exc
+    raw = _read_safe_bytes(path, label)
     value = _parse_strict_json(raw, label)
     if raw != _canonical_bytes(value):
         raise RuntimeError(f"{label} is not canonical JSON")
@@ -562,30 +708,13 @@ def _validate_phase_two_result(
     return result
 
 
-def _reuse_result(
+def _read_published_result(
+    *,
     claim_directory: Path,
     claim_key: str,
     decision_receipt: Mapping[str, Any],
+    pointer: Mapping[str, Any],
 ) -> dict[str, Any]:
-    pointer_path = claim_directory / f"{claim_key}.result-pointer.json"
-    deadline = time.monotonic() + _SAME_KEY_REUSE_WAIT_SECONDS
-    stabilize_deadline: float | None = None
-    while True:
-        if pointer_path.is_file():
-            if stabilize_deadline is None:
-                stabilize_deadline = time.monotonic() + _RESULT_POINTER_STABILIZE_SECONDS
-            try:
-                pointer, _ = _read_strict_file(
-                    pointer_path,
-                    "overlay result pointer",
-                )
-                break
-            except RuntimeError as exc:
-                if time.monotonic() >= stabilize_deadline:
-                    raise RuntimeError("same-key overlay result pointer did not stabilize") from exc
-        if time.monotonic() >= deadline:
-            raise RuntimeError("same-key overlay trial is still in progress")
-        time.sleep(_REUSE_POLL_SECONDS)
     if set(pointer) != {"claim_key", "result_sha256", "result_file"}:
         raise RuntimeError("overlay result pointer fields drifted")
     result_sha256 = pointer["result_sha256"]
@@ -613,6 +742,107 @@ def _reuse_result(
     }
 
 
+def _recover_complete_orphan_result(
+    *,
+    claim_directory: Path,
+    claim_key: str,
+    decision_receipt: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    candidates = sorted(
+        (
+            path
+            for path in claim_directory.iterdir()
+            if len(path.name) == 69 and path.name.endswith(".json") and _is_sha256(path.name[:-5])
+        ),
+        key=lambda path: path.name,
+    )
+    if not candidates:
+        return None
+
+    valid: list[tuple[Path, dict[str, Any], bytes]] = []
+    for path in candidates:
+        try:
+            result, raw = _read_strict_file(
+                path,
+                "orphan overlay result",
+            )
+            if hashlib.sha256(raw).hexdigest() != path.stem:
+                raise RuntimeError("orphan overlay result content hash drifted")
+            validated = _validate_phase_two_result(
+                result,
+                claim_key=claim_key,
+                decision_receipt=decision_receipt,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError("orphan overlay result is not complete and safe") from exc
+        valid.append((path, validated, raw))
+    if len(valid) != 1:
+        raise RuntimeError("multiple complete orphan overlay results are forbidden")
+
+    result_path, result, _ = valid[0]
+    pointer = {
+        "claim_key": claim_key,
+        "result_sha256": result_path.stem,
+        "result_file": result_path.name,
+    }
+    pointer_path = claim_directory / f"{claim_key}.result-pointer.json"
+    pointer_bytes = _canonical_bytes(pointer)
+    if not _atomic_publish_new(pointer_path, pointer_bytes):
+        existing, existing_raw = _read_strict_file(
+            pointer_path,
+            "overlay result pointer",
+        )
+        if existing != pointer or existing_raw != pointer_bytes:
+            raise RuntimeError("overlay result pointer identity drifted")
+    return {
+        "claim_key": claim_key,
+        "reused": True,
+        "result": result,
+        "result_sha256": result_path.stem,
+    }
+
+
+def _reuse_result(
+    claim_directory: Path,
+    claim_key: str,
+    decision_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    pointer_path = claim_directory / f"{claim_key}.result-pointer.json"
+    deadline = time.monotonic() + _SAME_KEY_REUSE_WAIT_SECONDS
+    stabilize_deadline: float | None = None
+    while True:
+        if os.path.lexists(pointer_path):
+            if _path_is_link_or_reparse(pointer_path):
+                raise RuntimeError("overlay result pointer is a link or reparse point")
+            if stabilize_deadline is None:
+                stabilize_deadline = time.monotonic() + _RESULT_POINTER_STABILIZE_SECONDS
+            try:
+                pointer, _ = _read_strict_file(
+                    pointer_path,
+                    "overlay result pointer",
+                )
+                break
+            except RuntimeError as exc:
+                if time.monotonic() >= stabilize_deadline:
+                    raise RuntimeError("same-key overlay result pointer did not stabilize") from exc
+        recovered = _recover_complete_orphan_result(
+            claim_directory=claim_directory,
+            claim_key=claim_key,
+            decision_receipt=decision_receipt,
+        )
+        if recovered is not None:
+            return recovered
+        if time.monotonic() >= deadline:
+            raise RuntimeError("same-key overlay trial is still in progress")
+        time.sleep(_REUSE_POLL_SECONDS)
+    return _read_published_result(
+        claim_directory=claim_directory,
+        claim_key=claim_key,
+        decision_receipt=decision_receipt,
+        pointer=pointer,
+    )
+
+
 def activate_low_rvol_overlay(
     receipt_descriptor: Mapping[str, Any],
     *,
@@ -624,8 +854,10 @@ def activate_low_rvol_overlay(
 ) -> dict[str, Any]:
     receipt = verify_phase_one_decision_receipt(receipt_descriptor)
     claim_key = compute_overlay_claim_key(receipt["evaluation_artifact_sha256"])
-    claim_directory = Path(claim_directory)
-    claim_directory.mkdir(parents=True, exist_ok=True)
+    claim_directory = _prepare_plain_directory(
+        Path(claim_directory),
+        "overlay claim directory",
+    )
     claim_path = claim_directory / f"{OVERLAY_ID}.claim.json"
     claim_payload = {
         "claim_key": claim_key,
@@ -633,9 +865,7 @@ def activate_low_rvol_overlay(
         "preregistration_raw_sha256": (EXPECTED_PREREGISTRATION_RAW_SHA256),
     }
     claim_bytes = _canonical_bytes(claim_payload)
-    try:
-        _write_exclusive(claim_path, claim_bytes)
-    except FileExistsError:
+    if not _atomic_publish_new(claim_path, claim_bytes):
         existing, existing_raw = _read_strict_file(
             claim_path,
             "overlay claim",
@@ -662,10 +892,12 @@ def activate_low_rvol_overlay(
     result_bytes = _canonical_bytes(result)
     result_sha256 = hashlib.sha256(result_bytes).hexdigest()
     result_path = claim_directory / f"{result_sha256}.json"
-    try:
-        _write_exclusive(result_path, result_bytes)
-    except FileExistsError:
-        if result_path.read_bytes() != result_bytes:
+    if not _atomic_publish_new(result_path, result_bytes):
+        _, existing_raw = _read_strict_file(
+            result_path,
+            "overlay content-addressed result",
+        )
+        if existing_raw != result_bytes:
             raise RuntimeError("content-addressed result collision")
 
     pointer = {
@@ -673,10 +905,15 @@ def activate_low_rvol_overlay(
         "result_sha256": result_sha256,
         "result_file": result_path.name,
     }
-    _write_exclusive(
-        claim_directory / f"{claim_key}.result-pointer.json",
-        _canonical_bytes(pointer),
-    )
+    pointer_path = claim_directory / f"{claim_key}.result-pointer.json"
+    pointer_bytes = _canonical_bytes(pointer)
+    if not _atomic_publish_new(pointer_path, pointer_bytes):
+        existing, existing_raw = _read_strict_file(
+            pointer_path,
+            "overlay result pointer",
+        )
+        if existing != pointer or existing_raw != pointer_bytes:
+            raise RuntimeError("overlay result pointer identity drifted")
     return {
         "claim_key": claim_key,
         "reused": False,
