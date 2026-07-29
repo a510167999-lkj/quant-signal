@@ -182,6 +182,9 @@ def test_normalizes_complete_end_labeled_session_and_keeps_opening_special() -> 
     assert receipt.minute_amounts[-1].interval_end_at == datetime(
         2026, 7, 28, 15, 0, tzinfo=_SHANGHAI
     )
+    assert receipt.vwap_ohlc_quality_diagnostic.passed is True
+    assert receipt.vwap_ohlc_quality_diagnostic.violation_count == 0
+    assert receipt.vwap_ohlc_quality_diagnostic.max_outside_cny == 0.0
 
 
 def test_normalized_minutes_drive_exact_entry_and_exit_windows() -> None:
@@ -410,11 +413,36 @@ def test_volume_and_amount_zero_state_must_be_consistent() -> None:
     assert receipt.normalized_minutes[99].amount_cny == 0.0
 
 
-def test_positive_volume_vwap_must_be_inside_ohlc_with_explicit_small_tolerance() -> None:
+def test_vwap_ohlc_is_diagnostic_but_obvious_unit_mismatch_still_rejects() -> None:
     assert VWAP_ABSOLUTE_TOLERANCE_CNY == 1e-6
-    for amount in (989.99995, 1_010.00005):
-        assert _normalize(_mutated_item(item_index=7, value=amount)).source_row_count == 241
-    for amount in (989.9998, 1_010.0002):
+    payload = _payload()
+    for row_index in range(7):
+        payload["data"]["items"][row_index + 1][7] = 989.9998
+    payload["data"]["items"][100] = _item(
+        _labels()[100],
+        open_price=9.14,
+        close_price=9.14,
+        high_price=9.14,
+        low_price=9.13,
+        volume=907_200,
+        amount=8_269_905.0,
+    )
+
+    receipt = _normalize(payload)
+    diagnostic = receipt.vwap_ohlc_quality_diagnostic
+    assert diagnostic.check_id == "implied_vwap_within_minute_ohlc"
+    assert diagnostic.schema_acceptance_effect == "DIAGNOSTIC_ONLY"
+    assert diagnostic.evaluated_positive_volume_rows == 241
+    assert diagnostic.passed is False
+    assert diagnostic.violation_count == 8
+    assert diagnostic.max_outside_cny == pytest.approx(
+        0.014143518518519,
+        abs=1e-12,
+    )
+    assert receipt.source_authority_status == "UNBOUND"
+    assert len(receipt.minute_amounts) == 240
+
+    for amount in (1.0, 100_000.0):
         with pytest.raises(ValueError):
             _normalize(_mutated_item(item_index=7, value=amount))
 
