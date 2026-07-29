@@ -128,6 +128,10 @@ def test_contract_freezes_scope_lag_features_arms_and_safety_gate() -> None:
     assert abnormal["variant"] == "free_float_turnover_rate_f"
     assert abnormal["paper_original_turnover_denominator"] == "total_shares"
     assert abnormal["project_turnover_denominator"] == "free_float_shares"
+    assert {
+        feature["scope"]
+        for feature in FACTOR_V3_POINTS_CONTRACT["features"].values()
+    } == {"same_signal_date_exact_history_eligible_common_subset"}
 
     warnings = FACTOR_V3_POINTS_CONTRACT["research_warnings"]
     assert warnings["china_anomaly_replication_insignificant_pct"] == 83.37
