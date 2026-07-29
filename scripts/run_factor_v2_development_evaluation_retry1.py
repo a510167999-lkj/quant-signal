@@ -11,25 +11,14 @@ BASE_MODULE_PATH = Path(
     r"E:\AI workspace\quant-signal-lkj\data\research_runs"
     r"\.run_factor_v2_development_evaluation.py"
 )
-EXPECTED_BASE_MODULE_SHA256 = (
-    "997f89e4f38262def6f1d846fa6a47355573b76efdd65eb4a5dee651e8034a4e"
-)
-SOURCE_ROOT = Path(
-    r"E:\AI workspace\quant-signal-lkj-factor-v2-eval-fix"
-)
-EXPECTED_SOURCE_COMMIT = (
-    "b0f0a78ebef207434e5cadd85299ef529dd1ff46"
-)
-OUTPUT_BASENAME = (
-    "audited_pit_factor_v2_development_evaluation_v1_"
-    "development_4_retry_1"
-)
+EXPECTED_BASE_MODULE_SHA256 = "997f89e4f38262def6f1d846fa6a47355573b76efdd65eb4a5dee651e8034a4e"
+SOURCE_ROOT = Path(r"E:\AI workspace\quant-signal-lkj-factor-v2-eval-fix")
+EXPECTED_SOURCE_COMMIT = "b0f0a78ebef207434e5cadd85299ef529dd1ff46"
+OUTPUT_BASENAME = "audited_pit_factor_v2_development_evaluation_v1_development_4_retry_1"
 RUNS_ROOT = BASE_MODULE_PATH.parent
 OUTPUT_DIR = RUNS_ROOT / OUTPUT_BASENAME
 STATUS_PATH = OUTPUT_DIR.with_name(f"{OUTPUT_BASENAME}.run.status.json")
-VERIFY_STATUS_PATH = OUTPUT_DIR.with_name(
-    f"{OUTPUT_BASENAME}.verify.status.json"
-)
+VERIFY_STATUS_PATH = OUTPUT_DIR.with_name(f"{OUTPUT_BASENAME}.verify.status.json")
 STATUS_CLAIM_PATH = STATUS_PATH.with_name(f"{STATUS_PATH.name}.claim")
 WRAPPER_PATH = Path(__file__).resolve(strict=True)
 OVERRIDDEN_BASE_GLOBALS = (
@@ -62,16 +51,10 @@ def _read_verified_base_source() -> bytes:
     if (
         path.is_symlink()
         or not stat.S_ISREG(after.st_mode)
-        or any(
-            getattr(before, field) != getattr(after, field)
-            for field in identity_fields
-        )
+        or any(getattr(before, field) != getattr(after, field) for field in identity_fields)
     ):
         raise RuntimeError("base module changed while being read")
-    if (
-        hashlib.sha256(source).hexdigest()
-        != EXPECTED_BASE_MODULE_SHA256
-    ):
+    if hashlib.sha256(source).hexdigest() != EXPECTED_BASE_MODULE_SHA256:
         raise RuntimeError("base module SHA-256 drifted")
     return source
 

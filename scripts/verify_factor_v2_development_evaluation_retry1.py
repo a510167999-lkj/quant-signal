@@ -11,35 +11,18 @@ BASE_MODULE_PATH = Path(
     r"E:\AI workspace\quant-signal-lkj\scripts"
     r"\verify_factor_v2_development_evaluation_v2.py"
 )
-EXPECTED_BASE_MODULE_SHA256 = (
-    "ffce06e2707809aa17592fdd032a896ca86337be684fbd792b921a4b9f89f976"
-)
-SOURCE_ROOT = Path(
-    r"E:\AI workspace\quant-signal-lkj-factor-v2-eval-fix"
-)
-EXPECTED_SOURCE_COMMIT = (
-    "b0f0a78ebef207434e5cadd85299ef529dd1ff46"
-)
-OUTPUT_BASENAME = (
-    "audited_pit_factor_v2_development_evaluation_v1_"
-    "development_4_retry_1"
-)
+EXPECTED_BASE_MODULE_SHA256 = "ffce06e2707809aa17592fdd032a896ca86337be684fbd792b921a4b9f89f976"
+SOURCE_ROOT = Path(r"E:\AI workspace\quant-signal-lkj-factor-v2-eval-fix")
+EXPECTED_SOURCE_COMMIT = "b0f0a78ebef207434e5cadd85299ef529dd1ff46"
+OUTPUT_BASENAME = "audited_pit_factor_v2_development_evaluation_v1_development_4_retry_1"
 MAIN_ROOT = BASE_MODULE_PATH.parent.parent
 RUNS_ROOT = MAIN_ROOT / "data" / "research_runs"
 OUTPUT_DIR = RUNS_ROOT / OUTPUT_BASENAME
-BUILD_STATUS_PATH = OUTPUT_DIR.with_name(
-    f"{OUTPUT_BASENAME}.run.status.json"
-)
-VERIFY_STATUS_PATH = OUTPUT_DIR.with_name(
-    f"{OUTPUT_BASENAME}.verify.status.json"
-)
-VERIFY_CLAIM_PATH = VERIFY_STATUS_PATH.with_name(
-    f"{VERIFY_STATUS_PATH.name}.claim"
-)
+BUILD_STATUS_PATH = OUTPUT_DIR.with_name(f"{OUTPUT_BASENAME}.run.status.json")
+VERIFY_STATUS_PATH = OUTPUT_DIR.with_name(f"{OUTPUT_BASENAME}.verify.status.json")
+VERIFY_CLAIM_PATH = VERIFY_STATUS_PATH.with_name(f"{VERIFY_STATUS_PATH.name}.claim")
 WRAPPER_PATH = Path(__file__).resolve(strict=True)
-RUNNER_PATH = WRAPPER_PATH.with_name(
-    "run_factor_v2_development_evaluation_retry1.py"
-)
+RUNNER_PATH = WRAPPER_PATH.with_name("run_factor_v2_development_evaluation_retry1.py")
 OVERRIDDEN_BASE_GLOBALS = (
     "SOURCE_ROOT",
     "EXPECTED_SOURCE_COMMIT",
@@ -71,16 +54,10 @@ def _read_verified_base_source() -> bytes:
     if (
         path.is_symlink()
         or not stat.S_ISREG(after.st_mode)
-        or any(
-            getattr(before, field) != getattr(after, field)
-            for field in identity_fields
-        )
+        or any(getattr(before, field) != getattr(after, field) for field in identity_fields)
     ):
         raise RuntimeError("base module changed while being read")
-    if (
-        hashlib.sha256(source).hexdigest()
-        != EXPECTED_BASE_MODULE_SHA256
-    ):
+    if hashlib.sha256(source).hexdigest() != EXPECTED_BASE_MODULE_SHA256:
         raise RuntimeError("base module SHA-256 drifted")
     return source
 
