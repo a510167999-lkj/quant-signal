@@ -42,6 +42,13 @@ SHA_A = "a" * 64
 SHA_B = "b" * 64
 SHA_C = "c" * 64
 PUBLICATION_CAPABILITY = "9a91dd99-1579-4dba-9b13-dd1c56b0760f"
+FEATURE_HISTORY_APIS = (
+    "bak_basic",
+    "daily",
+    "adj_factor",
+    "stk_limit",
+    "suspend_d",
+)
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -65,14 +72,32 @@ def _business_days_before(value: date, count: int) -> list[str]:
 
 
 def _development_sessions() -> list[str]:
-    available: list[str] = []
+    holidays = frozenset(
+        """
+        2024-09-16 2024-09-17
+        2024-10-01 2024-10-02 2024-10-03 2024-10-04 2024-10-07
+        2025-01-01
+        2025-01-28 2025-01-29 2025-01-30 2025-01-31 2025-02-03 2025-02-04
+        2025-04-04
+        2025-05-01 2025-05-02 2025-05-05
+        2025-06-02
+        2025-10-01 2025-10-02 2025-10-03 2025-10-06 2025-10-07 2025-10-08
+        2026-01-01 2026-01-02
+        2026-02-16 2026-02-17 2026-02-18 2026-02-19 2026-02-20 2026-02-23
+        2026-04-06
+        2026-05-01 2026-05-04 2026-05-05
+        2026-06-19
+        """.split()
+    )
+    sessions: list[str] = []
     cursor = DEVELOPMENT_START
     while cursor <= DEVELOPMENT_END:
-        if cursor.weekday() < 5:
-            available.append(cursor.isoformat())
+        if cursor.weekday() < 5 and cursor.isoformat() not in holidays:
+            sessions.append(cursor.isoformat())
         cursor += timedelta(days=1)
-    assert len(available) > 483
-    return [*available[:482], available[-1]]
+    assert len(sessions) == 483
+    assert canonical_sha256(sessions) == FROZEN_DEVELOPMENT_SESSIONS_SHA256
+    return sessions
 
 
 def _calendar_fixture() -> tuple[list[str], list[str], dict[str, object]]:
@@ -170,12 +195,18 @@ def _install_synthetic_calendar(
     monkeypatch: pytest.MonkeyPatch,
     manifest: dict[str, object],
     development: list[str],
+    *,
+    allow_test_contract: bool = False,
 ) -> None:
-    monkeypatch.setattr(
-        history_authority,
-        "_FROZEN_DEVELOPMENT_SESSIONS_SHA256",
-        canonical_sha256(development),
-    )
+    development_root = canonical_sha256(development)
+    if allow_test_contract:
+        monkeypatch.setattr(
+            history_authority,
+            "_FROZEN_DEVELOPMENT_SESSIONS_SHA256",
+            development_root,
+        )
+    else:
+        assert development_root == FROZEN_DEVELOPMENT_SESSIONS_SHA256
     monkeypatch.setattr(
         history_authority,
         "_load_verified_trade_cal_manifest",
@@ -184,6 +215,27 @@ def _install_synthetic_calendar(
             _trade_cal_verification(manifest),
         ),
     )
+
+
+def _feature_history_route_policy_descriptor() -> dict[str, object]:
+    document = {
+        "routes": [
+            {
+                "api_name": api_name,
+                "credential_slot_id": "points-primary",
+                "purpose": "factor-v3-feature-history",
+                "route_id": f"feature-history:points-primary:{api_name}",
+            }
+            for api_name in FEATURE_HISTORY_APIS
+        ],
+        "schema": "jiaoch-credential-feature-history-routing-policy/v1",
+    }
+    return {
+        "credential_proof_claimed": False,
+        "document": document,
+        "schema": "jiaoch-credential-feature-history-policy-descriptor/v1",
+        "sha256": canonical_sha256(document),
+    }
 
 
 def _build_plan(
@@ -330,7 +382,12 @@ def _small_plan(
     monkeypatch.setattr(history_authority, "_FROZEN_DEVELOPMENT_SESSION_COUNT", 1)
     monkeypatch.setattr(history_authority, "_FROZEN_DEVELOPMENT_START", development[0])
     monkeypatch.setattr(history_authority, "_FROZEN_DEVELOPMENT_END", development[-1])
-    _install_synthetic_calendar(monkeypatch, manifest, development)
+    _install_synthetic_calendar(
+        monkeypatch,
+        manifest,
+        development,
+        allow_test_contract=True,
+    )
     publication = _trade_cal_publication()
     plan = history_authority.build_factor_v3_feature_history_collection_plan(
         trade_cal_output_root=Path("synthetic-trade-cal-root"),
@@ -345,20 +402,28 @@ def _collector_for_session(
     store: PITReceiptStore,
     transport: _FeatureHistoryTransport,
     trade_date: str,
+    *,
+    api_url: str = "https://jiaoch.site",
+    source_profile: str = "jiaoch",
+    request_protocol: str = "tushare-path-per-interface/v1",
 ) -> ControlledTushareCollector:
     contract = load_temporal_partition_contract(PARTITION_V1_PATH)
     role = "development" if trade_date < "2024-01-01" else "contaminated_diagnostic"
+    host = api_url.split("://", 1)[-1].split("/", 1)[0]
     return ControlledTushareCollector(
         store=store,
         token="synthetic-token-never-persisted",
-        api_url="https://feature-history.example.test",
-        allowed_hosts=("feature-history.example.test",),
+        api_url=api_url,
+        allowed_hosts=(host,),
         transport=transport,
         clock=_FixtureClock(),
         max_attempts=3,
         sleeper=lambda _seconds: None,
-        source_profile="feature-history-fixture",
-        request_protocol="tushare-path-per-interface/v1",
+        source_profile=source_profile,
+        request_protocol=request_protocol,
+        row_cap_overrides=(
+            {"stk_limit": 10_000} if source_profile == "jiaoch" else None
+        ),
         temporal_contract=contract,
         temporal_role=role,
         temporal_contract_sha256=contract["contract_sha256"],
@@ -405,7 +470,10 @@ def _independent_session_refs(
     sessions: list[str],
 ) -> list[dict[str, object]]:
     output = []
-    with sqlite3.connect(store.database_path) as connection:
+    with sqlite3.connect(
+        f"{Path(store.database_path).resolve().as_uri()}?mode=ro&immutable=1",
+        uri=True,
+    ) as connection:
         connection.row_factory = sqlite3.Row
         for session in sessions:
             receipt = connection.execute(
@@ -471,6 +539,9 @@ def _real_store_fixture(
     include_star: bool = True,
     semantic_empty_sessions: frozenset[str] = frozenset(),
     omit_market_session: str | None = None,
+    api_url: str = "https://jiaoch.site",
+    source_profile: str = "jiaoch",
+    request_protocol: str = "tushare-path-per-interface/v1",
 ) -> tuple[
     dict[str, object],
     dict[str, object],
@@ -488,7 +559,14 @@ def _real_store_fixture(
     )
     reports: dict[str, dict[str, object]] = {}
     for session in sessions:
-        collector = _collector_for_session(store, transport, session)
+        collector = _collector_for_session(
+            store,
+            transport,
+            session,
+            api_url=api_url,
+            source_profile=source_profile,
+            request_protocol=request_protocol,
+        )
         collector.fetch_membership_snapshot(build_bak_basic_specs([session])[0])
         if session != omit_market_session:
             reports[session] = collector.collect_market_session_generation(
@@ -543,11 +621,25 @@ def test_public_surface_is_offline_and_caller_cannot_select_history_window() -> 
             history_authority.verify_factor_v3_feature_history_collection_authority
         ).parameters
     ) == {
+        "collection_publication",
+        "collection_publication_output_root",
         "collection_plan",
         "development_session_refs",
-        "expected_pit_store_database_sha256",
         "pit_store_root",
-        "session_authority_refs",
+        "temporal_partition_contract",
+        "trade_cal_output_root",
+        "trade_cal_publication",
+    }
+    assert set(
+        inspect.signature(
+            history_authority._publish_factor_v3_feature_history_collection_candidate
+        ).parameters
+    ) == {
+        "collection_plan",
+        "development_session_refs",
+        "feature_history_route_policy_descriptor",
+        "pit_store_root",
+        "publication_output_root",
         "temporal_partition_contract",
         "trade_cal_output_root",
         "trade_cal_publication",
@@ -555,12 +647,57 @@ def test_public_surface_is_offline_and_caller_cannot_select_history_window() -> 
     source = inspect.getsource(history_authority)
     for forbidden in (
         "os.environ",
-        "jiaoch_credential_slots",
         "requests.",
         "urllib.",
         "ControlledTushareCollector(",
     ):
         assert forbidden not in source
+
+
+def test_feature_history_route_policy_is_exact_and_does_not_claim_token_capability() -> None:
+    descriptor = history_authority._validated_feature_history_route_policy_descriptor(
+        _feature_history_route_policy_descriptor()
+    )
+
+    assert descriptor["credential_proof_claimed"] is False
+    assert descriptor["document"]["routes"] == [
+        {
+            "api_name": api_name,
+            "credential_slot_id": "points-primary",
+            "purpose": "factor-v3-feature-history",
+            "route_id": f"feature-history:points-primary:{api_name}",
+        }
+        for api_name in FEATURE_HISTORY_APIS
+    ]
+    assert descriptor["sha256"] == canonical_sha256(descriptor["document"])
+
+
+def test_producer_binding_covers_direct_semantic_dependencies_and_loaded_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    required = {
+        "audited_pit_factor_v3_feature_history_authority.py",
+        "audited_pit_factor_v3_points_contract.py",
+        "jiaoch_credential_slots.py",
+        "jiaoch_trade_cal_authority.py",
+        "research_partitions.py",
+        "research_pit_collector.py",
+        "research_pit_sources.py",
+        "research_pit_store.py",
+        "research_security_code_transition.py",
+    }
+    assert required <= set(history_authority._PRODUCER_FILES)
+    before = history_authority._producer_binding()
+    monkeypatch.setattr(history_authority, "classify_date", lambda *_args: "development")
+    after = history_authority._producer_binding()
+
+    assert before["source_manifest_root_sha256"] == after[
+        "source_manifest_root_sha256"
+    ]
+    assert before["loaded_execution_root_sha256"] != after[
+        "loaded_execution_root_sha256"
+    ]
+    assert before["root_sha256"] != after["root_sha256"]
 
 
 def test_trade_calendar_loader_requires_offline_verifier_and_content_address(
@@ -1131,7 +1268,10 @@ def test_formal_authority_rejects_raw_receipt_tamper_even_with_refreshed_databas
         tmp_path,
         monkeypatch,
     )
-    with sqlite3.connect(store.database_path) as connection:
+    with sqlite3.connect(
+        f"{Path(store.database_path).resolve().as_uri()}?mode=ro&immutable=1",
+        uri=True,
+    ) as connection:
         raw_path = connection.execute(
             "SELECT raw_path FROM receipts WHERE dataset='bak_basic' ORDER BY partition_key LIMIT 1"
         ).fetchone()[0]
@@ -1144,6 +1284,100 @@ def test_formal_authority_rejects_raw_receipt_tamper_even_with_refreshed_databas
             store=store,
             refs=refs,
             database_sha256=database_sha256,
+        )
+
+
+@pytest.mark.parametrize(
+    ("api_url", "source_profile", "request_protocol"),
+    [
+        (
+            "https://feature-history.example.test",
+            "jiaoch",
+            "tushare-path-per-interface/v1",
+        ),
+        (
+            "https://jiaoch.site",
+            "feature-history-fixture",
+            "tushare-path-per-interface/v1",
+        ),
+        (
+            "https://jiaoch.site",
+            "jiaoch",
+            "tushare-root-post/v1",
+        ),
+    ],
+)
+def test_replay_rejects_self_consistent_nonfrozen_jiaoch_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    api_url: str,
+    source_profile: str,
+    request_protocol: str,
+) -> None:
+    plan, _publication, sessions, store, _refs, database_sha256 = _real_store_fixture(
+        tmp_path,
+        monkeypatch,
+        api_url=api_url,
+        source_profile=source_profile,
+        request_protocol=request_protocol,
+    )
+
+    with pytest.raises(ValueError, match="Jiaoch source"):
+        history_authority._replay_pit_store(
+            pit_store_root=store.root,
+            expected_database_sha256=database_sha256,
+            sessions=sessions,
+            temporal_partition_contract=load_temporal_partition_contract(
+                PARTITION_V1_PATH
+            ),
+        )
+
+
+def test_replay_reopens_every_raw_after_midflight_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _plan, _publication, sessions, store, _refs, database_sha256 = _real_store_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    with sqlite3.connect(
+        f"{Path(store.database_path).resolve().as_uri()}?mode=ro&immutable=1",
+        uri=True,
+    ) as connection:
+        raw_path = connection.execute(
+            """
+            SELECT raw_path FROM receipts
+            WHERE dataset='bak_basic' AND partition_key=?
+            """,
+            (sessions[0],),
+        ).fetchone()[0]
+    target = Path(store.root, raw_path)
+    original = history_authority._market_authority_on_connection
+    mutated = False
+
+    def mutate_after_first_session(**kwargs):
+        nonlocal mutated
+        result = original(**kwargs)
+        if not mutated:
+            target.write_bytes(b"midflight-raw-replacement")
+            mutated = True
+        return result
+
+    monkeypatch.setattr(
+        history_authority,
+        "_market_authority_on_connection",
+        mutate_after_first_session,
+    )
+
+    with pytest.raises(ValueError, match="raw artifact drifted"):
+        history_authority._replay_pit_store(
+            pit_store_root=store.root,
+            expected_database_sha256=database_sha256,
+            sessions=sessions,
+            temporal_partition_contract=load_temporal_partition_contract(
+                PARTITION_V1_PATH
+            ),
         )
 
 
