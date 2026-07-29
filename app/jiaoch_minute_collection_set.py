@@ -38,6 +38,7 @@ COLLECTOR_VERSION = "app.jiaoch_minute_collection_set/1"
 _PRODUCER_SCHEMA = "jiaoch-minute-collection-producer/v1"
 _SOURCE_ID = "jiaoch"
 _CREDENTIAL_SLOT_ID = "historical-minute"
+_EXPECTED_ROUTING_POLICY_SHA256 = "de38737b3d44bc9730b5504a622ef88eb7fd517b6a7fb8c42255702d02445694"
 _AUTHORITY_SCOPE = "RAW_SOURCE_COLLECTION_ONLY"
 _MAX_BODY_BYTES = 1024 * 1024
 _MAX_MANIFEST_BYTES = 128 * 1024
@@ -470,6 +471,8 @@ def _collect_jiaoch_minute_collection_set_with_route_credential(
         raise ValueError("Jiaoch minute collection route credential rejected")
     generation = _uuid4_text(generation_id, label="Jiaoch runtime generation_id")
     policy = _sha256_text(policy_sha256, label="Jiaoch routing policy_sha256")
+    if not hmac.compare_digest(policy, _EXPECTED_ROUTING_POLICY_SHA256):
+        raise ValueError("Jiaoch routing policy binding rejected")
     root = _safe_existing_directory(Path(output_root), "Jiaoch minute collection root")
     ts_code = _ts_code(requested_ts_code)
     session = _execution_session(execution_session)
@@ -702,7 +705,12 @@ def _verify_and_load_collection_set(
     ):
         raise ValueError("Jiaoch runtime mapping descriptor rejected")
     _uuid4_text(runtime.get("generation_id"), label="Jiaoch runtime generation_id")
-    _sha256_text(runtime.get("policy_sha256"), label="Jiaoch routing policy_sha256")
+    policy = _sha256_text(
+        runtime.get("policy_sha256"),
+        label="Jiaoch routing policy_sha256",
+    )
+    if not hmac.compare_digest(policy, _EXPECTED_ROUTING_POLICY_SHA256):
+        raise ValueError("Jiaoch routing policy binding rejected")
     if payload.get("credential_binding") != {
         "basis": "ONE_SEALED_ENTRYPOINT_INVOCATION",
         "credential_proof_claimed": False,

@@ -659,6 +659,34 @@ def test_attempt_from_another_runtime_call_cannot_be_spliced_into_manifest(
         )
 
 
+def test_rehashed_runtime_policy_drift_is_rejected(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    publication, _, _, _ = _collect(tmp_path, monkeypatch)
+    forged_manifest = _manifest(tmp_path, publication)
+    forged_manifest["runtime_mapping_descriptor"]["policy_sha256"] = "0" * 64
+    forged = json.dumps(
+        forged_manifest,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    digest = hashlib.sha256(forged).hexdigest()
+    relative = f"collection_sets/sha256/{digest[:2]}/{digest}.json"
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(forged)
+
+    with pytest.raises(ValueError, match="policy"):
+        verify_jiaoch_minute_collection_set(
+            output_root=tmp_path,
+            collection_set_relative_path=relative,
+            expected_collection_set_sha256=digest,
+        )
+
+
 def test_verified_adapter_upgrades_only_collection_status_and_keeps_capacity_false(
     tmp_path: Path,
     monkeypatch,
