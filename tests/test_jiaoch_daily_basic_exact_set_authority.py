@@ -17,6 +17,18 @@ def _sha(seed: str) -> str:
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
 
+def _canonical_sha(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _transition(
     predecessor: str = "300114.SZ",
     successor: str = "302132.SZ",
@@ -79,6 +91,16 @@ def _daily_authority() -> authority.AuditedDailyAuthority:
             ts_codes=second_codes,
         ),
     )
+    market_generation_refs = [
+        {
+            "generation_id": item.generation_id,
+            "lineage_sha256": item.generation_lineage_sha256,
+            "manifest_sha256": item.generation_manifest_sha256,
+            "trade_date": item.trade_date,
+            "vintage": item.vintage,
+        }
+        for item in partitions
+    ]
     return authority.AuditedDailyAuthority(
         manifest_file_sha256=_sha("audited-manifest-file"),
         manifest_sha256=_sha("audited-manifest"),
@@ -91,7 +113,7 @@ def _daily_authority() -> authority.AuditedDailyAuthority:
         daily_table_rows=8,
         daily_table_sha256=_sha("daily-table"),
         market_generation_count=2,
-        market_generation_root_sha256=_sha("market-generations"),
+        market_generation_root_sha256=_canonical_sha(market_generation_refs),
         partitions=partitions,
     )
 
@@ -165,6 +187,18 @@ def _daily_basic_partition(
         canonical_rows_sha256=canonical_rows_sha256,
         normalization_receipt_sha256=_sha(f"normalization-receipt:{trade_date}"),
         rows=rows,
+    )
+
+
+def _replace_partition_rows(
+    partition: authority.DailyBasicPartition,
+    rows: tuple[NormalizedDailyBasicRow, ...],
+) -> authority.DailyBasicPartition:
+    ordered = tuple(sorted(rows, key=lambda row: (row.trade_date, row.ts_code)))
+    return replace(
+        partition,
+        canonical_rows_sha256=_canonical_sha([asdict(row) for row in ordered]),
+        rows=ordered,
     )
 
 
@@ -422,11 +456,9 @@ def test_transition_overlap_factor_conflict_fails_closed(
         successor,
         **{field: getattr(successor, field) + 0.25},
     )
-    partitions[first.trade_date] = replace(
+    partitions[first.trade_date] = _replace_partition_rows(
         first_basic,
-        rows=tuple(
-            conflicting if row.ts_code == successor.ts_code else row for row in first_basic.rows
-        ),
+        tuple(conflicting if row.ts_code == successor.ts_code else row for row in first_basic.rows),
     )
     _install_authorities(
         monkeypatch,
@@ -502,7 +534,7 @@ def test_any_raw_ts_code_difference_blocks_the_whole_coverage(
         rows.pop()
     else:
         rows.append(_row("600002.SH", first.trade_date))
-    partitions[first.trade_date] = replace(first, rows=tuple(rows))
+    partitions[first.trade_date] = _replace_partition_rows(first, tuple(rows))
     _install_authorities(
         monkeypatch,
         daily=daily,
@@ -523,9 +555,9 @@ def test_duplicate_daily_basic_identity_blocks_the_whole_coverage(
     daily = _daily_authority()
     partitions = {item.trade_date: _daily_basic_partition(item) for item in daily.partitions}
     first = partitions["2025-02-14"]
-    partitions[first.trade_date] = replace(
+    partitions[first.trade_date] = _replace_partition_rows(
         first,
-        rows=(*first.rows, first.rows[0]),
+        (*first.rows, first.rows[0]),
     )
     _install_authorities(
         monkeypatch,
@@ -547,9 +579,9 @@ def test_daily_basic_row_date_drift_blocks_the_whole_coverage(
     daily = _daily_authority()
     partitions = {item.trade_date: _daily_basic_partition(item) for item in daily.partitions}
     first = partitions["2025-02-14"]
-    partitions[first.trade_date] = replace(
+    partitions[first.trade_date] = _replace_partition_rows(
         first,
-        rows=(replace(first.rows[0], trade_date="2025-02-13"), *first.rows[1:]),
+        (replace(first.rows[0], trade_date="2025-02-13"), *first.rows[1:]),
     )
     _install_authorities(
         monkeypatch,
@@ -582,9 +614,9 @@ def test_normalized_segment_or_scope_drift_is_not_trusted(
     first = partitions["2025-02-14"]
     target = next(row for row in first.rows if row.ts_code == "600001.SH")
     replacement = replace(target, **{field: value})
-    partitions[first.trade_date] = replace(
+    partitions[first.trade_date] = _replace_partition_rows(
         first,
-        rows=tuple(replacement if row is target else row for row in first.rows),
+        tuple(replacement if row is target else row for row in first.rows),
     )
     _install_authorities(
         monkeypatch,
@@ -607,7 +639,7 @@ def test_transition_provider_backfill_is_rejected_even_if_stable_identity_matche
         _row("302132.SZ", first.trade_date) if row.ts_code == "300114.SZ" else row
         for row in first.rows
     )
-    partitions[first.trade_date] = replace(first, rows=rows)
+    partitions[first.trade_date] = _replace_partition_rows(first, rows)
     _install_authorities(
         monkeypatch,
         daily=daily,
@@ -729,9 +761,9 @@ def test_source_missingness_cannot_be_converted_to_candidate_exclusions(
     daily = _daily_authority()
     partitions = {item.trade_date: _daily_basic_partition(item) for item in daily.partitions}
     first = partitions["2025-02-14"]
-    partitions[first.trade_date] = replace(
+    partitions[first.trade_date] = _replace_partition_rows(
         first,
-        rows=tuple(row for row in first.rows if row.ts_code != "600001.SH"),
+        tuple(row for row in first.rows if row.ts_code != "600001.SH"),
     )
     _install_authorities(
         monkeypatch,
