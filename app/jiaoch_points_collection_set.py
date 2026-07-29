@@ -400,11 +400,15 @@ def _attempt_binding(spec: Mapping[str, Any], publication: Mapping[str, Any]) ->
     }
 
 
-def _rollback_created_manifest(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        return
+def _rollback_created_manifest(path: Path, expected_raw: bytes) -> None:
+    observed = _read_safe_file(
+        path,
+        label="Jiaoch points collection rollback manifest",
+        max_bytes=len(expected_raw),
+    )
+    if len(observed) != len(expected_raw) or not hmac.compare_digest(observed, expected_raw):
+        raise ValueError("Jiaoch points collection rollback identity rejected")
+    path.unlink()
     raw_authority.fsync_directory(path.parent)
 
 
@@ -511,6 +515,7 @@ def _collect_jiaoch_points_collection_set_with_route_credential(
         "source_id": _SOURCE_ID,
         "trade_date": session.isoformat(),
     }
+    _verify_collection_payload(root=root, payload=manifest)
     manifest_raw = _canonical_json(manifest)
     if len(manifest_raw) > _MAX_MANIFEST_BYTES:
         raise ValueError("Jiaoch points collection manifest size rejected")
@@ -537,7 +542,10 @@ def _collect_jiaoch_points_collection_set_with_route_credential(
         )
     except BaseException:
         if created:
-            _rollback_created_manifest(path)
+            try:
+                _rollback_created_manifest(path, manifest_raw)
+            except Exception:
+                raise ValueError("Jiaoch points collection rollback failed") from None
         raise
     return {
         "collection_set_created": created,
@@ -615,30 +623,10 @@ def _verified_raw_body(
     )
 
 
-def _verify_and_load_collection_set(
-    *,
-    output_root: str | Path,
-    collection_set_relative_path: str,
-    expected_collection_set_sha256: str,
-) -> dict[str, Any]:
-    root = _safe_existing_directory(Path(output_root), "Jiaoch points collection root")
-    path = _manifest_path(
-        root=root,
-        relative_path=collection_set_relative_path,
-        expected_sha256=expected_collection_set_sha256,
-    )
-    raw = _read_safe_file(
-        path,
-        label="Jiaoch points collection set",
-        max_bytes=_MAX_MANIFEST_BYTES,
-    )
-    if not hmac.compare_digest(_sha256(raw), expected_collection_set_sha256):
-        raise ValueError("Jiaoch points collection set content address rejected")
-    payload = _strict_json_loads(raw, label="Jiaoch points collection set")
+def _verify_collection_payload(*, root: Path, payload: Any) -> dict[str, Any]:
     if (
         type(payload) is not dict
         or set(payload) != _MANIFEST_FIELDS
-        or not hmac.compare_digest(raw, _canonical_json(payload))
         or payload.get("schema") != COLLECTION_SET_SCHEMA
         or payload.get("source_id") != _SOURCE_ID
         or payload.get("collector_version") != COLLECTOR_VERSION
@@ -733,6 +721,31 @@ def _verify_and_load_collection_set(
     if len(attempt_ids) != 2 or len(attempt_digests) != 2:
         raise ValueError("Jiaoch points collection attempts rejected")
     return payload
+
+
+def _verify_and_load_collection_set(
+    *,
+    output_root: str | Path,
+    collection_set_relative_path: str,
+    expected_collection_set_sha256: str,
+) -> dict[str, Any]:
+    root = _safe_existing_directory(Path(output_root), "Jiaoch points collection root")
+    path = _manifest_path(
+        root=root,
+        relative_path=collection_set_relative_path,
+        expected_sha256=expected_collection_set_sha256,
+    )
+    raw = _read_safe_file(
+        path,
+        label="Jiaoch points collection set",
+        max_bytes=_MAX_MANIFEST_BYTES,
+    )
+    if not hmac.compare_digest(_sha256(raw), expected_collection_set_sha256):
+        raise ValueError("Jiaoch points collection set content address rejected")
+    payload = _strict_json_loads(raw, label="Jiaoch points collection set")
+    if not hmac.compare_digest(raw, _canonical_json(payload)):
+        raise ValueError("Jiaoch points collection set descriptor rejected")
+    return _verify_collection_payload(root=root, payload=payload)
 
 
 def verify_jiaoch_points_collection_set(
