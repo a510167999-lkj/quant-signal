@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import sqlite3
 from typing import Any
+import uuid
 
 import pytest
 
@@ -336,6 +337,7 @@ def test_public_entrypoints_are_offline_and_do_not_accept_credentials() -> None:
         "output_root",
         "receipt_relative_path",
         "expected_receipt_sha256",
+        "publication_capability",
     }
 
 
@@ -574,6 +576,7 @@ def test_publishes_full_market_exact_set_then_derives_target_scope(
         **{key: value for key, value in kwargs.items() if key != "collection_set_refs"},
         receipt_relative_path=publication["receipt_relative_path"],
         expected_receipt_sha256=publication["receipt_sha256"],
+        publication_capability=publication["publication_capability"],
     )
 
     assert verified["verified"] is True
@@ -625,6 +628,15 @@ def test_publishes_full_market_exact_set_then_derives_target_scope(
     assert verified["final_oos_consumed"] is False
     assert verified["production_profile_registered"] is False
     assert verified["production_recommendation_eligible"] is False
+    assert {item["path"] for item in verified["producer_binding"]["entries"]} == {
+        "app/jiaoch_daily_basic_exact_set_authority.py",
+        "app/jiaoch_points_collection_set.py",
+        "app/jiaoch_points_raw_authority.py",
+        "app/jiaoch_points_response_normalization.py",
+        "app/research_pit_store.py",
+        "app/research_scope.py",
+        "app/research_security_code_transition.py",
+    }
 
 
 def test_authoritative_transition_backfill_is_excluded_before_exact_set_comparison(
@@ -655,6 +667,7 @@ def test_authoritative_transition_backfill_is_excluded_before_exact_set_comparis
         **{key: value for key, value in kwargs.items() if key != "collection_set_refs"},
         receipt_relative_path=publication["receipt_relative_path"],
         expected_receipt_sha256=publication["receipt_sha256"],
+        publication_capability=publication["publication_capability"],
     )
 
     first_stats = verified["per_date_statistics"][0]
@@ -777,7 +790,7 @@ def test_transition_boundary_requires_both_authoritative_codes(
     assert not list(kwargs["output_root"].rglob("*.json"))
 
 
-def test_publication_is_content_addressed_and_idempotent(
+def test_publication_returns_unique_postverified_candidate_descriptors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -788,7 +801,11 @@ def test_publication_is_content_addressed_and_idempotent(
     second = authority.publish_daily_basic_exact_set_coverage(**kwargs)
 
     assert first["receipt_created"] is True
-    assert second == {**first, "receipt_created": False}
+    assert second["receipt_created"] is True
+    assert first["receipt_sha256"] != second["receipt_sha256"]
+    assert first["publication_capability"] != second["publication_capability"]
+    assert first["publication_status"] == "DURABLE_POSTVERIFIED_AND_RETURNED"
+    assert first["schema"] == "daily-basic-exact-set-publication/v1"
     path = _receipt_path(first, kwargs["output_root"])
     assert path.read_bytes() == authority._canonical_json(
         json.loads(path.read_text(encoding="utf-8"))
@@ -954,6 +971,39 @@ def test_transition_provider_backfill_is_rejected_even_if_stable_identity_matche
         authority.publish_daily_basic_exact_set_coverage(**_kwargs(tmp_path, daily))
 
 
+@pytest.mark.parametrize(
+    ("partition_index", "correct_code", "wrong_code"),
+    [
+        (0, "300114.SZ", "302132.SZ"),
+        (1, "302132.SZ", "300114.SZ"),
+    ],
+)
+def test_wrong_period_alias_cannot_disappear_from_both_sources_without_counterpart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    partition_index: int,
+    correct_code: str,
+    wrong_code: str,
+) -> None:
+    daily = _daily_authority()
+    partitions = list(daily.partitions)
+    target = partitions[partition_index]
+    partitions[partition_index] = replace(
+        target,
+        ts_codes=tuple(
+            sorted(wrong_code if code == correct_code else code for code in target.ts_codes)
+        ),
+    )
+    daily = _replace_daily_partitions(daily, tuple(partitions))
+    _install_authorities(monkeypatch, daily=daily)
+    kwargs = _kwargs(tmp_path, daily)
+
+    with pytest.raises(ValueError, match="correct counterpart"):
+        authority.publish_daily_basic_exact_set_coverage(**kwargs)
+
+    assert not list(kwargs["output_root"].rglob("*.json"))
+
+
 def test_transition_resolution_collision_blocks_coverage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1003,6 +1053,7 @@ def test_tampered_receipt_or_source_binding_cannot_verify(
             **{key: value for key, value in kwargs.items() if key != "collection_set_refs"},
             receipt_relative_path=publication["receipt_relative_path"],
             expected_receipt_sha256=publication["receipt_sha256"],
+            publication_capability=publication["publication_capability"],
         )
 
 
@@ -1037,10 +1088,11 @@ def test_verified_receipt_fails_when_any_bound_input_drifts(
             **{key: value for key, value in kwargs.items() if key != "collection_set_refs"},
             receipt_relative_path=publication["receipt_relative_path"],
             expected_receipt_sha256=publication["receipt_sha256"],
+            publication_capability=publication["publication_capability"],
         )
 
 
-def test_failed_post_publication_self_verification_rolls_back_only_created_receipt(
+def test_failed_postpublication_verification_leaves_only_unreferenced_candidate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1055,7 +1107,54 @@ def test_failed_post_publication_self_verification_rolls_back_only_created_recei
     with pytest.raises(ValueError, match="forced self verify failure"):
         authority.publish_daily_basic_exact_set_coverage(**kwargs)
 
-    assert not list(kwargs["output_root"].rglob("*.json"))
+    candidates = list(kwargs["output_root"].rglob("*.json"))
+    assert len(candidates) == 1
+    assert b"publication_capability_sha256" in candidates[0].read_bytes()
+    assert b'"publication_capability":' not in candidates[0].read_bytes()
+
+
+def test_foreign_replacement_after_candidate_write_is_never_deleted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    daily, _daily_basic, _transitions = _install_authorities(monkeypatch)
+    kwargs = _kwargs(tmp_path, daily)
+    original = authority._write_receipt_candidate_create_only
+    captured: dict[str, Path] = {}
+
+    def replace_after_write(path: Path, raw: bytes) -> bool:
+        created = original(path, raw)
+        captured["path"] = path
+        path.write_bytes(b"foreign replacement")
+        return created
+
+    monkeypatch.setattr(
+        authority,
+        "_write_receipt_candidate_create_only",
+        replace_after_write,
+    )
+
+    with pytest.raises(ValueError, match="content address"):
+        authority.publish_daily_basic_exact_set_coverage(**kwargs)
+
+    assert captured["path"].read_bytes() == b"foreign replacement"
+
+
+def test_verifier_requires_the_explicit_returned_publication_capability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    daily, _daily_basic, _transitions = _install_authorities(monkeypatch)
+    kwargs = _kwargs(tmp_path, daily)
+    publication = authority.publish_daily_basic_exact_set_coverage(**kwargs)
+
+    with pytest.raises(ValueError, match="publication capability"):
+        authority.verify_daily_basic_exact_set_coverage(
+            **{key: value for key, value in kwargs.items() if key != "collection_set_refs"},
+            receipt_relative_path=publication["receipt_relative_path"],
+            expected_receipt_sha256=publication["receipt_sha256"],
+            publication_capability=str(uuid.uuid4()),
+        )
 
 
 def test_source_missingness_cannot_be_converted_to_candidate_exclusions(
