@@ -115,11 +115,7 @@ def _contains_semantic_token(value: Any, token: str) -> bool:
 
 
 def _valid_sha256(value: Any) -> bool:
-    return (
-        type(value) is str
-        and len(value) == 64
-        and all(character in _HEX for character in value)
-    )
+    return type(value) is str and len(value) == 64 and all(character in _HEX for character in value)
 
 
 def _aware_timestamp(value: Any) -> str:
@@ -155,9 +151,7 @@ def _validate_source(source: TushareSource) -> None:
         or source.request_protocol != _REQUEST_PROTOCOL
         or type(source.token) is not str
         or not source.token
-        or any(
-            ord(character) < 32 or ord(character) == 127 for character in source.token
-        )
+        or any(ord(character) < 32 or ord(character) == 127 for character in source.token)
     ):
         raise ValueError("Jiaoch stk_mins source binding rejected")
 
@@ -383,9 +377,7 @@ def verify_jiaoch_historical_minute_diagnostic(
         _opaque_date_argument(params.get("end_date"), "end_date")
         _aware_timestamp(payload.get("retrieved_at"))
     except ValueError:
-        raise ValueError(
-            "Jiaoch historical-minute diagnostic descriptor rejected"
-        ) from None
+        raise ValueError("Jiaoch historical-minute diagnostic descriptor rejected") from None
 
     if (
         payload.get("classification") not in _CLASSIFICATIONS
@@ -526,9 +518,7 @@ def load_jiaoch_historical_minute_diagnostic(
         if candidate.name != f"{verification['descriptor_sha256']}.json":
             raise ValueError
     except (OSError, TypeError, ValueError):
-        raise ValueError(
-            "Jiaoch historical-minute diagnostic descriptor rejected"
-        ) from None
+        raise ValueError("Jiaoch historical-minute diagnostic descriptor rejected") from None
     return dict(payload)
 
 

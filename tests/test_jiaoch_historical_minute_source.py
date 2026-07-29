@@ -77,11 +77,7 @@ def _collect(
 
 def _all_keys(value) -> set[str]:
     if isinstance(value, dict):
-        return set(value) | {
-            key
-            for nested in value.values()
-            for key in _all_keys(nested)
-        }
+        return set(value) | {key for nested in value.values() for key in _all_keys(nested)}
     if isinstance(value, list):
         return {key for nested in value for key in _all_keys(nested)}
     return set()
@@ -275,9 +271,7 @@ def test_failure_diagnostic_is_content_addressed_and_tamper_rejected(
     tmp_path: Path,
 ) -> None:
     transport = RecordingTransport(
-        _response(
-            '{"code":-1,"msg":"权限不足: stk_mins 未授权","data":null}'.encode("utf-8")
-        )
+        _response('{"code":-1,"msg":"权限不足: stk_mins 未授权","data":null}'.encode("utf-8"))
     )
 
     publication, manifest = _collect(tmp_path, transport)
