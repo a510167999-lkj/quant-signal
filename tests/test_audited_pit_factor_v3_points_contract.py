@@ -8,6 +8,7 @@ import pytest
 
 from app.audited_pit_factor_v3_points_contract import (
     FACTOR_V3_POINTS_ARMS,
+    FACTOR_V3_POINTS_ARM_STRATEGY_SHA256,
     FACTOR_V3_POINTS_CONTRACT,
     FACTOR_V3_POINTS_CONTRACT_SHA256,
     FACTOR_V3_POINTS_FEATURE_NAMES,
@@ -76,12 +77,8 @@ def _materialize(
         sessions=sessions,
         parent_rows=parents,
         daily_basic_rows=daily_basic,
-        parent_binding_root_sha256=(
-            FACTOR_V3_POINTS_PARENT_BINDING_ROOT_SHA256
-        ),
-        expected_parent_identity_root_sha256=(
-            factor_v3_parent_identity_root(parents)
-        ),
+        parent_binding_root_sha256=(FACTOR_V3_POINTS_PARENT_BINDING_ROOT_SHA256),
+        expected_parent_identity_root_sha256=(factor_v3_parent_identity_root(parents)),
     )
 
 
@@ -93,9 +90,7 @@ def test_contract_freezes_scope_lag_features_arms_and_safety_gate() -> None:
     assert dict(FACTOR_V3_POINTS_ARMS) == {
         "control": (),
         "turnover_level": ("turnover_rate_f_rank",),
-        "abnormal_turnover": (
-            "abnormal_turnover_rate_f_20_to_250_rank",
-        ),
+        "abnormal_turnover": ("abnormal_turnover_rate_f_20_to_250_rank",),
     }
     assert FACTOR_V3_POINTS_CONTRACT["arm_order"] == [
         "control",
@@ -118,9 +113,7 @@ def test_contract_freezes_scope_lag_features_arms_and_safety_gate() -> None:
     assert sources["moneyflow"]["hard_filter_permitted"] is False
     assert sources["moneyflow"]["first_round_arm_permitted"] is False
 
-    abnormal = FACTOR_V3_POINTS_CONTRACT["features"][
-        "abnormal_turnover_rate_f_20_to_250_rank"
-    ]
+    abnormal = FACTOR_V3_POINTS_CONTRACT["features"]["abnormal_turnover_rate_f_20_to_250_rank"]
     assert abnormal["raw_formula"] == "log(mean_20/mean_250)"
     assert abnormal["minimum_history_market_sessions"] == 250
     assert abnormal["latest_source_session"] == "T-1"
@@ -138,15 +131,10 @@ def test_contract_freezes_scope_lag_features_arms_and_safety_gate() -> None:
             "doi": "10.1016/j.jfineco.2019.03.008",
         },
         "china_anomaly_replication": {
-            "title": (
-                "Replicating and Digesting Anomalies in the Chinese "
-                "A-share Market"
-            ),
+            "title": ("Replicating and Digesting Anomalies in the Chinese A-share Market"),
             "doi": "10.1287/mnsc.2023.4904",
         },
-        "daily_basic_documentation": (
-            "https://tushare.pro/document/2?doc_id=32"
-        ),
+        "daily_basic_documentation": ("https://tushare.pro/document/2?doc_id=32"),
     }
 
     gate = FACTOR_V3_POINTS_CONTRACT["experiment_gate"]
@@ -156,34 +144,29 @@ def test_contract_freezes_scope_lag_features_arms_and_safety_gate() -> None:
     assert FACTOR_V3_POINTS_CONTRACT["embargo_consumed"] is False
     assert FACTOR_V3_POINTS_CONTRACT["final_oos_consumed"] is False
     assert FACTOR_V3_POINTS_CONTRACT["production_profile_registered"] is False
-    assert (
-        FACTOR_V3_POINTS_CONTRACT["production_recommendation_eligible"]
-        is False
+    assert FACTOR_V3_POINTS_CONTRACT["production_recommendation_eligible"] is False
+    assert canonical_sha256(FACTOR_V3_POINTS_CONTRACT) == (FACTOR_V3_POINTS_CONTRACT_SHA256)
+    assert FACTOR_V3_POINTS_PARENT_BINDING_ROOT_SHA256 == (
+        "de7c9a3715631d186e730d775673df1ed753717be44029b6c12dba34e56a5ef5"
     )
-    assert canonical_sha256(FACTOR_V3_POINTS_CONTRACT) == (
-        FACTOR_V3_POINTS_CONTRACT_SHA256
+    assert FACTOR_V3_POINTS_CONTRACT_SHA256 == (
+        "791ca95296969424f0255ef7aeb011e98b4051e0e2b62dbdac12213716b3448b"
     )
+    assert dict(FACTOR_V3_POINTS_ARM_STRATEGY_SHA256) == {
+        "control": "cd6e0e40954c5ad7f956b10b9426d3e40ce07e7e3cd6292baa7a4a32620259f9",
+        "turnover_level": "0d9bd4d0801e0f6a71e8c9d509cb3cb417efa8ad895c152d9363dff43a93459a",
+        "abnormal_turnover": "a0754536544368a9b3743f5b6f7a0ced62529a2bbbae85f0f6aa0d4f828028b9",
+    }
 
 
 def test_arm_contracts_are_individually_content_addressed() -> None:
-    contracts = {
-        arm: factor_v3_points_arm_contract(arm)
-        for arm in FACTOR_V3_POINTS_ARMS
-    }
+    contracts = {arm: factor_v3_points_arm_contract(arm) for arm in FACTOR_V3_POINTS_ARMS}
     for arm, contract in contracts.items():
         assert contract["arm"] == arm
-        assert contract["points_feature_names"] == list(
-            FACTOR_V3_POINTS_ARMS[arm]
-        )
-        assert contract["factor_v3_points_contract_sha256"] == (
-            FACTOR_V3_POINTS_CONTRACT_SHA256
-        )
+        assert contract["points_feature_names"] == list(FACTOR_V3_POINTS_ARMS[arm])
+        assert contract["factor_v3_points_contract_sha256"] == (FACTOR_V3_POINTS_CONTRACT_SHA256)
         assert contract["strategy_sha256"] == canonical_sha256(
-            {
-                key: value
-                for key, value in contract.items()
-                if key != "strategy_sha256"
-            }
+            {key: value for key, value in contract.items() if key != "strategy_sha256"}
         )
     assert len({value["strategy_sha256"] for value in contracts.values()}) == 3
     with pytest.raises(ValueError, match="frozen"):
@@ -227,31 +210,19 @@ def test_materialization_uses_t_minus_1_and_deterministic_midranks() -> None:
         parents[1]["candidate_key"],
         parents[2]["candidate_key"],
     ]
-    assert {row["source_session"] for row in rows} == {
-        sessions[-2]["trade_date"]
-    }
-    assert [row["turnover_rate_f_rank"] for row in rows] == pytest.approx(
-        [-0.5, 0.0, 0.5]
+    assert {row["source_session"] for row in rows} == {sessions[-2]["trade_date"]}
+    assert [row["turnover_rate_f_rank"] for row in rows] == pytest.approx([-0.5, 0.0, 0.5])
+    assert [row["abnormal_turnover_rate_f_20_to_250_rank"] for row in rows] == pytest.approx(
+        [-0.25, -0.25, 0.5]
     )
-    assert [
-        row["abnormal_turnover_rate_f_20_to_250_rank"] for row in rows
-    ] == pytest.approx([-0.25, -0.25, 0.5])
     receipt = result["receipt"]
     assert receipt["parent_row_count"] == len(parents)
     assert receipt["output_row_count"] == len(parents)
     assert receipt["dropped_parent_row_count"] == 0
-    assert receipt["parent_identity_root_sha256"] == (
-        factor_v3_parent_identity_root(parents)
-    )
-    assert receipt["output_identity_root_sha256"] == (
-        receipt["parent_identity_root_sha256"]
-    )
+    assert receipt["parent_identity_root_sha256"] == (factor_v3_parent_identity_root(parents))
+    assert receipt["output_identity_root_sha256"] == (receipt["parent_identity_root_sha256"])
     assert receipt["receipt_sha256"] == canonical_sha256(
-        {
-            key: value
-            for key, value in receipt.items()
-            if key != "receipt_sha256"
-        }
+        {key: value for key, value in receipt.items() if key != "receipt_sha256"}
     )
 
 
@@ -277,18 +248,14 @@ def test_materialization_rejects_parent_root_drift() -> None:
             parent_rows=parents,
             daily_basic_rows=daily_basic,
             parent_binding_root_sha256="0" * 64,
-            expected_parent_identity_root_sha256=(
-                factor_v3_parent_identity_root(parents)
-            ),
+            expected_parent_identity_root_sha256=(factor_v3_parent_identity_root(parents)),
         )
     with pytest.raises(ValueError, match="parent identity"):
         materialize_factor_v3_points_rows(
             sessions=sessions,
             parent_rows=parents,
             daily_basic_rows=daily_basic,
-            parent_binding_root_sha256=(
-                FACTOR_V3_POINTS_PARENT_BINDING_ROOT_SHA256
-            ),
+            parent_binding_root_sha256=(FACTOR_V3_POINTS_PARENT_BINDING_ROOT_SHA256),
             expected_parent_identity_root_sha256="0" * 64,
         )
 
