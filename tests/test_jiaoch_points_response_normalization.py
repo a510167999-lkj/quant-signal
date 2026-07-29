@@ -49,6 +49,7 @@ MONEYFLOW_FIELDS = [
     "net_mf_vol",
     "net_mf_amount",
 ]
+_UNSET = object()
 
 
 def _daily_row(
@@ -131,7 +132,7 @@ def _normalize(
     payload: object | None = None,
     response_body: object | None = None,
     expected_trade_date: object = TRADE_DATE,
-    expected_raw_sha256: object | None = None,
+    expected_raw_sha256: object = _UNSET,
 ) -> JiaochPointsNormalizationPreviewReceipt:
     body = _raw(_payload(api_name) if payload is None else payload)
     if response_body is not None:
@@ -141,7 +142,7 @@ def _normalize(
         response_body=body,
         expected_api_name=api_name,
         expected_trade_date=expected_trade_date,
-        expected_raw_sha256=digest if expected_raw_sha256 is None else expected_raw_sha256,
+        expected_raw_sha256=digest if expected_raw_sha256 is _UNSET else expected_raw_sha256,
     )
 
 
