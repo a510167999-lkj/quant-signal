@@ -424,8 +424,15 @@ def normalize_jiaoch_stk_mins_success_response(
         )
         for index, row in enumerate(items)
     )
-    if tuple(bar.source_label_at for bar in bars) != _expected_source_labels(session):
+    expected_labels = _expected_source_labels(session)
+    observed_labels = tuple(bar.source_label_at for bar in bars)
+    if observed_labels == expected_labels:
+        ordered_bars = bars
+    elif observed_labels == tuple(reversed(expected_labels)):
+        ordered_bars = tuple(reversed(bars))
+    else:
         raise ValueError("stk_mins source labels are not the exact 241-label schedule")
+    bars = ordered_bars
 
     opening = _opening_special(
         bars[0],
