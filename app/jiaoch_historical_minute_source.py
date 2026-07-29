@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from app.durable_io import fsync_directory
-from app.research_pit_sources import TushareSource
+from app.research_pit_sources import TushareSource, _validate_loopback_http_proxy
 from app.research_pit_transport import UrllibTushareTransport
 
 
@@ -156,6 +156,19 @@ def _opaque_date_argument(value: Any, field: str) -> str:
 
 
 def _validate_source(source: TushareSource) -> None:
+    route_valid = False
+    if isinstance(source, TushareSource):
+        if source.proxy_url is None:
+            route_valid = source.network_route == "direct"
+        elif type(source.proxy_url) is str:
+            try:
+                normalized_proxy = _validate_loopback_http_proxy(source.proxy_url)
+            except ValueError:
+                normalized_proxy = None
+            route_valid = (
+                normalized_proxy == source.proxy_url
+                and source.network_route == "loopback_http_proxy"
+            )
     if (
         not isinstance(source, TushareSource)
         or source.name != "jiaoch"
@@ -165,6 +178,7 @@ def _validate_source(source: TushareSource) -> None:
         or type(source.token) is not str
         or not source.token
         or any(ord(character) < 32 or ord(character) == 127 for character in source.token)
+        or not route_valid
     ):
         raise ValueError("Jiaoch stk_mins source binding rejected")
 

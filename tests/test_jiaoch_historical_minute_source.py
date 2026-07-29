@@ -116,9 +116,7 @@ def test_unsafe_proxy_source_is_rejected_before_transport_construction(
 
     def transport_factory(*, proxy_url):
         constructed.append(proxy_url)
-        return RecordingTransport(
-            _response(b'{"code":-1,"msg":"permission denied","data":null}')
-        )
+        return RecordingTransport(_response(b'{"code":-1,"msg":"permission denied","data":null}'))
 
     monkeypatch.setattr(
         jiaoch_historical_minute_source,
