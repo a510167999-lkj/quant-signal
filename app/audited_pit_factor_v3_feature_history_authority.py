@@ -837,9 +837,18 @@ def verify_factor_v3_feature_history_collection_authority(
     *,
     collection_evidence: Mapping[str, Any],
     collection_plan: Mapping[str, Any],
+    trade_cal_output_root: str | Path,
+    development_session_refs: Sequence[Mapping[str, Any]],
+    temporal_partition_contract: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Verify per-session feature-history evidence without reading outcomes."""
 
+    verify_factor_v3_feature_history_collection_plan(
+        collection_plan=collection_plan,
+        trade_cal_output_root=trade_cal_output_root,
+        development_session_refs=development_session_refs,
+        temporal_partition_contract=temporal_partition_contract,
+    )
     sessions = _verify_plan_self_integrity(collection_plan)
     evidence = _strict_mapping(
         collection_evidence,

@@ -6,6 +6,8 @@ import hashlib
 import inspect
 import json
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -239,6 +241,21 @@ def _collection_evidence(plan: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _verify_authority(
+    *,
+    evidence: dict[str, object],
+    plan: dict[str, object],
+) -> dict[str, object]:
+    development = plan["development_sessions"]["sessions"]
+    return history_authority.verify_factor_v3_feature_history_collection_authority(
+        collection_evidence=evidence,
+        collection_plan=plan,
+        trade_cal_output_root=Path("synthetic-trade-cal-root"),
+        development_session_refs=_development_refs(development),
+        temporal_partition_contract=load_temporal_partition_contract(PARTITION_V1_PATH),
+    )
+
+
 def test_public_surface_is_offline_and_caller_cannot_select_history_window() -> None:
     assert history_authority.__all__ == (
         "build_factor_v3_feature_history_collection_plan",
@@ -260,7 +277,13 @@ def test_public_surface_is_offline_and_caller_cannot_select_history_window() -> 
         inspect.signature(
             history_authority.verify_factor_v3_feature_history_collection_authority
         ).parameters
-    ) == {"collection_evidence", "collection_plan"}
+    ) == {
+        "collection_evidence",
+        "collection_plan",
+        "development_session_refs",
+        "temporal_partition_contract",
+        "trade_cal_output_root",
+    }
     source = inspect.getsource(history_authority)
     for forbidden in (
         "os.environ",
@@ -270,6 +293,50 @@ def test_public_surface_is_offline_and_caller_cannot_select_history_window() -> 
         "ControlledTushareCollector(",
     ):
         assert forbidden not in source
+
+
+def test_trade_calendar_loader_requires_offline_verifier_and_content_address(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _prewindow, _development, manifest = _calendar_fixture()
+    raw = _canonical_bytes(manifest)
+    digest = hashlib.sha256(raw).hexdigest()
+    relative = f"trade_cal_manifests/sha256/{digest[:2]}/{digest}.json"
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True)
+    path.write_bytes(raw)
+    calls: list[dict[str, object]] = []
+
+    def verifier(**kwargs):
+        calls.append(kwargs)
+        return {
+            "authority_manifest_sha256": digest,
+            "verified": True,
+        }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "app.jiaoch_trade_cal_authority",
+        SimpleNamespace(verify_jiaoch_trade_cal_authority=verifier),
+    )
+    assert (
+        history_authority._load_verified_trade_cal_manifest(
+            output_root=tmp_path,
+            authority_manifest_relative_path=relative,
+            expected_authority_manifest_sha256=digest,
+        )
+        == manifest
+    )
+    assert len(calls) == 2
+
+    path.write_bytes(b"{}")
+    with pytest.raises(ValueError, match="manifest"):
+        history_authority._load_verified_trade_cal_manifest(
+            output_root=tmp_path,
+            authority_manifest_relative_path=relative,
+            expected_authority_manifest_sha256=digest,
+        )
 
 
 def test_frozen_contract_binds_parent_calendar_transition_and_safety() -> None:
@@ -427,6 +494,17 @@ def test_plan_verifier_rebuilds_all_authorities_and_rejects_tamper(
             temporal_partition_contract=load_temporal_partition_contract(PARTITION_V1_PATH),
         )
 
+    rehashed = deepcopy(plan)
+    rehashed["prewindow"]["sessions"][0] = "1999-01-01"
+    rehashed["prewindow"]["start"] = "1999-01-01"
+    rehashed["prewindow"]["sha256"] = canonical_sha256(rehashed["prewindow"]["sessions"])
+    rehashed["plan_sha256"] = canonical_sha256(
+        {key: value for key, value in rehashed.items() if key != "plan_sha256"}
+    )
+    rehashed_evidence = _collection_evidence(rehashed)
+    with pytest.raises(ValueError, match="plan"):
+        _verify_authority(evidence=rehashed_evidence, plan=rehashed)
+
 
 def test_plan_rejects_insufficient_history_and_development_alignment_drift(
     monkeypatch: pytest.MonkeyPatch,
@@ -545,10 +623,7 @@ def test_formal_collection_authority_accepts_exact_nonempty_daily_and_suspend_ev
     plan, prewindow, _development, _manifest = _build_plan(monkeypatch)
     evidence = _collection_evidence(plan)
 
-    receipt = history_authority.verify_factor_v3_feature_history_collection_authority(
-        collection_evidence=evidence,
-        collection_plan=plan,
-    )
+    receipt = _verify_authority(evidence=evidence, plan=plan)
 
     assert receipt["verified"] is True
     assert receipt["authority_status"] == "VERIFIED_FEATURE_HISTORY_ONLY"
@@ -594,10 +669,7 @@ def test_formal_authority_rejects_nonexact_or_empty_bak_basic(
     evidence = _collection_evidence(plan)
     evidence["session_authorities"][0]["bak_basic"][field] = value
     with pytest.raises(ValueError, match=message):
-        history_authority.verify_factor_v3_feature_history_collection_authority(
-            collection_evidence=evidence,
-            collection_plan=plan,
-        )
+        _verify_authority(evidence=evidence, plan=plan)
 
 
 @pytest.mark.parametrize(
@@ -634,10 +706,7 @@ def test_formal_authority_rejects_missing_or_unverified_market_shards(
     else:
         generation["final_oos_eligible"] = True
     with pytest.raises(ValueError, match=message):
-        history_authority.verify_factor_v3_feature_history_collection_authority(
-            collection_evidence=evidence,
-            collection_plan=plan,
-        )
+        _verify_authority(evidence=evidence, plan=plan)
 
 
 @pytest.mark.parametrize(
@@ -674,10 +743,7 @@ def test_formal_authority_rejects_upstream_star_or_beijing_filtering(
         scope["preserved_row_count"] -= 1
         scope["source_row_count"] -= 1
     with pytest.raises(ValueError, match="upstream"):
-        history_authority.verify_factor_v3_feature_history_collection_authority(
-            collection_evidence=evidence,
-            collection_plan=plan,
-        )
+        _verify_authority(evidence=evidence, plan=plan)
 
 
 @pytest.mark.parametrize(
@@ -703,10 +769,7 @@ def test_formal_authority_rejects_forbidden_outputs_or_safety_drift(
     evidence = _collection_evidence(plan)
     evidence[field] = value
     with pytest.raises(ValueError, match="feature history"):
-        history_authority.verify_factor_v3_feature_history_collection_authority(
-            collection_evidence=evidence,
-            collection_plan=plan,
-        )
+        _verify_authority(evidence=evidence, plan=plan)
 
 
 def test_formal_authority_rejects_transition_session_or_plan_binding_drift(
@@ -716,26 +779,17 @@ def test_formal_authority_rejects_transition_session_or_plan_binding_drift(
     evidence = _collection_evidence(plan)
     evidence["security_code_transition_contract_sha256"] = SHA_A
     with pytest.raises(ValueError, match="transition"):
-        history_authority.verify_factor_v3_feature_history_collection_authority(
-            collection_evidence=evidence,
-            collection_plan=plan,
-        )
+        _verify_authority(evidence=evidence, plan=plan)
 
     evidence = _collection_evidence(plan)
     evidence["session_authorities"] = evidence["session_authorities"][:-1]
     with pytest.raises(ValueError, match="session"):
-        history_authority.verify_factor_v3_feature_history_collection_authority(
-            collection_evidence=evidence,
-            collection_plan=plan,
-        )
+        _verify_authority(evidence=evidence, plan=plan)
 
     evidence = _collection_evidence(plan)
     evidence["plan_sha256"] = SHA_A
     with pytest.raises(ValueError, match="plan"):
-        history_authority.verify_factor_v3_feature_history_collection_authority(
-            collection_evidence=evidence,
-            collection_plan=plan,
-        )
+        _verify_authority(evidence=evidence, plan=plan)
 
 
 def test_formal_authority_is_structurally_strict(
@@ -745,15 +799,9 @@ def test_formal_authority_is_structurally_strict(
     evidence = _collection_evidence(plan)
     evidence["surprise"] = True
     with pytest.raises(ValueError, match="fields"):
-        history_authority.verify_factor_v3_feature_history_collection_authority(
-            collection_evidence=evidence,
-            collection_plan=plan,
-        )
+        _verify_authority(evidence=evidence, plan=plan)
 
     evidence = _collection_evidence(plan)
     evidence["session_authorities"][0]["bak_basic"]["surprise"] = True
     with pytest.raises(ValueError, match="fields"):
-        history_authority.verify_factor_v3_feature_history_collection_authority(
-            collection_evidence=evidence,
-            collection_plan=plan,
-        )
+        _verify_authority(evidence=evidence, plan=plan)
