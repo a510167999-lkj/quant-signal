@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -581,6 +582,10 @@ class _SourceCollectionAuthority:
     proxy_endpoint: str | None
     allow_insecure_http: bool
     row_cap_overrides: tuple[tuple[str, int], ...]
+    credential_slot_id: str | None
+    credential_route_purpose: str | None
+    credential_route_id_prefix: str | None
+    credential_generation_id: str | None
 
 
 class ControlledTushareCollector:
@@ -611,6 +616,10 @@ class ControlledTushareCollector:
         source_profile: str = "official",
         request_protocol: str = "tushare-root-post/v1",
         row_cap_overrides: Mapping[str, int] | None = None,
+        credential_slot_id: str | None = None,
+        credential_route_purpose: str | None = None,
+        credential_route_id_prefix: str | None = None,
+        credential_generation_id: str | None = None,
         network_route: str = "direct",
         proxy_endpoint: str | None = None,
         temporal_contract: Mapping[str, Any],
@@ -665,6 +674,40 @@ class ControlledTushareCollector:
             raise PITCollectionError("direct network route forbids a proxy endpoint")
         if network_route == "loopback_http_proxy" and not proxy_endpoint:
             raise PITCollectionError("loopback HTTP proxy network route requires a proxy endpoint")
+        if len(
+            {
+                credential_slot_id is None,
+                credential_route_purpose is None,
+                credential_route_id_prefix is None,
+                credential_generation_id is None,
+            }
+        ) != 1:
+            raise PITCollectionError("credential route identity is incomplete")
+        if credential_slot_id is not None and (
+            not isinstance(credential_slot_id, str)
+            or not credential_slot_id
+            or credential_slot_id != credential_slot_id.strip()
+            or not isinstance(credential_route_purpose, str)
+            or not credential_route_purpose
+            or credential_route_purpose != credential_route_purpose.strip()
+            or not isinstance(credential_route_id_prefix, str)
+            or not credential_route_id_prefix
+            or credential_route_id_prefix != credential_route_id_prefix.strip()
+            or not isinstance(credential_generation_id, str)
+            or not credential_generation_id
+            or credential_generation_id != credential_generation_id.strip()
+        ):
+            raise PITCollectionError("credential route identity is invalid")
+        if credential_generation_id is not None:
+            try:
+                parsed_generation_id = uuid.UUID(credential_generation_id)
+            except (AttributeError, ValueError):
+                raise PITCollectionError("credential route identity is invalid") from None
+            if (
+                parsed_generation_id.version != 4
+                or str(parsed_generation_id) != credential_generation_id
+            ):
+                raise PITCollectionError("credential route identity is invalid")
         self.store = store
         self._token = str(token)
         frozen_overrides = tuple(
@@ -681,6 +724,10 @@ class ControlledTushareCollector:
             proxy_endpoint=proxy_endpoint,
             allow_insecure_http=bool(allow_insecure_http),
             row_cap_overrides=frozen_overrides,
+            credential_slot_id=credential_slot_id,
+            credential_route_purpose=credential_route_purpose,
+            credential_route_id_prefix=credential_route_id_prefix,
+            credential_generation_id=credential_generation_id,
         )
         # Freeze a private JSON-shaped copy so caller mutation cannot change the
         # collection authority after request semantics have been pinned.
@@ -767,6 +814,22 @@ class ControlledTushareCollector:
     @property
     def row_cap_overrides(self) -> dict[str, int]:
         return dict(self._source_authority.row_cap_overrides)
+
+    @property
+    def credential_slot_id(self) -> str | None:
+        return self._source_authority.credential_slot_id
+
+    @property
+    def credential_route_purpose(self) -> str | None:
+        return self._source_authority.credential_route_purpose
+
+    @property
+    def credential_route_id_prefix(self) -> str | None:
+        return self._source_authority.credential_route_id_prefix
+
+    @property
+    def credential_generation_id(self) -> str | None:
+        return self._source_authority.credential_generation_id
 
     def _authority_guard(self) -> None:
         authority = self._temporal_authority
@@ -1077,7 +1140,7 @@ class ControlledTushareCollector:
 
     def _request_semantics(self, spec: FetchSpec) -> dict[str, Any]:
         source = self._source_authority
-        return {
+        semantics = {
             "schema_version": "tushare-wire-request/v1",
             "source_profile": source.source_profile,
             "request_protocol": source.request_protocol,
@@ -1095,6 +1158,15 @@ class ControlledTushareCollector:
             "temporal_role": self._temporal_authority.role,
             "temporal_contract_sha256": self._temporal_authority.contract_sha256,
         }
+        if source.credential_slot_id is not None:
+            semantics["credential_slot_id"] = source.credential_slot_id
+            semantics["credential_route_purpose"] = source.credential_route_purpose
+            semantics["credential_route_id"] = (
+                f"{source.credential_route_id_prefix}:"
+                f"{source.credential_slot_id}:{spec.api_name}"
+            )
+            semantics["credential_generation_id"] = source.credential_generation_id
+        return semantics
 
     def _request_url(self, spec: FetchSpec) -> str:
         source = self._source_authority

@@ -424,6 +424,10 @@ def _collector_for_session(
         row_cap_overrides=(
             {"stk_limit": 10_000} if source_profile == "jiaoch" else None
         ),
+        credential_slot_id="points-primary",
+        credential_route_purpose="factor-v3-feature-history",
+        credential_route_id_prefix="feature-history",
+        credential_generation_id=PUBLICATION_CAPABILITY,
         temporal_contract=contract,
         temporal_role=role,
         temporal_contract_sha256=contract["contract_sha256"],
@@ -578,6 +582,35 @@ def _real_store_fixture(
     return plan, publication, sessions, sealed, refs, database_sha256
 
 
+def _publish_source_bound(
+    *,
+    plan: dict[str, object],
+    publication: dict[str, object],
+    store: PITReceiptStore,
+) -> tuple[Path, dict[str, object]]:
+    publication_output_root = Path(store.root).parent / "collection-publication"
+    publication_output_root.mkdir()
+    collection_publication = (
+        history_authority._publish_factor_v3_feature_history_collection_candidate(
+            collection_plan=plan,
+            trade_cal_output_root=Path("synthetic-trade-cal-root"),
+            trade_cal_publication=publication,
+            development_session_refs=_development_refs(
+                plan["development_sessions"]["sessions"]
+            ),
+            temporal_partition_contract=load_temporal_partition_contract(
+                PARTITION_V1_PATH
+            ),
+            pit_store_root=Path(store.root),
+            publication_output_root=publication_output_root,
+            feature_history_route_policy_descriptor=(
+                _feature_history_route_policy_descriptor()
+            ),
+        )
+    )
+    return publication_output_root, collection_publication
+
+
 def _verify_source_bound(
     *,
     plan: dict[str, object],
@@ -586,6 +619,12 @@ def _verify_source_bound(
     refs: list[dict[str, object]],
     database_sha256: str,
 ) -> dict[str, object]:
+    del refs, database_sha256
+    publication_output_root, collection_publication = _publish_source_bound(
+        plan=plan,
+        publication=publication,
+        store=store,
+    )
     return history_authority.verify_factor_v3_feature_history_collection_authority(
         collection_plan=plan,
         trade_cal_output_root=Path("synthetic-trade-cal-root"),
@@ -595,8 +634,8 @@ def _verify_source_bound(
         ),
         temporal_partition_contract=load_temporal_partition_contract(PARTITION_V1_PATH),
         pit_store_root=Path(store.root),
-        expected_pit_store_database_sha256=database_sha256,
-        session_authority_refs=refs,
+        collection_publication_output_root=publication_output_root,
+        collection_publication=collection_publication,
     )
 
 
@@ -698,6 +737,26 @@ def test_producer_binding_covers_direct_semantic_dependencies_and_loaded_identit
         "loaded_execution_root_sha256"
     ]
     assert before["root_sha256"] != after["root_sha256"]
+
+    def replacement(
+        _cls: object,
+        _attempt: object,
+        *,
+        dataset: str,
+        partition_key: str,
+        marker: str = "replacement-default",
+    ) -> tuple[dict[str, object], str, str]:
+        return ({"marker": marker}, dataset, partition_key)
+
+    monkeypatch.setattr(
+        PITReceiptStore,
+        "_membership_attempt_authority",
+        classmethod(replacement),
+    )
+    class_method_after = history_authority._producer_binding()
+    assert class_method_after["loaded_execution_root_sha256"] != after[
+        "loaded_execution_root_sha256"
+    ]
 
 
 def test_trade_calendar_loader_requires_offline_verifier_and_content_address(
@@ -1173,7 +1232,7 @@ def test_formal_authority_rejects_semantic_empty_instead_of_exact_bak_basic(
         )
 
 
-def test_formal_authority_rejects_forged_caller_session_refs(
+def test_formal_authority_does_not_accept_caller_session_refs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1181,16 +1240,79 @@ def test_formal_authority_rejects_forged_caller_session_refs(
         tmp_path,
         monkeypatch,
     )
-    forged = deepcopy(refs)
-    forged[0]["bak_basic_normalized_rows_sha256"] = SHA_A
+    assert "session_authority_refs" not in inspect.signature(
+        history_authority.verify_factor_v3_feature_history_collection_authority
+    ).parameters
+    receipt = _verify_source_bound(
+        plan=plan,
+        publication=publication,
+        store=store,
+        refs=refs,
+        database_sha256=database_sha256,
+    )
+    assert receipt["session_authority_refs_sha256"] == canonical_sha256(refs)
 
-    with pytest.raises(ValueError, match="session authority"):
-        _verify_source_bound(
-            plan=plan,
-            publication=publication,
-            store=store,
-            refs=forged,
-            database_sha256=database_sha256,
+
+def test_collection_publication_is_strictly_six_fields_and_capability_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, publication, _sessions, store, _refs, _database_sha256 = _real_store_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    output_root, collection_publication = _publish_source_bound(
+        plan=plan,
+        publication=publication,
+        store=store,
+    )
+    assert set(collection_publication) == {
+        "authority_manifest_created",
+        "authority_manifest_relative_path",
+        "authority_manifest_sha256",
+        "publication_capability",
+        "publication_status",
+        "schema",
+    }
+    tampered = deepcopy(collection_publication)
+    tampered["publication_capability"] = "9a91dd99-1579-4dba-9b13-dd1c56b0760f"
+    with pytest.raises(ValueError, match="capability"):
+        history_authority.verify_factor_v3_feature_history_collection_authority(
+            collection_publication=tampered,
+            collection_publication_output_root=output_root,
+            collection_plan=plan,
+            development_session_refs=_development_refs(
+                plan["development_sessions"]["sessions"]
+            ),
+            pit_store_root=Path(store.root),
+            temporal_partition_contract=load_temporal_partition_contract(
+                PARTITION_V1_PATH
+            ),
+            trade_cal_output_root=Path("synthetic-trade-cal-root"),
+            trade_cal_publication=publication,
+        )
+
+    issuance = history_authority._collection_publication_issuance(
+        collection_publication
+    )
+    issuance_path = output_root / history_authority._collection_issuance_relative_path(
+        issuance
+    )
+    issuance_path.unlink()
+    with pytest.raises(ValueError, match="issuance"):
+        history_authority.verify_factor_v3_feature_history_collection_authority(
+            collection_publication=collection_publication,
+            collection_publication_output_root=output_root,
+            collection_plan=plan,
+            development_session_refs=_development_refs(
+                plan["development_sessions"]["sessions"]
+            ),
+            pit_store_root=Path(store.root),
+            temporal_partition_contract=load_temporal_partition_contract(
+                PARTITION_V1_PATH
+            ),
+            trade_cal_output_root=Path("synthetic-trade-cal-root"),
+            trade_cal_publication=publication,
         )
 
 
@@ -1241,22 +1363,36 @@ def test_formal_authority_derives_and_requires_upstream_star_and_beijing_rows(
         )
 
 
-def test_formal_authority_rejects_wrong_database_anchor(
+def test_formal_authority_rejects_database_drift_after_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    plan, publication, _sessions, store, refs, _database_sha256 = _real_store_fixture(
+    plan, publication, _sessions, store, _refs, _database_sha256 = _real_store_fixture(
         tmp_path,
         monkeypatch,
     )
+    publication_output_root, collection_publication = _publish_source_bound(
+        plan=plan,
+        publication=publication,
+        store=store,
+    )
+    database = Path(store.database_path)
+    database.write_bytes(database.read_bytes() + b"drift")
 
     with pytest.raises(ValueError, match="database"):
-        _verify_source_bound(
-            plan=plan,
-            publication=publication,
-            store=store,
-            refs=refs,
-            database_sha256=SHA_A,
+        history_authority.verify_factor_v3_feature_history_collection_authority(
+            collection_publication=collection_publication,
+            collection_publication_output_root=publication_output_root,
+            collection_plan=plan,
+            development_session_refs=_development_refs(
+                plan["development_sessions"]["sessions"]
+            ),
+            pit_store_root=Path(store.root),
+            temporal_partition_contract=load_temporal_partition_contract(
+                PARTITION_V1_PATH
+            ),
+            trade_cal_output_root=Path("synthetic-trade-cal-root"),
+            trade_cal_publication=publication,
         )
 
 
@@ -1268,10 +1404,8 @@ def test_formal_authority_rejects_raw_receipt_tamper_even_with_refreshed_databas
         tmp_path,
         monkeypatch,
     )
-    with sqlite3.connect(
-        f"{Path(store.database_path).resolve().as_uri()}?mode=ro&immutable=1",
-        uri=True,
-    ) as connection:
+    with sqlite3.connect(store.database_path) as connection:
+        connection.row_factory = sqlite3.Row
         raw_path = connection.execute(
             "SELECT raw_path FROM receipts WHERE dataset='bak_basic' ORDER BY partition_key LIMIT 1"
         ).fetchone()[0]
@@ -1381,6 +1515,87 @@ def test_replay_reopens_every_raw_after_midflight_replacement(
         )
 
 
+def test_closed_store_scope_rejects_unrelated_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _plan, _publication, sessions, store, _refs, _database_sha256 = _real_store_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO stock_basic_generations (
+                generation_sequence, generation_id, scope_key, contract_sha256,
+                status, started_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (999, "unrelated-stock-basic", "unrelated", SHA_A, "abandoned", "2024-01-04T00:00:00+00:00"),
+        )
+    with sqlite3.connect(store.database_path) as connection:
+        with pytest.raises(ValueError, match="scope"):
+            history_authority._validate_closed_collection_store_scope(
+                connection=connection,
+                sessions=sessions,
+            )
+
+
+def test_market_attempt_scope_checks_every_unselected_attempt_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _plan, _publication, sessions, store, _refs, _database_sha256 = _real_store_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        original = dict(
+            connection.execute(
+                """
+                SELECT * FROM fetch_attempts
+                WHERE dataset='daily' AND partition_key=?
+                """,
+                (sessions[0],),
+            ).fetchone()
+        )
+    semantics = json.loads(original["request_semantics_json"])
+    semantics["url"] = "https://not-jiaoch.example.test/daily"
+    store.record_fetch_attempt(
+        dataset="daily",
+        partition_key=sessions[0],
+        endpoint="daily",
+        params=json.loads(original["params_json"]),
+        fields=json.loads(original["fields_json"]),
+        wire_request_sha256=original["wire_request_sha256"],
+        raw_bytes=Path(store.root, original["raw_path"]).read_bytes(),
+        http_status=original["http_status"],
+        started_at=original["started_at"],
+        retrieved_at=original["retrieved_at"],
+        elapsed_ns=original["elapsed_ns"],
+        row_cap=original["row_cap"],
+        body_complete=True,
+        response_headers=json.loads(original["response_headers_json"]),
+        clock_attestation=json.loads(original["clock_attestation_json"]),
+        error_kind="invalid_json",
+        request_body_sha256=original["wire_request_sha256"],
+        request_semantics=semantics,
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        with pytest.raises(ValueError, match="Jiaoch source"):
+            history_authority._validated_market_attempt_routes_on_connection(
+                store=store,
+                connection=connection,
+                trade_date=sessions[0],
+                expected_temporal_role="development",
+                expected_temporal_contract_sha256=load_temporal_partition_contract(
+                    PARTITION_V1_PATH
+                )["contract_sha256"],
+            )
+
+
 def test_formal_authority_rejects_wal_or_shm_instead_of_ignoring_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1428,26 +1643,41 @@ def test_formal_authority_is_structurally_strict(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    plan, publication, _sessions, store, refs, database_sha256 = _real_store_fixture(
+    plan, publication, sessions, store, _refs, _database_sha256 = _real_store_fixture(
         tmp_path,
         monkeypatch,
     )
-    unexpected = deepcopy(refs)
-    unexpected[0]["surprise"] = True
+    output_root, collection_publication = _publish_source_bound(
+        plan=plan,
+        publication=publication,
+        store=store,
+    )
+    unexpected = deepcopy(collection_publication)
+    unexpected["surprise"] = True
     with pytest.raises(ValueError, match="fields"):
-        _verify_source_bound(
-            plan=plan,
-            publication=publication,
-            store=store,
-            refs=unexpected,
-            database_sha256=database_sha256,
+        history_authority.verify_factor_v3_feature_history_collection_authority(
+            collection_publication=unexpected,
+            collection_publication_output_root=output_root,
+            collection_plan=plan,
+            development_session_refs=_development_refs(
+                plan["development_sessions"]["sessions"]
+            ),
+            pit_store_root=Path(store.root),
+            temporal_partition_contract=load_temporal_partition_contract(
+                PARTITION_V1_PATH
+            ),
+            trade_cal_output_root=Path("synthetic-trade-cal-root"),
+            trade_cal_publication=publication,
         )
 
+    manifest = history_authority._read_collection_manifest(
+        output_root=output_root,
+        publication=collection_publication,
+    )
+    manifest["session_authority_refs"] = manifest["session_authority_refs"][:-1]
     with pytest.raises(ValueError, match="session authority"):
-        _verify_source_bound(
-            plan=plan,
-            publication=publication,
-            store=store,
-            refs=refs[:-1],
-            database_sha256=database_sha256,
+        history_authority._validated_collection_manifest(
+            manifest,
+            publication=collection_publication,
+            sessions=sessions,
         )
