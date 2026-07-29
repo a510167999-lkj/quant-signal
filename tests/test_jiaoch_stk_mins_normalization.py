@@ -500,6 +500,22 @@ def test_rejects_star_bse_b_shares_funds_cdr_and_board_code_mismatch() -> None:
             _normalize(board=board)
 
 
+def test_accepts_exact_real_provider_descending_order_then_normalizes_ascending() -> None:
+    payload = _payload()
+    payload["data"]["items"].reverse()
+
+    receipt = _normalize(payload)
+
+    assert receipt.opening_special_unresolved.source_label_at.strftime("%H:%M") == "09:30"
+    assert [
+        row.source_label_at.strftime("%H:%M")
+        for row in (
+            receipt.normalized_minutes[0],
+            receipt.normalized_minutes[-1],
+        )
+    ] == ["09:31", "15:00"]
+
+
 def test_requires_exact_unique_ascending_241_label_schedule_without_fill() -> None:
     invalid_payloads = []
     missing = _payload()
