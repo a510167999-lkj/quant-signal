@@ -234,6 +234,34 @@ def test_concurrency_limit_is_distinct_from_permission_denied(
     _assert_unbound(manifest)
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "您的并发请求过多（上限 2个），等待 59 秒后自动恢复!",
+        "您的并发请求过多（上限 2个），请稍后重试!",
+    ],
+)
+def test_observed_concurrency_limit_messages_allow_optional_spacing(
+    tmp_path: Path,
+    monkeypatch,
+    message: str,
+) -> None:
+    transport = RecordingTransport(
+        _response(
+            json.dumps(
+                {"code": -1, "msg": message, "data": None},
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+    )
+
+    _, manifest = _collect(tmp_path, transport, monkeypatch)
+
+    assert manifest["classification"] == "RATE_LIMITED_CONCURRENCY"
+    assert manifest["provider_code"] == -1
+    _assert_unbound(manifest)
+
+
 def test_unclassified_code_minus_one_remains_source_error(
     tmp_path: Path,
     monkeypatch,
