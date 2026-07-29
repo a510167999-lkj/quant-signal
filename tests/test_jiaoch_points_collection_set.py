@@ -616,6 +616,37 @@ def test_transport_failure_has_no_retry_fallback_or_secret_exception_context(
     assert not (tmp_path / "points_collection_sets").exists()
 
 
+def test_final_manifest_verification_failure_rolls_back_manifest_only(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    transport = RecordingTransport([_entity(body) for body in _response_bodies()])
+    monkeypatch.setattr(jiaoch_points_collection_set, "_transport_factory", lambda: transport)
+
+    def failing_verifier(**_kwargs):
+        raise ValueError(f"verification failed {POINTS_TOKEN}")
+
+    monkeypatch.setattr(
+        jiaoch_points_collection_set,
+        "verify_jiaoch_points_collection_set",
+        failing_verifier,
+    )
+
+    with pytest.raises(ValueError, match="collection failed") as caught:
+        collect_jiaoch_points_collection_set(
+            generation=_generation(),
+            output_root=tmp_path,
+            trade_date=TRADE_DATE,
+        )
+
+    assert caught.value.__context__ is None
+    assert POINTS_TOKEN not in str(caught.value)
+    assert len(transport.calls) == 2
+    assert len(list((tmp_path / "raw").rglob("*.body"))) == 2
+    assert len(list((tmp_path / "attempts").rglob("*.json"))) == 2
+    assert not list((tmp_path / "points_collection_sets").rglob("*.json"))
+
+
 def test_credential_echo_on_second_response_is_rejected_before_attempt_write(
     tmp_path: Path,
     monkeypatch,
