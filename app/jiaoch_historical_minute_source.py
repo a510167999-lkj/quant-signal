@@ -89,12 +89,24 @@ def _strict_json_loads(raw: bytes) -> Any:
     def reject_constant(value):
         raise ValueError(f"JSON contains a non-finite value: {value}")
 
+    def reject_nonfinite(value):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("JSON contains a non-finite numeric value")
+        if isinstance(value, Mapping):
+            for item in value.values():
+                reject_nonfinite(item)
+        elif isinstance(value, list):
+            for item in value:
+                reject_nonfinite(item)
+
     try:
-        return json.loads(
+        value = json.loads(
             raw,
             object_pairs_hook=object_pairs,
             parse_constant=reject_constant,
         )
+        reject_nonfinite(value)
+        return value
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("Jiaoch stk_mins response was not valid JSON") from exc
 
