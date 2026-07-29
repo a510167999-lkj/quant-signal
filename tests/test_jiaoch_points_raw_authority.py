@@ -17,6 +17,7 @@ from app.jiaoch_points_raw_authority import (
 
 TOKEN = "points-unit-secret/path"
 RETRIEVED_AT = "2026-07-29T17:30:00+08:00"
+MAX_RAW_BYTES = 32 * 1024 * 1024
 PARAMS = {"trade_date": "20260728", "ts_code": ""}
 DAILY_BASIC_FIELDS = (
     "ts_code,trade_date,turnover_rate,turnover_rate_f,free_share,float_share,total_mv,circ_mv"
@@ -313,7 +314,7 @@ def test_only_single_trade_date_full_cross_section_and_fixed_fields_are_allowed(
     "overrides",
     [
         {"raw_body": bytearray(RAW)},
-        {"raw_body": b"x" * (1024 * 1024 + 1)},
+        {"raw_body": b"x" * (MAX_RAW_BYTES + 1)},
         {"credential_slot_id": "historical-minute"},
         {"credential_slot_id": "../points"},
         {"network_route": "automatic-fallback"},
@@ -370,6 +371,23 @@ def test_credential_echo_is_rejected_before_any_write(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_full_market_raw_body_at_32_mib_bound_is_persisted_and_verified(
+    tmp_path: Path,
+) -> None:
+    raw = b"x" * MAX_RAW_BYTES
+
+    publication = _publish(tmp_path, raw=raw)
+
+    assert jiaoch_points_raw_authority._MAX_RAW_BYTES == MAX_RAW_BYTES
+    assert (tmp_path / publication["raw_relative_path"]).stat().st_size == MAX_RAW_BYTES
+    verified = verify_jiaoch_points_raw_attempt(
+        output_root=tmp_path,
+        attempt_relative_path=publication["attempt_relative_path"],
+        expected_attempt_sha256=publication["attempt_sha256"],
+    )
+    assert verified["raw_bytes"] == MAX_RAW_BYTES
+
+
 def test_excessively_deep_json_is_rejected_by_bounded_echo_scan_before_writes(
     tmp_path: Path,
 ) -> None:
@@ -404,7 +422,7 @@ def test_existing_oversized_raw_conflict_is_rejected_before_unbounded_read(
     destination = tmp_path / "raw" / "sha256" / digest[:2] / f"{digest}.body"
     destination.parent.mkdir(parents=True)
     with destination.open("wb") as handle:
-        handle.seek(1024 * 1024)
+        handle.seek(MAX_RAW_BYTES)
         handle.write(b"x")
     original_read_bytes = Path.read_bytes
 
@@ -418,7 +436,7 @@ def test_existing_oversized_raw_conflict_is_rejected_before_unbounded_read(
     with pytest.raises(ValueError, match="raw content-addressed object.*size"):
         _publish(tmp_path)
 
-    assert destination.stat().st_size == 1024 * 1024 + 1
+    assert destination.stat().st_size == MAX_RAW_BYTES + 1
     assert not (tmp_path / "attempts").exists()
 
 
