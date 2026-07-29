@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -465,6 +466,32 @@ def test_existing_conflicting_raw_object_is_rejected_without_overwrite(
     assert not (tmp_path / "attempts").exists()
 
 
+def test_existing_oversized_raw_conflict_is_rejected_before_unbounded_read(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    digest = hashlib.sha256(RAW).hexdigest()
+    destination = tmp_path / "raw" / "sha256" / digest[:2] / f"{digest}.body"
+    destination.parent.mkdir(parents=True)
+    with destination.open("wb") as handle:
+        handle.seek(1024 * 1024)
+        handle.write(b"x")
+    original_read_bytes = Path.read_bytes
+
+    def guarded_read_bytes(path: Path) -> bytes:
+        if path == destination:
+            raise AssertionError("oversized raw object was read without a bound")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+
+    with pytest.raises(ValueError, match="raw content-addressed object.*size"):
+        _publish(tmp_path)
+
+    assert destination.stat().st_size == 1024 * 1024 + 1
+    assert not (tmp_path / "attempts").exists()
+
+
 def test_offline_verifier_recomputes_raw_sha_and_size(tmp_path: Path) -> None:
     publication = _publish(tmp_path)
     raw_path = tmp_path / publication["raw_relative_path"]
@@ -476,6 +503,35 @@ def test_offline_verifier_recomputes_raw_sha_and_size(tmp_path: Path) -> None:
             attempt_relative_path=publication["attempt_relative_path"],
             expected_attempt_sha256=publication["attempt_sha256"],
         )
+
+
+def test_offline_verifier_rejects_identity_swap_between_preflight_and_open(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    publication = _publish(tmp_path)
+    raw_path = (tmp_path / publication["raw_relative_path"]).resolve()
+    replacement = tmp_path / "same-bytes-replacement.body"
+    replacement.write_bytes(RAW)
+    original_open = os.open
+    swapped = False
+
+    def swapping_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and Path(path).resolve() == raw_path:
+            os.replace(replacement, raw_path)
+            swapped = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+
+    with pytest.raises(ValueError, match="identity"):
+        verify_jiaoch_minute_raw_attempt(
+            output_root=tmp_path,
+            attempt_relative_path=publication["attempt_relative_path"],
+            expected_attempt_sha256=publication["attempt_sha256"],
+        )
+    assert swapped is True
 
 
 @pytest.mark.parametrize(
