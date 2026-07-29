@@ -26,6 +26,7 @@ _PATH = "/stk_mins"
 _FREQ = "1min"
 _MAX_BODY_BYTES = 1024 * 1024
 _MAX_DIAGNOSTIC_BYTES = 128 * 1024
+_MAX_JSON_NESTING_DEPTH = 64
 _TS_CODE_PATTERN = re.compile(r"[0-9]{6}\.(?:SH|SZ)")
 _HEX = frozenset("0123456789abcdef")
 _CLASSIFICATIONS = frozenset(
@@ -78,6 +79,31 @@ def _canonical_json(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def _iter_bounded_json_tree(value: Any):
+    stack = [(value, 0)]
+    seen_containers: set[int] = set()
+    while stack:
+        item, depth = stack.pop()
+        if depth > _MAX_JSON_NESTING_DEPTH:
+            raise ValueError("JSON nesting depth exceeded")
+        yield item
+        if isinstance(item, Mapping):
+            identity = id(item)
+            if identity in seen_containers:
+                raise ValueError("JSON tree contains a repeated container")
+            seen_containers.add(identity)
+            for key, nested in reversed(tuple(item.items())):
+                stack.append((nested, depth + 1))
+                stack.append((key, depth + 1))
+        elif isinstance(item, (list, tuple)):
+            identity = id(item)
+            if identity in seen_containers:
+                raise ValueError("JSON tree contains a repeated container")
+            seen_containers.add(identity)
+            for nested in reversed(item):
+                stack.append((nested, depth + 1))
+
+
 def _strict_json_loads(raw: bytes) -> Any:
     def object_pairs(pairs):
         result = {}
@@ -90,41 +116,24 @@ def _strict_json_loads(raw: bytes) -> Any:
     def reject_constant(value):
         raise ValueError(f"JSON contains a non-finite value: {value}")
 
-    def reject_nonfinite(value):
-        if isinstance(value, float) and not math.isfinite(value):
-            raise ValueError("JSON contains a non-finite numeric value")
-        if isinstance(value, Mapping):
-            for item in value.values():
-                reject_nonfinite(item)
-        elif isinstance(value, list):
-            for item in value:
-                reject_nonfinite(item)
-
     try:
         value = json.loads(
             raw,
             object_pairs_hook=object_pairs,
             parse_constant=reject_constant,
         )
-        reject_nonfinite(value)
-        return value
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ValueError("Jiaoch stk_mins response was not valid JSON") from exc
+    for item in _iter_bounded_json_tree(value):
+        if isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("JSON contains a non-finite numeric value")
+    return value
 
 
 def _contains_semantic_token(value: Any, token: str) -> bool:
     if not token:
         return False
-    if isinstance(value, str):
-        return token in value
-    if isinstance(value, Mapping):
-        return any(
-            _contains_semantic_token(key, token) or _contains_semantic_token(item, token)
-            for key, item in value.items()
-        )
-    if isinstance(value, (list, tuple)):
-        return any(_contains_semantic_token(item, token) for item in value)
-    return False
+    return any(isinstance(item, str) and token in item for item in _iter_bounded_json_tree(value))
 
 
 def _valid_sha256(value: Any) -> bool:
@@ -367,6 +376,7 @@ def _response_manifest(
 def verify_jiaoch_historical_minute_diagnostic(
     payload: Mapping[str, Any],
 ) -> dict[str, Any]:
+    tuple(_iter_bounded_json_tree(payload))
     if (
         not isinstance(payload, Mapping)
         or set(payload) != {*_UNSIGNED_FIELDS, "descriptor_sha256"}

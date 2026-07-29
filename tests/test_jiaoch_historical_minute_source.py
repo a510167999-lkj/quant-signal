@@ -276,13 +276,7 @@ def test_deep_bounded_response_is_stably_rejected_without_rows_or_authority(
     monkeypatch,
 ) -> None:
     depth = 600
-    raw = (
-        b'{"code":0,"msg":'
-        + b"[" * depth
-        + b'"safe"'
-        + b"]" * depth
-        + b',"data":{}}'
-    )
+    raw = b'{"code":0,"msg":' + b"[" * depth + b'"safe"' + b"]" * depth + b',"data":{}}'
     assert len(raw) < 1024 * 1024
     transport = RecordingTransport(_response(raw))
 
@@ -301,9 +295,7 @@ def test_loader_maps_deep_descriptor_to_stable_public_value_error(
     monkeypatch,
 ) -> None:
     transport = RecordingTransport(
-        _response(
-            '{"code":-1,"msg":"权限不足: stk_mins 未授权","data":null}'.encode("utf-8")
-        )
+        _response('{"code":-1,"msg":"权限不足: stk_mins 未授权","data":null}'.encode("utf-8"))
     )
     _, manifest = _collect(tmp_path / "seed", transport, monkeypatch)
     manifest["request_semantics"] = "__DEEP__"
