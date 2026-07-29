@@ -13,6 +13,7 @@ from app.audited_pit_factor_v3_points_contract import (
     FACTOR_V3_POINTS_CONTRACT,
     FACTOR_V3_POINTS_CONTRACT_SHA256,
     FACTOR_V3_POINTS_FEATURE_NAMES,
+    FACTOR_V3_POINTS_PARENT_EXPECTATION_SHA256,
     canonical_sha256,
     compute_abnormal_turnover_rate_f_20_to_250,
     factor_v3_points_arm_contract,
@@ -143,15 +144,20 @@ def test_contract_freezes_scope_lag_features_arms_and_safety_gate() -> None:
         "verified_factor_v2_parent_descriptor": {
             "required": True,
             "present": False,
+            "descriptor_sha256": None,
         },
         "authoritative_extended_trading_calendar_descriptor": {
             "required": True,
             "present": False,
+            "descriptor_root_sha256": None,
         },
         "verified_jiaoch_points_collection_and_normalized_row_authority": {
             "required": True,
             "present": False,
+            "collection_set_root_sha256": None,
+            "normalized_row_authority_root_sha256": None,
             "source_bound_context_required": True,
+            "source_bound_context_root_sha256": None,
         },
         "all_present": False,
         "formal_materializer_implemented": False,
@@ -169,6 +175,17 @@ def test_contract_freezes_scope_lag_features_arms_and_safety_gate() -> None:
     assert FACTOR_V3_POINTS_CONTRACT["production_profile_registered"] is False
     assert FACTOR_V3_POINTS_CONTRACT["production_recommendation_eligible"] is False
     assert canonical_sha256(FACTOR_V3_POINTS_CONTRACT) == (FACTOR_V3_POINTS_CONTRACT_SHA256)
+    assert FACTOR_V3_POINTS_PARENT_EXPECTATION_SHA256 == (
+        "5267707efcbee9088fd44ddc44f68bb686982d75b97514a091db79620e7b289f"
+    )
+    assert FACTOR_V3_POINTS_CONTRACT_SHA256 == (
+        "ab34593e75abad87e41ab82b2961a4cb7177d4d3568cf605b7afa2d227699245"
+    )
+    assert dict(FACTOR_V3_POINTS_ARM_STRATEGY_SHA256) == {
+        "control": "f72026779fb336825ead11b10a0b8ea91e102ea667b9a5082d2c9c8b2c534483",
+        "turnover_level": "363a7e8a4a99aa8c3645bcba62dcd4c69da05c48b7fe365de88887dab813f7c8",
+        "abnormal_turnover": "87d75a57de221b2d66e52ab378da60ba270d348419a640eb6594a240837f5cc0",
+    }
 
 
 def test_arm_contracts_are_individually_content_addressed() -> None:
@@ -231,6 +248,8 @@ def test_unbound_preview_uses_last_input_label_and_deterministic_midranks() -> N
     receipt = result["unbound_preview_receipt"]
     assert receipt["schema_version"] == ("audited-pit-factor-v3-points-unbound-preview/v1")
     assert receipt["authority_status"] == "UNBOUND_PREVIEW_ONLY"
+    assert receipt["row_authority_status"] == "NOT_GRANTED"
+    assert receipt["receipt_sha256_semantics"] == ("preview_self_integrity_only_not_authority")
     assert receipt["parent_input_row_count"] == len(parents)
     assert receipt["preview_output_row_count"] == len(parents)
     assert receipt["preview_dropped_input_row_count"] == 0
@@ -238,6 +257,9 @@ def test_unbound_preview_uses_last_input_label_and_deterministic_midranks() -> N
     assert receipt["session_calendar_authority_verified"] is False
     assert receipt["daily_basic_row_authority_verified"] is False
     assert receipt["formal_materialization_performed"] is False
+    assert receipt["formal_receipt_eligible"] is False
+    assert receipt["ordered_date_labels_are_market_sessions"] is False
+    assert receipt["pit_claimed"] is False
     assert receipt["experiment_launch_eligible"] is False
     assert receipt["embargo_consumed"] is False
     assert receipt["final_oos_consumed"] is False
@@ -270,6 +292,14 @@ def test_old_formal_materializer_name_is_not_public() -> None:
         points_contract_module,
         "materialize_factor_v3_points_rows",
     )
+    assert not hasattr(
+        points_contract_module,
+        "factor_v3_parent_identity_root",
+    )
+    assert not hasattr(
+        points_contract_module,
+        "FACTOR_V3_POINTS_PARENT_BINDING_ROOT_SHA256",
+    )
 
 
 def test_natural_dates_and_arbitrary_subsample_remain_unbound_preview() -> None:
@@ -286,6 +316,7 @@ def test_natural_dates_and_arbitrary_subsample_remain_unbound_preview() -> None:
     assert receipt["session_calendar_authority_verified"] is False
     assert receipt["daily_basic_row_authority_verified"] is False
     assert receipt["formal_materialization_performed"] is False
+    assert receipt["formal_receipt_eligible"] is False
 
 
 @pytest.mark.parametrize("ts_code", ["688001.SH", "920001.BJ", "430001.BJ"])

@@ -30,7 +30,6 @@ FACTOR_V3_POINTS_ARMS: Mapping[str, tuple[str, ...]] = MappingProxyType(
     }
 )
 
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _TS_CODE_RE = re.compile(r"^[0-9]{6}\.(?:SH|SZ)$")
 _SESSION_FIELDS = frozenset({"session_position", "trade_date"})
 _PARENT_FIELDS = frozenset({"candidate_key", "signal_date", "ts_code"})
@@ -54,8 +53,8 @@ def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
-_FACTOR_V3_POINTS_PARENT_BINDING = {
-    "schema_version": "audited-pit-factor-v3-points-parent-binding/v1",
+_FACTOR_V3_POINTS_PARENT_EXPECTATION = {
+    "schema_version": "audited-pit-factor-v3-points-parent-expectation/v1",
     "sample_reference": "factor_v2_development_4_common_eligible_sample",
     "factor_v2_parent_artifact_sha256": (
         "9cff7474222360ed830d0f24164864dcb946695464467c8be9ccc5dda2b33469"
@@ -82,23 +81,23 @@ _FACTOR_V3_POINTS_PARENT_BINDING = {
         "sha256": ("d4dd11e90438a407ba470398a218696a3abe4151881dd41956248dace37c27b6"),
     },
 }
-FACTOR_V3_POINTS_PARENT_BINDING_ROOT_SHA256 = (
-    "de7c9a3715631d186e730d775673df1ed753717be44029b6c12dba34e56a5ef5"
+FACTOR_V3_POINTS_PARENT_EXPECTATION_SHA256 = (
+    "5267707efcbee9088fd44ddc44f68bb686982d75b97514a091db79620e7b289f"
 )
 if (
-    canonical_sha256(_FACTOR_V3_POINTS_PARENT_BINDING)
-    != FACTOR_V3_POINTS_PARENT_BINDING_ROOT_SHA256
+    canonical_sha256(_FACTOR_V3_POINTS_PARENT_EXPECTATION)
+    != FACTOR_V3_POINTS_PARENT_EXPECTATION_SHA256
 ):
-    raise RuntimeError("frozen factor-v3 points parent binding drifted")
+    raise RuntimeError("frozen factor-v3 points parent expectation drifted")
 
 FACTOR_V3_POINTS_CONTRACT = {
     "schema_version": "audited-pit-factor-v3-points-contract/v1",
     "temporal_role": "development_4",
     "development_only": True,
     "market_scope": market_scope_contract(),
-    "parent_binding": deepcopy(_FACTOR_V3_POINTS_PARENT_BINDING),
-    "parent_binding_root_sha256": (FACTOR_V3_POINTS_PARENT_BINDING_ROOT_SHA256),
-    "parent_sample_policy": {
+    "preregistered_parent_expectation": deepcopy(_FACTOR_V3_POINTS_PARENT_EXPECTATION),
+    "preregistered_parent_expectation_sha256": (FACTOR_V3_POINTS_PARENT_EXPECTATION_SHA256),
+    "formal_parent_sample_policy": {
         "identity_fields": ["candidate_key", "signal_date"],
         "coverage": "exact_full_parent",
         "arbitrary_row_drops_permitted": False,
@@ -179,6 +178,37 @@ FACTOR_V3_POINTS_CONTRACT = {
         "project_frozen_oof_is_only_return_authority": True,
         "mainboard_value_weighting_and_capacity_must_be_reported": True,
     },
+    "formal_materialization_prerequisites": {
+        "verified_factor_v2_parent_descriptor": {
+            "required": True,
+            "present": False,
+            "descriptor_sha256": None,
+        },
+        "authoritative_extended_trading_calendar_descriptor": {
+            "required": True,
+            "present": False,
+            "descriptor_root_sha256": None,
+        },
+        "verified_jiaoch_points_collection_and_normalized_row_authority": {
+            "required": True,
+            "present": False,
+            "collection_set_root_sha256": None,
+            "normalized_row_authority_root_sha256": None,
+            "source_bound_context_required": True,
+            "source_bound_context_root_sha256": None,
+        },
+        "all_present": False,
+        "formal_materializer_implemented": False,
+    },
+    "preview_policy": {
+        "authority_status": "UNBOUND_PREVIEW_ONLY",
+        "parent_authority_verified": False,
+        "session_calendar_authority_verified": False,
+        "daily_basic_row_authority_verified": False,
+        "formal_materialization_performed": False,
+        "ordered_date_labels_are_market_sessions": False,
+        "pit_claimed": False,
+    },
     "experiment_gate": {
         "factor_v2_verified_terminal_decision_required": True,
         "factor_v2_verified_terminal_decision_present": False,
@@ -190,16 +220,16 @@ FACTOR_V3_POINTS_CONTRACT = {
     "production_recommendation_eligible": False,
 }
 FACTOR_V3_POINTS_CONTRACT_SHA256 = (
-    "791ca95296969424f0255ef7aeb011e98b4051e0e2b62dbdac12213716b3448b"
+    "ab34593e75abad87e41ab82b2961a4cb7177d4d3568cf605b7afa2d227699245"
 )
 if canonical_sha256(FACTOR_V3_POINTS_CONTRACT) != FACTOR_V3_POINTS_CONTRACT_SHA256:
     raise RuntimeError("frozen factor-v3 points contract drifted")
 
 FACTOR_V3_POINTS_ARM_STRATEGY_SHA256: Mapping[str, str] = MappingProxyType(
     {
-        "control": ("cd6e0e40954c5ad7f956b10b9426d3e40ce07e7e3cd6292baa7a4a32620259f9"),
-        "turnover_level": ("0d9bd4d0801e0f6a71e8c9d509cb3cb417efa8ad895c152d9363dff43a93459a"),
-        "abnormal_turnover": ("a0754536544368a9b3743f5b6f7a0ced62529a2bbbae85f0f6aa0d4f828028b9"),
+        "control": ("f72026779fb336825ead11b10a0b8ea91e102ea667b9a5082d2c9c8b2c534483"),
+        "turnover_level": ("363a7e8a4a99aa8c3645bcba62dcd4c69da05c48b7fe365de88887dab813f7c8"),
+        "abnormal_turnover": ("87d75a57de221b2d66e52ab378da60ba270d348419a640eb6594a240837f5cc0"),
     }
 )
 
@@ -276,12 +306,6 @@ def _strict_number(value: Any, *, field: str) -> float:
     if not math.isfinite(output):
         raise ValueError(f"factor-v3 {field} must be finite")
     return output
-
-
-def _strict_sha256(value: Any, *, field: str) -> str:
-    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
-        raise ValueError(f"factor-v3 {field} must be a SHA-256")
-    return value
 
 
 def _validated_sessions(
@@ -375,12 +399,6 @@ def _parent_identity_payload(
     ]
 
 
-def factor_v3_parent_identity_root(
-    parent_rows: Sequence[Mapping[str, Any]],
-) -> str:
-    return canonical_sha256(_parent_identity_payload(parent_rows))
-
-
 def compute_abnormal_turnover_rate_f_20_to_250(
     history: Sequence[Any],
 ) -> float:
@@ -461,15 +479,17 @@ def _arm_strategy_payload(arm: str) -> dict[str, Any]:
         "arm": arm,
         "points_feature_names": list(FACTOR_V3_POINTS_ARMS[arm]),
         "base_model_and_evaluation": ("inherit_exact_factor_v2_verified_terminal_decision"),
-        "sample_policy_sha256": canonical_sha256(FACTOR_V3_POINTS_CONTRACT["parent_sample_policy"]),
+        "sample_policy_sha256": canonical_sha256(
+            FACTOR_V3_POINTS_CONTRACT["formal_parent_sample_policy"]
+        ),
         "combination_search_permitted": False,
     }
 
 
 def assert_frozen_factor_v3_points_contract() -> None:
     if (
-        canonical_sha256(_FACTOR_V3_POINTS_PARENT_BINDING)
-        != FACTOR_V3_POINTS_PARENT_BINDING_ROOT_SHA256
+        canonical_sha256(_FACTOR_V3_POINTS_PARENT_EXPECTATION)
+        != FACTOR_V3_POINTS_PARENT_EXPECTATION_SHA256
         or canonical_sha256(FACTOR_V3_POINTS_CONTRACT) != FACTOR_V3_POINTS_CONTRACT_SHA256
         or set(FACTOR_V3_POINTS_ARM_STRATEGY_SHA256) != set(FACTOR_V3_POINTS_ARMS)
         or any(
@@ -491,25 +511,15 @@ def factor_v3_points_arm_contract(arm: str) -> dict[str, Any]:
     }
 
 
-def materialize_factor_v3_points_rows(
+def preview_factor_v3_points_rows_unbound(
     *,
     sessions: Sequence[Mapping[str, Any]],
     parent_rows: Sequence[Mapping[str, Any]],
     daily_basic_rows: Sequence[Mapping[str, Any]],
-    parent_binding_root_sha256: str,
-    expected_parent_identity_root_sha256: str,
 ) -> dict[str, Any]:
+    """Compute strict factor math without claiming parent, PIT, or row authority."""
+
     assert_frozen_factor_v3_points_contract()
-    supplied_parent_binding = _strict_sha256(
-        parent_binding_root_sha256,
-        field="parent binding root",
-    )
-    if supplied_parent_binding != FACTOR_V3_POINTS_PARENT_BINDING_ROOT_SHA256:
-        raise ValueError("factor-v3 parent binding root drifted")
-    expected_identity = _strict_sha256(
-        expected_parent_identity_root_sha256,
-        field="parent identity root",
-    )
     normalized_sessions = _validated_sessions(sessions)
     normalized_parents = _validated_parent_rows(parent_rows)
     parent_identity_payload = [
@@ -520,8 +530,6 @@ def materialize_factor_v3_points_rows(
         for row in normalized_parents
     ]
     observed_identity = canonical_sha256(parent_identity_payload)
-    if observed_identity != expected_identity:
-        raise ValueError("factor-v3 parent identity root drifted")
 
     dates = [trade_date for _, trade_date in normalized_sessions]
     position_by_date = {trade_date: ordinal for ordinal, trade_date in enumerate(dates)}
@@ -532,7 +540,7 @@ def materialize_factor_v3_points_rows(
         if signal_position is None:
             raise ValueError("factor-v3 parent signal_date is outside sessions")
         if signal_position < 250:
-            raise ValueError("factor-v3 parent lacks 250 prior market sessions")
+            raise ValueError("factor-v3 preview parent lacks 250 prior ordered input labels")
         window = tuple(dates[signal_position - 250 : signal_position])
         windows_by_candidate[parent["candidate_key"]] = window
         required_source_keys.update((parent["ts_code"], trade_date) for trade_date in window)
@@ -581,7 +589,7 @@ def materialize_factor_v3_points_rows(
                 {
                     "candidate_key": row["candidate_key"],
                     "signal_date": signal_date,
-                    "source_session": row["source_session"],
+                    "source_input_date_label": row["source_session"],
                     "turnover_rate_f_rank": level_rank,
                     "abnormal_turnover_rate_f_20_to_250_rank": (abnormal_rank),
                 }
@@ -606,18 +614,27 @@ def materialize_factor_v3_points_rows(
         for ts_code, trade_date in sorted(source)
     ]
     receipt_unsigned = {
-        "schema_version": "audited-pit-factor-v3-points-pure-receipt/v1",
+        "schema_version": ("audited-pit-factor-v3-points-unbound-preview/v1"),
+        "authority_status": "UNBOUND_PREVIEW_ONLY",
+        "row_authority_status": "NOT_GRANTED",
+        "receipt_sha256_semantics": ("preview_self_integrity_only_not_authority"),
         "factor_v3_points_contract_sha256": (FACTOR_V3_POINTS_CONTRACT_SHA256),
-        "parent_binding_root_sha256": supplied_parent_binding,
-        "parent_identity_root_sha256": observed_identity,
-        "parent_row_count": len(normalized_parents),
-        "daily_basic_source_row_count": len(source_payload),
-        "daily_basic_source_rows_sha256": canonical_sha256(source_payload),
-        "output_row_count": len(output_rows),
-        "dropped_parent_row_count": 0,
-        "output_identity_root_sha256": output_identity_root,
-        "output_rows_sha256": canonical_sha256(output_rows),
-        "latest_source_lag_market_sessions": 1,
+        "parent_input_identity_sha256": observed_identity,
+        "parent_input_row_count": len(normalized_parents),
+        "daily_basic_input_row_count": len(source_payload),
+        "daily_basic_input_rows_sha256": canonical_sha256(source_payload),
+        "preview_output_row_count": len(output_rows),
+        "preview_dropped_input_row_count": 0,
+        "preview_output_identity_sha256": output_identity_root,
+        "preview_output_rows_sha256": canonical_sha256(output_rows),
+        "latest_source_lag_ordered_input_labels": 1,
+        "parent_authority_verified": False,
+        "session_calendar_authority_verified": False,
+        "daily_basic_row_authority_verified": False,
+        "formal_materialization_performed": False,
+        "formal_receipt_eligible": False,
+        "ordered_date_labels_are_market_sessions": False,
+        "pit_claimed": False,
         "moneyflow_consumed": False,
         "experiment_launch_eligible": False,
         "embargo_consumed": False,
@@ -629,4 +646,7 @@ def materialize_factor_v3_points_rows(
         **receipt_unsigned,
         "receipt_sha256": canonical_sha256(receipt_unsigned),
     }
-    return {"rows": output_rows, "receipt": receipt}
+    return {
+        "preview_rows": output_rows,
+        "unbound_preview_receipt": receipt,
+    }
