@@ -1,0 +1,228 @@
+{
+  "schema_version": "factor-v2-low-rvol20-rank-overlay-dormant-preregistration/v1",
+  "created_at_utc": "2026-07-29T03:04:13.5617211Z",
+  "external_anchor": {
+    "kind": "git_introducing_commit_plus_raw_sha256_sidecar",
+    "json_path": "docs/research_preregistrations/factor_v2_low_rvol20_rank_overlay_dormant_preregistration_v1.json",
+    "sha256_sidecar_path": "docs/research_preregistrations/factor_v2_low_rvol20_rank_overlay_dormant_preregistration_v1.sha256",
+    "required_git_commit": "the first commit that adds both exact paths",
+    "activation_rule": "the activator must read both files from the introducing commit, verify the JSON raw SHA-256 against the sidecar, and reject current or later replacements",
+    "runtime_recalculation_of_an_unanchored_expected_hash_allowed": false
+  },
+  "scope": {
+    "temporal_role": "development",
+    "dormant": true,
+    "model_training_allowed": false,
+    "model_rescoring_allowed": false,
+    "embargo_consumed": false,
+    "final_oos_consumed": false,
+    "production_profile_registration_allowed": false,
+    "production_recommendation_eligible": false
+  },
+  "pre_result_witness": {
+    "captured_at_utc": "2026-07-29T03:04:13.5617211Z",
+    "performance_metrics_read_for_this_preregistration": false,
+    "sqlite_database_opened_for_this_preregistration": false,
+    "development_evaluation": {
+      "status_path": "E:/AI workspace/quant-signal-lkj/data/research_runs/audited_pit_factor_v2_development_evaluation_v1_development_4.run.status.json",
+      "status_file_sha256_while_running": "a5e3abe3fda40e5b21224106128a31a971a4172fbc2ef1c9596ff7185aba3044",
+      "status": "running",
+      "stage": "evaluating",
+      "pid": 31564,
+      "started_at": "2026-07-29T02:44:43.361756+00:00",
+      "runner_file_sha256": "997f89e4f38262def6f1d846fa6a47355573b76efdd65eb4a5dee651e8034a4e",
+      "output_directory": "E:/AI workspace/quant-signal-lkj/data/research_runs/audited_pit_factor_v2_development_evaluation_v1_development_4",
+      "output_directory_existed": false,
+      "related_entry_snapshot_sha256": "99562741bc582ec69fb3c52929063859dfa59fb818cccf78f692b6446ee14897",
+      "related_entry_snapshot_lines": [
+        "audited_pit_factor_v2_development_evaluation_v1_development_4.run.status.json|False|7276|2026-07-29T02:44:47.2767204Z",
+        "audited_pit_factor_v2_development_evaluation_v1_development_4.run.status.json.claim|False|165|2026-07-29T02:44:43.3637568Z"
+      ],
+      "lock_path": "E:/AI workspace/quant-signal-lkj/data/research_runs/.factor_v2_development_evaluation.lock",
+      "claim_path": "E:/AI workspace/quant-signal-lkj/data/research_runs/audited_pit_factor_v2_development_evaluation_v1_development_4.run.status.json.claim"
+    },
+    "arm_statuses": [
+      {
+        "arm": "v2_control",
+        "status_path": "E:/AI workspace/quant-signal-lkj/data/research_runs/audited_pit_factor_v2_development_oof_v2_development_4_v2_control.run.status.json",
+        "status": "completed",
+        "status_file_sha256": "726c252d769ff9767efef7b3ddb25fc55b6a917506e8e0c06d1d7786d3556ef2"
+      },
+      {
+        "arm": "overnight_20",
+        "status_path": "E:/AI workspace/quant-signal-lkj/data/research_runs/audited_pit_factor_v2_development_oof_v2_development_4_overnight_20.run.status.json",
+        "status": "completed",
+        "status_file_sha256": "7a4476edfa20c41ccb688083f736efe04b6fe19fcc0642f49da8794575b8ceea"
+      },
+      {
+        "arm": "intraday_20",
+        "status_path": "E:/AI workspace/quant-signal-lkj/data/research_runs/audited_pit_factor_v2_development_oof_v2_development_4_intraday_20.run.status.json",
+        "running_status_file_sha256": "2dc7f26cd8eb6c12ee96ff0b80754d567e0b58a183b0a80a7bb8c63acfe2fa6b",
+        "completed_status_file_sha256": "10b5f5fbc189ae315caf51244108ac5c3c5d1643063fb8fb2991b0f56813ad81",
+        "pid": 30228,
+        "started_at": "2026-07-29T00:22:17.747506+00:00",
+        "source_commit": "1e311c194baa6b721f159cdd077ab4253b7e869d",
+        "output_directory": "E:/AI workspace/quant-signal-lkj/data/research_runs/audited_pit_factor_v2_development_oof_v2_development_4_intraday_20",
+        "parent_view": "E:/AI workspace/quant-signal-lkj/data/research_runs/audited_pit_shallow_gbdt_training_dataset_v1_development_4_factor_v2_arm_source_intraday_20",
+        "overlay_artifact_sha256": "abd4b2166da4520952d7bfc5c8a988bc0a8027dd576a90ae0fdda2560b3a02f8",
+        "overlay_manifest_file_sha256": "9131f15e13f247a4663fae658af544b94bf2af01a3494b8eb0a3d0c095ee1312",
+        "gate_artifact_sha256": "bd3a6e6b7e01bd33f183838df99713469ad2efd6c4e5f4fcdf71cc037e75704d",
+        "gate_manifest_file_sha256": "f8e8416648602df5a1e3559518f2b686f81e3255d99d726bec5dec7af60dbeae",
+        "completion_identity_rule": "the completed status must be the monotonic terminal state of this exact path, pid, started_at, source_commit, output_directory, parent_view, overlay roots, and gate roots; restart, second run, path replacement, or identity drift is forbidden"
+      }
+    ]
+  },
+  "activation_policy": {
+    "required_verified_arm_order": [
+      "v2_control",
+      "overnight_20",
+      "intraday_20"
+    ],
+    "required_condition": "all three preregistered_decision values are exactly RED",
+    "phase_one_allowed_input_only": "an independently published content-addressed decision_verification_receipt",
+    "decision_verification_receipt_required_fields": [
+      "schema_version",
+      "evaluation_artifact_sha256",
+      "evaluation_manifest_file_sha256",
+      "evaluation_producer_root_sha256",
+      "arm_order",
+      "arm_decisions",
+      "receipt_sha256"
+    ],
+    "missing_minimal_decision_receipt_action": "STOP_FAIL_CLOSED",
+    "any_green_action": "VOID_BEFORE_THE_OVERLAY_ACTIVATOR_CALLS_ANY_CONTROL_SCORE_OVERLAY_FEATURE_OUTCOME_OR_PERFORMANCE_READER",
+    "verifier_source_replay_is_not_an_overlay_reader": true,
+    "all_red_phase_two": "only after phase one succeeds may the overlay activator perform complete source replay and overlay evaluation",
+    "missing_unknown_or_unverified_decision_action": "STOP_FAIL_CLOSED",
+    "activation_after_any_embargo_or_final_oos_consumption_allowed": false,
+    "activation_may_change_this_contract": false
+  },
+  "source_binding": {
+    "factor_v2_spec_sha256": "685487c7159a6f0e9748bb46265b93d4c86f4a9dc7dc734beac2c267547a2cdf",
+    "formal_oof_source_commit": "1e311c194baa6b721f159cdd077ab4253b7e869d",
+    "development_evaluator_source_commit": "3e9bd1bcf12024f9bf52a0b0fbcdd86f7bc64109",
+    "training_parent_artifact_sha256": "9cff7474222360ed830d0f24164864dcb946695464467c8be9ccc5dda2b33469",
+    "training_parent_manifest_file_sha256": "b8b0ef670b00742f5ccb9aaa5a7535b55590c22ecebc8fa70f82b6f12816d5b5",
+    "shallow_gbdt_strategy_sha256": "53d00badc8683670ef3d6c02307697e2c3ef8ec769b9d8da072d36420cea70ac",
+    "frozen_evaluation_contract_root_sha256": "930580ef200562c0a31265e28e70ae5347d90f01bdf90f87ecfa0f6d0328a5c9",
+    "score_contract_sha256": "cb0652daf55283fa28654b77db8a3d8fb60e0307327df34e6e81262c9fcf0553",
+    "cost_and_execution_sha256": "232a00b7b41eece613bda13411c7515e12e2cab7ab721571203c9d38cb9051bb",
+    "selection_sha256": "ec7b0b455e6ed7ec53f81ef5696d9717136a5a6fe106dca1bf587f4f48cfa788",
+    "advancement_thresholds_sha256": "0cd633968ff824545b9b51a141f1a781e7dcc86c2db3b7ae69faaf0c133b54e3",
+    "overlay_artifact_sha256": "abd4b2166da4520952d7bfc5c8a988bc0a8027dd576a90ae0fdda2560b3a02f8",
+    "overlay_manifest_file_sha256": "9131f15e13f247a4663fae658af544b94bf2af01a3494b8eb0a3d0c095ee1312",
+    "full_parent_gate_artifact_sha256": "bd3a6e6b7e01bd33f183838df99713469ad2efd6c4e5f4fcdf71cc037e75704d",
+    "full_parent_gate_manifest_file_sha256": "f8e8416648602df5a1e3559518f2b686f81e3255d99d726bec5dec7af60dbeae",
+    "v2_control_artifact_sha256": "6ca32dcedde8f1cf01c66316c9728c2f87453181d3da52d52c73a243a43d7532",
+    "v2_control_manifest_file_sha256": "3514c5bf7e8d73bcb9bc4ac4df20aa6f5a077dde464cd4192e6791dab9771c51",
+    "overnight_20_artifact_sha256": "2c9ae075cc3939cb84b4a47b70097615b20af7bef7c9ed39c6088b0d3678dc1e",
+    "overnight_20_manifest_file_sha256": "5048d40890fe8ecd86e33a82fdd0b502825bef1f38567fd57b3725a8d2c014be",
+    "intraday_20_artifact_sha256": "643e23fa38ff520b38fd333c8950ba0df6caf46e688dff0db44dff166cfafe66",
+    "intraday_20_manifest_file_sha256": "c0660a872e031267958e9882a23e270e3f478e300477da89147c5e1b76522273",
+    "completion_binding_file_sha256": "efbf897315f03cb9d0609461258afec6a37c9da39201b357cafe2a523313e17f",
+    "existing_execution_stress_preregistration_file_sha256": "7610b851982dbbc3d1f570ed778f433068500ad12d6bb1d8034119647a106234"
+  },
+  "prior_contract_supplement": {
+    "supplemented_contract_file_sha256": "7610b851982dbbc3d1f570ed778f433068500ad12d6bb1d8034119647a106234",
+    "narrow_override": "replace only arm_selection_policy.no_green_action with permission for exactly one dormant low_rvol20_rank_overlay_20 development evaluation",
+    "all_other_prior_cost_capacity_metric_and_failure_policies_unchanged": true,
+    "overlay_red_action": "STOP_WITHOUT_SWITCHING_WEIGHT_CHANGE_SECOND_OVERLAY_RETRAINING_RESCORING_OR_TRADE_DELETION"
+  },
+  "overlay_contract": {
+    "overlay_id": "low_rvol20_rank_overlay_20",
+    "base_arm": "v2_control",
+    "positive_pool": {
+      "field": "predicted_positive_utility_probability",
+      "operator": "strict_greater_than",
+      "threshold": 0.5,
+      "scope": "exact verified v2_control positive pool for each signal_date",
+      "factor_missing_action": "FAIL_ENTIRE_ARM_WITHOUT_ROW_DELETION_SUBSTITUTION_OR_BACKFILL"
+    },
+    "probability_rank": {
+      "symbol": "P",
+      "N_definition": "the number of exact verified v2_control rows with p_base strictly greater than 0.5 on that signal_date",
+      "N_zero_action": "no candidates and no selection for that signal_date",
+      "rank_definition": "ascending deterministic average rank over integers 1 through N, so larger p_base receives larger rank",
+      "tie_policy": "ties share their average rank",
+      "formula": "P = average_rank / (N + 1)",
+      "range": "[1/(N+1), N/(N+1)] when N is positive",
+      "equivalent_formula": "P = (deterministic_midrank_pm1 + 1) / 2",
+      "pandas_rank_pct_semantics_allowed": false
+    },
+    "low_volatility_term": {
+      "raw_symbol": "V",
+      "feature_name": "realized_volatility_20_pct_rank",
+      "frozen_feature_index": 4,
+      "value_source": "the exact IEEE-754 binary64 bits stored by the verified factor-v2 training overlay",
+      "creator_formula": "V = (2 * source_average_rank / (N_source + 1)) - 1",
+      "source_scope": "the original parent/base full signal-date cross-section used by the overlay creator",
+      "source_scope_must_not_be_replaced_by": [
+        "the v2_control positive pool",
+        "a suspension-eligible subset",
+        "an execution-eligible subset"
+      ],
+      "domain": "finite and strictly greater than -1 and strictly less than 1",
+      "formula": "L = 1 - V",
+      "divide_by_two_clip_recompute_or_rerank_allowed": false
+    },
+    "rank_score": {
+      "formula": "rank_score = (0.80 * P) + (0.20 * L)",
+      "numeric_semantics": "IEEE-754 binary64 with the written multiplication and addition order",
+      "rounding_allowed": false,
+      "clipping_allowed": false,
+      "winsorization_allowed": false,
+      "alternative_weight_or_weight_grid_allowed": false,
+      "may_be_written_as_model_probability_or_expected_return": false
+    }
+  },
+  "selection_contract": {
+    "only_replaced_component": "v2_control main ranking key",
+    "ranking_keys": [
+      "rank_score descending",
+      "candidate_amount descending",
+      "stable_security_id ascending"
+    ],
+    "top_n": 3,
+    "portfolio_constraints": "inherit exact frozen selection contract bound by selection_sha256, including max active positions, same-security exclusion, one-position-per-frozen-industry, and same-day exit-before-selection semantics",
+    "positive_pool_change_allowed": false,
+    "trade_outcome_change_allowed": false,
+    "exit_or_cost_change_allowed": false,
+    "no_increment_test": {
+      "scope": "all selected positions over the complete development evaluation window, including right-censored positions",
+      "trade_key_uniqueness_must_be_verified": true,
+      "ordering": "binary or bytewise lexicographic ascending exact trade_key",
+      "equality": "counts are identical and ordered trade_key lists and their SHA-256 roots are identical",
+      "ordinary_set_semantics_allowed": false,
+      "complete_trades_only_comparison_allowed": false,
+      "comparison_must_precede_any_return_or_performance_metric_read": true,
+      "equal_action": "RED_NO_INCREMENT_WITHOUT_STRESS"
+    }
+  },
+  "evaluation_contract": {
+    "development_folds": "exactly inherit verified v2_control",
+    "execution_outcomes": "exactly inherit verified v2_control for identical trade keys",
+    "amount_baseline": "reference and verify the exact v2_control amount baseline because the positive pool is unchanged",
+    "metric_and_gate_policy": "exactly inherit the frozen evaluation contract and the prior execution-stress preregistration without new thresholds",
+    "all_threshold_comparisons_use_unrounded_raw_values": true,
+    "any_required_gate_failure_action": "RED",
+    "result_after_red_action": "STOP_WITHOUT_WEIGHT_CHANGE_SECOND_OVERLAY_RETRAINING_RESCORING_OR_TRADE_DELETION"
+  },
+  "atomic_claim_policy": {
+    "claim_key_formula": "SHA256(preregistration_raw_sha256 || verified_all_red_evaluation_artifact_sha256)",
+    "claim_creation": "atomic create-if-absent before any phase-two source read",
+    "maximum_distinct_claim_count": 1,
+    "same_key_retry": "verify and reuse the exact same content-addressed result only",
+    "different_output_for_same_key_action": "REJECT",
+    "second_claim_or_parameter_change_after_failure_action": "REJECT"
+  },
+  "publication_policy": {
+    "separate_content_addressed_artifact_required": true,
+    "second_score_database_allowed": false,
+    "required_false_flags": [
+      "embargo_consumed",
+      "final_oos_consumed",
+      "production_recommendation_eligible"
+    ],
+    "production_authorization_effect": "NONE"
+  }
+}
