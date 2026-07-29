@@ -93,8 +93,8 @@ def _planned_legs() -> list[PlannedLeg]:
             side="sell",
             execution_session=date(2026, 7, 8),
             execution_window="exit",
-            planned_order_notional_at_c_cny=4_000.0,
-            planned_order_notional_at_two_c_cny=8_000.0,
+            planned_order_notional_at_c_cny=2_500.0,
+            planned_order_notional_at_two_c_cny=5_000.0,
         ),
         PlannedLeg(
             trade_key="trade-a",
@@ -105,6 +105,16 @@ def _planned_legs() -> list[PlannedLeg]:
             execution_window="entry",
             planned_order_notional_at_c_cny=2_500.0,
             planned_order_notional_at_two_c_cny=5_000.0,
+        ),
+        PlannedLeg(
+            trade_key="trade-b",
+            order_key="order-sell-2",
+            stable_security_id="security-600001",
+            side="sell",
+            execution_session=date(2026, 7, 8),
+            execution_window="exit",
+            planned_order_notional_at_c_cny=1_500.0,
+            planned_order_notional_at_two_c_cny=3_000.0,
         ),
     ]
 
@@ -329,6 +339,52 @@ def test_planned_leg_aggregation_rejects_ambiguous_identity_or_side_window() -> 
     )
     with pytest.raises(ValueError, match="side.*window"):
         aggregate_planned_legs(invalid)
+
+
+def test_each_trade_key_requires_at_least_one_buy_and_one_sell_leg() -> None:
+    incomplete = [
+        leg for leg in _planned_legs() if not (leg.trade_key == "trade-b" and leg.side == "sell")
+    ]
+
+    with pytest.raises(ValueError, match="trade_key.*buy.*sell"):
+        aggregate_planned_legs(incomplete)
+
+
+def test_capacity_revalidates_trade_completeness_and_order_identity() -> None:
+    planned = list(aggregate_planned_legs(_planned_legs()))
+    sell = planned[1]
+    planned[1] = type(sell)(
+        **{
+            **asdict(sell),
+            "trade_and_order_keys": tuple(
+                pair for pair in sell.trade_and_order_keys if pair[0] != "trade-b"
+            ),
+        }
+    )
+    with pytest.raises(ValueError, match="trade_key.*buy.*sell"):
+        evaluate_capacity_scenarios(
+            planned_legs=planned,
+            window_liquidity=_liquidity(),
+            base_participation_rate=0.10,
+        )
+
+    planned = list(aggregate_planned_legs(_planned_legs()))
+    buy = planned[0]
+    planned[0] = type(buy)(
+        **{
+            **asdict(buy),
+            "trade_and_order_keys": (
+                ("trade-a", "duplicate-order"),
+                ("trade-b", "duplicate-order"),
+            ),
+        }
+    )
+    with pytest.raises(ValueError, match="duplicate order_key"):
+        evaluate_capacity_scenarios(
+            planned_legs=planned,
+            window_liquidity=_liquidity(),
+            base_participation_rate=0.10,
+        )
 
 
 def test_minute_selector_uses_asia_shanghai_half_open_window_and_end_boundary() -> None:
