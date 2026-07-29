@@ -336,6 +336,36 @@ def test_invalid_private_clock_fails_before_transport_construction(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_private_clock_exception_is_normalized_without_secret_or_transport(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    constructions = []
+
+    def exploding_clock():
+        raise RuntimeError(MINUTE_TOKEN)
+
+    monkeypatch.setattr(jiaoch_minute_collection_set, "_utc_now", exploding_clock)
+    monkeypatch.setattr(
+        jiaoch_minute_collection_set,
+        "_transport_factory",
+        lambda: constructions.append(True),
+    )
+
+    with pytest.raises(ValueError, match="collection failed") as caught:
+        collect_jiaoch_historical_minute_collection_set(
+            generation=_generation(),
+            output_root=tmp_path,
+            requested_ts_code=TS_CODE,
+            execution_session=SESSION,
+        )
+
+    assert caught.value.__context__ is None
+    assert MINUTE_TOKEN not in str(caught.value)
+    assert constructions == []
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_closed_collection_uses_one_transport_one_minute_token_and_exactly_three_posts(
     tmp_path: Path,
     monkeypatch,
