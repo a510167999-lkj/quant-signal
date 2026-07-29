@@ -631,7 +631,7 @@ def _validate_daily_basic_partition(
 
 
 def _same_number(left: float, right: float) -> bool:
-    return math.isclose(left, right, rel_tol=1e-12, abs_tol=1e-12)
+    return left == right
 
 
 def _daily_basic_overlap_proofs(
