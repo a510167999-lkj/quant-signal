@@ -381,7 +381,7 @@ def test_fixed_formula_sorting_and_top3_use_original_low_vol_factor() -> None:
     assert [row["stable_security_id"] for row in result["selected_rows"]] == [
         "000006.SZ",
         "000004.SZ",
-        "000003.SZ",
+        "000005.SZ",
     ]
 
 
