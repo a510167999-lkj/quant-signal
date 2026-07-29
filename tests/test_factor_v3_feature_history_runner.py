@@ -74,6 +74,25 @@ def _write_spec(tmp_path: Path, spec: dict[str, object]) -> Path:
     return path
 
 
+def _v1_state(
+    *,
+    run_spec_sha256: str,
+    status: str,
+    completed_session_count: int,
+    collection_publication: dict[str, object] | None = None,
+    receipt: dict[str, object] | None = None,
+) -> dict[str, object]:
+    unsigned = {
+        "schema": runner._RUN_STATE_V1_SCHEMA,
+        "run_spec_sha256": run_spec_sha256,
+        "status": status,
+        "completed_session_count": completed_session_count,
+        "collection_publication": collection_publication,
+        "receipt": receipt,
+    }
+    return {**unsigned, "state_sha256": runner._canonical_sha256(unsigned)}
+
+
 def _run_with_synthetic_route(*, run_spec_path: Path, run_root: Path) -> dict[str, object]:
     return runner._run_factor_v3_feature_history_collection_with_route_credential(
         run_spec_path=run_spec_path,
@@ -152,8 +171,13 @@ def test_public_run_delegates_credential_resolution_to_slots(
 
     monkeypatch.setattr(
         jiaoch_credential_slots,
-        "collect_jiaoch_feature_history_from_environment",
+        "_collect_jiaoch_feature_history_from_environment_for_run",
         collect_from_environment,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_run_credential_generation_id",
+        lambda **_kwargs: SOURCE_GENERATION_ID,
     )
     result = runner.run_factor_v3_feature_history_collection(
         run_spec_path=spec_path,
@@ -161,7 +185,13 @@ def test_public_run_delegates_credential_resolution_to_slots(
     )
 
     assert result == {"status": "verified", "credential_exposed": False}
-    assert calls == [{"run_spec_path": spec_path, "run_root": tmp_path / "run"}]
+    assert calls == [
+        {
+            "run_spec_path": spec_path,
+            "run_root": tmp_path / "run",
+            "source_generation_id": SOURCE_GENERATION_ID,
+        }
+    ]
 
 
 def test_run_uses_only_five_frozen_interfaces_and_two_sequential_collectors(
@@ -426,6 +456,7 @@ def test_resume_keeps_monotonic_completed_session_progress(
     )
     assert failed_state["status"] == "failed"
     assert failed_state["completed_session_count"] == 2
+    assert failed_state["credential_generation_id"] == SOURCE_GENERATION_ID
 
     fail_once["enabled"] = False
     result = _run_with_synthetic_route(
@@ -440,6 +471,110 @@ def test_resume_keeps_monotonic_completed_session_progress(
     assert market_sessions.count(development[1]) == 1
     assert market_sessions.count(development[2]) == 2
     assert market_sessions[-1] == diagnostic[0]
+
+
+def test_run_scoped_credential_generation_id_is_durable_across_restarts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec_path = _write_spec(tmp_path, _run_spec(tmp_path))
+    monkeypatch.setattr(runner, "_verify_plan", lambda _spec: None)
+
+    first = runner._run_credential_generation_id(
+        run_spec_path=spec_path,
+        run_root=tmp_path / "generation-run",
+    )
+    second = runner._run_credential_generation_id(
+        run_spec_path=spec_path,
+        run_root=tmp_path / "generation-run",
+    )
+
+    assert first == second
+    state = runner._read_json_file(
+        tmp_path / "generation-run" / "state.json",
+        label="run state",
+        max_bytes=runner._MAX_STATE_BYTES,
+    )
+    assert state["credential_generation_id"] == first
+
+
+def test_v1_zero_progress_state_migrates_to_v2_before_generation_is_issued(
+    tmp_path: Path,
+) -> None:
+    spec = _run_spec(tmp_path)
+    paths = runner._run_paths(tmp_path / "v1-zero-run", create=True)
+    runner._load_or_initialize_run(paths, spec, allow_initialize=True)
+    runner._atomic_json(
+        paths["state"],
+        _v1_state(
+            run_spec_sha256=spec["run_spec_sha256"],
+            status="initialized",
+            completed_session_count=0,
+        ),
+    )
+
+    migrated = runner._load_or_initialize_run(paths, spec, allow_initialize=True)
+
+    assert migrated["schema"] == runner._RUN_STATE_SCHEMA
+    assert migrated["credential_generation_id"] is None
+
+
+def test_v1_partial_state_migrates_only_a_single_persisted_generation(
+    tmp_path: Path,
+) -> None:
+    spec = _run_spec(tmp_path)
+    paths = runner._run_paths(tmp_path / "v1-partial-run", create=True)
+    runner._load_or_initialize_run(paths, spec, allow_initialize=True)
+    store = runner._safe_directory(paths["store"], label="PIT store", create=True)
+    with sqlite3.connect(store / "metadata.sqlite3") as connection:
+        connection.execute("CREATE TABLE fetch_attempts (request_semantics TEXT NOT NULL)")
+        connection.execute(
+            "INSERT INTO fetch_attempts VALUES (?)",
+            (runner._canonical_bytes({"credential_generation_id": SOURCE_GENERATION_ID}).decode(),),
+        )
+        connection.commit()
+    runner._atomic_json(
+        paths["state"],
+        _v1_state(
+            run_spec_sha256=spec["run_spec_sha256"],
+            status="collecting",
+            completed_session_count=1,
+        ),
+    )
+
+    migrated = runner._load_or_initialize_run(paths, spec, allow_initialize=True)
+
+    assert migrated["schema"] == runner._RUN_STATE_SCHEMA
+    assert migrated["credential_generation_id"] == SOURCE_GENERATION_ID
+
+
+def test_partial_resume_rejects_a_different_credential_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = _run_spec(tmp_path)
+    spec_path = _write_spec(tmp_path, spec)
+    paths = runner._run_paths(tmp_path / "generation-drift-run", create=True)
+    runner._load_or_initialize_run(paths, spec, allow_initialize=True)
+    runner._atomic_json(
+        paths["state"],
+        runner._state_payload(
+            run_spec_sha256=spec["run_spec_sha256"],
+            status="collecting",
+            completed_session_count=1,
+            credential_generation_id=SOURCE_GENERATION_ID,
+        ),
+    )
+    monkeypatch.setattr(runner, "_verify_plan", lambda _spec: None)
+
+    with pytest.raises(runner.FactorV3FeatureHistoryRunnerError, match="generation drifted"):
+        runner._run_factor_v3_feature_history_collection_with_route_credential(
+            run_spec_path=spec_path,
+            run_root=tmp_path / "generation-drift-run",
+            credential="synthetic-token",
+            source_generation_id="8a879340-f696-472d-8f44-bf840e71e0fc",
+            feature_history_policy_descriptor=(
+                runner.FACTOR_V3_FEATURE_HISTORY_COLLECTION_POLICY_DESCRIPTOR
+            ),
+        )
 
 
 def test_resume_reverifies_published_candidate_without_recollecting_or_republishing(
@@ -458,6 +593,7 @@ def test_resume_reverifies_published_candidate_without_recollecting_or_republish
             run_spec_sha256=spec["run_spec_sha256"],
             status="published",
             completed_session_count=250,
+            credential_generation_id=SOURCE_GENERATION_ID,
             collection_publication=PUBLICATION,
         ),
     )

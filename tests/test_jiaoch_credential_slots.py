@@ -301,6 +301,13 @@ def test_feature_history_environment_entry_reads_only_points_primary(
     assert result == {"status": "verified"}
     assert environment_reads == [POINTS_PRIMARY_ENV]
     assert calls[0]["credential"] == POINTS_TOKEN
+    assert re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        str(calls[0]["source_generation_id"]),
+    )
+    assert "source_generation_id" not in inspect.signature(
+        jiaoch_credential_slots.collect_jiaoch_feature_history_from_environment
+    ).parameters
 
 
 def test_environment_snapshot_is_copied_without_live_environment_access() -> None:

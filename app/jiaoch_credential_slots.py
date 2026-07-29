@@ -393,6 +393,18 @@ def _credential(value: Any) -> str:
     return value
 
 
+def _credential_generation_id(value: Any) -> str:
+    if type(value) is not str:
+        raise ValueError("Jiaoch credential generation rejected")
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError as exc:
+        raise ValueError("Jiaoch credential generation rejected") from exc
+    if parsed.version != 4 or str(parsed) != value:
+        raise ValueError("Jiaoch credential generation rejected")
+    return value
+
+
 def _seal_generation(credentials: tuple[str, ...]) -> JiaochCredentialGeneration:
     generation = object.__new__(JiaochCredentialGeneration)
     object.__setattr__(
@@ -409,7 +421,9 @@ def _seal_generation(credentials: tuple[str, ...]) -> JiaochCredentialGeneration
 
 
 def _create_feature_history_generation(
-    *, credential_resolver: Callable[[str], str]
+    *,
+    credential_resolver: Callable[[str], str],
+    source_generation_id: str | None = None,
 ) -> _FeatureHistoryCredentialGeneration:
     if not callable(credential_resolver):
         raise ValueError("Jiaoch feature-history credential resolution rejected")
@@ -426,7 +440,11 @@ def _create_feature_history_generation(
     object.__setattr__(
         generation,
         "_FeatureHistoryCredentialGeneration__generation_id",
-        str(uuid.uuid4()),
+        (
+            str(uuid.uuid4())
+            if source_generation_id is None
+            else _credential_generation_id(source_generation_id)
+        ),
     )
     return generation
 
@@ -499,13 +517,32 @@ def collect_jiaoch_feature_history_collection_set(
     )
 
 
+def _collect_jiaoch_feature_history_from_environment_for_run(
+    *,
+    run_spec_path: str | Path,
+    run_root: str | Path,
+    source_generation_id: str,
+) -> dict[str, Any]:
+    """Private runner bridge for a run-scoped generation identifier."""
+
+    generation = _create_feature_history_generation(
+        credential_resolver=lambda slot_id: str(os.getenv(_ENV_BY_SLOT[slot_id]) or ""),
+        source_generation_id=source_generation_id,
+    )
+    return collect_jiaoch_feature_history_collection_set(
+        generation=generation,
+        run_spec_path=run_spec_path,
+        run_root=run_root,
+    )
+
+
 def collect_jiaoch_feature_history_from_environment(
     *, run_spec_path: str | Path, run_root: str | Path
 ) -> dict[str, Any]:
-    """Resolve sealed credentials only inside this module, then run the closed set."""
+    """Resolve the points slot only, without exposing credential provenance control."""
 
     generation = _create_feature_history_generation(
-        credential_resolver=lambda slot_id: str(os.getenv(_ENV_BY_SLOT[slot_id]) or "")
+        credential_resolver=lambda slot_id: str(os.getenv(_ENV_BY_SLOT[slot_id]) or ""),
     )
     return collect_jiaoch_feature_history_collection_set(
         generation=generation,
