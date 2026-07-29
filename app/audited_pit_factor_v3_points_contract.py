@@ -141,15 +141,46 @@ FACTOR_V3_POINTS_CONTRACT = {
             "selection": (
                 "deterministic_fail_closed_from_verified_source_bound_authorities"
             ),
-            "minimum_prior_market_sessions": 250,
+            "window_market_sessions": {
+                "short": 20,
+                "long": 250,
+            },
+            "minimum_observed_trading_records": {
+                "short_window": 15,
+                "long_window": 120,
+            },
+            "minimum_ipo_age_calendar_months": 6,
             "latest_usable_source_session": "T-1",
             "allowed_exclusion_reasons": [
-                "listing_history_less_than_250_authoritative_market_sessions",
-                "authoritative_suspension_in_required_history_window",
+                "ipo_age_less_than_6_calendar_months",
+                (
+                    "observed_trading_records_less_than_15_in_"
+                    "20_market_session_window"
+                ),
+                (
+                    "observed_trading_records_less_than_120_in_"
+                    "250_market_session_window"
+                ),
                 (
                     "authoritative_daily_cross_section_row_missing_in_"
                     "required_history_window"
                 ),
+                "unresolved_authoritative_security_code_transition",
+            ],
+            "observed_trading_record_definition": (
+                "normalized daily_basic row matched to the authoritative daily "
+                "traded cross-section after security-code transition resolution"
+            ),
+            "exact_250_observed_rows_required": False,
+            "missing_observation_fill": "none",
+            "authoritative_suspension_rows_count_as_observed": False,
+            "required_authority_roles": [
+                "extended_trading_calendar",
+                "pit_listing_and_membership",
+                "pit_suspension",
+                "daily_traded_cross_section",
+                "security_code_transition",
+                "normalized_daily_basic",
             ],
             "exclusion_record_identity_fields": [
                 "candidate_key",
@@ -200,13 +231,25 @@ FACTOR_V3_POINTS_CONTRACT = {
             "raw_formula": "log(mean_20/mean_250)",
             "history_field": "turnover_rate_f",
             "history_order": "strict_market_session_order",
-            "minimum_history_market_sessions": 250,
+            "window_market_sessions": {
+                "short": 20,
+                "long": 250,
+            },
+            "mean_observation_policy": "observed_trading_records_only",
+            "minimum_observed_trading_records": {
+                "short_window": 15,
+                "long_window": 120,
+            },
+            "minimum_ipo_age_calendar_months": 6,
+            "missing_observation_fill": "none",
             "latest_source_session": "T-1",
             "cross_section_transform": "deterministic_midrank",
             "mapping": "2*midrank/(N+1)-1",
             "tie_policy": "equal_values_share_average_rank",
             "scope": "same_signal_date_exact_parent_sample",
             "variant": "free_float_turnover_rate_f",
+            "paper_original_turnover_denominator": "total_shares",
+            "project_turnover_denominator": "free_float_shares",
             "literature_replication_claimed": False,
             "literature_boundary": (
                 "literature-inspired free-float variant; PMO is not "
@@ -281,16 +324,16 @@ FACTOR_V3_POINTS_CONTRACT = {
     "production_recommendation_eligible": False,
 }
 FACTOR_V3_POINTS_CONTRACT_SHA256 = (
-    "935567d770aa61491d0fbcac30646d2f608d733a172a8eb8d7b512549fc1c2a2"
+    "1346bc1f2f46193e22cf22efc608cd30c98e3e2c3b7264b3d2612b858892aecc"
 )
 if canonical_sha256(FACTOR_V3_POINTS_CONTRACT) != FACTOR_V3_POINTS_CONTRACT_SHA256:
     raise RuntimeError("frozen factor-v3 points contract drifted")
 
 FACTOR_V3_POINTS_ARM_STRATEGY_SHA256: Mapping[str, str] = MappingProxyType(
     {
-        "control": ("89e073cf9563cba4182f417715d2a7e251634f349507deccf14fcfbfd93ead51"),
-        "turnover_level": ("1e07097c4bab1b30ba161a9d348d0a2b3bc7cb9116277edef1d6d3f528a79bd7"),
-        "abnormal_turnover": ("66426217dd68a4c9421d2970f1481fbed6247122c84b3e8df69a0fec1207b7c7"),
+        "control": ("5e5d112984d57f0f3e6b0ba31b34f26b4b2d495f9211b41c27bc8fd29f4b9f3d"),
+        "turnover_level": ("cebb81dbebd8e6c030140283f1adbf7a3232d11aece78dfd68fb883f6382150a"),
+        "abnormal_turnover": ("3079c907297f7fcb65808c87e720329294d250bf1302afd9686f20114e7b5265"),
     }
 )
 
