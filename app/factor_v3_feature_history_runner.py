@@ -596,7 +596,9 @@ def _legacy_store_generation_id(store_root: Path, *, required: bool) -> str | No
         connection = sqlite3.connect(str(database_path), timeout=30)
         try:
             connection.execute("PRAGMA query_only=ON")
-            rows = connection.execute("SELECT request_semantics FROM fetch_attempts").fetchall()
+            rows = connection.execute(
+                "SELECT request_semantics_json FROM fetch_attempts"
+            ).fetchall()
         finally:
             connection.close()
     except sqlite3.DatabaseError as exc:
@@ -637,12 +639,14 @@ def _migrate_v1_state(
         legacy["completed_session_count"] != 0
         or legacy["collection_publication"] is not None
         or legacy["receipt"] is not None
-        or legacy["status"] in {"collecting", "collected", "published", "verified"}
     )
     generation_id = _legacy_store_generation_id(store_root, required=needs_generation)
+    status = legacy["status"]
+    if status == "collecting" and generation_id is None:
+        status = "failed"
     return _state_payload(
         run_spec_sha256=run_spec_sha256,
-        status=legacy["status"],
+        status=status,
         completed_session_count=legacy["completed_session_count"],
         credential_generation_id=generation_id,
         collection_publication=legacy["collection_publication"],

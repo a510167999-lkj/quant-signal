@@ -541,13 +541,15 @@ def collect_jiaoch_feature_history_from_environment(
 ) -> dict[str, Any]:
     """Resolve the points slot only, without exposing credential provenance control."""
 
-    generation = _create_feature_history_generation(
-        credential_resolver=lambda slot_id: str(os.getenv(_ENV_BY_SLOT[slot_id]) or ""),
-    )
-    return collect_jiaoch_feature_history_collection_set(
-        generation=generation,
+    from app.factor_v3_feature_history_runner import _run_credential_generation_id
+
+    return _collect_jiaoch_feature_history_from_environment_for_run(
         run_spec_path=run_spec_path,
         run_root=run_root,
+        source_generation_id=_run_credential_generation_id(
+            run_spec_path=run_spec_path,
+            run_root=run_root,
+        ),
     )
 
 

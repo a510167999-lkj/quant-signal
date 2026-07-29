@@ -526,7 +526,7 @@ def test_v1_partial_state_migrates_only_a_single_persisted_generation(
     runner._load_or_initialize_run(paths, spec, allow_initialize=True)
     store = runner._safe_directory(paths["store"], label="PIT store", create=True)
     with sqlite3.connect(store / "metadata.sqlite3") as connection:
-        connection.execute("CREATE TABLE fetch_attempts (request_semantics TEXT NOT NULL)")
+        connection.execute("CREATE TABLE fetch_attempts (request_semantics_json TEXT NOT NULL)")
         connection.execute(
             "INSERT INTO fetch_attempts VALUES (?)",
             (runner._canonical_bytes({"credential_generation_id": SOURCE_GENERATION_ID}).decode(),),
@@ -545,6 +545,27 @@ def test_v1_partial_state_migrates_only_a_single_persisted_generation(
 
     assert migrated["schema"] == runner._RUN_STATE_SCHEMA
     assert migrated["credential_generation_id"] == SOURCE_GENERATION_ID
+
+
+def test_v1_collecting_zero_progress_state_becomes_restartable_v2_failure(
+    tmp_path: Path,
+) -> None:
+    spec = _run_spec(tmp_path)
+    paths = runner._run_paths(tmp_path / "v1-collecting-zero-run", create=True)
+    runner._load_or_initialize_run(paths, spec, allow_initialize=True)
+    runner._atomic_json(
+        paths["state"],
+        _v1_state(
+            run_spec_sha256=spec["run_spec_sha256"],
+            status="collecting",
+            completed_session_count=0,
+        ),
+    )
+
+    migrated = runner._load_or_initialize_run(paths, spec, allow_initialize=True)
+
+    assert migrated["status"] == "failed"
+    assert migrated["credential_generation_id"] is None
 
 
 def test_partial_resume_rejects_a_different_credential_generation(

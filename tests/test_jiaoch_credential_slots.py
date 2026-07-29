@@ -292,6 +292,11 @@ def test_feature_history_environment_entry_reads_only_points_primary(
         "_run_factor_v3_feature_history_collection_with_route_credential",
         run_closed,
     )
+    monkeypatch.setattr(
+        factor_v3_feature_history_runner,
+        "_run_credential_generation_id",
+        lambda **_kwargs: "6c21fe93-a24b-436d-8ac9-fcecd3b31042",
+    )
 
     result = jiaoch_credential_slots.collect_jiaoch_feature_history_from_environment(
         run_spec_path="C:/safe/run-spec.json",
