@@ -221,7 +221,10 @@ def _credential(value: Any) -> str:
         or not value
         or len(value) > 4096
         or value.strip() != value
-        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or any(
+            ord(character) < 32 or ord(character) == 127 or 0xD800 <= ord(character) <= 0xDFFF
+            for character in value
+        )
     ):
         raise ValueError("Jiaoch credential rejected")
     return value
