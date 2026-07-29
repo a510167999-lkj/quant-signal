@@ -1,22 +1,31 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import inspect
 import json
 from pathlib import Path
+import sqlite3
 import sys
 from types import SimpleNamespace
+import uuid
 
 import pytest
 
 from app import audited_pit_factor_v3_feature_history_authority as history_authority
+from app import jiaoch_trade_cal_authority
 from app.audited_pit_factor_v3_points_contract import (
     FACTOR_V3_POINTS_CONTRACT_SHA256,
     canonical_sha256,
 )
 from app.research_partitions import load_temporal_partition_contract
+from app.research_pit_collector import (
+    ControlledTushareCollector,
+    HttpEntityResponse,
+    build_bak_basic_specs,
+)
+from app.research_pit_store import NORMALIZED_FIELDS, PITReceiptStore
 from app.research_security_code_transition import (
     SECURITY_CODE_TRANSITION_CONTRACT_SHA256,
 )
@@ -31,6 +40,7 @@ FROZEN_DEVELOPMENT_SESSIONS_SHA256 = (
 SHA_A = "a" * 64
 SHA_B = "b" * 64
 SHA_C = "c" * 64
+PUBLICATION_CAPABILITY = "9a91dd99-1579-4dba-9b13-dd1c56b0760f"
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -78,7 +88,9 @@ def _calendar_fixture() -> tuple[list[str], list[str], dict[str, object]]:
     }
     manifest = {
         "authority_scope": "SSE_TRADING_CALENDAR_WINDOW_ONLY",
-        "calendar_authority_status": "VERIFIED_SINGLE_SEALED_CALL",
+        "calendar_authority_status": (
+            "NOT_GRANTED_WITHOUT_RETURNED_PUBLICATION_CAPABILITY"
+        ),
         "calendar_integrity_verified": True,
         "development_session_alignment_verified": False,
         "development_session_count_claimed": False,
@@ -101,6 +113,41 @@ def _calendar_fixture() -> tuple[list[str], list[str], dict[str, object]]:
         "start_date": prewindow[0],
     }
     return prewindow, development, manifest
+
+
+def _trade_cal_publication(digest: str = SHA_A) -> dict[str, object]:
+    return {
+        "authority_manifest_created": True,
+        "authority_manifest_relative_path": (
+            f"trade_cal_manifest_candidates/sha256/{digest[:2]}/{digest}.json"
+        ),
+        "authority_manifest_sha256": digest,
+        "publication_capability": PUBLICATION_CAPABILITY,
+        "publication_status": "DURABLE_POSTVERIFIED_AND_RETURNED",
+        "schema": "jiaoch-trade-cal-authority-publication/v1",
+    }
+
+
+def _trade_cal_verification(
+    manifest: dict[str, object],
+    digest: str = SHA_A,
+) -> dict[str, object]:
+    return {
+        "authority_manifest_sha256": digest,
+        "calendar_authority_status": "VERIFIED_SINGLE_SEALED_CALL",
+        "development_session_alignment_verified": False,
+        "embargo_consumed": False,
+        "end_date": manifest["end_date"],
+        "exchange": "SSE",
+        "final_oos_consumed": False,
+        "is_open_normalization_root_sha256": SHA_B,
+        "open_session_count": manifest["open_session_count"],
+        "open_sessions_root_sha256": manifest["open_sessions_root_sha256"],
+        "production_profile_registered": False,
+        "production_recommendation_eligible": False,
+        "start_date": manifest["start_date"],
+        "verified": True,
+    }
 
 
 def _development_refs(development: list[str]) -> list[dict[str, str]]:
@@ -131,7 +178,10 @@ def _install_synthetic_calendar(
     monkeypatch.setattr(
         history_authority,
         "_load_verified_trade_cal_manifest",
-        lambda **_kwargs: deepcopy(manifest),
+        lambda **_kwargs: (
+            deepcopy(manifest),
+            _trade_cal_verification(manifest),
+        ),
     )
 
 
@@ -142,117 +192,321 @@ def _build_plan(
     _install_synthetic_calendar(monkeypatch, manifest, development)
     plan = history_authority.build_factor_v3_feature_history_collection_plan(
         trade_cal_output_root=Path("synthetic-trade-cal-root"),
-        trade_cal_authority_manifest_relative_path=(
-            f"trade_cal_manifests/sha256/{SHA_A[:2]}/{SHA_A}.json"
-        ),
-        expected_trade_cal_authority_manifest_sha256=SHA_A,
+        trade_cal_publication=_trade_cal_publication(),
         development_session_refs=_development_refs(development),
         temporal_partition_contract=load_temporal_partition_contract(PARTITION_V1_PATH),
     )
     return plan, prewindow, development, manifest
 
 
-def _board_counts() -> dict[str, int]:
-    return {
-        "beijing": 1,
-        "chinext": 1,
-        "mainboard": 1,
-        "science_technology": 1,
-    }
+class _FixtureClock:
+    def __init__(self) -> None:
+        self._monotonic = 0
+
+    def assert_synchronized(self) -> dict[str, object]:
+        return {"source": "feature-history-fixture", "synchronized": True}
+
+    def now_utc(self) -> datetime:
+        return datetime(2024, 1, 4, tzinfo=timezone.utc)
+
+    def monotonic_ns(self) -> int:
+        self._monotonic += 1_000_000
+        return self._monotonic
 
 
-def _session_authority(trade_date: str) -> dict[str, object]:
-    counts = _board_counts()
-    return {
-        "bak_basic": {
-            "dataset": "bak_basic",
-            "normalized_rows_sha256": SHA_B,
-            "partition_key": trade_date,
-            "raw_sha256": SHA_A,
-            "receipt_status": "stored",
-            "request_semantics_sha256": SHA_C,
-            "row_count": 4,
-            "semantic_empty": False,
-            "source_kind": "exact_nonempty_snapshot",
-            "upstream_scope": {
-                "filter_applied": False,
-                "preserved_board_counts": deepcopy(counts),
-                "preserved_row_count": 4,
-                "preserved_rows_sha256": SHA_B,
-                "source_board_counts": deepcopy(counts),
-                "source_row_count": 4,
-                "source_rows_sha256": SHA_B,
-            },
-        },
-        "market_generation": {
-            "final_oos_eligible": False,
-            "generation_id": f"generation:{trade_date}",
-            "lineage_sha256": SHA_B,
-            "manifest_sha256": SHA_A,
-            "shards": [
+class _FeatureHistoryTransport:
+    def __init__(
+        self,
+        *,
+        include_beijing: bool = True,
+        include_star: bool = True,
+        semantic_empty_sessions: frozenset[str] = frozenset(),
+    ) -> None:
+        self.include_beijing = include_beijing
+        self.include_star = include_star
+        self.semantic_empty_sessions = semantic_empty_sessions
+        self.calls: list[dict[str, object]] = []
+
+    def post(self, *, body: bytes, **_kwargs) -> HttpEntityResponse:
+        request = json.loads(body)
+        self.calls.append(request)
+        dataset = request["api_name"]
+        compact = request["params"]["trade_date"]
+        trade_date = f"{compact[:4]}-{compact[4:6]}-{compact[6:]}"
+        if dataset == "bak_basic":
+            rows = [] if trade_date in self.semantic_empty_sessions else [
+                [compact, "600001.SH", "Main", "Industry", "20000101"],
+                [compact, "300001.SZ", "ChiNext", "Industry", "20100101"],
+            ]
+            if self.include_star and rows:
+                rows.append([compact, "688001.SH", "STAR", "Industry", "20200101"])
+            if self.include_beijing and rows:
+                rows.append([compact, "430001.BJ", "BSE", "Industry", "20100101"])
+        elif dataset == "daily":
+            rows = [
+                [
+                    "600001.SH",
+                    compact,
+                    10.0,
+                    10.5,
+                    9.8,
+                    10.2,
+                    9.9,
+                    0.3,
+                    3.03,
+                    1000,
+                    10100,
+                ]
+            ]
+        elif dataset == "adj_factor":
+            rows = [["600001.SH", compact, 1.5]]
+        elif dataset == "stk_limit":
+            rows = [[compact, "600001.SH", 9.9, 10.89, 8.91]]
+        elif dataset == "suspend_d":
+            rows = []
+        else:
+            raise AssertionError(f"unexpected feature-history API: {dataset}")
+        return HttpEntityResponse(
+            status=200,
+            headers={},
+            body=_canonical_bytes(
                 {
-                    "authority_status": "VERIFIED",
-                    "dataset": "daily",
-                    "row_count": 4,
-                },
-                {
-                    "authority_status": "VERIFIED",
-                    "dataset": "adj_factor",
-                    "row_count": 4,
-                },
-                {
-                    "authority_status": "VERIFIED",
-                    "dataset": "stk_limit",
-                    "row_count": 4,
-                },
-                {
-                    "authority_status": "VERIFIED",
-                    "dataset": "suspend_d",
-                    "row_count": 0,
-                },
-            ],
-            "status": "published",
-            "trade_date": trade_date,
-            "verification_status": "passed",
-            "vintage": "historical_backfill",
-        },
-        "trade_date": trade_date,
-    }
+                    "code": 0,
+                    "data": {
+                        "fields": request["fields"].split(","),
+                        "items": rows,
+                    },
+                    "msg": "",
+                }
+            ),
+            body_complete=True,
+        )
 
 
-def _collection_evidence(plan: dict[str, object]) -> dict[str, object]:
-    sessions = plan["prewindow"]["sessions"]
-    return {
-        "candidate_rows_generated": False,
-        "collector_class": "app.research_pit_collector.ControlledTushareCollector",
+def _small_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[str, object], dict[str, object], list[str]]:
+    prewindow = ["2023-12-29", "2024-01-02"]
+    development = ["2024-01-03"]
+    open_wire = [value.replace("-", "") for value in [*prewindow, *development]]
+    manifest: dict[str, object] = {
+        "authority_scope": "SSE_TRADING_CALENDAR_WINDOW_ONLY",
+        "calendar_authority_status": (
+            "NOT_GRANTED_WITHOUT_RETURNED_PUBLICATION_CAPABILITY"
+        ),
+        "calendar_integrity_verified": True,
+        "development_session_alignment_verified": False,
+        "development_session_count_claimed": False,
         "embargo_consumed": False,
-        "experiment_launched": False,
-        "feature_history_only": True,
+        "end_date": development[-1],
+        "exchange": "SSE",
+        "experiment_launch_eligible": False,
         "final_oos_consumed": False,
-        "label_rows_generated": False,
-        "plan_sha256": plan["plan_sha256"],
+        "formal_materialization_eligible": False,
+        "natural_day_coverage_verified": True,
+        "open_session_count": len(open_wire),
+        "open_sessions": open_wire,
+        "open_sessions_root_sha256": hashlib.sha256(
+            _canonical_bytes(
+                {
+                    "end_date": development[-1].replace("-", ""),
+                    "exchange": "SSE",
+                    "open_sessions": open_wire,
+                    "schema": "jiaoch-trade-cal-open-sessions/v1",
+                    "start_date": prewindow[0].replace("-", ""),
+                }
+            )
+        ).hexdigest(),
+        "open_sessions_sorted": True,
+        "pretrade_chain_verified": True,
         "production_profile_registered": False,
         "production_recommendation_eligible": False,
-        "schema_version": "audited-pit-factor-v3-feature-history-collection-evidence/v1",
-        "security_code_transition_contract_sha256": (SECURITY_CODE_TRANSITION_CONTRACT_SHA256),
-        "session_authorities": [_session_authority(value) for value in sessions],
-        "target_rows_generated": False,
-        "train_backtest_validate_performed": False,
+        "rows_published": False,
+        "schema": "jiaoch-trade-cal-authority/v1",
+        "start_date": prewindow[0],
     }
-
-
-def _verify_authority(
-    *,
-    evidence: dict[str, object],
-    plan: dict[str, object],
-) -> dict[str, object]:
-    development = plan["development_sessions"]["sessions"]
-    return history_authority.verify_factor_v3_feature_history_collection_authority(
-        collection_evidence=evidence,
-        collection_plan=plan,
+    monkeypatch.setattr(history_authority, "_REQUIRED_PRIOR_OPEN_SESSIONS", 2)
+    monkeypatch.setattr(history_authority, "_FROZEN_DEVELOPMENT_SESSION_COUNT", 1)
+    monkeypatch.setattr(history_authority, "_FROZEN_DEVELOPMENT_START", development[0])
+    monkeypatch.setattr(history_authority, "_FROZEN_DEVELOPMENT_END", development[-1])
+    _install_synthetic_calendar(monkeypatch, manifest, development)
+    publication = _trade_cal_publication()
+    plan = history_authority.build_factor_v3_feature_history_collection_plan(
         trade_cal_output_root=Path("synthetic-trade-cal-root"),
+        trade_cal_publication=publication,
         development_session_refs=_development_refs(development),
         temporal_partition_contract=load_temporal_partition_contract(PARTITION_V1_PATH),
+    )
+    return plan, publication, prewindow
+
+
+def _collector_for_session(
+    store: PITReceiptStore,
+    transport: _FeatureHistoryTransport,
+    trade_date: str,
+) -> ControlledTushareCollector:
+    contract = load_temporal_partition_contract(PARTITION_V1_PATH)
+    role = "development" if trade_date < "2024-01-01" else "contaminated_diagnostic"
+    return ControlledTushareCollector(
+        store=store,
+        token="synthetic-token-never-persisted",
+        api_url="https://feature-history.example.test",
+        allowed_hosts=("feature-history.example.test",),
+        transport=transport,
+        clock=_FixtureClock(),
+        max_attempts=3,
+        sleeper=lambda _seconds: None,
+        source_profile="feature-history-fixture",
+        request_protocol="tushare-path-per-interface/v1",
+        temporal_contract=contract,
+        temporal_role=role,
+        temporal_contract_sha256=contract["contract_sha256"],
+        temporal_start_date=trade_date,
+        temporal_end_date=trade_date,
+        workers=1,
+    )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _receipt_ref_sha256(receipt: sqlite3.Row) -> str:
+    params = json.loads(receipt["params_json"])
+    return canonical_sha256(
+        {
+            "dataset": receipt["dataset"],
+            "partition_key": receipt["partition_key"],
+            "endpoint": receipt["endpoint"],
+            "params": params,
+            "retrieved_at": receipt["retrieved_at"],
+            "http_status": receipt["http_status"],
+            "raw_path": receipt["raw_path"],
+            "raw_sha256": receipt["raw_sha256"],
+            "raw_bytes": receipt["raw_bytes"],
+            "response_code": receipt["response_code"],
+            "response_message": receipt["response_message"],
+            "row_cap": receipt["row_cap"],
+            "row_count": receipt["row_count"],
+            "normalized_sha256": receipt["normalized_sha256"],
+            "parser_version": receipt["parser_version"],
+        }
+    )
+
+
+def _independent_session_refs(
+    store: PITReceiptStore,
+    reports: dict[str, dict[str, object]],
+    sessions: list[str],
+) -> list[dict[str, object]]:
+    output = []
+    with sqlite3.connect(store.database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        for session in sessions:
+            receipt = connection.execute(
+                "SELECT * FROM receipts WHERE dataset='bak_basic' AND partition_key=?",
+                (session,),
+            ).fetchone()
+            if receipt is None or session not in reports:
+                output.append(
+                    {
+                        "trade_date": session,
+                        "bak_basic_receipt_sha256": SHA_A,
+                        "bak_basic_raw_sha256": SHA_A,
+                        "bak_basic_normalized_rows_sha256": SHA_A,
+                        "bak_basic_row_count": 1,
+                        "market_generation_id": f"missing:{session}",
+                        "market_generation_manifest_sha256": SHA_A,
+                        "market_generation_lineage_sha256": SHA_A,
+                        "daily_rows_root_sha256": SHA_A,
+                        "suspend_d_rows_root_sha256": SHA_A,
+                    }
+                )
+                continue
+            market = reports[session]
+            manifest = market["manifest"]
+            output.append(
+                {
+                    "trade_date": session,
+                    "bak_basic_receipt_sha256": _receipt_ref_sha256(receipt),
+                    "bak_basic_raw_sha256": receipt["raw_sha256"],
+                    "bak_basic_normalized_rows_sha256": receipt["normalized_sha256"],
+                    "bak_basic_row_count": int(receipt["row_count"]),
+                    "market_generation_id": market["generation_id"],
+                    "market_generation_manifest_sha256": market["manifest_sha256"],
+                    "market_generation_lineage_sha256": market["lineage_sha256"],
+                    "daily_rows_root_sha256": manifest["dataset_roots"]["daily"],
+                    "suspend_d_rows_root_sha256": manifest["dataset_roots"]["suspend_d"],
+                }
+            )
+    return output
+
+
+def _finalize_store(store: PITReceiptStore) -> str:
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    return _file_sha256(Path(store.database_path))
+
+
+def _real_store_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    include_beijing: bool = True,
+    include_star: bool = True,
+    semantic_empty_sessions: frozenset[str] = frozenset(),
+    omit_market_session: str | None = None,
+) -> tuple[
+    dict[str, object],
+    dict[str, object],
+    list[str],
+    PITReceiptStore,
+    list[dict[str, object]],
+    str,
+]:
+    plan, publication, sessions = _small_plan(monkeypatch)
+    store = PITReceiptStore(str(tmp_path / "pit-store"))
+    transport = _FeatureHistoryTransport(
+        include_beijing=include_beijing,
+        include_star=include_star,
+        semantic_empty_sessions=semantic_empty_sessions,
+    )
+    reports: dict[str, dict[str, object]] = {}
+    for session in sessions:
+        collector = _collector_for_session(store, transport, session)
+        collector.fetch_membership_snapshot(build_bak_basic_specs([session])[0])
+        if session != omit_market_session:
+            reports[session] = collector.collect_market_session_generation(
+                session,
+                vintage="historical_backfill",
+            )
+    refs = _independent_session_refs(store, reports, sessions)
+    return plan, publication, sessions, store, refs, _finalize_store(store)
+
+
+def _verify_source_bound(
+    *,
+    plan: dict[str, object],
+    publication: dict[str, object],
+    store: PITReceiptStore,
+    refs: list[dict[str, object]],
+    database_sha256: str,
+) -> dict[str, object]:
+    return history_authority.verify_factor_v3_feature_history_collection_authority(
+        collection_plan=plan,
+        trade_cal_output_root=Path("synthetic-trade-cal-root"),
+        trade_cal_publication=publication,
+        development_session_refs=_development_refs(
+            plan["development_sessions"]["sessions"]
+        ),
+        temporal_partition_contract=load_temporal_partition_contract(PARTITION_V1_PATH),
+        pit_store_root=Path(store.root),
+        expected_pit_store_database_sha256=database_sha256,
+        session_authority_refs=refs,
     )
 
 
@@ -268,8 +522,7 @@ def test_public_surface_is_offline_and_caller_cannot_select_history_window() -> 
         ).parameters
     ) == {
         "trade_cal_output_root",
-        "trade_cal_authority_manifest_relative_path",
-        "expected_trade_cal_authority_manifest_sha256",
+        "trade_cal_publication",
         "development_session_refs",
         "temporal_partition_contract",
     }
@@ -278,11 +531,14 @@ def test_public_surface_is_offline_and_caller_cannot_select_history_window() -> 
             history_authority.verify_factor_v3_feature_history_collection_authority
         ).parameters
     ) == {
-        "collection_evidence",
         "collection_plan",
         "development_session_refs",
+        "expected_pit_store_database_sha256",
+        "pit_store_root",
+        "session_authority_refs",
         "temporal_partition_contract",
         "trade_cal_output_root",
+        "trade_cal_publication",
     }
     source = inspect.getsource(history_authority)
     for forbidden in (
@@ -302,7 +558,8 @@ def test_trade_calendar_loader_requires_offline_verifier_and_content_address(
     _prewindow, _development, manifest = _calendar_fixture()
     raw = _canonical_bytes(manifest)
     digest = hashlib.sha256(raw).hexdigest()
-    relative = f"trade_cal_manifests/sha256/{digest[:2]}/{digest}.json"
+    publication = _trade_cal_publication(digest)
+    relative = publication["authority_manifest_relative_path"]
     path = tmp_path / relative
     path.parent.mkdir(parents=True)
     path.write_bytes(raw)
@@ -310,33 +567,126 @@ def test_trade_calendar_loader_requires_offline_verifier_and_content_address(
 
     def verifier(**kwargs):
         calls.append(kwargs)
-        return {
-            "authority_manifest_sha256": digest,
-            "verified": True,
-        }
+        return _trade_cal_verification(manifest, digest)
 
     monkeypatch.setitem(
         sys.modules,
         "app.jiaoch_trade_cal_authority",
         SimpleNamespace(verify_jiaoch_trade_cal_authority=verifier),
     )
-    assert (
-        history_authority._load_verified_trade_cal_manifest(
-            output_root=tmp_path,
-            authority_manifest_relative_path=relative,
-            expected_authority_manifest_sha256=digest,
-        )
-        == manifest
+    loaded, verification = history_authority._load_verified_trade_cal_manifest(
+        output_root=tmp_path,
+        trade_cal_publication=publication,
     )
+    assert loaded == manifest
+    assert verification["calendar_authority_status"] == "VERIFIED_SINGLE_SEALED_CALL"
     assert len(calls) == 2
+    assert calls[0]["publication_capability"] == PUBLICATION_CAPABILITY
 
     path.write_bytes(b"{}")
     with pytest.raises(ValueError, match="manifest"):
         history_authority._load_verified_trade_cal_manifest(
             output_root=tmp_path,
-            authority_manifest_relative_path=relative,
-            expected_authority_manifest_sha256=digest,
+            trade_cal_publication=publication,
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema", "wrong"),
+        ("publication_status", "DURABLE"),
+        ("authority_manifest_created", False),
+        ("publication_capability", "not-a-uuid4"),
+        (
+            "authority_manifest_relative_path",
+            f"trade_cal_manifests/sha256/{SHA_A[:2]}/{SHA_A}.json",
+        ),
+    ],
+)
+def test_trade_calendar_publication_descriptor_is_complete_and_strict(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    _prewindow, development, manifest = _calendar_fixture()
+    _install_synthetic_calendar(monkeypatch, manifest, development)
+    publication = _trade_cal_publication()
+    publication[field] = value
+    with pytest.raises(ValueError, match="publication"):
+        history_authority.build_factor_v3_feature_history_collection_plan(
+            trade_cal_output_root=Path("synthetic-trade-cal-root"),
+            trade_cal_publication=publication,
+            development_session_refs=_development_refs(development),
+            temporal_partition_contract=load_temporal_partition_contract(
+                PARTITION_V1_PATH
+            ),
+        )
+
+
+def test_trade_calendar_loader_accepts_real_candidate_shape_without_monkeypatching_loader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [
+        ["SSE", "20240101", 0, "20231229"],
+        ["SSE", "20240102", 1, "20231229"],
+        ["SSE", "20240103", 1, "20240102"],
+    ]
+    body = _canonical_bytes(
+        {
+            "code": 0,
+            "data": {
+                "fields": ["exchange", "cal_date", "is_open", "pretrade_date"],
+                "items": list(reversed(rows)),
+            },
+            "msg": "success",
+        }
+    )
+
+    class Transport:
+        def post(self, **_kwargs):
+            return HttpEntityResponse(
+                status=200,
+                headers={},
+                body=body,
+                body_complete=True,
+            )
+
+    monkeypatch.setattr(
+        jiaoch_trade_cal_authority,
+        "_transport_factory",
+        lambda: Transport(),
+    )
+    monkeypatch.setattr(
+        jiaoch_trade_cal_authority,
+        "_utc_now",
+        lambda: datetime(2026, 7, 29, tzinfo=timezone.utc),
+    )
+    publication = (
+        jiaoch_trade_cal_authority._collect_jiaoch_trade_cal_with_route_credential(
+            credential="synthetic-secret-never-persisted",
+            generation_id=str(uuid.uuid4()),
+            auxiliary_policy_descriptor=(
+                jiaoch_trade_cal_authority._current_auxiliary_policy_descriptor()
+            ),
+            output_root=tmp_path,
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 1, 3),
+            timeout_seconds=5,
+        )
+    )
+
+    manifest, verification = history_authority._load_verified_trade_cal_manifest(
+        output_root=tmp_path,
+        trade_cal_publication=publication,
+    )
+
+    assert manifest["calendar_authority_status"] == (
+        "NOT_GRANTED_WITHOUT_RETURNED_PUBLICATION_CAPABILITY"
+    )
+    assert verification["calendar_authority_status"] == "VERIFIED_SINGLE_SEALED_CALL"
+    assert verification["verified"] is True
 
 
 def test_frozen_contract_binds_parent_calendar_transition_and_safety() -> None:
@@ -454,10 +804,7 @@ def test_prewindow_start_is_derived_not_a_frozen_or_caller_selected_date(
     _install_synthetic_calendar(monkeypatch, changed_manifest, development)
     changed = history_authority.build_factor_v3_feature_history_collection_plan(
         trade_cal_output_root=Path("synthetic-trade-cal-root"),
-        trade_cal_authority_manifest_relative_path=(
-            f"trade_cal_manifests/sha256/{SHA_A[:2]}/{SHA_A}.json"
-        ),
-        expected_trade_cal_authority_manifest_sha256=SHA_A,
+        trade_cal_publication=_trade_cal_publication(),
         development_session_refs=_development_refs(development),
         temporal_partition_contract=load_temporal_partition_contract(PARTITION_V1_PATH),
     )
@@ -473,6 +820,7 @@ def test_plan_verifier_rebuilds_all_authorities_and_rejects_tamper(
     receipt = history_authority.verify_factor_v3_feature_history_collection_plan(
         collection_plan=plan,
         trade_cal_output_root=Path("synthetic-trade-cal-root"),
+        trade_cal_publication=_trade_cal_publication(),
         development_session_refs=_development_refs(development),
         temporal_partition_contract=load_temporal_partition_contract(PARTITION_V1_PATH),
     )
@@ -490,6 +838,7 @@ def test_plan_verifier_rebuilds_all_authorities_and_rejects_tamper(
         history_authority.verify_factor_v3_feature_history_collection_plan(
             collection_plan=tampered,
             trade_cal_output_root=Path("synthetic-trade-cal-root"),
+            trade_cal_publication=_trade_cal_publication(),
             development_session_refs=_development_refs(development),
             temporal_partition_contract=load_temporal_partition_contract(PARTITION_V1_PATH),
         )
@@ -501,9 +850,16 @@ def test_plan_verifier_rebuilds_all_authorities_and_rejects_tamper(
     rehashed["plan_sha256"] = canonical_sha256(
         {key: value for key, value in rehashed.items() if key != "plan_sha256"}
     )
-    rehashed_evidence = _collection_evidence(rehashed)
     with pytest.raises(ValueError, match="plan"):
-        _verify_authority(evidence=rehashed_evidence, plan=rehashed)
+        history_authority.verify_factor_v3_feature_history_collection_plan(
+            collection_plan=rehashed,
+            trade_cal_output_root=Path("synthetic-trade-cal-root"),
+            trade_cal_publication=_trade_cal_publication(),
+            development_session_refs=_development_refs(development),
+            temporal_partition_contract=load_temporal_partition_contract(
+                PARTITION_V1_PATH
+            ),
+        )
 
 
 def test_plan_rejects_insufficient_history_and_development_alignment_drift(
@@ -518,10 +874,7 @@ def test_plan_rejects_insufficient_history_and_development_alignment_drift(
     with pytest.raises(ValueError, match="250"):
         history_authority.build_factor_v3_feature_history_collection_plan(
             trade_cal_output_root=Path("synthetic-trade-cal-root"),
-            trade_cal_authority_manifest_relative_path=(
-                f"trade_cal_manifests/sha256/{SHA_A[:2]}/{SHA_A}.json"
-            ),
-            expected_trade_cal_authority_manifest_sha256=SHA_A,
+            trade_cal_publication=_trade_cal_publication(),
             development_session_refs=_development_refs(development),
             temporal_partition_contract=load_temporal_partition_contract(PARTITION_V1_PATH),
         )
@@ -535,10 +888,7 @@ def test_plan_rejects_insufficient_history_and_development_alignment_drift(
     with pytest.raises(ValueError, match="development"):
         history_authority.build_factor_v3_feature_history_collection_plan(
             trade_cal_output_root=Path("synthetic-trade-cal-root"),
-            trade_cal_authority_manifest_relative_path=(
-                f"trade_cal_manifests/sha256/{SHA_A[:2]}/{SHA_A}.json"
-            ),
-            expected_trade_cal_authority_manifest_sha256=SHA_A,
+            trade_cal_publication=_trade_cal_publication(),
             development_session_refs=_development_refs(development),
             temporal_partition_contract=load_temporal_partition_contract(PARTITION_V1_PATH),
         )
@@ -573,10 +923,7 @@ def test_plan_rejects_unverified_or_unsafe_trade_calendar_manifest(
     with pytest.raises(ValueError, match="trade calendar"):
         history_authority.build_factor_v3_feature_history_collection_plan(
             trade_cal_output_root=Path("synthetic-trade-cal-root"),
-            trade_cal_authority_manifest_relative_path=(
-                f"trade_cal_manifests/sha256/{SHA_A[:2]}/{SHA_A}.json"
-            ),
-            expected_trade_cal_authority_manifest_sha256=SHA_A,
+            trade_cal_publication=_trade_cal_publication(),
             development_session_refs=_development_refs(development),
             temporal_partition_contract=load_temporal_partition_contract(PARTITION_V1_PATH),
         )
@@ -592,10 +939,7 @@ def test_plan_rejects_wrong_partition_contract_or_frozen_parent_root(
     with pytest.raises(ValueError, match="partition"):
         history_authority.build_factor_v3_feature_history_collection_plan(
             trade_cal_output_root=Path("synthetic-trade-cal-root"),
-            trade_cal_authority_manifest_relative_path=(
-                f"trade_cal_manifests/sha256/{SHA_A[:2]}/{SHA_A}.json"
-            ),
-            expected_trade_cal_authority_manifest_sha256=SHA_A,
+            trade_cal_publication=_trade_cal_publication(),
             development_session_refs=_development_refs(development),
             temporal_partition_contract=wrong_contract,
         )
@@ -608,35 +952,46 @@ def test_plan_rejects_wrong_partition_contract_or_frozen_parent_root(
     with pytest.raises(ValueError, match="frozen development"):
         history_authority.build_factor_v3_feature_history_collection_plan(
             trade_cal_output_root=Path("synthetic-trade-cal-root"),
-            trade_cal_authority_manifest_relative_path=(
-                f"trade_cal_manifests/sha256/{SHA_A[:2]}/{SHA_A}.json"
-            ),
-            expected_trade_cal_authority_manifest_sha256=SHA_A,
+            trade_cal_publication=_trade_cal_publication(),
             development_session_refs=_development_refs(development),
             temporal_partition_contract=load_temporal_partition_contract(PARTITION_V1_PATH),
         )
 
 
-def test_formal_collection_authority_accepts_exact_nonempty_daily_and_suspend_evidence(
+def test_formal_collection_authority_replays_real_store_and_grants_only_feature_history(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    plan, prewindow, _development, _manifest = _build_plan(monkeypatch)
-    evidence = _collection_evidence(plan)
+    plan, publication, sessions, store, refs, database_sha256 = _real_store_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    before = Path(store.database_path).stat()
 
-    receipt = _verify_authority(evidence=evidence, plan=plan)
+    receipt = _verify_source_bound(
+        plan=plan,
+        publication=publication,
+        store=store,
+        refs=refs,
+        database_sha256=database_sha256,
+    )
 
+    after = Path(store.database_path).stat()
     assert receipt["verified"] is True
     assert receipt["authority_status"] == "VERIFIED_FEATURE_HISTORY_ONLY"
-    assert receipt["session_count"] == 250
-    assert receipt["sessions_sha256"] == canonical_sha256(prewindow)
-    assert receipt["exact_nonempty_bak_basic_session_count"] == 250
-    assert receipt["daily_generation_session_count"] == 250
-    assert receipt["suspend_d_authority_session_count"] == 250
-    assert receipt["upstream_star_preserved_session_count"] == 250
-    assert receipt["upstream_beijing_preserved_session_count"] == 250
+    assert receipt["session_count"] == 2
+    assert receipt["sessions_sha256"] == canonical_sha256(sessions)
+    assert receipt["pit_store_database_sha256"] == database_sha256
+    assert receipt["exact_nonempty_bak_basic_session_count"] == 2
+    assert receipt["daily_generation_session_count"] == 2
+    assert receipt["suspend_d_authority_session_count"] == 2
+    assert receipt["upstream_star_preserved_session_count"] == 2
+    assert receipt["upstream_beijing_preserved_session_count"] == 2
     assert receipt["security_code_transition_contract_sha256"] == (
         SECURITY_CODE_TRANSITION_CONTRACT_SHA256
     )
+    assert receipt["source_authority_root_sha256"] not in {SHA_A, SHA_B, SHA_C}
+    assert receipt["producer_code_root_sha256"] not in {SHA_A, SHA_B, SHA_C}
     assert receipt["factor_materialization_eligible"] is False
     assert receipt["experiment_launch_eligible"] is False
     assert receipt["embargo_consumed"] is False
@@ -646,162 +1001,207 @@ def test_formal_collection_authority_accepts_exact_nonempty_daily_and_suspend_ev
     assert receipt["receipt_sha256"] == canonical_sha256(
         {key: value for key, value in receipt.items() if key != "receipt_sha256"}
     )
+    assert (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns)
+
+
+def test_formal_authority_rejects_semantic_empty_instead_of_exact_bak_basic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, publication, _sessions, store, refs, database_sha256 = _real_store_fixture(
+        tmp_path,
+        monkeypatch,
+        semantic_empty_sessions=frozenset({"2023-12-29"}),
+    )
+
+    with pytest.raises(ValueError, match="exact nonempty"):
+        _verify_source_bound(
+            plan=plan,
+            publication=publication,
+            store=store,
+            refs=refs,
+            database_sha256=database_sha256,
+        )
+
+
+def test_formal_authority_rejects_forged_caller_session_refs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, publication, _sessions, store, refs, database_sha256 = _real_store_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    forged = deepcopy(refs)
+    forged[0]["bak_basic_normalized_rows_sha256"] = SHA_A
+
+    with pytest.raises(ValueError, match="session authority"):
+        _verify_source_bound(
+            plan=plan,
+            publication=publication,
+            store=store,
+            refs=forged,
+            database_sha256=database_sha256,
+        )
+
+
+def test_formal_authority_rejects_missing_four_shard_market_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, publication, _sessions, store, refs, database_sha256 = _real_store_fixture(
+        tmp_path,
+        monkeypatch,
+        omit_market_session="2024-01-02",
+    )
+
+    with pytest.raises(ValueError, match="market generation"):
+        _verify_source_bound(
+            plan=plan,
+            publication=publication,
+            store=store,
+            refs=refs,
+            database_sha256=database_sha256,
+        )
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "message"),
-    [
-        ("semantic_empty", True, "exact nonempty"),
-        ("source_kind", "semantic_empty", "exact nonempty"),
-        ("source_kind", "causal_carry_forward", "exact nonempty"),
-        ("source_kind", "pre_anchor_quarantine", "exact nonempty"),
-        ("row_count", 0, "exact nonempty"),
-        ("receipt_status", "invalid_json", "exact nonempty"),
-    ],
+    ("include_star", "include_beijing"),
+    [(False, True), (True, False)],
 )
-def test_formal_authority_rejects_nonexact_or_empty_bak_basic(
+def test_formal_authority_derives_and_requires_upstream_star_and_beijing_rows(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    field: str,
-    value: object,
-    message: str,
+    include_star: bool,
+    include_beijing: bool,
 ) -> None:
-    plan, _prewindow, _development, _manifest = _build_plan(monkeypatch)
-    evidence = _collection_evidence(plan)
-    evidence["session_authorities"][0]["bak_basic"][field] = value
-    with pytest.raises(ValueError, match=message):
-        _verify_authority(evidence=evidence, plan=plan)
+    plan, publication, _sessions, store, refs, database_sha256 = _real_store_fixture(
+        tmp_path,
+        monkeypatch,
+        include_star=include_star,
+        include_beijing=include_beijing,
+    )
 
-
-@pytest.mark.parametrize(
-    ("mutation", "message"),
-    [
-        ("missing_daily", "daily"),
-        ("empty_daily", "daily"),
-        ("missing_suspend", "suspend_d"),
-        ("unverified_suspend", "suspend_d"),
-        ("unpublished", "market generation"),
-        ("final_oos", "market generation"),
-    ],
-)
-def test_formal_authority_rejects_missing_or_unverified_market_shards(
-    monkeypatch: pytest.MonkeyPatch,
-    mutation: str,
-    message: str,
-) -> None:
-    plan, _prewindow, _development, _manifest = _build_plan(monkeypatch)
-    evidence = _collection_evidence(plan)
-    generation = evidence["session_authorities"][0]["market_generation"]
-    if mutation == "missing_daily":
-        generation["shards"] = [row for row in generation["shards"] if row["dataset"] != "daily"]
-    elif mutation == "empty_daily":
-        generation["shards"][0]["row_count"] = 0
-    elif mutation == "missing_suspend":
-        generation["shards"] = [
-            row for row in generation["shards"] if row["dataset"] != "suspend_d"
-        ]
-    elif mutation == "unverified_suspend":
-        generation["shards"][-1]["authority_status"] = "MISSING"
-    elif mutation == "unpublished":
-        generation["status"] = "collecting"
-    else:
-        generation["final_oos_eligible"] = True
-    with pytest.raises(ValueError, match=message):
-        _verify_authority(evidence=evidence, plan=plan)
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        "filter",
-        "counts",
-        "root",
-        "star_missing",
-        "beijing_missing",
-    ],
-)
-def test_formal_authority_rejects_upstream_star_or_beijing_filtering(
-    monkeypatch: pytest.MonkeyPatch,
-    mutation: str,
-) -> None:
-    plan, _prewindow, _development, _manifest = _build_plan(monkeypatch)
-    evidence = _collection_evidence(plan)
-    scope = evidence["session_authorities"][0]["bak_basic"]["upstream_scope"]
-    if mutation == "filter":
-        scope["filter_applied"] = True
-    elif mutation == "counts":
-        scope["preserved_row_count"] -= 1
-    elif mutation == "root":
-        scope["preserved_rows_sha256"] = SHA_C
-    elif mutation == "star_missing":
-        scope["preserved_board_counts"]["science_technology"] = 0
-        scope["source_board_counts"]["science_technology"] = 0
-        scope["preserved_row_count"] -= 1
-        scope["source_row_count"] -= 1
-    else:
-        scope["preserved_board_counts"]["beijing"] = 0
-        scope["source_board_counts"]["beijing"] = 0
-        scope["preserved_row_count"] -= 1
-        scope["source_row_count"] -= 1
     with pytest.raises(ValueError, match="upstream"):
-        _verify_authority(evidence=evidence, plan=plan)
+        _verify_source_bound(
+            plan=plan,
+            publication=publication,
+            store=store,
+            refs=refs,
+            database_sha256=database_sha256,
+        )
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("candidate_rows_generated", True),
-        ("label_rows_generated", True),
-        ("target_rows_generated", True),
-        ("train_backtest_validate_performed", True),
-        ("experiment_launched", True),
-        ("embargo_consumed", True),
-        ("final_oos_consumed", True),
-        ("production_profile_registered", True),
-        ("production_recommendation_eligible", True),
-    ],
-)
-def test_formal_authority_rejects_forbidden_outputs_or_safety_drift(
+def test_formal_authority_rejects_wrong_database_anchor(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    field: str,
-    value: object,
 ) -> None:
-    plan, _prewindow, _development, _manifest = _build_plan(monkeypatch)
-    evidence = _collection_evidence(plan)
-    evidence[field] = value
-    with pytest.raises(ValueError, match="feature history"):
-        _verify_authority(evidence=evidence, plan=plan)
+    plan, publication, _sessions, store, refs, _database_sha256 = _real_store_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+
+    with pytest.raises(ValueError, match="database"):
+        _verify_source_bound(
+            plan=plan,
+            publication=publication,
+            store=store,
+            refs=refs,
+            database_sha256=SHA_A,
+        )
+
+
+def test_formal_authority_rejects_raw_receipt_tamper_even_with_refreshed_database_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, publication, _sessions, store, refs, database_sha256 = _real_store_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        raw_path = connection.execute(
+            "SELECT raw_path FROM receipts WHERE dataset='bak_basic' ORDER BY partition_key LIMIT 1"
+        ).fetchone()[0]
+    Path(store.root, raw_path).write_bytes(b"tampered")
+
+    with pytest.raises(ValueError, match="PIT"):
+        _verify_source_bound(
+            plan=plan,
+            publication=publication,
+            store=store,
+            refs=refs,
+            database_sha256=database_sha256,
+        )
+
+
+def test_formal_authority_rejects_wal_or_shm_instead_of_ignoring_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, publication, _sessions, store, refs, database_sha256 = _real_store_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    Path(f"{store.database_path}-wal").write_bytes(b"unexpected-live-wal")
+
+    with pytest.raises(ValueError, match="WAL|SHM|finalized"):
+        _verify_source_bound(
+            plan=plan,
+            publication=publication,
+            store=store,
+            refs=refs,
+            database_sha256=database_sha256,
+        )
 
 
 def test_formal_authority_rejects_transition_session_or_plan_binding_drift(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    plan, _prewindow, _development, _manifest = _build_plan(monkeypatch)
-    evidence = _collection_evidence(plan)
-    evidence["security_code_transition_contract_sha256"] = SHA_A
+    plan, publication, _sessions, store, refs, database_sha256 = _real_store_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    tampered = deepcopy(plan)
+    tampered["security_code_transition_contract_sha256"] = SHA_A
+    tampered["plan_sha256"] = canonical_sha256(
+        {key: value for key, value in tampered.items() if key != "plan_sha256"}
+    )
     with pytest.raises(ValueError, match="transition"):
-        _verify_authority(evidence=evidence, plan=plan)
-
-    evidence = _collection_evidence(plan)
-    evidence["session_authorities"] = evidence["session_authorities"][:-1]
-    with pytest.raises(ValueError, match="session"):
-        _verify_authority(evidence=evidence, plan=plan)
-
-    evidence = _collection_evidence(plan)
-    evidence["plan_sha256"] = SHA_A
-    with pytest.raises(ValueError, match="plan"):
-        _verify_authority(evidence=evidence, plan=plan)
+        _verify_source_bound(
+            plan=tampered,
+            publication=publication,
+            store=store,
+            refs=refs,
+            database_sha256=database_sha256,
+        )
 
 
 def test_formal_authority_is_structurally_strict(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    plan, _prewindow, _development, _manifest = _build_plan(monkeypatch)
-    evidence = _collection_evidence(plan)
-    evidence["surprise"] = True
+    plan, publication, _sessions, store, refs, database_sha256 = _real_store_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    unexpected = deepcopy(refs)
+    unexpected[0]["surprise"] = True
     with pytest.raises(ValueError, match="fields"):
-        _verify_authority(evidence=evidence, plan=plan)
+        _verify_source_bound(
+            plan=plan,
+            publication=publication,
+            store=store,
+            refs=unexpected,
+            database_sha256=database_sha256,
+        )
 
-    evidence = _collection_evidence(plan)
-    evidence["session_authorities"][0]["bak_basic"]["surprise"] = True
-    with pytest.raises(ValueError, match="fields"):
-        _verify_authority(evidence=evidence, plan=plan)
+    with pytest.raises(ValueError, match="session authority"):
+        _verify_source_bound(
+            plan=plan,
+            publication=publication,
+            store=store,
+            refs=refs[:-1],
+            database_sha256=database_sha256,
+        )
