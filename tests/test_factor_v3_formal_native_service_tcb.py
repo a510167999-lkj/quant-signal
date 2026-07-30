@@ -205,7 +205,7 @@ def _build_handoff_fixture(root: Path) -> tuple[Path, Path, Path, Path, bytes, s
         credential,
         builtin_users_rights=None,
         grant_current_user=False,
-        interactive_rights="R",
+        interactive_rights="F",
     )
 
     paths = {
