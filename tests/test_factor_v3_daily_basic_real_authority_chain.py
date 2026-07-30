@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 import hashlib
+import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -462,10 +463,12 @@ def test_real_250_plus_483_authority_chain_runs_and_cli_reverifies(
         "security_code_transition_evidence_root": str(evidence_root),
         "expected_security_code_transition_contract_sha256": transition_sha256,
     }
+    authority_binding = {"binding_sha256": "9" * 64}
     monkeypatch.setattr(
         frozen,
         "verify_factor_v3_feature_history_frozen_source_attestation",
         lambda **kwargs: {
+            "authority_binding": authority_binding,
             "receipt_sha256": history_runner.verify_factor_v3_feature_history_run(
                 run_spec_path=kwargs["feature_history_run_spec_path"],
                 run_root=kwargs["feature_history_run_root"],
@@ -474,6 +477,11 @@ def test_real_250_plus_483_authority_chain_runs_and_cli_reverifies(
             "sessions_sha256": "f" * 64,
             "verified": True,
         },
+    )
+    monkeypatch.setattr(
+        frozen,
+        "_validated_attested_replay_context",
+        lambda **_kwargs: {"authority_binding": authority_binding},
     )
     spec = runner.build_factor_v3_daily_basic_run_spec(
         exact_set_authority_inputs=exact_inputs,
@@ -532,6 +540,15 @@ def test_real_250_plus_483_authority_chain_runs_and_cli_reverifies(
         )
         == 2
     )
+
+
+def test_real_chain_fixture_binds_initial_and_terminal_attestation_context() -> None:
+    source = inspect.getsource(
+        test_real_250_plus_483_authority_chain_runs_and_cli_reverifies
+    )
+
+    assert '"authority_binding": authority_binding' in source
+    assert '"_validated_attested_replay_context"' in source
 
 
 def test_real_b805_attestation_builds_capability_free_250_plus_483_spec(

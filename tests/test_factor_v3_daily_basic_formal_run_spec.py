@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 from copy import deepcopy
 from datetime import date, timedelta
@@ -202,6 +203,7 @@ def test_formal_paths_and_authority_inputs_are_frozen_exactly() -> None:
 def test_formal_review_manifest_covers_the_complete_runtime_import_closure() -> None:
     assert formal.FORMAL_REVIEW_SOURCE_RELATIVE_PATHS == (
         "scripts/build_factor_v3_daily_basic_formal_run_spec.py",
+        "scripts/run_factor_v3_daily_basic_formal.py",
         "app/audited_pit_factor_v3_feature_history_authority.py",
         "app/audited_pit_factor_v3_points_contract.py",
         "app/current_pool.py",
@@ -237,6 +239,113 @@ def test_formal_review_manifest_covers_the_complete_runtime_import_closure() -> 
         "app/research_security_code_transition.py",
         "app/research_suspension_evidence.py",
     )
+
+
+def test_formal_bootstrap_modules_have_no_top_level_application_imports() -> None:
+    root = Path(__file__).resolve().parents[1]
+    for relative_path in (
+        "scripts/build_factor_v3_daily_basic_formal_run_spec.py",
+        "scripts/run_factor_v3_daily_basic_formal.py",
+    ):
+        tree = ast.parse((root / relative_path).read_text(encoding="utf-8"))
+        top_level_imports = []
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                top_level_imports.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                top_level_imports.append(node.module or "")
+        assert not any(
+            name == "app" or name.startswith("app.")
+            for name in top_level_imports
+        )
+
+
+def test_external_bootstrap_claim_binds_every_runtime_trust_anchor() -> None:
+    commit = "d" * 40
+    builder_sha256 = "1" * 64
+    shim_sha256 = "2" * 64
+    source_manifest = [
+        {
+            "bytes": 1,
+            "path": "scripts/build_factor_v3_daily_basic_formal_run_spec.py",
+            "sha256": builder_sha256,
+        },
+        {
+            "bytes": 1,
+            "path": "scripts/run_factor_v3_daily_basic_formal.py",
+            "sha256": shim_sha256,
+        },
+    ]
+    source_root = hashlib.sha256(
+        formal._canonical_bytes(source_manifest)
+    ).hexdigest()
+    review_evidence = {
+        "payload": {
+            "formal_input_root_sha256": formal.FORMAL_INPUT_ROOT_SHA256,
+            "reviewed_commit": commit,
+            "reviewed_source_root_sha256": source_root,
+        },
+        "payload_sha256": "3" * 64,
+        "receipt_sha256": "4" * 64,
+    }
+    claim = {
+        "base_python_executable_path": str(formal.BASE_PYTHON_EXECUTABLE),
+        "base_python_executable_sha256": (
+            formal.BASE_PYTHON_EXECUTABLE_SHA256
+        ),
+        "branch": formal.EXPECTED_BRANCH,
+        "builder_sha256": builder_sha256,
+        "formal_input_root_sha256": formal.FORMAL_INPUT_ROOT_SHA256,
+        "git_executable_path": str(formal.GIT_EXECUTABLE),
+        "git_executable_sha256": formal.GIT_EXECUTABLE_SHA256,
+        "project_id": "quant-signal-lkj",
+        "python_executable_path": str(formal.PYTHON_EXECUTABLE),
+        "python_executable_sha256": formal.PYTHON_EXECUTABLE_SHA256,
+        "review_payload_sha256": review_evidence["payload_sha256"],
+        "review_public_key_spki_sha256": (
+            formal.FORMAL_REVIEW_PUBLIC_KEY_SPKI_SHA256
+        ),
+        "review_receipt_sha256": review_evidence["receipt_sha256"],
+        "reviewed_commit": commit,
+        "reviewed_source_root_sha256": source_root,
+        "schema": "factor-v3-daily-basic-formal-bootstrap-claim/v1",
+        "shim_sha256": shim_sha256,
+    }
+    raw = formal._canonical_bytes(claim)
+    digest = hashlib.sha256(raw).hexdigest()
+
+    assert formal._validated_external_bootstrap_claim(
+        raw,
+        expected_claim_sha256=digest,
+        expected_commit=commit,
+        expected_source_manifest=source_manifest,
+        review_evidence=review_evidence,
+    ) == claim
+
+    for rejected in (
+        {key: value for key, value in claim.items() if key != "shim_sha256"},
+        {**claim, "review_receipt_sha256": "5" * 64},
+        {**claim, "python_executable_path": "C:\\attacker\\python.exe"},
+    ):
+        rejected_raw = formal._canonical_bytes(rejected)
+        with pytest.raises(formal.FormalRunSpecError, match="bootstrap"):
+            formal._validated_external_bootstrap_claim(
+                rejected_raw,
+                expected_claim_sha256=hashlib.sha256(
+                    rejected_raw
+                ).hexdigest(),
+                expected_commit=commit,
+                expected_source_manifest=source_manifest,
+                review_evidence=review_evidence,
+            )
+    with pytest.raises(formal.FormalRunSpecError, match="bootstrap"):
+        formal._validated_external_bootstrap_claim(
+            raw,
+            expected_claim_sha256="0" * 64,
+            expected_commit=commit,
+            expected_source_manifest=source_manifest,
+            review_evidence=review_evidence,
+        )
 
 
 def test_offline_candidate_uses_exact_inputs_builds_twice_and_loads_once() -> None:
@@ -647,17 +756,37 @@ def test_formal_runner_load_binds_physical_source_through_import_and_postverify(
     assert "FACTOR_V3_DAILY_BASIC_RUNNER_SHA256" in source
     assert "_open_pinned_file" in source
     assert "_postverify_pinned_file" in source
+    assert "_postverify_loaded_review_modules" in inspect.getsource(
+        formal.run_locked_runner_cli
+    )
 
 
-def test_formal_main_holds_complete_reviewed_sources_through_build_and_publish() -> None:
+def test_formal_build_and_run_require_external_anchor_and_hold_complete_review() -> None:
     source = inspect.getsource(formal.main)
+    signature = inspect.signature(formal.main)
 
+    assert signature.parameters[
+        "expected_bootstrap_claim_sha256"
+    ].default is inspect.Parameter.empty
+    assert "_validated_fixed_runtime_identity" in source
     assert "_locked_formal_review_sources" in source
     assert source.index("_locked_formal_review_sources") < source.index(
         "verify_formal_worktree"
     )
     assert source.index("build_and_verify_candidate") < source.index(
         "publish_candidate"
+    )
+    runner_source = inspect.getsource(formal.run_locked_runner_cli)
+    assert "_validated_fixed_runtime_identity" in runner_source
+    assert "_locked_formal_review_sources" in runner_source
+    assert runner_source.index("_locked_formal_review_sources") < (
+        runner_source.index("verify_formal_worktree")
+    )
+    assert runner_source.index("verify_formal_worktree") < runner_source.index(
+        "_load_runner"
+    )
+    assert runner_source.index("_load_runner") < runner_source.index(
+        "runner.main"
     )
 
 
@@ -670,7 +799,19 @@ def test_formal_spec_publication_reuses_safe_cas_primitives() -> None:
     assert "fsync_directory" in source
 
 
-def test_isolated_cli_shim_delegates_verify_without_import_path_leak(
+def test_fixed_runtime_identity_requires_python_base_python_isolation_and_pycache() -> None:
+    source = inspect.getsource(formal._validated_fixed_runtime_identity)
+
+    assert "sys.executable" in source
+    assert "sys._base_executable" in source
+    assert "PYTHON_EXECUTABLE_SHA256" in source
+    assert "BASE_PYTHON_EXECUTABLE_SHA256" in source
+    assert "sys.flags.isolated" in source
+    assert "sys.dont_write_bytecode" in source
+    assert "sys.pycache_prefix" in source
+
+
+def test_isolated_cli_shim_fails_closed_without_external_bootstrap_anchor(
     tmp_path: Path,
 ) -> None:
     shim = (
@@ -704,6 +845,23 @@ def test_isolated_cli_shim_delegates_verify_without_import_path_leak(
         "formal bootstrap claim unavailable; external trusted bootstrap context required\n",
     }
     assert completed.stdout == ""
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    (
+        "private_key",
+        "private-key",
+        "signing_private_key",
+        "rsa_private_key_pem",
+        "RSA Private Key PEM",
+    ),
+)
+def test_formal_credential_shape_rejects_private_key_variants(
+    forbidden: str,
+) -> None:
+    with pytest.raises(formal.FormalRunSpecError, match="credential"):
+        formal._assert_no_credential_shape({forbidden: "not-a-real-secret"})
 
 
 def test_safe_summary_excludes_inputs_credentials_and_capabilities() -> None:
