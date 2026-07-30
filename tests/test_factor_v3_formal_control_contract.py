@@ -717,7 +717,7 @@ def test_actual_completion_supervisor_runtime_and_be3_dispatch_chain(
     )
 
     now = datetime.now(timezone.utc).replace(microsecond=0)
-    config, _execution_payload, execution_authorization_path, public_der = (
+    config, execution_payload, execution_authorization_path, public_der = (
         _be3_crossline_authorized_fixture(
             tmp_path,
             authorization_now=now,
@@ -807,7 +807,15 @@ def test_actual_completion_supervisor_runtime_and_be3_dispatch_chain(
     launch_sha256 = str(launch_authorization["launch_authorization_sha256"])
     completed_path = supervisor.completed_path_for_authorization(ledger_root, launch_sha256)
     completed = json.loads(completed_path.read_bytes())
+    terminal = json.loads(observed[-1].stdout)
     assert result["status"] == "completed"
     assert result["launch_authorization_sha256"] == launch_sha256
     assert completed["status"] == "completed"
     assert completed["worker_terminal_sha256"] == result["worker_terminal_sha256"]
+    assert terminal["schema"] == contract.WORKER_TERMINAL_SCHEMA
+    assert terminal["result"] == {
+        "run_root": execution_payload["run_root"],
+        "run_spec_path": execution_payload["run_spec_path"],
+        "source": "be3-crossline-lightweight-runner",
+        "status": "verified",
+    }
