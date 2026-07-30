@@ -358,7 +358,12 @@ def build_factor_v3_daily_basic_run_spec(
     timeout_seconds: float,
     max_attempts: int,
 ) -> dict[str, Any]:
-    """Create an offline, self-addressed spec derived from the two authorities."""
+    """Create the 733-date acquisition spec derived from the two authorities.
+
+    These are collection sessions, not a materializer's T-1 feature labels:
+    the full 250+483 union stays frozen here even when a downstream transform
+    later consumes a smaller shifted source-date label union.
+    """
 
     prewindow, development, plan_sha256, receipt_sha256 = _verified_history_sources(
         feature_history_collection_plan=feature_history_collection_plan,
