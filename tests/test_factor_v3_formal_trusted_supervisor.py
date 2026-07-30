@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import hashlib
 import inspect
@@ -518,7 +517,6 @@ def test_failed_claim_requires_independently_signed_resume_action(
         original_sha256,
     )
     claim_sha256 = _file_sha256(claim_path)
-    worker_path = Path(str(payload["bootstrap_worker_path"]))
     worker_raw = _worker_source(
         artifact_path=Path(str(payload["formal_output_root"])) / "terminal-artifact.json",
         artifact_raw=_canonical_bytes({"status": "verified"}),
@@ -529,12 +527,18 @@ def test_failed_claim_requires_independently_signed_resume_action(
         worker_action="run",
     )
     assert len(worker_raw) > 0
-    worker_path.write_bytes(worker_raw)
+    worker_path, worker_sha256 = _cas_write(
+        Path(str(payload["bootstrap_output_root"])),
+        "bootstraps",
+        worker_raw,
+        ".py",
+    )
     payload.update(
         {
             "action": "resume",
             "authorization_nonce_sha256": _sha256(b"resume-nonce"),
-            "bootstrap_worker_sha256": _sha256(worker_raw),
+            "bootstrap_worker_path": str(worker_path),
+            "bootstrap_worker_sha256": worker_sha256,
             "resume_of_authorization_sha256": original_sha256,
             "resume_status_path": str(claim_path),
             "resume_status_sha256": claim_sha256,
@@ -551,7 +555,10 @@ def test_failed_claim_requires_independently_signed_resume_action(
         Path(str(payload["publication_completion_receipt_path"])).read_text(encoding="utf-8")
     )
     publication["bootstrap_bytes"] = len(worker_raw)
-    publication["bootstrap_sha256"] = _sha256(worker_raw)
+    publication["bootstrap_relative_path"] = worker_path.relative_to(
+        Path(str(payload["bootstrap_output_root"]))
+    ).as_posix()
+    publication["bootstrap_sha256"] = worker_sha256
     publication_raw = _canonical_bytes(publication)
     publication_path, publication_sha256 = _cas_write(
         Path(str(payload["bootstrap_output_root"])),
