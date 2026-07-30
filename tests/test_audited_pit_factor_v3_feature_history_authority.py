@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 import hashlib
@@ -692,6 +693,11 @@ def test_attestation_cannot_authorize_a_different_same_producer_publication(
         frozen_attestation,
         "_validated_attested_replay_context",
         lambda **_kwargs: deepcopy(attested_context),
+    )
+    monkeypatch.setattr(
+        frozen_attestation,
+        "_locked_physical_frozen_source_binding",
+        lambda _root: nullcontext({}),
     )
 
     with pytest.raises(ValueError, match="attest|binding|mismatch"):

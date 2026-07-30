@@ -27,6 +27,7 @@ from app.audited_pit_factor_v3_points_contract import (
     canonical_sha256,
 )
 from app.durable_io import fsync_directory
+from app import jiaoch_points_raw_authority as raw_authority
 from app.research_partitions import (
     PartitionContractError,
     assert_range_allowed,
@@ -900,14 +901,13 @@ def _promote_snapshot_directory(
 
 
 def _safe_collection_output_root(value: str | Path) -> Path:
-    root = Path(value)
     try:
-        if _is_reparse_point(root) or not root.is_dir():
-            raise OSError
-        resolved = root.resolve(strict=True)
-    except OSError:
+        return raw_authority._safe_existing_directory(
+            Path(value),
+            "factor-v3 feature history collection output root",
+        )
+    except (OSError, ValueError):
         raise ValueError("factor-v3 feature history collection output root rejected") from None
-    return resolved
 
 
 def _collection_manifest_path(
@@ -945,17 +945,15 @@ def _read_collection_manifest(
         expected_sha256=publication["authority_manifest_sha256"],
     )
     try:
-        stat_before = path.stat()
-        if stat_before.st_size <= 0 or stat_before.st_size > _MAX_COLLECTION_MANIFEST_BYTES:
-            raise OSError
-        raw = path.read_bytes()
-        stat_after = path.stat()
-    except OSError:
+        raw = raw_authority._read_safe_file(
+            path,
+            label="factor-v3 feature history collection manifest",
+            max_bytes=_MAX_COLLECTION_MANIFEST_BYTES,
+        )
+    except (OSError, ValueError):
         raise ValueError("factor-v3 feature history collection manifest rejected") from None
     if (
-        len(raw) != stat_before.st_size
-        or stat_after.st_size != stat_before.st_size
-        or stat_after.st_mtime_ns != stat_before.st_mtime_ns
+        not raw
         or not hmac.compare_digest(
             hashlib.sha256(raw).hexdigest(), publication["authority_manifest_sha256"]
         )
@@ -980,46 +978,36 @@ def _write_collection_content_addressed_candidate(
     root = _safe_collection_output_root(output_root)
     if path_pattern.fullmatch(relative_path) is None:
         raise ValueError(f"factor-v3 feature history collection {label} rejected")
-    parent = root
+    parts = relative_path.split("/")
+    digest = parts[-1].removesuffix(".json")
     try:
-        for part in relative_path.split("/")[:-1]:
-            parent = parent / part
-            parent.mkdir(exist_ok=True)
-            resolved = parent.resolve(strict=True)
-            if (
-                _is_reparse_point(parent)
-                or not parent.is_dir()
-                or not resolved.is_relative_to(root)
-            ):
-                raise OSError
-        path = parent / relative_path.rsplit("/", 1)[1]
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_BINARY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
+        parent = raw_authority._content_addressed_directory(
+            root,
+            parts[0],
+            digest,
         )
-        descriptor = os.open(path, flags, 0o600)
-    except FileExistsError:
+        path = parent / parts[-1]
+        if path.relative_to(root).as_posix() != relative_path:
+            raise ValueError
+        raw_authority._write_create_only(
+            path,
+            raw,
+            label=f"factor-v3 feature history collection {label}",
+            reuse_identical=False,
+        )
+        fsync_directory(parent)
+        stored = raw_authority._read_safe_file(
+            path,
+            label=f"factor-v3 feature history collection {label}",
+            max_bytes=len(raw),
+            expected_size=len(raw),
+        )
+    except (OSError, ValueError):
+        raise ValueError(f"factor-v3 feature history collection {label} rejected") from None
+    if not hmac.compare_digest(stored, raw):
         raise ValueError(
-            f"factor-v3 feature history collection {label} content-address conflict"
-        ) from None
-    except OSError:
-        raise ValueError(f"factor-v3 feature history collection {label} rejected") from None
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-        if hasattr(os, "O_DIRECTORY"):
-            directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-    except OSError:
-        raise ValueError(f"factor-v3 feature history collection {label} rejected") from None
+            f"factor-v3 feature history collection {label} postverify rejected"
+        )
     return True
 
 
@@ -1089,23 +1077,15 @@ def _validated_collection_publication_issuance(
     root = _safe_collection_output_root(output_root)
     path = root.joinpath(*relative_path.split("/"))
     try:
-        if (
-            _is_reparse_point(path)
-            or not path.is_file()
-            or path.resolve(strict=True).parent != path.parent.resolve(strict=True)
-            or not path.resolve(strict=True).is_relative_to(root)
-        ):
-            raise OSError
-        stat_before = path.stat()
-        raw = path.read_bytes()
-        stat_after = path.stat()
-    except OSError:
+        raw = raw_authority._read_safe_file(
+            path,
+            label="factor-v3 feature history collection issuance",
+            max_bytes=_MAX_COLLECTION_ISSUANCE_BYTES,
+        )
+    except (OSError, ValueError):
         raise ValueError("factor-v3 feature history collection issuance rejected") from None
     if (
-        stat_before.st_size != len(raw)
-        or stat_after.st_size != stat_before.st_size
-        or stat_after.st_mtime_ns != stat_before.st_mtime_ns
-        or len(raw) > _MAX_COLLECTION_ISSUANCE_BYTES
+        len(raw) > _MAX_COLLECTION_ISSUANCE_BYTES
         or not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), digest)
     ):
         raise ValueError("factor-v3 feature history collection issuance rejected")
@@ -3866,6 +3846,95 @@ def _publish_factor_v3_feature_history_collection_candidate(
         trade_cal_publication=trade_cal_publication,
     )
     return publication
+
+
+def _factor_v3_feature_history_attestation_binding(
+    *,
+    collection_publication: Mapping[str, Any],
+    collection_publication_output_root: str | Path,
+    collection_plan: Mapping[str, Any],
+    development_session_refs: Sequence[Mapping[str, Any]],
+    temporal_partition_contract: Mapping[str, Any],
+    trade_cal_output_root: str | Path,
+    trade_cal_publication: Mapping[str, Any],
+    feature_history_run_spec_path: str | Path,
+    feature_history_run_spec_sha256: str,
+    feature_history_run_root: str | Path,
+    manifest: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    publication = _validated_collection_publication(collection_publication)
+    issuance = _collection_publication_issuance(publication)
+    public_publication = {
+        key: value
+        for key, value in publication.items()
+        if key != "publication_capability"
+    }
+    spec_path = Path(feature_history_run_spec_path).resolve(strict=True)
+    run_root = Path(feature_history_run_root).resolve(strict=True)
+    publication_root = _safe_collection_output_root(
+        collection_publication_output_root
+    )
+    trade_cal_root = Path(trade_cal_output_root).resolve(strict=True)
+    identity = {
+        "collection_plan_sha256": collection_plan["plan_sha256"],
+        "collection_publication": public_publication,
+        "collection_publication_capability_sha256": issuance[
+            "publication_capability_sha256"
+        ],
+        "collection_publication_issuance_relative_path": (
+            _collection_issuance_relative_path(issuance)
+        ),
+        "collection_publication_issuance_sha256": hashlib.sha256(
+            _canonical_bytes(issuance)
+        ).hexdigest(),
+        "collection_publication_output_root": str(publication_root),
+        "development_session_refs_sha256": canonical_sha256(
+            _validated_development_sessions(development_session_refs)
+        ),
+        "feature_history_run_root": str(run_root),
+        "feature_history_run_spec_file_sha256": hashlib.sha256(
+            raw_authority._read_safe_file(
+                spec_path,
+                label="factor-v3 feature history run spec",
+                max_bytes=4 * 1024 * 1024,
+            )
+        ).hexdigest(),
+        "feature_history_run_spec_path": str(spec_path),
+        "feature_history_run_spec_sha256": _strict_sha256(
+            feature_history_run_spec_sha256,
+            label="feature run spec sha256",
+        ),
+        "manifest_identity_sha256": canonical_sha256(dict(manifest)),
+        "manifest_relative_path": publication[
+            "authority_manifest_relative_path"
+        ],
+        "manifest_sha256": publication["authority_manifest_sha256"],
+        "pit_store_database_sha256": receipt["pit_store_database_sha256"],
+        "receipt": dict(receipt),
+        "receipt_sha256": receipt["receipt_sha256"],
+        "schema": "factor-v3-feature-history-attestation-authority-binding/v1",
+        "session_authority_refs_sha256": receipt[
+            "session_authority_refs_sha256"
+        ],
+        "session_count": receipt["session_count"],
+        "sessions_sha256": receipt["sessions_sha256"],
+        "snapshot_index_sha256": receipt["snapshot_index_sha256"],
+        "source_authority_root_sha256": receipt[
+            "source_authority_root_sha256"
+        ],
+        "temporal_partition_contract_sha256": canonical_sha256(
+            _validated_partition_contract(temporal_partition_contract)
+        ),
+        "trade_cal_output_root": str(trade_cal_root),
+        "trade_cal_publication_sha256": canonical_sha256(
+            dict(trade_cal_publication)
+        ),
+    }
+    return {
+        **identity,
+        "binding_sha256": canonical_sha256(identity),
+    }
 
 
 def _verify_factor_v3_feature_history_collection_authority(

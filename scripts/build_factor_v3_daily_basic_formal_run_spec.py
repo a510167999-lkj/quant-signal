@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import date
 import hashlib
 import json
@@ -13,6 +14,9 @@ import sys
 import tempfile
 from types import ModuleType
 from typing import Any
+
+from app import jiaoch_points_raw_authority as raw_authority
+from app.durable_io import fsync_directory
 
 
 class FormalRunSpecError(RuntimeError):
@@ -64,6 +68,35 @@ FORMAL_REVIEW_SOURCE_RELATIVE_PATHS = (
     "app/research_suspension_evidence.py",
 )
 MAIN_REPO_ROOT = Path(r"E:\AI workspace\quant-signal-lkj")
+FORMAL_REVIEW_SOURCE_RELATIVE_PATHS = (
+    "app/audited_pit_factor_v3_feature_history_authority.py",
+    "app/durable_io.py",
+    "app/factor_v3_daily_basic_733_exact_set_authority.py",
+    "app/factor_v3_daily_basic_runner.py",
+    "app/factor_v3_feature_history_frozen_source_attestation.py",
+    "app/factor_v3_feature_history_runner.py",
+    "app/jiaoch_daily_basic_collection_set.py",
+    "app/jiaoch_daily_basic_exact_set_authority.py",
+    "app/jiaoch_points_response_normalization.py",
+    "app/jiaoch_points_raw_authority.py",
+    "app/research_pit_store.py",
+    "app/research_scope.py",
+    "app/research_security_code_transition.py",
+)
+FORMAL_REVIEW_SOURCE_ROOT_SHA256 = (
+    "85942cbc494f7c033b038ce11e43ad7296b44e0c3fa54b4840a1f6016ab781cf"
+)
+FORMAL_REVIEW_RECEIPT_SHA256 = "0" * 64
+FORMAL_REVIEW_RECEIPT_PATH = (
+    MAIN_REPO_ROOT
+    / "data/research_artifacts/factor_v3_daily_basic_formal_review_v1"
+    / "review_receipts/sha256"
+    / FORMAL_REVIEW_RECEIPT_SHA256[:2]
+    / f"{FORMAL_REVIEW_RECEIPT_SHA256}.json"
+)
+FACTOR_V3_DAILY_BASIC_RUNNER_SHA256 = (
+    "454e0f4437cdfe5283b59d1b1cf0383151fe017fa5d0a0918f1d1108a0901ce9"
+)
 SPEC_OUTPUT_ROOT = (
     MAIN_REPO_ROOT
     / "data"
@@ -164,6 +197,109 @@ def _script_worktree_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+@contextmanager
+def _open_pinned_file(
+    path: Path,
+    *,
+    expected_sha256: str,
+    label: str,
+    max_bytes: int = 64 * 1024 * 1024,
+):
+    candidate = raw_authority._safe_existing_file(path, label)
+    before = candidate.lstat()
+    if before.st_size <= 0 or before.st_size > max_bytes:
+        raise FormalRunSpecError(f"{label} rejected")
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        handle = create_file(
+            str(candidate),
+            0x80000000,
+            0x00000001,
+            None,
+            3,
+            0x00200000 | 0x08000000,
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle in (None, invalid):
+            raise FormalRunSpecError(f"{label} safe open rejected")
+        try:
+            descriptor = msvcrt.open_osfhandle(
+                int(handle),
+                os.O_RDONLY | getattr(os, "O_BINARY", 0),
+            )
+        except BaseException:
+            kernel32.CloseHandle(handle)
+            raise
+    else:
+        descriptor = os.open(
+            candidate,
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    stream = os.fdopen(descriptor, "rb")
+    try:
+        opened = os.fstat(stream.fileno())
+        stream.seek(0)
+        raw = stream.read(max_bytes + 1)
+        stream.seek(0)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or int(getattr(opened, "st_file_attributes", 0)) & 0x00000400
+            or not os.path.samestat(before, opened)
+            or len(raw) != opened.st_size
+            or hashlib.sha256(raw).hexdigest() != expected_sha256
+        ):
+            raise FormalRunSpecError(f"{label} identity rejected")
+        yield candidate.resolve(strict=True), stream
+        _postverify_pinned_file(
+            candidate,
+            stream,
+            expected_sha256=expected_sha256,
+            label=label,
+            max_bytes=max_bytes,
+        )
+    finally:
+        stream.close()
+
+
+def _postverify_pinned_file(
+    path: Path,
+    handle: Any,
+    *,
+    expected_sha256: str,
+    label: str,
+    max_bytes: int = 64 * 1024 * 1024,
+) -> None:
+    opened = os.fstat(handle.fileno())
+    terminal = raw_authority._safe_existing_file(path, label).lstat()
+    handle.seek(0)
+    raw = handle.read(max_bytes + 1)
+    handle.seek(0)
+    if (
+        not os.path.samestat(opened, terminal)
+        or len(raw) != opened.st_size
+        or hashlib.sha256(raw).hexdigest() != expected_sha256
+    ):
+        raise FormalRunSpecError(f"{label} drifted")
+
+
 def _git_output(*args: str) -> str:
     environment = {
         key: value
@@ -178,16 +314,21 @@ def _git_output(*args: str) -> str:
             "GIT_TERMINAL_PROMPT": "0",
         }
     )
-    completed = subprocess.run(
-        [str(GIT_EXECUTABLE), "-C", str(FORMAL_WORKTREE_ROOT), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        env=environment,
-        stdin=subprocess.DEVNULL,
-        timeout=60,
-    )
+    with _open_pinned_file(
+        GIT_EXECUTABLE,
+        expected_sha256=GIT_EXECUTABLE_SHA256,
+        label="formal git executable",
+    ) as (executable, _handle):
+        completed = subprocess.run(
+            [str(executable), "-C", str(FORMAL_WORKTREE_ROOT), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            timeout=60,
+        )
     return completed.stdout.strip()
 
 
@@ -202,12 +343,57 @@ def _is_reparse(path: Path) -> bool:
     )
 
 
-def verify_formal_worktree(*, expected_reviewed_commit: str) -> None:
+def _formal_review_source_root() -> str:
+    entries = []
+    for relative_path in FORMAL_REVIEW_SOURCE_RELATIVE_PATHS:
+        raw = raw_authority._read_safe_file(
+            FORMAL_WORKTREE_ROOT / Path(*relative_path.split("/")),
+            label="formal reviewed source",
+            max_bytes=4 * 1024 * 1024,
+        )
+        entries.append(
+            {
+                "path": relative_path,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        )
+    return hashlib.sha256(_canonical_bytes(entries)).hexdigest()
+
+
+def _validated_formal_review_receipt() -> dict[str, Any]:
+    raw = raw_authority._read_safe_file(
+        FORMAL_REVIEW_RECEIPT_PATH,
+        label="factor-v3 formal review receipt",
+        max_bytes=64 * 1024,
+    )
+    if hashlib.sha256(raw).hexdigest() != FORMAL_REVIEW_RECEIPT_SHA256:
+        raise FormalRunSpecError("formal review receipt content rejected")
+    try:
+        receipt = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FormalRunSpecError("formal review receipt rejected") from exc
     if (
-        type(expected_reviewed_commit) is not str
-        or _COMMIT_RE.fullmatch(expected_reviewed_commit) is None
+        type(receipt) is not dict
+        or set(receipt)
+        != {
+            "branch",
+            "review_status",
+            "reviewed_source_root_sha256",
+            "schema",
+        }
+        or _canonical_bytes(receipt) != raw
+        or receipt["schema"]
+        != "factor-v3-daily-basic-formal-review-receipt/v1"
+        or receipt["branch"] != EXPECTED_BRANCH
+        or receipt["review_status"] != "APPROVED_NO_P0_P1_P2"
+        or receipt["reviewed_source_root_sha256"]
+        != FORMAL_REVIEW_SOURCE_ROOT_SHA256
     ):
-        raise FormalRunSpecError("formal worktree reviewed commit rejected")
+        raise FormalRunSpecError("formal review receipt rejected")
+    return receipt
+
+
+def verify_formal_worktree() -> None:
     script_root = _script_worktree_root()
     if (
         script_root != FORMAL_WORKTREE_ROOT
@@ -228,10 +414,17 @@ def verify_formal_worktree(*, expected_reviewed_commit: str) -> None:
         raise FormalRunSpecError("formal worktree git identity unavailable") from exc
     if git_root != FORMAL_WORKTREE_ROOT or branch != EXPECTED_BRANCH:
         raise FormalRunSpecError("formal worktree branch drifted")
-    if commit != expected_reviewed_commit:
-        raise FormalRunSpecError("formal worktree reviewed commit drifted")
+    if _COMMIT_RE.fullmatch(commit) is None:
+        raise FormalRunSpecError("formal worktree commit rejected")
     if dirty:
         raise FormalRunSpecError("formal worktree is dirty")
+    receipt = _validated_formal_review_receipt()
+    source_root = _formal_review_source_root()
+    if (
+        source_root != FORMAL_REVIEW_SOURCE_ROOT_SHA256
+        or receipt["reviewed_source_root_sha256"] != source_root
+    ):
+        raise FormalRunSpecError("formal worktree reviewed source drifted")
 
 
 def verify_planned_run_root() -> None:
@@ -376,28 +569,44 @@ def publish_candidate(content: bytes) -> Path:
         raise FormalRunSpecError("content-addressed candidate rejected") from exc
     if not content or content.endswith(b"\n") or _canonical_bytes(parsed) != content:
         raise FormalRunSpecError("content-addressed candidate rejected")
-    target = _target_for(content)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    for directory in (SPEC_OUTPUT_ROOT, target.parent):
-        if not directory.is_dir() or _is_reparse(directory):
-            raise FormalRunSpecError("content-addressed output directory rejected")
-    if target.exists() or target.is_symlink():
-        _verify_existing_target(target, content)
-        return target
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    digest = hashlib.sha256(content).hexdigest()
+    if SPEC_OUTPUT_ROOT.name != "sha256":
+        raise FormalRunSpecError("content-addressed output directory rejected")
+    authority_root = SPEC_OUTPUT_ROOT.parent.parent
     try:
-        descriptor = os.open(str(target), flags, 0o600)
-    except FileExistsError:
-        _verify_existing_target(target, content)
-        return target
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except BaseException:
-        target.unlink(missing_ok=True)
-        raise
+        authority_parent = raw_authority._safe_existing_directory(
+            authority_root.parent,
+            "factor-v3 formal spec output parent",
+        )
+        authority_root = raw_authority._ensure_child_directory(
+            authority_parent,
+            authority_root.name,
+        )
+        target_parent = raw_authority._content_addressed_directory(
+            authority_root,
+            SPEC_OUTPUT_ROOT.parent.name,
+            digest,
+        )
+        target = target_parent / f"{digest}.json"
+        raw_authority._write_create_only(
+            target,
+            content,
+            label="factor-v3 formal run spec",
+            reuse_identical=True,
+        )
+        fsync_directory(target_parent)
+        stored = raw_authority._read_safe_file(
+            target,
+            label="factor-v3 formal run spec",
+            max_bytes=len(content),
+            expected_size=len(content),
+        )
+    except (OSError, ValueError) as exc:
+        raise FormalRunSpecError(
+            "content-addressed target exists with different bytes"
+        ) from exc
+    if stored != content:
+        raise FormalRunSpecError("content-addressed target postverify rejected")
     return target
 
 
@@ -420,22 +629,38 @@ def safe_summary(
 
 
 def _load_runner() -> ModuleType:
-    worktree = str(FORMAL_WORKTREE_ROOT)
-    if worktree not in sys.path:
-        sys.path.insert(0, worktree)
-    from app import factor_v3_daily_basic_runner
+    runner_path = FORMAL_WORKTREE_ROOT / "app/factor_v3_daily_basic_runner.py"
+    with _open_pinned_file(
+        runner_path,
+        expected_sha256=FACTOR_V3_DAILY_BASIC_RUNNER_SHA256,
+        label="factor-v3 daily-basic runner source",
+        max_bytes=4 * 1024 * 1024,
+    ) as (candidate, handle):
+        worktree = str(FORMAL_WORKTREE_ROOT)
+        if worktree not in sys.path:
+            sys.path.insert(0, worktree)
+        from app import factor_v3_daily_basic_runner
 
-    return factor_v3_daily_basic_runner
+        imported_path = Path(
+            factor_v3_daily_basic_runner.__file__
+        ).resolve(strict=True)
+        if imported_path != candidate:
+            raise FormalRunSpecError("formal runner import identity rejected")
+        _postverify_pinned_file(
+            candidate,
+            handle,
+            expected_sha256=FACTOR_V3_DAILY_BASIC_RUNNER_SHA256,
+            label="factor-v3 daily-basic runner source",
+            max_bytes=4 * 1024 * 1024,
+        )
+        return factor_v3_daily_basic_runner
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--write", action="store_true")
-    parser.add_argument("--expected-reviewed-commit", required=True)
     args = parser.parse_args(argv)
-    verify_formal_worktree(
-        expected_reviewed_commit=args.expected_reviewed_commit,
-    )
+    verify_formal_worktree()
     verify_planned_run_root()
     candidate, content = build_and_verify_candidate(_load_runner())
     if args.write:

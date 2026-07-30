@@ -259,7 +259,7 @@ def _open_database_read_lock(path: Path) -> BinaryIO:
             0x00000001,
             None,
             3,
-            0x00000080 | 0x08000000,
+            0x00000080 | 0x00200000 | 0x08000000,
             None,
         )
         invalid = ctypes.c_void_p(-1).value
@@ -288,6 +288,7 @@ def _open_database_read_lock(path: Path) -> BinaryIO:
     if (
         not stat.S_ISREG(opened.st_mode)
         or int(getattr(opened, "st_nlink", 1)) != 1
+        or int(getattr(opened, "st_file_attributes", 0)) & 0x00000400
         or not os.path.samestat(before, opened)
     ):
         stream.close()
@@ -578,7 +579,7 @@ def _load_feature_history_prewindow_authority(
     return authority
 
 
-def _load_development_authority(
+def _load_development_authority_locked(
     *,
     audited_development_universe_sqlite_path: str | Path,
     expected_development_coverage_audit_sha256: str,
@@ -710,6 +711,80 @@ def _load_development_authority(
         or len(authority.partitions) != 483
     ):
         raise ValueError("factor-v3 daily-basic development authority requires exact 483 sessions")
+    return authority
+
+
+def _development_database_sidecars(database_path: Path) -> tuple[Path, ...]:
+    return tuple(
+        database_path.with_name(f"{database_path.name}{suffix}")
+        for suffix in ("-journal", "-shm", "-wal")
+    )
+
+
+def _reject_development_database_sidecars(database_path: Path) -> None:
+    if any(
+        os.path.lexists(path)
+        for path in _development_database_sidecars(database_path)
+    ):
+        raise ValueError(
+            "factor-v3 daily-basic development database sidecar rejected"
+        )
+
+
+def _load_development_authority(
+    *,
+    audited_development_universe_sqlite_path: str | Path,
+    expected_development_coverage_audit_sha256: str,
+    expected_development_artifact_root_sha256: str,
+    expected_development_temporal_contract_sha256: str,
+    expected_development_temporal_role: str,
+) -> legacy.AuditedDailyAuthority:
+    database_path = Path(audited_development_universe_sqlite_path)
+    if not database_path.is_absolute():
+        raise ValueError(
+            "factor-v3 daily-basic development database path rejected"
+        )
+    manifest_path = database_path.parent / "manifest.json"
+    _reject_development_database_sidecars(database_path)
+    with (
+        _open_database_read_lock(database_path) as database_handle,
+        _open_database_read_lock(manifest_path) as manifest_handle,
+    ):
+        database_sha256 = _locked_file_sha256(database_handle)
+        manifest_sha256 = _locked_file_sha256(manifest_handle)
+        authority = _load_development_authority_locked(
+            audited_development_universe_sqlite_path=database_path,
+            expected_development_coverage_audit_sha256=(
+                expected_development_coverage_audit_sha256
+            ),
+            expected_development_artifact_root_sha256=(
+                expected_development_artifact_root_sha256
+            ),
+            expected_development_temporal_contract_sha256=(
+                expected_development_temporal_contract_sha256
+            ),
+            expected_development_temporal_role=(
+                expected_development_temporal_role
+            ),
+        )
+        if (
+            database_sha256 != authority.sqlite_sha256
+            or manifest_sha256 != authority.manifest_file_sha256
+        ):
+            raise ValueError(
+                "factor-v3 daily-basic development physical identity rejected"
+            )
+        _reject_development_database_sidecars(database_path)
+        _postverify_database_lock(
+            database_path,
+            database_handle,
+            expected_sha256=database_sha256,
+        )
+        _postverify_database_lock(
+            manifest_path,
+            manifest_handle,
+            expected_sha256=manifest_sha256,
+        )
     return authority
 
 

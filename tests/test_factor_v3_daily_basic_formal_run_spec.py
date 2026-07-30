@@ -246,20 +246,32 @@ def test_formal_worktree_requires_exact_branch_and_clean_status(
         "_script_worktree_root",
         lambda: formal.FORMAL_WORKTREE_ROOT,
     )
-    formal.verify_formal_worktree(
-        expected_reviewed_commit=reviewed_commit,
+    reviewed_source = "f" * 64
+    monkeypatch.setattr(
+        formal,
+        "FORMAL_REVIEW_SOURCE_ROOT_SHA256",
+        reviewed_source,
     )
+    monkeypatch.setattr(
+        formal,
+        "_validated_formal_review_receipt",
+        lambda: {"reviewed_source_root_sha256": reviewed_source},
+    )
+    monkeypatch.setattr(
+        formal,
+        "_formal_review_source_root",
+        lambda: reviewed_source,
+    )
+    formal.verify_formal_worktree()
 
+    responses[("rev-parse", "HEAD")] = "not-a-commit"
     with pytest.raises(formal.FormalRunSpecError, match="commit"):
-        formal.verify_formal_worktree(
-            expected_reviewed_commit="e" * 40,
-        )
+        formal.verify_formal_worktree()
+    responses[("rev-parse", "HEAD")] = reviewed_commit
 
     responses[("status", "--porcelain=v1", "--untracked-files=all")] = " M unsafe.py"
     with pytest.raises(formal.FormalRunSpecError, match="dirty"):
-        formal.verify_formal_worktree(
-            expected_reviewed_commit=reviewed_commit,
-        )
+        formal.verify_formal_worktree()
 
 
 def test_formal_worktree_review_anchor_is_not_caller_supplied() -> None:

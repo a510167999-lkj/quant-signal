@@ -746,6 +746,54 @@ def _existing_read_only_run_lock(path: str | Path):
         os.close(descriptor)
 
 
+@contextmanager
+def _locked_physical_frozen_source_binding(source_root: str | Path):
+    root = Path(source_root).resolve(strict=True)
+    with ExitStack() as stack:
+        locked: list[tuple[Path, Any, str, int]] = []
+        entries = []
+        for relative_path in FROZEN_PRODUCER_RELATIVE_PATHS:
+            path = root / Path(*relative_path.split("/"))
+            candidate, handle = stack.enter_context(
+                _open_pinned_file(
+                    path,
+                    label="producer source",
+                    max_bytes=_MAX_SOURCE_BYTES,
+                )
+            )
+            raw = _locked_file_bytes(
+                handle,
+                label="producer source",
+                max_bytes=_MAX_SOURCE_BYTES,
+            )
+            digest = _sha256(raw)
+            entries.append(
+                {
+                    "physical_bytes": len(raw),
+                    "physical_sha256": digest,
+                    "relative_path": relative_path,
+                }
+            )
+            locked.append((candidate, handle, digest, len(raw)))
+        identity = {
+            "physical_files": entries,
+            "schema": "factor-v3-feature-history-frozen-physical-source/v1",
+        }
+        binding = {
+            **identity,
+            "producer_binding_root_sha256": _canonical_sha256(identity),
+        }
+        yield binding
+        for candidate, handle, digest, size in locked:
+            _postverify_pinned_file(
+                candidate,
+                handle,
+                expected_sha256=digest,
+                label="producer source",
+                max_bytes=max(_MAX_SOURCE_BYTES, size),
+            )
+
+
 def _attestor_producer_binding() -> dict[str, Any]:
     source_root = Path(__file__).resolve(strict=True).parents[1]
     entries = []
