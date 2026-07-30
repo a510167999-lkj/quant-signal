@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import date
 import hashlib
@@ -234,7 +235,12 @@ def _assert_safe_existing_path(path: Path, *, label: str) -> None:
 
 
 def _assert_no_live_store_sidecars(path: Path, *, label: str) -> None:
-    if any(Path(f"{path}{suffix}").exists() for suffix in ("-wal", "-shm", "-WAL", "-SHM")):
+    _assert_safe_existing_path(path.parent, label=f"{label} parent")
+    sidecar_names = {f"{path.name.lower()}{suffix}" for suffix in ("-wal", "-shm")}
+    if any(
+        child.name.lower() in sidecar_names
+        for child in path.parent.iterdir()
+    ):
         raise ValueError(f"{label} has WAL/SHM live store sidecars")
     if path.suffix.lower() in {".sqlite", ".sqlite3", ".db"}:
         raise ValueError(f"{label} must not be a live store")
@@ -255,6 +261,65 @@ def _directory_identity(path: Path, *, label: str) -> tuple[int, int]:
         raise ValueError(f"{label} must be a directory")
     stat = path.stat()
     return stat.st_dev, stat.st_ino
+
+
+@contextmanager
+def _locked_output_directory(path: Path, *, label: str):
+    """Keep a Windows output directory non-deletable while create-only files are opened.
+
+    The handle intentionally omits ``FILE_SHARE_DELETE``.  That prevents a
+    second process from replacing this directory with a junction/reparse point
+    between the path validation and a child create.  Other platforms retain an
+    inode identity check; the project deployment target is Windows.
+    """
+
+    before = _directory_identity(path, label=label)
+    handle: int | None = None
+    if os.name == "nt":
+        import ctypes
+
+        generic_read = 0x80000000
+        file_share_read_write = 0x00000003
+        open_existing = 3
+        file_flag_backup_semantics = 0x02000000
+        file_flag_open_reparse_point = 0x00200000
+        invalid_handle_value = ctypes.c_void_p(-1).value
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        create_file.restype = ctypes.c_void_p
+        opened = create_file(
+            str(path),
+            generic_read,
+            file_share_read_write,
+            None,
+            open_existing,
+            file_flag_backup_semantics | file_flag_open_reparse_point,
+            None,
+        )
+        if opened == invalid_handle_value:
+            raise ValueError(f"{label} could not be locked against reparse replacement")
+        handle = int(opened)
+        if _is_reparse_point(path) or _directory_identity(path, label=label) != before:
+            ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
+            raise ValueError(f"{label} changed during reparse-safe lock acquisition")
+    try:
+        yield
+    finally:
+        if handle is not None:
+            import ctypes
+
+            ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
+        if _directory_identity(path, label=label) != before:
+            raise ValueError(f"{label} changed during create-only output")
 
 
 def _read_regular_bytes_no_follow(path: Path, *, label: str) -> bytes:
@@ -1321,6 +1386,12 @@ def _receipt_path(output_root: Path, *, receipt_sha256: str) -> Path:
 
 def _write_create_only(path: Path, raw: bytes, *, label: str) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
+    with _locked_output_directory(path.parent, label=f"{label} parent"):
+        return _write_create_only_locked(path, raw, label=label)
+
+
+def _write_create_only_locked(path: Path, raw: bytes, *, label: str) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
     _assert_safe_existing_path(path.parent, label=f"{label} parent")
     expected_parent_identity = _directory_identity(path.parent, label=f"{label} parent")
     try:
@@ -1553,20 +1624,21 @@ def materialize_factor_v3_development_candidate(
         candidate_file_sha256=candidate_file_sha256,
     )
     destination = _safe_output_root(output_root)
-    candidate_file = _candidate_path(destination, artifact_sha256=artifact_sha256)
-    receipt_file = _receipt_path(destination, receipt_sha256=receipt_sha256)
-    _write_create_only(candidate_file, candidate_raw, label="materialization candidate")
-    _write_create_only(receipt_file, receipt_raw, label="materialization receipt")
-    verification = verify_factor_v3_development_candidate(
-        candidate_path=candidate_file,
-        receipt_path=receipt_file,
-        input_authority_descriptor_path=input_authority_descriptor_path,
-        expected_input_authority_descriptor_sha256=(
-            expected_input_authority_descriptor_sha256
-        ),
-        expected_artifact_sha256=artifact_sha256,
-        expected_receipt_sha256=receipt_sha256,
-    )
+    with _locked_output_directory(destination, label="candidate output root"):
+        candidate_file = _candidate_path(destination, artifact_sha256=artifact_sha256)
+        receipt_file = _receipt_path(destination, receipt_sha256=receipt_sha256)
+        _write_create_only(candidate_file, candidate_raw, label="materialization candidate")
+        _write_create_only(receipt_file, receipt_raw, label="materialization receipt")
+        verification = verify_factor_v3_development_candidate(
+            candidate_path=candidate_file,
+            receipt_path=receipt_file,
+            input_authority_descriptor_path=input_authority_descriptor_path,
+            expected_input_authority_descriptor_sha256=(
+                expected_input_authority_descriptor_sha256
+            ),
+            expected_artifact_sha256=artifact_sha256,
+            expected_receipt_sha256=receipt_sha256,
+        )
     return {
         "candidate_path": str(candidate_file),
         "receipt_path": str(receipt_file),
