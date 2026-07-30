@@ -10,6 +10,7 @@ _EXECUTED_SUPERVISOR_PATH: str | None = None
 _EXECUTED_SUPERVISOR_SHA256: str | None = None
 _EXECUTION_PUBLIC_KEY_N: int | None = None
 _EXECUTION_PUBLIC_KEY_E: int | None = None
+_NATIVE_BROKER_MARKER = "--native-broker-v1"
 
 
 def _early_sha256(raw: bytes) -> str:
@@ -234,6 +235,7 @@ def _install_early_exact_import_boundary() -> None:
     sys.path_importer_cache.clear()
 
 
+_native_broker_mode = len(sys.argv) == 3 and sys.argv[2] == _NATIVE_BROKER_MARKER
 if (
     sys.flags.isolated != 1
     or not sys.dont_write_bytecode
@@ -241,15 +243,19 @@ if (
     or not sys.flags.safe_path
     or sys.pycache_prefix is not None
     or not sys.argv[0]
-    or len(sys.argv) != 2
+    or (len(sys.argv) != 2 and not _native_broker_mode)
 ):
     raise RuntimeError("trusted supervisor loader runtime rejected")
 _loader_orig_argv = list(sys.orig_argv)
 if (
-    len(_loader_orig_argv) != 7
+    len(_loader_orig_argv) != 7 + int(_native_broker_mode)
     or _loader_orig_argv[1:5] != ["-I", "-B", "-S", "-P"]
     or _loader_orig_argv[5] != sys.argv[0]
     or _loader_orig_argv[6] != sys.argv[1]
+    or (
+        _native_broker_mode
+        and _loader_orig_argv[7] != _NATIVE_BROKER_MARKER
+    )
 ):
     raise RuntimeError("trusted supervisor loader argv rejected")
 _TRUSTED_SUPERVISOR_LOADER_PATH = sys.argv[0]
@@ -331,6 +337,41 @@ if (
 ):
     raise RuntimeError("launch authorization artifact binding rejected")
 _verify_signature(_canonical_bytes(_payload), _authorization["signature_base64"])
+
+
+def _native_broker_credential_provider() -> int:
+    global _native_broker_provider_called
+    if not _native_broker_mode or _native_broker_provider_called:
+        raise RuntimeError("native broker credential provider rejected")
+    action = _payload.get("action")
+    if action not in {"run", "resume"}:
+        raise RuntimeError("native broker credential provider rejected")
+    _native_broker_provider_called = True
+    ready = (
+        "READY factor-v3-formal-native-broker-supervisor/v1\n"
+        f"launch_authorization_sha256={_early_sha256(_authorization_raw)}\n"
+        f"action={action}\n"
+    ).encode("ascii")
+    sys.stdout.buffer.write(ready)
+    sys.stdout.buffer.flush()
+    line = sys.stdin.buffer.readline(128)
+    if not line.endswith(b"\n") or len(line) > 32 or not line.startswith(b"HANDLE="):
+        raise RuntimeError("native broker credential handle rejected")
+    handle_hex = line[len(b"HANDLE=") : -1]
+    try:
+        handle = int(handle_hex, 16)
+    except ValueError as exc:
+        raise RuntimeError("native broker credential handle rejected") from exc
+    if (
+        not handle_hex
+        or handle <= 0
+        or handle_hex.decode("ascii") != f"{handle:x}"
+    ):
+        raise RuntimeError("native broker credential handle rejected")
+    return handle
+
+
+_native_broker_provider_called = False
 with open(_TRUSTED_SUPERVISOR_LOADER_PATH, "rb") as _stream:
     _supervisor_loader_raw = _stream.read(8 * 1024 * 1024 + 1)
 _TRUSTED_SUPERVISOR_LOADER_SHA256 = _early_sha256(_supervisor_loader_raw)
@@ -358,6 +399,9 @@ _namespace = {
     "_TRUSTED_EXECUTED_SUPERVISOR_SHA256": _EXECUTED_SUPERVISOR_SHA256,
     "_TRUSTED_SUPERVISOR_LOADER_PATH": _TRUSTED_SUPERVISOR_LOADER_PATH,
     "_TRUSTED_SUPERVISOR_LOADER_SHA256": _TRUSTED_SUPERVISOR_LOADER_SHA256,
+    "_TRUSTED_NATIVE_BROKER_CREDENTIAL_PROVIDER": (
+        _native_broker_credential_provider if _native_broker_mode else None
+    ),
 }
 sys.argv = [_EXECUTED_SUPERVISOR_PATH, _authorization_path]
 exec(
