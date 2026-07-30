@@ -454,6 +454,20 @@ def test_service_installer_is_explicit_dry_run_and_documents_external_tcb() -> N
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_attribute_list_failed_initialization_is_never_deleted(
+    tmp_path: Path,
+) -> None:
+    native = _compile_test_broker(tmp_path)
+    completed = _run(native, "--test-attribute-init-failure-cleanup")
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == ""
+    assert completed.stderr == ""
+    source = BROKER_SOURCE.read_text(encoding="utf-8")
+    assert source.count("attributes_initialized") >= 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
 def test_restricted_child_gets_credential_only_after_bound_ready_and_broker_completes(
     tmp_path: Path,
 ) -> None:

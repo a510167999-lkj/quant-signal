@@ -20,6 +20,9 @@ BROKER_SOURCE = (
     / "factor_v3_formal_native_broker.c"
 )
 BROKER_INCLUDE = BROKER_SOURCE.parent
+NESTED_JOB_LAUNCHER_SOURCE = (
+    REPO_ROOT / "tests" / "native" / "factor_v3_nested_job_launcher.c"
+)
 
 
 def _broker_module():
@@ -386,6 +389,19 @@ def test_candidate_builder_rejects_invalid_action_paths_and_resume_shape(
         r"C:\frozen\..\authorization.json",
         r"C:\PROGRA~1\authorization.json",
         r"C:\frozen\NUL.txt",
+        r"C:\frozen\bad*.json",
+        r"C:\frozen\bad?.json",
+        'C:\\frozen\\bad"name.json',
+        r"C:\frozen\bad<name.json",
+        r"C:\frozen\bad>name.json",
+        r"C:\frozen\bad|name.json",
+        "中:\\frozen\\authorization.json",
+        "C:\\frozen\\COM¹.txt",
+        "C:\\frozen\\COM².txt",
+        "C:\\frozen\\COM³.txt",
+        "C:\\frozen\\LPT¹.txt",
+        "C:\\frozen\\LPT².txt",
+        "C:\\frozen\\LPT³.txt",
     ],
 )
 def test_candidate_builder_rejects_windows_path_aliases(
@@ -584,6 +600,27 @@ def test_native_broker_assigns_job_atomically_before_child_resume(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_native_broker_child_job_remains_atomic_inside_outer_job(
+    tmp_path: Path,
+) -> None:
+    native, _child = _compile_fixture_broker(tmp_path)
+    candidate_raw, _paths = _candidate(tmp_path)
+    candidate = _publish_candidate(tmp_path, candidate_raw)
+    output = tmp_path / "nested-job-child.txt"
+    launcher = tmp_path / "nested-job-launcher.exe"
+    _compile(source=NESTED_JOB_LAUNCHER_SOURCE, output=launcher)
+    completed = subprocess.run(
+        [str(launcher), str(native), str(candidate), str(output)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "IN_JOB=1\n" in output.read_text(encoding="ascii")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
 @pytest.mark.parametrize(
     "argument",
     [
@@ -698,6 +735,18 @@ def test_native_broker_rejects_relative_public_path_in_untrusted_candidate(
         r"C:\frozen\..\authorization.json",
         r"C:\PROGRA~1\authorization.json",
         r"C:\frozen\NUL.txt",
+        r"C:\frozen\bad*.json",
+        r"C:\frozen\bad?.json",
+        'C:\\frozen\\bad"name.json',
+        r"C:\frozen\bad<name.json",
+        r"C:\frozen\bad>name.json",
+        r"C:\frozen\bad|name.json",
+        "C:\\frozen\\COM¹.txt",
+        "C:\\frozen\\COM².txt",
+        "C:\\frozen\\COM³.txt",
+        "C:\\frozen\\LPT¹.txt",
+        "C:\\frozen\\LPT².txt",
+        "C:\\frozen\\LPT³.txt",
     ],
 )
 def test_native_candidate_parser_rejects_windows_path_aliases(
