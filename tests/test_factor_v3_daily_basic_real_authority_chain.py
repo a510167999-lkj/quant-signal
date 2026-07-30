@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from datetime import date, datetime, timedelta, timezone
 import hashlib
-import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -542,13 +542,137 @@ def test_real_250_plus_483_authority_chain_runs_and_cli_reverifies(
     )
 
 
-def test_real_chain_fixture_binds_initial_and_terminal_attestation_context() -> None:
-    source = inspect.getsource(
-        test_real_250_plus_483_authority_chain_runs_and_cli_reverifies
+def test_real_chain_fixture_uses_trusted_dispatch_and_buffers_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority_binding = {"binding_sha256": "9" * 64}
+
+    class FrozenConfig(Mapping[str, object]):
+        def __init__(self) -> None:
+            self.values = {
+                "action": "verify",
+                "formal_input_root": formal_spec.FORMAL_INPUT_ROOT_SHA256,
+                "formal_output_root": str(formal_spec.SPEC_OUTPUT_ROOT),
+                "run_spec_path": str(
+                    (tmp_path / "daily-basic-run-spec.json").resolve()
+                ),
+                "run_root": str((tmp_path / "daily-basic-run").resolve()),
+            }
+
+        def __getitem__(self, key: str) -> object:
+            return self.values[key]
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(self.values)
+
+        def __len__(self) -> int:
+            return len(self.values)
+
+    config = FrozenConfig()
+    buffered: list[object] = []
+    ledger_entries: list[Mapping[str, object]] = []
+
+    class Context:
+        def validate_action_config(self, candidate: object) -> None:
+            if candidate is not config:
+                raise RuntimeError("untrusted config")
+
+        def verified_ledger_entry(
+            self,
+            module_name: str,
+        ) -> Mapping[str, object]:
+            relative_path = (
+                "app/__init__.py"
+                if module_name == "app"
+                else f"{module_name.replace('.', '/')}.py"
+            )
+            entry = {
+                "absolute_path": str(
+                    formal_spec.FORMAL_WORKTREE_ROOT
+                    / Path(*relative_path.split("/"))
+                ),
+                "byte_count": 1,
+                "is_package": module_name == "app",
+                "loader_identity": (
+                    "external-verified-source-loader/v1"
+                ),
+                "module_name": module_name,
+                "relative_path": relative_path,
+                "source_sha256": hashlib.sha256(
+                    module_name.encode()
+                ).hexdigest(),
+            }
+            ledger_entries.append(entry)
+            return entry
+
+        def assert_verified_module(
+            self,
+            _module_name: str,
+            _relative_path: str,
+            _expected_sha256: str,
+        ) -> None:
+            return None
+
+        def emit_json(self, value: object) -> None:
+            buffered.append(value)
+
+        def postverify(self) -> None:
+            raise AssertionError("external bootstrap owns terminal postverify")
+
+    calls: list[tuple[str, str]] = []
+    fake_runner = SimpleNamespace(
+        verify_factor_v3_daily_basic_run=lambda **kwargs: (
+            calls.append(
+                (
+                    str(kwargs["run_spec_path"]),
+                    str(kwargs["run_root"]),
+                )
+            )
+            or {
+                "authority_binding": authority_binding,
+                "status": "verified",
+            }
+        )
+    )
+    monkeypatch.setattr(
+        formal_spec,
+        "_load_runner",
+        lambda _context: fake_runner,
+    )
+    monkeypatch.setattr(
+        formal_spec,
+        "_postverify_verified_module_ledger",
+        lambda _context, _manifest: None,
     )
 
-    assert '"authority_binding": authority_binding' in source
-    assert '"_validated_attested_replay_context"' in source
+    assert formal_spec.trusted_dispatch(Context(), config) == 0
+    assert calls == [
+        (
+            str(config["run_spec_path"]),
+            str(config["run_root"]),
+        )
+    ]
+    assert buffered == [
+        {
+            "authority_binding": authority_binding,
+            "status": "verified",
+        }
+    ]
+    assert ledger_entries
+    assert all(
+        set(entry)
+        == {
+            "absolute_path",
+            "byte_count",
+            "is_package",
+            "loader_identity",
+            "module_name",
+            "relative_path",
+            "source_sha256",
+        }
+        for entry in ledger_entries
+    )
 
 
 def test_real_b805_attestation_builds_capability_free_250_plus_483_spec(

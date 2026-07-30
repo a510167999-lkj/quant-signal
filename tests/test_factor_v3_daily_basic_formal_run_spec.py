@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
+from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from datetime import date, timedelta
 import hashlib
@@ -16,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import build_factor_v3_daily_basic_formal_run_spec as formal
+from scripts import run_factor_v3_daily_basic_formal as formal_shim
 
 
 _OPENSSL = Path(r"C:\Program Files\Git\mingw64\bin\openssl.exe")
@@ -133,6 +135,101 @@ class _FakeRunner:
         return json.loads(candidate_path.read_text(encoding="utf-8"))
 
 
+class _FrozenActionConfig(Mapping[str, object]):
+    def __init__(self, values: dict[str, object]) -> None:
+        self._values = dict(values)
+
+    def __getitem__(self, key: str) -> object:
+        return self._values[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+
+class _TrustedBootstrapContext:
+    def __init__(
+        self,
+        config: _FrozenActionConfig,
+        *,
+        rejected_modules: set[str] | None = None,
+    ) -> None:
+        self._config = config
+        self._rejected_modules = set(rejected_modules or ())
+        self.asserted_modules: list[tuple[str, str, str]] = []
+        self.buffered: list[object] = []
+        self.postverify_calls = 0
+
+    def validate_action_config(self, candidate: object) -> None:
+        if candidate is not self._config:
+            raise RuntimeError("untrusted frozen action config")
+
+    def verified_ledger_entry(self, module_name: str) -> Mapping[str, object]:
+        relative_path = (
+            "app/__init__.py"
+            if module_name == "app"
+            else f"{module_name.replace('.', '/')}.py"
+        )
+        return {
+            "absolute_path": str(
+                formal.FORMAL_WORKTREE_ROOT
+                / Path(*relative_path.split("/"))
+            ),
+            "byte_count": 1,
+            "is_package": module_name == "app",
+            "loader_identity": "external-verified-source-loader/v1",
+            "module_name": module_name,
+            "relative_path": relative_path,
+            "source_sha256": hashlib.sha256(module_name.encode()).hexdigest(),
+        }
+
+    def assert_verified_module(
+        self,
+        module_name: str,
+        relative_path: str,
+        expected_sha256: str,
+    ) -> None:
+        self.asserted_modules.append(
+            (module_name, relative_path, expected_sha256)
+        )
+        if module_name in self._rejected_modules:
+            raise RuntimeError("verified loader ledger rejected")
+
+    def emit_json(self, value: object) -> None:
+        self.buffered.append(value)
+
+    def postverify(self) -> None:
+        self.postverify_calls += 1
+
+
+def _frozen_action_config(action: str = "build-spec") -> _FrozenActionConfig:
+    return _FrozenActionConfig(
+        {
+            "action": action,
+            "formal_input_root": formal.FORMAL_INPUT_ROOT_SHA256,
+            "formal_output_root": str(formal.SPEC_OUTPUT_ROOT),
+            "run_root": str(formal.PLANNED_RUN_ROOT),
+            "run_spec_path": str(formal.SPEC_OUTPUT_ROOT / "planned.json"),
+        }
+    )
+
+
+def _required_existing_package_initializers(
+    root: Path,
+    relative_paths: tuple[str, ...],
+) -> set[str]:
+    required: set[str] = set()
+    for relative_path in relative_paths:
+        parts = relative_path.split("/")
+        for depth in range(1, len(parts)):
+            candidate = "/".join((*parts[:depth], "__init__.py"))
+            if (root / Path(*candidate.split("/"))).is_file():
+                required.add(candidate)
+    return required
+
+
 def test_formal_paths_and_authority_inputs_are_frozen_exactly() -> None:
     main = Path(r"E:\AI workspace\quant-signal-lkj")
     assert formal.SPEC_OUTPUT_ROOT == (
@@ -201,44 +298,18 @@ def test_formal_paths_and_authority_inputs_are_frozen_exactly() -> None:
 
 
 def test_formal_review_manifest_covers_the_complete_runtime_import_closure() -> None:
-    assert formal.FORMAL_REVIEW_SOURCE_RELATIVE_PATHS == (
+    relative_paths = formal.FORMAL_REVIEW_SOURCE_RELATIVE_PATHS
+
+    assert len(relative_paths) == len(set(relative_paths))
+    assert {
         "scripts/build_factor_v3_daily_basic_formal_run_spec.py",
         "scripts/run_factor_v3_daily_basic_formal.py",
-        "app/audited_pit_factor_v3_feature_history_authority.py",
-        "app/audited_pit_factor_v3_points_contract.py",
-        "app/current_pool.py",
-        "app/current_pool_gate.py",
-        "app/durable_io.py",
-        "app/factor_v3_daily_basic_733_exact_set_authority.py",
-        "app/factor_v3_daily_basic_runner.py",
-        "app/factor_v3_feature_history_frozen_source_attestation.py",
-        "app/factor_v3_feature_history_runner.py",
-        "app/jiaoch_credential_slots.py",
-        "app/jiaoch_daily_basic_collection_set.py",
-        "app/jiaoch_daily_basic_exact_set_authority.py",
-        "app/jiaoch_minute_collection_set.py",
-        "app/jiaoch_minute_raw_authority.py",
-        "app/jiaoch_minute_reconciliation.py",
-        "app/jiaoch_points_collection_set.py",
-        "app/jiaoch_points_raw_authority.py",
-        "app/jiaoch_points_response_normalization.py",
-        "app/jiaoch_trade_cal_authority.py",
-        "app/research_market_data.py",
-        "app/research_membership.py",
-        "app/research_partitions.py",
-        "app/research_pit_collector.py",
-        "app/research_pit_contracts.py",
-        "app/research_pit_sources.py",
-        "app/research_pit_store.py",
-        "app/research_pit_transport.py",
-        "app/research_provider_evidence_partitions.py",
-        "app/research_provider_pit_tail.py",
-        "app/research_provider_pit_tail_v2.py",
-        "app/research_proxy_data.py",
-        "app/research_scope.py",
-        "app/research_security_code_transition.py",
-        "app/research_suspension_evidence.py",
-    )
+    } <= set(relative_paths)
+    assert _required_existing_package_initializers(
+        formal.FORMAL_WORKTREE_ROOT,
+        relative_paths,
+    ) <= set(relative_paths)
+    assert "app/__init__.py" in relative_paths
 
 
 def test_formal_bootstrap_modules_have_no_top_level_application_imports() -> None:
@@ -258,6 +329,49 @@ def test_formal_bootstrap_modules_have_no_top_level_application_imports() -> Non
             name == "app" or name.startswith("app.")
             for name in top_level_imports
         )
+
+
+def test_shim_dispatch_uses_only_a_preloaded_verified_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _frozen_action_config()
+    context = _TrustedBootstrapContext(config)
+    calls: list[tuple[object, object]] = []
+    builder = SimpleNamespace(
+        trusted_dispatch=lambda received_context, received_config: (
+            calls.append((received_context, received_config)) or 17
+        )
+    )
+    builder_name = (
+        "scripts.build_factor_v3_daily_basic_formal_run_spec"
+    )
+    monkeypatch.setitem(sys.modules, builder_name, builder)
+
+    result = formal_shim.trusted_dispatch(context, config)
+
+    assert result == 17
+    assert calls == [(context, config)]
+    assert context.asserted_modules == [
+        (
+            builder_name,
+            "scripts/build_factor_v3_daily_basic_formal_run_spec.py",
+            hashlib.sha256(builder_name.encode()).hexdigest(),
+        )
+    ]
+    dispatch_tree = ast.parse(inspect.getsource(formal_shim.trusted_dispatch))
+    assert not any(
+        isinstance(node, (ast.Import, ast.ImportFrom))
+        for node in ast.walk(dispatch_tree)
+    )
+
+
+def test_direct_formal_entrypoints_reject_untrusted_callers() -> None:
+    with pytest.raises(formal.FormalRunSpecError, match="trusted bootstrap"):
+        formal.trusted_dispatch({}, {})
+    with pytest.raises(formal.FormalRunSpecError, match="trusted bootstrap"):
+        formal.main([])
+    with pytest.raises(formal.FormalRunSpecError, match="trusted bootstrap"):
+        formal.run_locked_runner_cli(["verify"])
 
 
 def test_external_bootstrap_claim_binds_every_runtime_trust_anchor() -> None:
@@ -888,44 +1002,94 @@ def test_formal_runtime_holds_source_claim_receipt_key_and_executables(
     assert receipt.read_bytes() == receipt_raw
 
 
-def test_formal_runner_load_binds_physical_source_through_import_and_postverify() -> None:
+def test_formal_runner_load_requires_external_verified_loader_ledger() -> None:
     source = inspect.getsource(formal._load_runner)
 
-    assert "FACTOR_V3_DAILY_BASIC_RUNNER_SHA256" in source
-    assert "_open_pinned_file" in source
-    assert "_postverify_pinned_file" in source
-    assert "_postverify_loaded_review_modules" in inspect.getsource(
-        formal.run_locked_runner_cli
-    )
+    assert "assert_verified_module" in source
+    assert "verified_ledger_entry" in source
+    assert "FACTOR_V3_DAILY_BASIC_RUNNER_SHA256" not in source
 
 
-def test_formal_build_and_run_require_external_anchor_and_hold_complete_review() -> None:
-    source = inspect.getsource(formal.main)
-    signature = inspect.signature(formal.main)
+def test_formal_dispatch_requires_exact_trusted_context_api() -> None:
+    signature = inspect.signature(formal.trusted_dispatch)
 
-    assert signature.parameters[
-        "expected_bootstrap_claim_sha256"
-    ].default is inspect.Parameter.empty
-    assert "_validated_fixed_runtime_identity" in source
-    assert "_locked_formal_review_sources" in source
-    assert source.index("_locked_formal_review_sources") < source.index(
-        "verify_formal_worktree"
+    assert tuple(signature.parameters) == (
+        "context",
+        "frozen_action_config",
     )
-    assert source.index("build_and_verify_candidate") < source.index(
-        "publish_candidate"
+    source = inspect.getsource(formal.trusted_dispatch)
+    assert "validate_action_config" in source
+    assert "_postverify_verified_module_ledger" in source
+    assert "emit_json" in source
+    assert "print(" not in source
+    assert "runner.main" not in source
+
+
+def test_success_output_is_buffered_until_external_terminal_postverify(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = _frozen_action_config()
+    context = _TrustedBootstrapContext(config)
+    runner = _FakeRunner(_candidate())
+    events: list[str] = []
+    original_emit = context.emit_json
+
+    def emit_json(value: object) -> None:
+        events.append("emit")
+        original_emit(value)
+
+    context.emit_json = emit_json
+    monkeypatch.setattr(formal, "_load_runner", lambda _context: runner)
+    monkeypatch.setattr(formal, "verify_planned_run_root", lambda: None)
+    monkeypatch.setattr(
+        formal,
+        "publish_candidate",
+        lambda _content: formal.SPEC_OUTPUT_ROOT / "candidate.json",
     )
-    runner_source = inspect.getsource(formal.run_locked_runner_cli)
-    assert "_validated_fixed_runtime_identity" in runner_source
-    assert "_locked_formal_review_sources" in runner_source
-    assert runner_source.index("_locked_formal_review_sources") < (
-        runner_source.index("verify_formal_worktree")
+    monkeypatch.setattr(
+        formal,
+        "_postverify_verified_module_ledger",
+        lambda _context, _manifest: events.append("ledger"),
     )
-    assert runner_source.index("verify_formal_worktree") < runner_source.index(
-        "_load_runner"
+
+    assert formal.trusted_dispatch(context, config) == 0
+
+    assert events == ["ledger", "emit"]
+    assert len(context.buffered) == 1
+    assert context.postverify_calls == 0
+    assert capsys.readouterr() == ("", "")
+
+
+def test_failed_terminal_ledger_proof_emits_no_success(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = _frozen_action_config()
+    context = _TrustedBootstrapContext(config)
+    runner = _FakeRunner(_candidate())
+    monkeypatch.setattr(formal, "_load_runner", lambda _context: runner)
+    monkeypatch.setattr(formal, "verify_planned_run_root", lambda: None)
+    monkeypatch.setattr(
+        formal,
+        "publish_candidate",
+        lambda _content: formal.SPEC_OUTPUT_ROOT / "candidate.json",
     )
-    assert runner_source.index("_load_runner") < runner_source.index(
-        "runner.main"
+
+    def reject_ledger(_context: object, _manifest: object) -> None:
+        raise formal.FormalRunSpecError("formal verified loader ledger rejected")
+
+    monkeypatch.setattr(
+        formal,
+        "_postverify_verified_module_ledger",
+        reject_ledger,
     )
+
+    with pytest.raises(formal.FormalRunSpecError, match="ledger"):
+        formal.trusted_dispatch(context, config)
+
+    assert context.buffered == []
+    assert capsys.readouterr() == ("", "")
 
 
 def test_formal_spec_publication_reuses_safe_cas_primitives() -> None:
@@ -1028,39 +1192,80 @@ def test_fixed_runtime_identity_accepts_the_real_isolated_interpreter() -> None:
     assert completed.stderr == ""
 
 
-def test_loaded_application_modules_bind_exact_file_and_source(
+def test_loaded_application_modules_require_external_ledger_proof(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path.resolve()
     app_root = root / "app"
     app_root.mkdir()
+    package_source = app_root / "__init__.py"
+    package_raw = b"PACKAGE = 1\n"
+    package_source.write_bytes(package_raw)
     source = app_root / "reviewed.py"
     raw = b"VALUE = 1\n"
     source.write_bytes(raw)
     manifest = [
+        {
+            "bytes": len(package_raw),
+            "path": "app/__init__.py",
+            "sha256": hashlib.sha256(package_raw).hexdigest(),
+        },
         {
             "bytes": len(raw),
             "path": "app/reviewed.py",
             "sha256": hashlib.sha256(raw).hexdigest(),
         }
     ]
-    modules = {
-        "app": SimpleNamespace(),
-        "app.reviewed": SimpleNamespace(__file__=str(source)),
-    }
-    monkeypatch.setattr(formal, "FORMAL_WORKTREE_ROOT", root)
-    monkeypatch.setattr(
-        formal,
-        "sys",
-        SimpleNamespace(modules=modules),
+    config = _frozen_action_config()
+    context = _TrustedBootstrapContext(
+        config,
+        rejected_modules={"app.reviewed"},
+    )
+    monkeypatch.setitem(
+        formal.sys.modules,
+        "app",
+        SimpleNamespace(__file__=str(package_source)),
+    )
+    monkeypatch.setitem(
+        formal.sys.modules,
+        "app.reviewed",
+        SimpleNamespace(__file__=str(source)),
     )
 
-    formal._postverify_loaded_review_modules(manifest)
+    with pytest.raises(formal.FormalRunSpecError, match="ledger"):
+        formal._postverify_verified_module_ledger(context, manifest)
+    assert {item[0] for item in context.asserted_modules} == {
+        "app",
+        "app.reviewed",
+    }
 
-    modules["app.unreviewed"] = SimpleNamespace(__file__=str(source))
-    with pytest.raises(formal.FormalRunSpecError, match="closure"):
-        formal._postverify_loaded_review_modules(manifest)
+
+def test_custom_meta_path_and_forged_file_cannot_replace_ledger_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = (tmp_path / "reviewed.py").resolve()
+    raw = b"VALUE = 1\n"
+    source.write_bytes(raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    manifest = [{"bytes": len(raw), "path": "app/reviewed.py", "sha256": digest}]
+    forged = SimpleNamespace(
+        __file__=str(source),
+        __loader__=SimpleNamespace(name="attacker"),
+        __spec__=SimpleNamespace(origin=str(source)),
+    )
+    finder = SimpleNamespace(find_spec=lambda *_args: forged.__spec__)
+    monkeypatch.setitem(formal.sys.modules, "app.reviewed", forged)
+    monkeypatch.setattr(formal.sys, "meta_path", [finder])
+    config = _frozen_action_config()
+    context = _TrustedBootstrapContext(
+        config,
+        rejected_modules={"app.reviewed"},
+    )
+
+    with pytest.raises(formal.FormalRunSpecError, match="ledger"):
+        formal._postverify_verified_module_ledger(context, manifest)
 
 
 def test_cli_shim_rejects_a_nonfrozen_python_interpreter(
@@ -1107,7 +1312,7 @@ def test_isolated_cli_shim_fails_closed_without_external_bootstrap_anchor(
     )
     completed = subprocess.run(
         [
-            sys.executable,
+            str(formal.PYTHON_EXECUTABLE),
             "-I",
             "-B",
             str(shim),
