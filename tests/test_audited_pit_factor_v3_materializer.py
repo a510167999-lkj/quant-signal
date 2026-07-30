@@ -81,7 +81,9 @@ def _identity_roots() -> dict[str, str]:
     return {
         "factor_v2_parent_producer_root_sha256": _sha("factor-v2-parent-producer"),
         "extended_trading_calendar_descriptor_root_sha256": _sha("calendar"),
+        "extended_trading_calendar_receipt_sha256": _sha("calendar-receipt"),
         "feature_history_source_authority_root_sha256": _sha("feature-history"),
+        "factor_v3_feature_history_verification_receipt_sha256": _sha("feature-history-receipt"),
         "daily_basic_normalized_row_authority_root_sha256": _sha("daily-basic"),
         "daily_basic_coverage_receipt_sha256": _sha("daily-basic-receipt"),
         "daily_traded_cross_section_root_sha256": _sha("daily-cross-section"),
@@ -194,6 +196,9 @@ def _bundle(monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, Any], dict[str, 
             "all_market_sessions_sha256": _sha(calendar),
             "prewindow_sessions_sha256": _sha(prewindow),
             "development_sessions_sha256": _sha(development),
+            "authority_receipt_sha256": roots[
+                "extended_trading_calendar_receipt_sha256"
+            ],
         },
         "daily_basic": {
             "rows": daily_rows,
@@ -248,6 +253,9 @@ def _bundle(monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, Any], dict[str, 
     verified = {
         "feature_history": {
             "verified": True,
+            "receipt_sha256": roots[
+                "factor_v3_feature_history_verification_receipt_sha256"
+            ],
             "source_authority_root_sha256": roots[
                 "feature_history_source_authority_root_sha256"
             ],
@@ -309,6 +317,7 @@ def test_materializes_only_development_candidate_with_exact_pit_ledger(
     assert candidate_path.parts[-4:-1] == ("factor-v3-development-candidates", "sha256", result["artifact_sha256"][:2])
     assert candidate["development_only"] is True
     assert candidate["formal_materialization_performed"] is False
+    assert candidate["frozen_points_formal_materializer_implemented"] is False
     assert candidate["formal_receipt_eligible"] is False
     assert candidate["embargo_consumed"] is False
     assert candidate["final_oos_consumed"] is False
@@ -354,6 +363,7 @@ def test_materializes_only_development_candidate_with_exact_pit_ledger(
         "SSE_STAR",
     ]
     assert receipt["factor_v2_evaluation"] == bundle["factor_v2_evaluation"]
+    assert candidate["producer_binding"]["root_sha256"] == receipt["producer_binding"]["root_sha256"]
     assert "publication_capability" not in candidate_path.read_text(encoding="utf-8")
     assert "publication_capability" not in receipt_path.read_text(encoding="utf-8")
     assert result["verification"]["verified"] is True
@@ -456,6 +466,41 @@ def test_ipo_and_unresolved_transition_are_preregistered_exclusions(
         row["reason"] == "unresolved_authoritative_security_code_transition"
         for row in candidate["exclusion_ledger"]
     )
+
+
+def test_short_observation_threshold_uses_the_last_20_market_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle, verified = _bundle(monkeypatch)
+    short_window_dates = set(bundle["calendar"]["prewindow_sessions"][-6:])
+    bundle["daily_basic"]["rows"] = [
+        row
+        for row in bundle["daily_basic"]["rows"]
+        if not (row["security_id"] == "cn-a-share:000001" and row["trade_date"] in short_window_dates)
+    ]
+    bundle["daily_traded_cross_section"]["rows"] = [
+        row
+        for row in bundle["daily_traded_cross_section"]["rows"]
+        if not (row["security_id"] == "cn-a-share:000001" and row["trade_date"] in short_window_dates)
+    ]
+    bundle["suspensions"]["rows"] = [
+        {"security_id": "cn-a-share:000001", "trade_date": trade_date}
+        for trade_date in sorted(short_window_dates)
+    ]
+    bundle["daily_basic"]["rows_sha256"] = _sha(bundle["daily_basic"]["rows"])
+    bundle["daily_traded_cross_section"]["rows_sha256"] = _sha(
+        bundle["daily_traded_cross_section"]["rows"]
+    )
+
+    result = _materialize(tmp_path, bundle, verified)
+    candidate = json.loads(Path(result["candidate_path"]).read_text(encoding="utf-8"))
+    first_date = bundle["calendar"]["development_sessions"][0]
+    assert {
+        row["reason"]
+        for row in candidate["exclusion_ledger"]
+        if row["signal_date"] == first_date and row["candidate_key"].startswith("cn-a-share:000002")
+    } == {"observed_trading_records_less_than_15_in_20_market_session_window"}
 
 
 def test_create_only_post_verifier_and_unsafe_inputs_fail_closed(
