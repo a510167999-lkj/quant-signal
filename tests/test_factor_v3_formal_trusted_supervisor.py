@@ -707,6 +707,33 @@ def test_supervisor_executes_exact_worker_and_publishes_one_terminal_frame(
     assert "fixture-secret-must-never-be-logged" not in writes[0].decode("utf-8")
 
 
+def test_worker_credential_in_terminal_output_is_rejected_without_parent_output(
+    tmp_path: Path,
+) -> None:
+    pins, payload, authorization_path, environment, writes = _fixture(
+        tmp_path,
+        prefix="fixture-secret-must-never-be-logged",
+    )
+    authorization_sha256 = _file_sha256(authorization_path)
+    ledger_root = Path(str(payload["execution_ledger_root"]))
+
+    with pytest.raises(
+        supervisor.FormalSupervisorError,
+        match="isolated worker terminal rejected",
+    ):
+        _run_fixture(pins, authorization_path, environment, writes)
+
+    assert supervisor.claim_path_for_authorization(
+        ledger_root,
+        authorization_sha256,
+    ).is_file()
+    assert not supervisor.completed_path_for_authorization(
+        ledger_root,
+        authorization_sha256,
+    ).exists()
+    assert writes == []
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     (

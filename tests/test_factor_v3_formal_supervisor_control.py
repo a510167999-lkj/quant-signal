@@ -316,7 +316,23 @@ def test_external_loader_run_claims_before_credential_and_resumes_without_leak(
         },
     )
 
+    resume_sha256 = str(resume_authorization["launch_authorization_sha256"])
     assert result["status"] == "completed"
+    assert supervisor.claim_path_for_authorization(
+        ledger_root,
+        resume_sha256,
+    ).is_file()
+    assert supervisor.completed_path_for_authorization(
+        ledger_root,
+        resume_sha256,
+    ).is_file()
+    assert (
+        ledger_root
+        / "resumed_authorizations"
+        / "sha256"
+        / launch_sha256[:2]
+        / f"{launch_sha256}.json"
+    ).is_file()
     assert credential_value not in json.dumps(result, sort_keys=True)
     for ledger_path in ledger_root.rglob("*.json"):
         assert credential_value.encode("utf-8") not in ledger_path.read_bytes()
