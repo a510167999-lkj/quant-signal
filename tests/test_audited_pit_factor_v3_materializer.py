@@ -212,8 +212,18 @@ def _bundle(monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, Any], dict[str, 
         },
         "listing_membership": {
             "rows": [
-                {"security_id": security_one, "listing_date": "2020-01-01"},
-                {"security_id": security_two, "listing_date": "2020-01-01"},
+                {
+                    "security_id": security_one,
+                    "listing_date": "2020-01-01",
+                    "membership_start": "2020-01-01",
+                    "membership_end": "9999-12-31",
+                },
+                {
+                    "security_id": security_two,
+                    "listing_date": "2020-01-01",
+                    "membership_start": "2020-01-01",
+                    "membership_end": "9999-12-31",
+                },
             ],
         },
         "suspensions": {"rows": []},
@@ -501,6 +511,19 @@ def test_short_observation_threshold_uses_the_last_20_market_sessions(
         for row in candidate["exclusion_ledger"]
         if row["signal_date"] == first_date and row["candidate_key"].startswith("cn-a-share:000002")
     } == {"observed_trading_records_less_than_15_in_20_market_session_window"}
+
+
+def test_parent_signal_must_be_within_pit_listing_membership_interval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle, verified = _bundle(monkeypatch)
+    bundle["listing_membership"]["rows"][0]["membership_end"] = bundle["calendar"][
+        "prewindow_sessions"
+    ][-1]
+
+    with pytest.raises(ValueError, match="PIT listing membership"):
+        _materialize(tmp_path, bundle, verified)
 
 
 def test_create_only_post_verifier_and_unsafe_inputs_fail_closed(
