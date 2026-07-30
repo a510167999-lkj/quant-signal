@@ -17,9 +17,6 @@ import tempfile
 from types import ModuleType
 from typing import Any
 
-from app import jiaoch_points_raw_authority as raw_authority
-from app.durable_io import fsync_directory
-
 
 class FormalRunSpecError(RuntimeError):
     pass
@@ -76,8 +73,15 @@ PYTHON_EXECUTABLE = Path(
 PYTHON_EXECUTABLE_SHA256 = (
     "5fec912cd3c47c125754cfbcb9b21ce0b415f860cfa8e2a3b98ceb9cd73bd30f"
 )
+BASE_PYTHON_EXECUTABLE = Path(
+    r"C:\Users\51016\AppData\Local\Programs\Python\Python311\python.exe"
+)
+BASE_PYTHON_EXECUTABLE_SHA256 = (
+    "5be4ea9f930ff31f567d0505d76fe86ad6ffe8ee50f81e2739a142829f19a10d"
+)
 FORMAL_REVIEW_SOURCE_RELATIVE_PATHS = (
     "scripts/build_factor_v3_daily_basic_formal_run_spec.py",
+    "scripts/run_factor_v3_daily_basic_formal.py",
     "app/audited_pit_factor_v3_feature_history_authority.py",
     "app/audited_pit_factor_v3_points_contract.py",
     "app/current_pool.py",
@@ -117,6 +121,11 @@ FORMAL_REVIEW_RECEIPT_ROOT = (
     MAIN_REPO_ROOT
     / "data/research_artifacts/factor_v3_daily_basic_formal_review_v1"
     / "review_receipts/sha256"
+)
+FORMAL_BOOTSTRAP_CLAIM_ROOT = (
+    MAIN_REPO_ROOT
+    / "data/research_artifacts/factor_v3_daily_basic_formal_review_v1"
+    / "bootstrap_claims/sha256"
 )
 FORMAL_REVIEW_PUBLIC_KEY_PATH = (
     MAIN_REPO_ROOT
@@ -225,6 +234,9 @@ def _canonical_bytes(value: Any) -> bytes:
 
 
 _FORMAL_REVIEW_PROTOCOL = {
+    "bootstrap_claim_schema": (
+        "factor-v3-daily-basic-formal-bootstrap-claim/v1"
+    ),
     "decision": "APPROVED_NO_P0_P1_P2",
     "public_key_spki_sha256": FORMAL_REVIEW_PUBLIC_KEY_SPKI_SHA256,
     "receipt_schema": (
@@ -232,6 +244,15 @@ _FORMAL_REVIEW_PROTOCOL = {
     ),
     "signature_scheme": "RSASSA-PKCS1-v1_5-SHA256",
     "source_manifest_fields": ["bytes", "path", "sha256"],
+    "runtime_entrypoint": "scripts/run_factor_v3_daily_basic_formal.py",
+    "runtime_python": {
+        "base_executable_path": str(BASE_PYTHON_EXECUTABLE),
+        "base_executable_sha256": BASE_PYTHON_EXECUTABLE_SHA256,
+        "dont_write_bytecode": True,
+        "executable_path": str(PYTHON_EXECUTABLE),
+        "executable_sha256": PYTHON_EXECUTABLE_SHA256,
+        "isolated": True,
+    },
 }
 FORMAL_REVIEW_PROTOCOL_SHA256 = hashlib.sha256(
     _canonical_bytes(_FORMAL_REVIEW_PROTOCOL)
@@ -264,7 +285,7 @@ def _open_pinned_file(
     max_bytes: int = 64 * 1024 * 1024,
     allow_hardlinks: bool = False,
 ):
-    parent = raw_authority._safe_existing_directory(
+    parent = _safe_existing_directory(
         path.parent,
         f"{label} parent",
     )
@@ -363,7 +384,7 @@ def _postverify_pinned_file(
     allow_hardlinks: bool = False,
 ) -> None:
     opened = os.fstat(handle.fileno())
-    parent = raw_authority._safe_existing_directory(
+    parent = _safe_existing_directory(
         path.parent,
         f"{label} parent",
     )
@@ -430,10 +451,158 @@ def _is_reparse(path: Path) -> bool:
     )
 
 
+def _safe_existing_directory(path: Path, label: str) -> Path:
+    if not path.is_absolute() or any(part in {".", ".."} for part in path.parts):
+        raise FormalRunSpecError(f"{label} path rejected")
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except OSError:
+            raise FormalRunSpecError(f"{label} path rejected") from None
+        if not stat.S_ISDIR(metadata.st_mode) or _is_reparse(current):
+            raise FormalRunSpecError(
+                f"{label} contains a link or reparse point"
+            )
+    try:
+        return path.resolve(strict=True)
+    except OSError:
+        raise FormalRunSpecError(f"{label} path rejected") from None
+
+
+def _read_safe_file(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int,
+    expected_size: int | None = None,
+) -> bytes:
+    parent = _safe_existing_directory(path.parent, f"{label} parent")
+    candidate = parent / path.name
+    try:
+        before = candidate.lstat()
+    except OSError:
+        raise FormalRunSpecError(f"{label} is missing") from None
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or _is_reparse(candidate)
+        or int(getattr(before, "st_nlink", 1)) != 1
+        or before.st_size <= 0
+        or before.st_size > max_bytes
+        or (
+            expected_size is not None
+            and before.st_size != expected_size
+        )
+    ):
+        raise FormalRunSpecError(f"{label} rejected")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(candidate, flags)
+    except OSError:
+        raise FormalRunSpecError(f"{label} safe open rejected") from None
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or int(getattr(opened, "st_nlink", 1)) != 1
+            or int(getattr(opened, "st_file_attributes", 0)) & 0x00000400
+            or not os.path.samestat(before, opened)
+            or opened.st_size <= 0
+            or opened.st_size > max_bytes
+            or (
+                expected_size is not None
+                and opened.st_size != expected_size
+            )
+        ):
+            raise FormalRunSpecError(f"{label} identity rejected")
+        remaining = opened.st_size
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                raise FormalRunSpecError(f"{label} size rejected")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise FormalRunSpecError(f"{label} size rejected")
+        after = os.fstat(descriptor)
+        terminal = candidate.lstat()
+        if (
+            not os.path.samestat(opened, after)
+            or not os.path.samestat(opened, terminal)
+            or _is_reparse(candidate)
+            or int(getattr(terminal, "st_nlink", 1)) != 1
+            or after.st_size != opened.st_size
+        ):
+            raise FormalRunSpecError(f"{label} drifted")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _validated_fixed_runtime_identity() -> dict[str, str]:
+    base_executable = sys._base_executable
+    pycache_prefix = sys.pycache_prefix
+    if (
+        os.name != "nt"
+        or sys.flags.isolated != 1
+        or not sys.dont_write_bytecode
+        or type(base_executable) is not str
+        or Path(sys.executable) != PYTHON_EXECUTABLE
+        or Path(base_executable) != BASE_PYTHON_EXECUTABLE
+        or type(pycache_prefix) is not str
+        or not pycache_prefix
+        or any(
+            name == "app" or name.startswith("app.")
+            for name in sys.modules
+        )
+    ):
+        raise FormalRunSpecError("formal fixed Python runtime rejected")
+    cache_root = _safe_existing_directory(
+        Path(pycache_prefix),
+        "formal isolated pycache",
+    )
+    try:
+        if next(cache_root.iterdir(), None) is not None:
+            raise FormalRunSpecError("formal isolated pycache is not empty")
+    except OSError:
+        raise FormalRunSpecError(
+            "formal isolated pycache unavailable"
+        ) from None
+    with _open_pinned_file(
+        PYTHON_EXECUTABLE,
+        expected_sha256=PYTHON_EXECUTABLE_SHA256,
+        label="formal python executable",
+        allow_hardlinks=True,
+    ):
+        pass
+    with _open_pinned_file(
+        BASE_PYTHON_EXECUTABLE,
+        expected_sha256=BASE_PYTHON_EXECUTABLE_SHA256,
+        label="formal base python executable",
+        allow_hardlinks=True,
+    ):
+        pass
+    return {
+        "base_python_executable_path": str(BASE_PYTHON_EXECUTABLE),
+        "base_python_executable_sha256": (
+            BASE_PYTHON_EXECUTABLE_SHA256
+        ),
+        "python_executable_path": str(PYTHON_EXECUTABLE),
+        "python_executable_sha256": PYTHON_EXECUTABLE_SHA256,
+        "pycache_prefix": str(cache_root),
+    }
+
+
 def _formal_review_source_manifest() -> list[dict[str, Any]]:
     entries = []
     for relative_path in FORMAL_REVIEW_SOURCE_RELATIVE_PATHS:
-        raw = raw_authority._read_safe_file(
+        raw = _read_safe_file(
             FORMAL_WORKTREE_ROOT / Path(*relative_path.split("/")),
             label="formal reviewed source",
             max_bytes=4 * 1024 * 1024,
@@ -709,22 +878,136 @@ def _validated_signed_review_receipt(
     return payload
 
 
-def _review_receipt_candidates() -> list[Path]:
-    try:
-        root = raw_authority._safe_existing_directory(
-            FORMAL_REVIEW_RECEIPT_ROOT,
-            "factor-v3 formal review receipt root",
-        )
-        candidates = sorted(root.glob("*/*.json"))
-    except (OSError, ValueError):
-        raise FormalRunSpecError("formal review receipt unavailable") from None
-    if not candidates:
-        raise FormalRunSpecError("formal review receipt unavailable")
-    return candidates
+def _content_addressed_json_path(
+    root: Path,
+    digest: str,
+    *,
+    label: str,
+) -> Path:
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise FormalRunSpecError(f"{label} digest rejected")
+    safe_root = _safe_existing_directory(root, f"{label} root")
+    shard = _safe_existing_directory(
+        safe_root / digest[:2],
+        f"{label} shard",
+    )
+    return shard / f"{digest}.json"
+
+
+def _bootstrap_claim_path(digest: str) -> Path:
+    return _content_addressed_json_path(
+        FORMAL_BOOTSTRAP_CLAIM_ROOT,
+        digest,
+        label="factor-v3 formal bootstrap claim",
+    )
+
+
+def _review_receipt_path(digest: str) -> Path:
+    return _content_addressed_json_path(
+        FORMAL_REVIEW_RECEIPT_ROOT,
+        digest,
+        label="factor-v3 formal review receipt",
+    )
+
+
+def _source_manifest_sha(
+    source_manifest: list[dict[str, Any]],
+    relative_path: str,
+) -> str:
+    matches = [
+        item.get("sha256")
+        for item in source_manifest
+        if item.get("path") == relative_path
+    ]
+    if (
+        len(matches) != 1
+        or type(matches[0]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", matches[0]) is None
+    ):
+        raise FormalRunSpecError("formal bootstrap source manifest rejected")
+    return matches[0]
+
+
+def _validated_external_bootstrap_claim(
+    raw: bytes,
+    *,
+    expected_claim_sha256: str,
+    expected_commit: str,
+    expected_source_manifest: list[dict[str, Any]],
+    review_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", expected_claim_sha256) is None
+        or hashlib.sha256(raw).hexdigest() != expected_claim_sha256
+    ):
+        raise FormalRunSpecError("formal bootstrap claim identity rejected")
+    claim = _strict_canonical_json(raw, label="formal bootstrap claim")
+    _assert_no_credential_shape(claim)
+    payload = review_evidence.get("payload")
+    if type(payload) is not dict:
+        raise FormalRunSpecError("formal bootstrap review evidence rejected")
+    source_root = hashlib.sha256(
+        _canonical_bytes(expected_source_manifest)
+    ).hexdigest()
+    expected = {
+        "base_python_executable_path": str(BASE_PYTHON_EXECUTABLE),
+        "base_python_executable_sha256": (
+            BASE_PYTHON_EXECUTABLE_SHA256
+        ),
+        "branch": EXPECTED_BRANCH,
+        "builder_sha256": _source_manifest_sha(
+            expected_source_manifest,
+            "scripts/build_factor_v3_daily_basic_formal_run_spec.py",
+        ),
+        "formal_input_root_sha256": FORMAL_INPUT_ROOT_SHA256,
+        "git_executable_path": str(GIT_EXECUTABLE),
+        "git_executable_sha256": GIT_EXECUTABLE_SHA256,
+        "project_id": "quant-signal-lkj",
+        "python_executable_path": str(PYTHON_EXECUTABLE),
+        "python_executable_sha256": PYTHON_EXECUTABLE_SHA256,
+        "review_payload_sha256": review_evidence.get("payload_sha256"),
+        "review_public_key_spki_sha256": (
+            FORMAL_REVIEW_PUBLIC_KEY_SPKI_SHA256
+        ),
+        "review_receipt_sha256": review_evidence.get("receipt_sha256"),
+        "reviewed_commit": expected_commit,
+        "reviewed_source_root_sha256": source_root,
+        "schema": "factor-v3-daily-basic-formal-bootstrap-claim/v1",
+        "shim_sha256": _source_manifest_sha(
+            expected_source_manifest,
+            "scripts/run_factor_v3_daily_basic_formal.py",
+        ),
+    }
+    if (
+        claim != expected
+        or payload.get("reviewed_commit") != expected_commit
+        or payload.get("reviewed_source_root_sha256") != source_root
+        or payload.get("formal_input_root_sha256")
+        != FORMAL_INPUT_ROOT_SHA256
+    ):
+        raise FormalRunSpecError("formal bootstrap claim rejected")
+    return claim
+
+
+def _bootstrap_receipt_sha256(claim_raw: bytes) -> str:
+    claim = _strict_canonical_json(
+        claim_raw,
+        label="formal bootstrap claim",
+    )
+    receipt_sha256 = claim.get("review_receipt_sha256")
+    if (
+        type(receipt_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", receipt_sha256) is None
+    ):
+        raise FormalRunSpecError("formal bootstrap claim rejected")
+    return receipt_sha256
 
 
 @contextmanager
-def _locked_formal_review_sources():
+def _locked_formal_review_sources(
+    *,
+    expected_bootstrap_claim_sha256: str,
+):
     if os.name != "nt":
         raise FormalRunSpecError(
             "formal review source locking requires Windows"
@@ -746,12 +1029,20 @@ def _locked_formal_review_sources():
                 allow_hardlinks=True,
             )
         )
+        stack.enter_context(
+            _open_pinned_file(
+                BASE_PYTHON_EXECUTABLE,
+                expected_sha256=BASE_PYTHON_EXECUTABLE_SHA256,
+                label="formal base python executable",
+                allow_hardlinks=True,
+            )
+        )
         locked_manifest = []
         for relative_path in FORMAL_REVIEW_SOURCE_RELATIVE_PATHS:
             path = FORMAL_WORKTREE_ROOT / Path(
                 *relative_path.split("/")
             )
-            raw = raw_authority._read_safe_file(
+            raw = _read_safe_file(
                 path,
                 label="formal reviewed source",
                 max_bytes=4 * 1024 * 1024,
@@ -772,7 +1063,7 @@ def _locked_formal_review_sources():
                     "sha256": digest,
                 }
             )
-        public_raw = raw_authority._read_safe_file(
+        public_raw = _read_safe_file(
             FORMAL_REVIEW_PUBLIC_KEY_PATH,
             label="factor-v3 formal review public key",
             max_bytes=16 * 1024,
@@ -785,25 +1076,60 @@ def _locked_formal_review_sources():
                 max_bytes=16 * 1024,
             )
         )
-        for receipt_path in _review_receipt_candidates():
-            raw = raw_authority._read_safe_file(
+        claim_path = _bootstrap_claim_path(
+            expected_bootstrap_claim_sha256
+        )
+        claim_raw = _read_safe_file(
+            claim_path,
+            label="factor-v3 formal bootstrap claim",
+            max_bytes=512 * 1024,
+        )
+        if (
+            hashlib.sha256(claim_raw).hexdigest()
+            != expected_bootstrap_claim_sha256
+        ):
+            raise FormalRunSpecError(
+                "formal bootstrap claim content rejected"
+            )
+        stack.enter_context(
+            _open_pinned_file(
+                claim_path,
+                expected_sha256=expected_bootstrap_claim_sha256,
+                label="factor-v3 formal bootstrap claim",
+                max_bytes=512 * 1024,
+            )
+        )
+        receipt_sha256 = _bootstrap_receipt_sha256(claim_raw)
+        receipt_path = _review_receipt_path(receipt_sha256)
+        receipt_raw = _read_safe_file(
+            receipt_path,
+            label="factor-v3 formal review receipt",
+            max_bytes=512 * 1024,
+        )
+        if hashlib.sha256(receipt_raw).hexdigest() != receipt_sha256:
+            raise FormalRunSpecError("formal review receipt content rejected")
+        stack.enter_context(
+            _open_pinned_file(
                 receipt_path,
+                expected_sha256=receipt_sha256,
                 label="factor-v3 formal review receipt",
                 max_bytes=512 * 1024,
             )
-            stack.enter_context(
-                _open_pinned_file(
-                    receipt_path,
-                    expected_sha256=hashlib.sha256(raw).hexdigest(),
-                    label="factor-v3 formal review receipt",
-                    max_bytes=512 * 1024,
-                )
-            )
-        yield locked_manifest
+        )
+        yield {
+            "bootstrap_claim_sha256": expected_bootstrap_claim_sha256,
+            "review_receipt_sha256": receipt_sha256,
+            "source_manifest": locked_manifest,
+        }
 
 
-def _validated_formal_review_receipt() -> dict[str, Any]:
-    public_raw = raw_authority._read_safe_file(
+def _validated_formal_review_receipt(
+    *,
+    expected_receipt_sha256: str,
+    expected_commit: str,
+    expected_source_manifest: list[dict[str, Any]],
+) -> dict[str, Any]:
+    public_raw = _read_safe_file(
         FORMAL_REVIEW_PUBLIC_KEY_PATH,
         label="factor-v3 formal review public key",
         max_bytes=16 * 1024,
@@ -814,43 +1140,34 @@ def _validated_formal_review_receipt() -> dict[str, Any]:
         != FORMAL_REVIEW_PUBLIC_KEY_SPKI_SHA256
     ):
         raise FormalRunSpecError("formal review public key identity rejected")
-    commit = _git_output("rev-parse", "HEAD")
-    source_manifest = _formal_review_source_manifest()
-    accepted = []
-    for path in _review_receipt_candidates():
-        digest = path.stem
-        if (
-            re.fullmatch(r"[0-9a-f]{64}", digest) is None
-            or path.parent.name != digest[:2]
-        ):
-            raise FormalRunSpecError("formal review receipt path rejected")
-        raw = raw_authority._read_safe_file(
-            path,
-            label="factor-v3 formal review receipt",
-            max_bytes=512 * 1024,
-        )
-        if hashlib.sha256(raw).hexdigest() != digest:
-            raise FormalRunSpecError("formal review receipt content rejected")
-        try:
-            accepted.append(
-                _validated_signed_review_receipt(
-                    raw,
-                    expected_commit=commit,
-                    expected_source_manifest=source_manifest,
-                    expected_formal_input_root_sha256=(
-                        FORMAL_INPUT_ROOT_SHA256
-                    ),
-                    trusted_public_key_der=public_der,
-                )
-            )
-        except FormalRunSpecError:
-            continue
-    if len(accepted) != 1:
-        raise FormalRunSpecError("formal review signed receipt rejected")
-    return accepted[0]
+    path = _review_receipt_path(expected_receipt_sha256)
+    raw = _read_safe_file(
+        path,
+        label="factor-v3 formal review receipt",
+        max_bytes=512 * 1024,
+    )
+    if hashlib.sha256(raw).hexdigest() != expected_receipt_sha256:
+        raise FormalRunSpecError("formal review receipt content rejected")
+    payload = _validated_signed_review_receipt(
+        raw,
+        expected_commit=expected_commit,
+        expected_source_manifest=expected_source_manifest,
+        expected_formal_input_root_sha256=FORMAL_INPUT_ROOT_SHA256,
+        trusted_public_key_der=public_der,
+    )
+    return {
+        "payload": payload,
+        "payload_sha256": hashlib.sha256(
+            _canonical_bytes(payload)
+        ).hexdigest(),
+        "receipt_sha256": expected_receipt_sha256,
+    }
 
 
-def verify_formal_worktree() -> None:
+def verify_formal_worktree(
+    *,
+    expected_bootstrap_claim_sha256: str,
+) -> dict[str, Any]:
     script_root = _script_worktree_root()
     if (
         script_root != FORMAL_WORKTREE_ROOT
@@ -875,13 +1192,46 @@ def verify_formal_worktree() -> None:
         raise FormalRunSpecError("formal worktree commit rejected")
     if dirty:
         raise FormalRunSpecError("formal worktree is dirty")
-    receipt = _validated_formal_review_receipt()
-    source_root = _formal_review_source_root()
+    source_manifest = _formal_review_source_manifest()
+    source_root = hashlib.sha256(
+        _canonical_bytes(source_manifest)
+    ).hexdigest()
+    claim_path = _bootstrap_claim_path(
+        expected_bootstrap_claim_sha256
+    )
+    claim_raw = _read_safe_file(
+        claim_path,
+        label="factor-v3 formal bootstrap claim",
+        max_bytes=512 * 1024,
+    )
+    if (
+        hashlib.sha256(claim_raw).hexdigest()
+        != expected_bootstrap_claim_sha256
+    ):
+        raise FormalRunSpecError("formal bootstrap claim content rejected")
+    review_evidence = _validated_formal_review_receipt(
+        expected_receipt_sha256=_bootstrap_receipt_sha256(claim_raw),
+        expected_commit=commit,
+        expected_source_manifest=source_manifest,
+    )
+    claim = _validated_external_bootstrap_claim(
+        claim_raw,
+        expected_claim_sha256=expected_bootstrap_claim_sha256,
+        expected_commit=commit,
+        expected_source_manifest=source_manifest,
+        review_evidence=review_evidence,
+    )
+    receipt = review_evidence["payload"]
     if (
         receipt["reviewed_commit"] != commit
         or receipt["reviewed_source_root_sha256"] != source_root
     ):
         raise FormalRunSpecError("formal worktree reviewed source drifted")
+    return {
+        "bootstrap_claim": claim,
+        "review_evidence": review_evidence,
+        "source_manifest": source_manifest,
+    }
 
 
 def verify_planned_run_root() -> None:
@@ -917,6 +1267,7 @@ def _assert_no_credential_shape(value: Any) -> None:
     if type(value) is dict:
         for key, nested in value.items():
             normalized = str(key).lower().replace("-", "_")
+            compact = re.sub(r"[^a-z]", "", str(key).casefold())
             if (
                 normalized
                 in {
@@ -929,6 +1280,7 @@ def _assert_no_credential_shape(value: Any) -> None:
                     "credential_material",
                 }
                 or "capability" in normalized
+                or "privatekey" in compact
                 or normalized.endswith(("_token", "_secret", "_password", "_api_key"))
             ):
                 raise FormalRunSpecError("formal run spec contains a credential shape")
@@ -1020,6 +1372,9 @@ def _verify_existing_target(target: Path, content: bytes) -> None:
 
 
 def publish_candidate(content: bytes) -> Path:
+    from app import jiaoch_points_raw_authority as raw_authority
+    from app.durable_io import fsync_directory
+
     try:
         parsed = json.loads(content)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1113,26 +1468,131 @@ def _load_runner() -> ModuleType:
         return factor_v3_daily_basic_runner
 
 
-def main(argv: list[str] | None = None) -> int:
+def _postverify_loaded_review_modules(
+    source_manifest: list[dict[str, Any]],
+) -> None:
+    reviewed_modules = {
+        item["path"][:-3].replace("/", "."): item
+        for item in source_manifest
+        if (
+            type(item) is dict
+            and type(item.get("path")) is str
+            and item["path"].startswith("app/")
+            and item["path"].endswith(".py")
+        )
+    }
+    loaded_names = {
+        name
+        for name, module in sys.modules.items()
+        if (
+            module is not None
+            and name.startswith("app.")
+        )
+    }
+    if not loaded_names or loaded_names - set(reviewed_modules):
+        raise FormalRunSpecError(
+            "formal loaded application module closure rejected"
+        )
+    for name in sorted(loaded_names):
+        module = sys.modules[name]
+        expected = reviewed_modules[name]
+        module_file = getattr(module, "__file__", None)
+        expected_path = FORMAL_WORKTREE_ROOT / Path(
+            *expected["path"].split("/")
+        )
+        if (
+            type(module_file) is not str
+            or Path(module_file).resolve(strict=True) != expected_path
+        ):
+            raise FormalRunSpecError(
+                "formal loaded application module identity rejected"
+            )
+        raw = _read_safe_file(
+            expected_path,
+            label="formal loaded application module",
+            max_bytes=4 * 1024 * 1024,
+        )
+        if (
+            len(raw) != expected.get("bytes")
+            or hashlib.sha256(raw).hexdigest()
+            != expected.get("sha256")
+        ):
+            raise FormalRunSpecError(
+                "formal loaded application module source rejected"
+            )
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    expected_bootstrap_claim_sha256: str,
+) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--write", action="store_true")
     args = parser.parse_args(argv)
-    with _locked_formal_review_sources():
-        verify_formal_worktree()
-        verify_planned_run_root()
-        candidate, content = build_and_verify_candidate(_load_runner())
-        if args.write:
-            publish_candidate(content)
-        print(
-            json.dumps(
-                safe_summary(candidate, content, published=args.write),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
+    _validated_fixed_runtime_identity()
+    with _locked_formal_review_sources(
+        expected_bootstrap_claim_sha256=(
+            expected_bootstrap_claim_sha256
+        )
+    ):
+        evidence = verify_formal_worktree(
+            expected_bootstrap_claim_sha256=(
+                expected_bootstrap_claim_sha256
             )
         )
+        verify_planned_run_root()
+        runner = _load_runner()
+        try:
+            candidate, content = build_and_verify_candidate(runner)
+            if args.write:
+                publish_candidate(content)
+            print(
+                json.dumps(
+                    safe_summary(
+                        candidate,
+                        content,
+                        published=args.write,
+                    ),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        finally:
+            _postverify_loaded_review_modules(
+                evidence["source_manifest"]
+            )
     return 0
 
 
+def run_locked_runner_cli(
+    argv: list[str],
+    *,
+    expected_bootstrap_claim_sha256: str,
+) -> int:
+    _validated_fixed_runtime_identity()
+    with _locked_formal_review_sources(
+        expected_bootstrap_claim_sha256=(
+            expected_bootstrap_claim_sha256
+        )
+    ):
+        evidence = verify_formal_worktree(
+            expected_bootstrap_claim_sha256=(
+                expected_bootstrap_claim_sha256
+            )
+        )
+        runner = _load_runner()
+        try:
+            return int(runner.main(argv))
+        finally:
+            _postverify_loaded_review_modules(
+                evidence["source_manifest"]
+            )
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(
+        "use scripts/run_factor_v3_daily_basic_formal.py with an external "
+        "bootstrap claim"
+    )

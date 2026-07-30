@@ -9,8 +9,13 @@ without creating a run root.
 
 from __future__ import annotations
 
+import hashlib
+import os
 from pathlib import Path
+import re
+import stat
 import sys
+import tempfile
 
 
 _PYTHON_EXECUTABLE = Path(

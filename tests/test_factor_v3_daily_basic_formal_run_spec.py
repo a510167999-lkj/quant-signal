@@ -459,34 +459,76 @@ def test_formal_worktree_requires_exact_branch_and_clean_status(
         "_script_worktree_root",
         lambda: formal.FORMAL_WORKTREE_ROOT,
     )
-    reviewed_source = "f" * 64
+    source_manifest = [
+        {
+            "bytes": 1,
+            "path": "scripts/build_factor_v3_daily_basic_formal_run_spec.py",
+            "sha256": "f" * 64,
+        }
+    ]
+    reviewed_source = hashlib.sha256(
+        formal._canonical_bytes(source_manifest)
+    ).hexdigest()
+    receipt_sha256 = "b" * 64
+    claim_raw = formal._canonical_bytes(
+        {"review_receipt_sha256": receipt_sha256}
+    )
+    claim_sha256 = hashlib.sha256(claim_raw).hexdigest()
     monkeypatch.setattr(
         formal,
         "_validated_formal_review_receipt",
-        lambda: {
-            "reviewed_commit": reviewed_commit,
-            "reviewed_source_root_sha256": reviewed_source,
+        lambda **_kwargs: {
+            "payload": {
+                "reviewed_commit": reviewed_commit,
+                "reviewed_source_root_sha256": reviewed_source,
+            },
+            "payload_sha256": "c" * 64,
+            "receipt_sha256": receipt_sha256,
         },
     )
     monkeypatch.setattr(
         formal,
-        "_formal_review_source_root",
-        lambda: reviewed_source,
+        "_validated_external_bootstrap_claim",
+        lambda *_args, **_kwargs: {},
     )
-    formal.verify_formal_worktree()
+    monkeypatch.setattr(
+        formal,
+        "_formal_review_source_manifest",
+        lambda: source_manifest,
+    )
+    monkeypatch.setattr(
+        formal,
+        "_bootstrap_claim_path",
+        lambda _digest: Path("ignored-bootstrap-claim.json"),
+    )
+    monkeypatch.setattr(
+        formal,
+        "_read_safe_file",
+        lambda *_args, **_kwargs: claim_raw,
+    )
+    formal.verify_formal_worktree(
+        expected_bootstrap_claim_sha256=claim_sha256
+    )
 
     responses[("rev-parse", "HEAD")] = "not-a-commit"
     with pytest.raises(formal.FormalRunSpecError, match="commit"):
-        formal.verify_formal_worktree()
+        formal.verify_formal_worktree(
+            expected_bootstrap_claim_sha256=claim_sha256
+        )
     responses[("rev-parse", "HEAD")] = reviewed_commit
 
     responses[("status", "--porcelain=v1", "--untracked-files=all")] = " M unsafe.py"
     with pytest.raises(formal.FormalRunSpecError, match="dirty"):
-        formal.verify_formal_worktree()
+        formal.verify_formal_worktree(
+            expected_bootstrap_claim_sha256=claim_sha256
+        )
 
 
-def test_formal_worktree_review_anchor_is_not_caller_supplied() -> None:
-    assert inspect.signature(formal.verify_formal_worktree).parameters == {}
+def test_formal_worktree_requires_external_content_addressed_anchor() -> None:
+    parameter = inspect.signature(
+        formal.verify_formal_worktree
+    ).parameters["expected_bootstrap_claim_sha256"]
+    assert parameter.default is inspect.Parameter.empty
     assert not hasattr(formal, "FORMAL_REVIEW_RECEIPT_SHA256")
     assert formal.FORMAL_REVIEW_RECEIPT_ROOT == (
         formal.MAIN_REPO_ROOT
@@ -750,6 +792,102 @@ def test_formal_git_handle_denies_transient_replace(
     assert executable.read_bytes() == original
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows formal lock contract")
+def test_formal_runtime_holds_source_claim_receipt_key_and_executables(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worktree = (tmp_path / "worktree").resolve()
+    scripts = worktree / "scripts"
+    scripts.mkdir(parents=True)
+    source = scripts / "bootstrap.py"
+    source_raw = b"BOOTSTRAP = True\n"
+    source.write_bytes(source_raw)
+    public_key = (tmp_path / "review-public.pem").resolve()
+    public_raw = b"test-only-public-key"
+    public_key.write_bytes(public_raw)
+    git = (tmp_path / "git.exe").resolve()
+    python = (tmp_path / "python.exe").resolve()
+    base_python = (tmp_path / "base-python.exe").resolve()
+    executable_bytes = {
+        git: b"git",
+        python: b"python",
+        base_python: b"base-python",
+    }
+    for path, raw in executable_bytes.items():
+        path.write_bytes(raw)
+        os.link(path, path.with_name(f"{path.stem}-copy{path.suffix}"))
+    receipt_raw = b'{"test":"receipt"}'
+    receipt_sha256 = hashlib.sha256(receipt_raw).hexdigest()
+    receipt_root = (tmp_path / "receipts" / "sha256").resolve()
+    receipt_shard = receipt_root / receipt_sha256[:2]
+    receipt_shard.mkdir(parents=True)
+    receipt = receipt_shard / f"{receipt_sha256}.json"
+    receipt.write_bytes(receipt_raw)
+    claim_raw = formal._canonical_bytes(
+        {"review_receipt_sha256": receipt_sha256}
+    )
+    claim_sha256 = hashlib.sha256(claim_raw).hexdigest()
+    claim_root = (tmp_path / "claims" / "sha256").resolve()
+    claim_shard = claim_root / claim_sha256[:2]
+    claim_shard.mkdir(parents=True)
+    claim = claim_shard / f"{claim_sha256}.json"
+    claim.write_bytes(claim_raw)
+    monkeypatch.setattr(formal, "FORMAL_WORKTREE_ROOT", worktree)
+    monkeypatch.setattr(
+        formal,
+        "FORMAL_REVIEW_SOURCE_RELATIVE_PATHS",
+        ("scripts/bootstrap.py",),
+    )
+    monkeypatch.setattr(formal, "FORMAL_REVIEW_PUBLIC_KEY_PATH", public_key)
+    monkeypatch.setattr(formal, "FORMAL_REVIEW_RECEIPT_ROOT", receipt_root)
+    monkeypatch.setattr(formal, "FORMAL_BOOTSTRAP_CLAIM_ROOT", claim_root)
+    monkeypatch.setattr(formal, "GIT_EXECUTABLE", git)
+    monkeypatch.setattr(
+        formal,
+        "GIT_EXECUTABLE_SHA256",
+        hashlib.sha256(executable_bytes[git]).hexdigest(),
+    )
+    monkeypatch.setattr(formal, "PYTHON_EXECUTABLE", python)
+    monkeypatch.setattr(
+        formal,
+        "PYTHON_EXECUTABLE_SHA256",
+        hashlib.sha256(executable_bytes[python]).hexdigest(),
+    )
+    monkeypatch.setattr(formal, "BASE_PYTHON_EXECUTABLE", base_python)
+    monkeypatch.setattr(
+        formal,
+        "BASE_PYTHON_EXECUTABLE_SHA256",
+        hashlib.sha256(executable_bytes[base_python]).hexdigest(),
+    )
+
+    with formal._locked_formal_review_sources(
+        expected_bootstrap_claim_sha256=claim_sha256
+    ) as locked:
+        assert locked["source_manifest"] == [
+            {
+                "bytes": len(source_raw),
+                "path": "scripts/bootstrap.py",
+                "sha256": hashlib.sha256(source_raw).hexdigest(),
+            }
+        ]
+        for path in (
+            source,
+            public_key,
+            claim,
+            receipt,
+            git,
+            python,
+            base_python,
+        ):
+            with pytest.raises(PermissionError):
+                path.write_bytes(b"transient replacement")
+
+    assert source.read_bytes() == source_raw
+    assert claim.read_bytes() == claim_raw
+    assert receipt.read_bytes() == receipt_raw
+
+
 def test_formal_runner_load_binds_physical_source_through_import_and_postverify() -> None:
     source = inspect.getsource(formal._load_runner)
 
@@ -809,6 +947,154 @@ def test_fixed_runtime_identity_requires_python_base_python_isolation_and_pycach
     assert "sys.flags.isolated" in source
     assert "sys.dont_write_bytecode" in source
     assert "sys.pycache_prefix" in source
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows executable identity contract")
+def test_fixed_runtime_identity_allows_normal_python_hardlinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    python = (tmp_path / "python.exe").resolve()
+    base_python = (tmp_path / "base-python.exe").resolve()
+    python_raw = b"fixed-python"
+    base_raw = b"fixed-base-python"
+    python.write_bytes(python_raw)
+    base_python.write_bytes(base_raw)
+    os.link(python, tmp_path / "python-copy.exe")
+    os.link(base_python, tmp_path / "base-python-copy.exe")
+    pycache = (tmp_path / "isolated-pycache").resolve()
+    pycache.mkdir()
+    monkeypatch.setattr(formal, "PYTHON_EXECUTABLE", python)
+    monkeypatch.setattr(
+        formal,
+        "PYTHON_EXECUTABLE_SHA256",
+        hashlib.sha256(python_raw).hexdigest(),
+    )
+    monkeypatch.setattr(formal, "BASE_PYTHON_EXECUTABLE", base_python)
+    monkeypatch.setattr(
+        formal,
+        "BASE_PYTHON_EXECUTABLE_SHA256",
+        hashlib.sha256(base_raw).hexdigest(),
+    )
+    monkeypatch.setattr(
+        formal,
+        "sys",
+        SimpleNamespace(
+            _base_executable=str(base_python),
+            dont_write_bytecode=True,
+            executable=str(python),
+            flags=SimpleNamespace(isolated=1),
+            modules={},
+            pycache_prefix=str(pycache),
+        ),
+    )
+
+    identity = formal._validated_fixed_runtime_identity()
+
+    assert identity["python_executable_path"] == str(python)
+    assert identity["base_python_executable_path"] == str(base_python)
+
+
+def test_fixed_runtime_identity_accepts_the_real_isolated_interpreter() -> None:
+    root = Path(__file__).resolve().parents[1]
+    program = (
+        "import sys,tempfile;"
+        "temporary=tempfile.TemporaryDirectory("
+        "prefix='factor-v3-runtime-test-');"
+        "sys.pycache_prefix=temporary.name;"
+        f"sys.path.insert(0,{str(root)!r});"
+        "from scripts import "
+        "build_factor_v3_daily_basic_formal_run_spec as formal;"
+        "formal._validated_fixed_runtime_identity();"
+        "print('verified')"
+    )
+    completed = subprocess.run(
+        [
+            str(formal.PYTHON_EXECUTABLE),
+            "-I",
+            "-B",
+            "-c",
+            program,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env={},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "verified\n"
+    assert completed.stderr == ""
+
+
+def test_loaded_application_modules_bind_exact_file_and_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path.resolve()
+    app_root = root / "app"
+    app_root.mkdir()
+    source = app_root / "reviewed.py"
+    raw = b"VALUE = 1\n"
+    source.write_bytes(raw)
+    manifest = [
+        {
+            "bytes": len(raw),
+            "path": "app/reviewed.py",
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
+    ]
+    modules = {
+        "app": SimpleNamespace(),
+        "app.reviewed": SimpleNamespace(__file__=str(source)),
+    }
+    monkeypatch.setattr(formal, "FORMAL_WORKTREE_ROOT", root)
+    monkeypatch.setattr(
+        formal,
+        "sys",
+        SimpleNamespace(modules=modules),
+    )
+
+    formal._postverify_loaded_review_modules(manifest)
+
+    modules["app.unreviewed"] = SimpleNamespace(__file__=str(source))
+    with pytest.raises(formal.FormalRunSpecError, match="closure"):
+        formal._postverify_loaded_review_modules(manifest)
+
+
+def test_cli_shim_rejects_a_nonfrozen_python_interpreter(
+    tmp_path: Path,
+) -> None:
+    shim = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "run_factor_v3_daily_basic_formal.py"
+    )
+    completed = subprocess.run(
+        [
+            str(formal.BASE_PYTHON_EXECUTABLE),
+            "-I",
+            "-B",
+            str(shim),
+            "--bootstrap-claim-sha256",
+            "a" * 64,
+            "verify",
+            "--run-spec",
+            str(tmp_path / "absent-spec.json"),
+            "--run-root",
+            str(tmp_path / "absent-run"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env={},
+    )
+
+    assert completed.returncode == 2
+    assert "fixed Python -I -B" in completed.stderr
+    assert "run spec unavailable" not in completed.stderr
 
 
 def test_isolated_cli_shim_fails_closed_without_external_bootstrap_anchor(
