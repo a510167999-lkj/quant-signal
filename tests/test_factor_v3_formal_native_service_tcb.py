@@ -420,6 +420,55 @@ def test_protected_namespace_requires_trusted_owner_and_no_effective_caller_writ
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_protected_file_chain_validates_and_holds_all_ancestor_namespaces(
+    tmp_path: Path,
+) -> None:
+    native = _compile_test_broker(tmp_path)
+    mutable_file = tmp_path / "mutable-runtime.exe"
+    mutable_file.write_bytes(b"disposable\n")
+    mutable = _run(
+        native,
+        "--test-protected-file-chain",
+        str(mutable_file),
+    )
+    assert mutable.returncode != 0
+    assert "namespace chain rejected" in mutable.stderr.lower()
+
+    protected_file = Path(os.environ["SystemRoot"]) / "System32" / "kernel32.dll"
+    protected = _run(
+        native,
+        "--test-protected-file-chain",
+        str(protected_file),
+    )
+    assert protected.returncode == 0, protected.stderr
+    assert protected.stdout == ""
+    assert protected.stderr == ""
+
+
+def test_production_launch_checks_service_and_fixed_namespace_chains_before_fail_closed() -> None:
+    source = BROKER_SOURCE.read_text(encoding="utf-8")
+    launch = source.index('wcscmp(argv[1], L"--launch")')
+    service_check = source.index(
+        "f3_broker_current_process_is_expected_service",
+        launch,
+    )
+    namespace_check = source.index("hold_production_namespace_chains", launch)
+    fail_closed = source.index(
+        "native broker credential handoff is unimplemented",
+        launch,
+    )
+    assert launch < service_check < namespace_check < fail_closed
+    production_check = source[
+        source.index("hold_production_namespace_chains"):launch
+    ]
+    assert "F3_BROKER_RUNTIME_PATH" in production_check
+    assert "F3_BROKER_SOURCE_PATH" in production_check
+    assert "F3_BROKER_CREDENTIAL_SLOT_PATH" in production_check
+    assert "ACCESS_ALLOWED_ACE_TYPE" in source
+    assert "AccessCheck" in source
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
 def test_disposable_cng_key_is_nonexportable_signs_and_is_deleted(
     tmp_path: Path,
 ) -> None:
