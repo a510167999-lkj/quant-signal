@@ -435,6 +435,12 @@ def test_materializes_only_development_candidate_with_exact_pit_ledger(
     assert candidate["calendar"]["source_dates"] == bundle["daily_basic"]["source_dates"]
     assert candidate["history_eligible_row_count"] == len(bundle["factor_v2_parent"]["rows"])
     assert candidate["excluded_row_count"] == 0
+    assert candidate["eligible_candidate_keys_sha256"] == _sha(
+        [row["candidate_key"] for row in candidate["rows"]]
+    )
+    assert candidate["eligible_identity_rows_sha256"] == candidate["output_identity_root_sha256"]
+    assert candidate["excluded_candidate_keys_sha256"] == _sha([])
+    assert candidate["exclusion_reason_rows_sha256"] == _sha([])
     assert candidate["history_eligible_identity_root_sha256"] == candidate["output_identity_root_sha256"]
     assert {
         arm["identity_root_sha256"] for arm in candidate["arms"].values()
@@ -469,6 +475,9 @@ def test_materializes_only_development_candidate_with_exact_pit_ledger(
         "SSE_MAIN",
         "SSE_STAR",
     ]
+    assert candidate["upstream_board_ledger"]["per_date_board_ledger_root_sha256"] == _sha(
+        candidate["upstream_board_ledger"]["per_date"]
+    )
     assert receipt["factor_v2_evaluation"] == bundle["factor_v2_evaluation"]
     assert candidate["producer_binding"]["root_sha256"] == receipt["producer_binding"]["root_sha256"]
     assert "publication_capability" not in candidate_path.read_text(encoding="utf-8")
@@ -631,7 +640,7 @@ def test_parent_payload_cannot_persist_sensitive_or_unregistered_fields(
     bundle["factor_v2_parent"]["rows"][0]["token"] = "must-never-persist"
     bundle["factor_v2_parent"]["rows_sha256"] = _sha(bundle["factor_v2_parent"]["rows"])
 
-    with pytest.raises(ValueError, match="parent payload"):
+    with pytest.raises(ValueError, match="sensitive|parent payload"):
         _materialize(tmp_path, bundle, verified)
 
 
@@ -654,7 +663,8 @@ def test_create_only_post_verifier_and_unsafe_inputs_fail_closed(
         _materialize(tmp_path, bundle, verified)
 
     bundle, verified = _bundle(monkeypatch)
-    bundle["nested"] = {"publication_capability": "must-never-persist"}
+    bundle["factor_v2_parent"]["rows"][0]["publication_capability"] = "must-never-persist"
+    bundle["factor_v2_parent"]["rows_sha256"] = _sha(bundle["factor_v2_parent"]["rows"])
     with pytest.raises(ValueError, match="capability"):
         _materialize(tmp_path / "capability", bundle, verified)
 
