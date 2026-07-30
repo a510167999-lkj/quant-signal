@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 import inspect
 import json
@@ -411,6 +412,114 @@ def test_stdlib_zero_byte_rules_are_kind_exact(tmp_path: Path) -> None:
                 absent_paths=[str(tmp_path / "python311.zip")],
                 pycache_prefix=str(pycache),
             )
+
+
+def test_supervisor_stdlib_files_share_one_frozen_directory_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdlib = (tmp_path / "fake-python" / "Lib").resolve()
+    platstdlib = (tmp_path / "fake-python" / "DLLs").resolve()
+    pycache = (tmp_path / "pycache-blocker").resolve()
+    stdlib.mkdir(parents=True)
+    platstdlib.mkdir(parents=True)
+    pycache.write_bytes(b"factor-v3-pycache-blocker/v1\n")
+    entries = []
+    for index in range(12):
+        relative_path = f"fixture_{index}.py"
+        path = stdlib / relative_path
+        path.write_bytes(f"VALUE = {index}\n".encode("ascii"))
+        entries.append(_entry(stdlib, relative_path, f"fixture_{index}"))
+    policy = contract.canonical_stdlib_policy(
+        roots=[
+            {"path": str(platstdlib), "role": "platstdlib"},
+            {"path": str(stdlib), "role": "stdlib"},
+        ],
+        entries=entries,
+        absent_paths=[str(stdlib.parent / "python311.zip")],
+        pycache_prefix=str(pycache),
+    )
+    root_sha256 = contract.stdlib_policy_root_sha256(policy)
+    held_chain_parents: list[Path] = []
+    original_init = supervisor._HeldDirectoryChain.__init__
+
+    def observed_init(self: object, path: Path) -> None:
+        held_chain_parents.append(path)
+        original_init(self, path)
+
+    monkeypatch.setattr(supervisor._HeldDirectoryChain, "__init__", observed_init)
+
+    with ExitStack() as stack:
+        handles = supervisor._hold_stdlib_inventory(
+            contract.canonical_bytes(policy),
+            payload={"stdlib_inventory_root_sha256": root_sha256},
+            authorization={"stdlib_policy": policy},
+            stack=stack,
+        )
+
+        stdlib_roots = (stdlib, platstdlib)
+        per_file_chains = [
+            path
+            for path in held_chain_parents
+            if any(path == root or root in path.parents for root in stdlib_roots)
+        ]
+        assert per_file_chains == []
+        directory_guards = [
+            handle for handle in handles if isinstance(handle, supervisor._HeldFrozenDirectoryTree)
+        ]
+        assert len(directory_guards) == 1
+
+
+def test_shared_stdlib_directory_guard_terminally_reopens_every_held_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdlib = (tmp_path / "fake-python" / "Lib").resolve()
+    platstdlib = (tmp_path / "fake-python" / "DLLs").resolve()
+    nested = stdlib / "nested"
+    pycache = (tmp_path / "pycache-blocker").resolve()
+    nested.mkdir(parents=True)
+    platstdlib.mkdir(parents=True)
+    pycache.write_bytes(b"factor-v3-pycache-blocker/v1\n")
+    source = nested / "fixture.py"
+    source.write_bytes(b"VALUE = 1\n")
+    policy = contract.canonical_stdlib_policy(
+        roots=[
+            {"path": str(platstdlib), "role": "platstdlib"},
+            {"path": str(stdlib), "role": "stdlib"},
+        ],
+        entries=[_entry(stdlib, "nested/fixture.py", "nested.fixture")],
+        absent_paths=[str(stdlib.parent / "python311.zip")],
+        pycache_prefix=str(pycache),
+    )
+    root_sha256 = contract.stdlib_policy_root_sha256(policy)
+
+    with ExitStack() as stack:
+        handles = supervisor._hold_stdlib_inventory(
+            contract.canonical_bytes(policy),
+            payload={"stdlib_inventory_root_sha256": root_sha256},
+            authorization={"stdlib_policy": policy},
+            stack=stack,
+        )
+        guard = next(
+            handle for handle in handles if isinstance(handle, supervisor._HeldFrozenDirectoryTree)
+        )
+        expected_paths = {
+            os.path.normcase(str(path)) for _handle, path, _identity in guard._handles
+        }
+        reopened_paths: list[Path] = []
+        original_open = supervisor._open_directory_handle
+
+        def observed_open(path: Path, **kwargs: object) -> tuple[object, tuple[int, int, int]]:
+            reopened_paths.append(path)
+            return original_open(path, **kwargs)
+
+        monkeypatch.setattr(supervisor, "_open_directory_handle", observed_open)
+
+        guard.postverify()
+
+        assert {os.path.normcase(str(path)) for path in reopened_paths} == expected_paths
+        assert len(reopened_paths) == len(expected_paths)
 
 
 def test_runtime_installs_early_exact_loader_before_filesystem_imports() -> None:
