@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -15,6 +16,7 @@ import uuid
 import pytest
 
 from app import audited_pit_factor_v3_feature_history_authority as history_authority
+from app import durable_io
 from app import jiaoch_trade_cal_authority
 from app.audited_pit_factor_v3_points_contract import (
     FACTOR_V3_POINTS_CONTRACT_SHA256,
@@ -589,7 +591,7 @@ def _publish_source_bound(
     store: PITReceiptStore,
 ) -> tuple[Path, dict[str, object]]:
     publication_output_root = Path(store.root).parent / "collection-publication"
-    publication_output_root.mkdir()
+    publication_output_root.mkdir(exist_ok=True)
     collection_publication = (
         history_authority._publish_factor_v3_feature_history_collection_candidate(
             collection_plan=plan,
@@ -715,6 +717,7 @@ def test_producer_binding_covers_direct_semantic_dependencies_and_loaded_identit
     required = {
         "audited_pit_factor_v3_feature_history_authority.py",
         "audited_pit_factor_v3_points_contract.py",
+        "durable_io.py",
         "jiaoch_credential_slots.py",
         "jiaoch_trade_cal_authority.py",
         "research_partitions.py",
@@ -754,6 +757,19 @@ def test_producer_binding_covers_direct_semantic_dependencies_and_loaded_identit
     class_method_after = history_authority._producer_binding()
     assert class_method_after["loaded_execution_root_sha256"] != after[
         "loaded_execution_root_sha256"
+    ]
+
+    monkeypatch.setattr(
+        durable_io,
+        "_fsync_windows_directory",
+        lambda _path: None,
+    )
+    durable_after = history_authority._producer_binding()
+    assert durable_after["loaded_execution_root_sha256"] != (
+        class_method_after["loaded_execution_root_sha256"]
+    )
+    assert durable_after["root_sha256"] != class_method_after[
+        "root_sha256"
     ]
 
 
@@ -1282,7 +1298,6 @@ def test_collection_publication_is_strictly_six_fields_and_capability_bound(
             development_session_refs=_development_refs(
                 plan["development_sessions"]["sessions"]
             ),
-            pit_store_root=Path(store.root),
             temporal_partition_contract=load_temporal_partition_contract(
                 PARTITION_V1_PATH
             ),
@@ -1305,7 +1320,6 @@ def test_collection_publication_is_strictly_six_fields_and_capability_bound(
             development_session_refs=_development_refs(
                 plan["development_sessions"]["sessions"]
             ),
-            pit_store_root=Path(store.root),
             temporal_partition_contract=load_temporal_partition_contract(
                 PARTITION_V1_PATH
             ),
@@ -1361,7 +1375,7 @@ def test_formal_authority_derives_and_requires_upstream_star_and_beijing_rows(
         )
 
 
-def test_formal_authority_rejects_database_drift_after_publication(
+def test_live_database_drift_after_publication_does_not_change_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1377,7 +1391,7 @@ def test_formal_authority_rejects_database_drift_after_publication(
     database = Path(store.database_path)
     database.write_bytes(database.read_bytes() + b"drift")
 
-    with pytest.raises(ValueError, match="database"):
+    receipt = (
         history_authority.verify_factor_v3_feature_history_collection_authority(
             collection_publication=collection_publication,
             collection_publication_output_root=publication_output_root,
@@ -1385,13 +1399,14 @@ def test_formal_authority_rejects_database_drift_after_publication(
             development_session_refs=_development_refs(
                 plan["development_sessions"]["sessions"]
             ),
-            pit_store_root=Path(store.root),
             temporal_partition_contract=load_temporal_partition_contract(
                 PARTITION_V1_PATH
             ),
             trade_cal_output_root=Path("synthetic-trade-cal-root"),
             trade_cal_publication=publication,
         )
+    )
+    assert receipt["verified"] is True
 
 
 def test_public_verifier_replays_snapshot_after_live_store_is_detached(
@@ -1442,6 +1457,175 @@ def test_public_verifier_replays_snapshot_after_live_store_is_detached(
     )
 
 
+def test_existing_snapshot_is_flushed_before_postrename_failure_reuse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, _publication, _sessions, store, _refs, _database_sha256 = (
+        _real_store_fixture(tmp_path, monkeypatch)
+    )
+    publication_output_root = tmp_path / "collection-publication"
+    publication_output_root.mkdir()
+    sessions = plan["prewindow"]["sessions"]
+    partition_contract = load_temporal_partition_contract(
+        PARTITION_V1_PATH
+    )
+    original_promote = history_authority._promote_snapshot_directory
+    promotion_attempts = 0
+
+    def fail_after_rename(
+        *,
+        staging: Path,
+        final_root: Path,
+        final_parent_anchor: int,
+    ) -> None:
+        del final_parent_anchor
+        nonlocal promotion_attempts
+        promotion_attempts += 1
+        os.rename(staging, final_root)
+        raise ValueError(
+            "factor-v3 feature history snapshot promotion rejected"
+        )
+
+    monkeypatch.setattr(
+        history_authority,
+        "_promote_snapshot_directory",
+        fail_after_rename,
+    )
+    with pytest.raises(ValueError, match="promotion"):
+        history_authority._capture_feature_history_snapshot(
+            pit_store_root=store.root,
+            output_root=publication_output_root,
+            sessions=sessions,
+            temporal_partition_contract=partition_contract,
+        )
+    assert promotion_attempts == 1
+
+    flushes: list[int] = []
+    monkeypatch.setattr(
+        history_authority,
+        "_promote_snapshot_directory",
+        original_promote,
+    )
+    monkeypatch.setattr(
+        history_authority,
+        "_flush_snapshot_parent",
+        lambda anchor: flushes.append(anchor),
+        raising=False,
+    )
+    snapshot = history_authority._capture_feature_history_snapshot(
+        pit_store_root=store.root,
+        output_root=publication_output_root,
+        sessions=sessions,
+        temporal_partition_contract=partition_contract,
+    )
+
+    assert snapshot["replay"]["raw_artifact_count"] > 0
+    assert len(flushes) == 1
+
+
+def test_failed_snapshot_capture_preserves_quarantined_partial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, _publication, _sessions, store, _refs, _database_sha256 = (
+        _real_store_fixture(tmp_path, monkeypatch)
+    )
+    publication_output_root = tmp_path / "collection-publication"
+    publication_output_root.mkdir()
+    original_copy = history_authority._copy_snapshot_member
+    copy_calls = 0
+
+    def fail_after_database_copy(**kwargs):
+        nonlocal copy_calls
+        copy_calls += 1
+        if copy_calls == 2:
+            raise ValueError(
+                "factor-v3 feature history snapshot member rejected"
+            )
+        return original_copy(**kwargs)
+
+    monkeypatch.setattr(
+        history_authority,
+        "_copy_snapshot_member",
+        fail_after_database_copy,
+    )
+    with pytest.raises(ValueError, match="snapshot member"):
+        history_authority._capture_feature_history_snapshot(
+            pit_store_root=store.root,
+            output_root=publication_output_root,
+            sessions=plan["prewindow"]["sessions"],
+            temporal_partition_contract=load_temporal_partition_contract(
+                PARTITION_V1_PATH
+            ),
+        )
+
+    quarantined = [
+        path
+        for path in publication_output_root.iterdir()
+        if path.name.startswith(".feature-history-snapshot-")
+    ]
+    assert len(quarantined) == 1
+    assert quarantined[0].name.endswith(".partial")
+    assert quarantined[0].is_dir()
+
+
+def test_public_verifier_rejects_same_size_same_mtime_snapshot_raw_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, publication, _sessions, store, _refs, _database_sha256 = (
+        _real_store_fixture(tmp_path, monkeypatch)
+    )
+    publication_output_root, collection_publication = _publish_source_bound(
+        plan=plan,
+        publication=publication,
+        store=store,
+    )
+    manifest = history_authority._read_collection_manifest(
+        output_root=publication_output_root,
+        publication=collection_publication,
+    )
+    snapshot = history_authority._read_and_replay_collection_snapshot(
+        output_root=publication_output_root,
+        relative_path=manifest["snapshot_index_relative_path"],
+        expected_sha256=manifest["snapshot_index_sha256"],
+        sessions=plan["prewindow"]["sessions"],
+        temporal_partition_contract=load_temporal_partition_contract(
+            PARTITION_V1_PATH
+        ),
+    )
+    descriptor = snapshot["index"]["raw_artifacts"][0]
+    target = snapshot["snapshot_root"].joinpath(
+        *descriptor["raw_path"].split("/")
+    )
+    target_stat = target.stat()
+    tampered = bytearray(target.read_bytes())
+    tampered[0] ^= 1
+    target.write_bytes(bytes(tampered))
+    os.utime(
+        target,
+        ns=(target_stat.st_atime_ns, target_stat.st_mtime_ns),
+    )
+    assert target.stat().st_size == target_stat.st_size
+    assert target.stat().st_mtime_ns == target_stat.st_mtime_ns
+
+    with pytest.raises(ValueError, match="snapshot raw artifact"):
+        history_authority.verify_factor_v3_feature_history_collection_authority(
+            collection_publication=collection_publication,
+            collection_publication_output_root=publication_output_root,
+            collection_plan=plan,
+            development_session_refs=_development_refs(
+                plan["development_sessions"]["sessions"]
+            ),
+            temporal_partition_contract=load_temporal_partition_contract(
+                PARTITION_V1_PATH
+            ),
+            trade_cal_output_root=Path("synthetic-trade-cal-root"),
+            trade_cal_publication=publication,
+        )
+
+
 def test_formal_authority_rejects_raw_receipt_tamper_even_with_refreshed_database_anchor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1465,6 +1649,12 @@ def test_formal_authority_rejects_raw_receipt_tamper_even_with_refreshed_databas
             refs=refs,
             database_sha256=database_sha256,
         )
+    publication_root = tmp_path / "collection-publication"
+    assert publication_root.is_dir()
+    assert not any(
+        path.name.startswith(".feature-history-snapshot-")
+        for path in publication_root.iterdir()
+    )
 
 
 @pytest.mark.parametrize(
@@ -1708,7 +1898,6 @@ def test_formal_authority_is_structurally_strict(
             development_session_refs=_development_refs(
                 plan["development_sessions"]["sessions"]
             ),
-            pit_store_root=Path(store.root),
             temporal_partition_contract=load_temporal_partition_contract(
                 PARTITION_V1_PATH
             ),
