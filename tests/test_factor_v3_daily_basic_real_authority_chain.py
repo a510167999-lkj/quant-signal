@@ -45,9 +45,7 @@ def _real_feature_history_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[Path, Path, list[str]]:
-    plan, _prewindow, development, _manifest = history_fixture._build_plan(
-        monkeypatch
-    )
+    plan, _prewindow, development, _manifest = history_fixture._build_plan(monkeypatch)
     sessions = list(plan["prewindow"]["sessions"])
     run_root = (tmp_path / "feature-history-run").resolve()
     run_root.mkdir()
@@ -60,9 +58,7 @@ def _real_feature_history_run(
         trade_cal_output_root=trade_cal_root,
         trade_cal_publication=history_fixture._trade_cal_publication(),
         development_session_refs=history_fixture._development_refs(development),
-        temporal_partition_contract=load_temporal_partition_contract(
-            PARTITION_PATH
-        ),
+        temporal_partition_contract=load_temporal_partition_contract(PARTITION_PATH),
         timeout_seconds=30,
         max_attempts=3,
         workers=1,
@@ -77,9 +73,7 @@ def _real_feature_history_run(
             transport,
             session,
         )
-        collector.fetch_membership_snapshot(
-            history_fixture.build_bak_basic_specs([session])[0]
-        )
+        collector.fetch_membership_snapshot(history_fixture.build_bak_basic_specs([session])[0])
         collector.collect_market_session_generation(
             session,
             vintage="historical_backfill",
@@ -109,10 +103,13 @@ def _real_feature_history_run(
             receipt=receipt,
         ),
     )
-    assert history_runner.verify_factor_v3_feature_history_run(
-        run_spec_path=spec_path,
-        run_root=run_root,
-    )["status"] == "verified"
+    assert (
+        history_runner.verify_factor_v3_feature_history_run(
+            run_spec_path=spec_path,
+            run_root=run_root,
+        )["status"]
+        == "verified"
+    )
     return spec_path, run_root, sessions
 
 
@@ -163,9 +160,7 @@ def _seed_stock_generation(
                 endpoint="stock_basic",
                 params=params,
                 fields=NORMALIZED_FIELDS["stock_basic"],
-                wire_request_sha256=hashlib.sha256(
-                    f"stock:{partition}".encode()
-                ).hexdigest(),
+                wire_request_sha256=hashlib.sha256(f"stock:{partition}".encode()).hexdigest(),
                 raw_bytes=pit_fixture._stock_response(rows),
                 http_status=200,
                 started_at=started_at,
@@ -235,9 +230,7 @@ def _publish_market_session(
             },
             separators=(",", ":"),
         ).encode()
-        wire_sha256 = hashlib.sha256(
-            f"{dataset}:{session}:{retrieved_at}".encode()
-        ).hexdigest()
+        wire_sha256 = hashlib.sha256(f"{dataset}:{session}:{retrieved_at}".encode()).hexdigest()
         attempt = store.record_fetch_attempt(
             dataset=dataset,
             partition_key=session,
@@ -311,9 +304,7 @@ def _real_development_artifact(
                 "start_date": sessions[0].replace("-", ""),
                 "end_date": sessions[-1].replace("-", ""),
             },
-            raw_bytes=pit_fixture._calendar_response(
-                _calendar_rows(exchange, sessions)
-            ),
+            raw_bytes=pit_fixture._calendar_response(_calendar_rows(exchange, sessions)),
             http_status=200,
             retrieved_at=started,
             row_cap=10000,
@@ -427,15 +418,9 @@ def test_real_250_plus_483_authority_chain_runs_and_cli_reverifies(
     )
     loaded = authority._load_development_authority(
         audited_development_universe_sqlite_path=artifact["path"],
-        expected_development_coverage_audit_sha256=artifact[
-            "coverage_audit_sha256"
-        ],
-        expected_development_artifact_root_sha256=artifact[
-            "artifact_root_sha256"
-        ],
-        expected_development_temporal_contract_sha256=contract[
-            "contract_sha256"
-        ],
+        expected_development_coverage_audit_sha256=artifact["coverage_audit_sha256"],
+        expected_development_artifact_root_sha256=artifact["artifact_root_sha256"],
+        expected_development_temporal_contract_sha256=contract["contract_sha256"],
         expected_development_temporal_role="development_4",
     )
     assert len(loaded.partitions) == 483
@@ -447,19 +432,11 @@ def test_real_250_plus_483_authority_chain_runs_and_cli_reverifies(
         ),
         "expected_feature_history_frozen_source_attestation_sha256": "a" * 64,
         "feature_history_frozen_source_root": str(frozen.FROZEN_SOURCE_ROOT),
-        "expected_feature_history_frozen_source_commit": (
-            frozen.FROZEN_SOURCE_COMMIT
-        ),
+        "expected_feature_history_frozen_source_commit": (frozen.FROZEN_SOURCE_COMMIT),
         "audited_development_universe_sqlite_path": str(artifact["path"]),
-        "expected_development_coverage_audit_sha256": artifact[
-            "coverage_audit_sha256"
-        ],
-        "expected_development_artifact_root_sha256": artifact[
-            "artifact_root_sha256"
-        ],
-        "expected_development_temporal_contract_sha256": contract[
-            "contract_sha256"
-        ],
+        "expected_development_coverage_audit_sha256": artifact["coverage_audit_sha256"],
+        "expected_development_artifact_root_sha256": artifact["artifact_root_sha256"],
+        "expected_development_temporal_contract_sha256": contract["contract_sha256"],
         "expected_development_temporal_role": "development_4",
         "security_code_transition_evidence_root": str(evidence_root),
         "expected_security_code_transition_contract_sha256": transition_sha256,
@@ -470,9 +447,7 @@ def test_real_250_plus_483_authority_chain_runs_and_cli_reverifies(
         run_root=feature_run_root,
     )["receipt"]
     assert feature_receipt["session_count"] == len(prewindow)
-    assert feature_receipt[
-        "sessions_sha256"
-    ] == history_runner._canonical_sha256(prewindow)
+    assert feature_receipt["sessions_sha256"] == history_runner._canonical_sha256(prewindow)
     monkeypatch.setattr(
         frozen,
         "verify_factor_v3_feature_history_frozen_source_attestation",
@@ -507,9 +482,7 @@ def test_real_250_plus_483_authority_chain_runs_and_cli_reverifies(
         run_root=run_root,
         credential="fixture-only-credential",
         source_generation_id=str(uuid.uuid4()),
-        daily_basic_policy_descriptor=(
-            runner.FACTOR_V3_DAILY_BASIC_COLLECTION_POLICY_DESCRIPTOR
-        ),
+        daily_basic_policy_descriptor=(runner.FACTOR_V3_DAILY_BASIC_COLLECTION_POLICY_DESCRIPTOR),
     )
 
     assert result["status"] == "verified"
@@ -530,8 +503,10 @@ def test_real_250_plus_483_authority_chain_runs_and_cli_reverifies(
         label="run state",
         max_bytes=runner._MAX_STATE_BYTES,
     )
-    attestation_path = run_root / "exact-set-authority" / Path(
-        *state["exact_set_publication"]["attestation_relative_path"].split("/")
+    attestation_path = (
+        run_root
+        / "exact-set-authority"
+        / Path(*state["exact_set_publication"]["attestation_relative_path"].split("/"))
     )
     attestation_path.unlink()
     assert (
@@ -549,9 +524,7 @@ def test_real_250_plus_483_authority_chain_runs_and_cli_reverifies(
 
 
 def test_real_chain_fixture_inherits_the_verified_receipt_identity_triple() -> None:
-    source = inspect.getsource(
-        test_real_250_plus_483_authority_chain_runs_and_cli_reverifies
-    )
+    source = inspect.getsource(test_real_250_plus_483_authority_chain_runs_and_cli_reverifies)
 
     assert '"sessions_sha256": "f" * 64' not in source
     assert 'feature_receipt["receipt_sha256"]' in source
@@ -583,9 +556,7 @@ def test_real_chain_fixture_uses_trusted_dispatch_and_buffers_binding(
                 "action": "verify",
                 "formal_input_root": formal_spec.FORMAL_INPUT_ROOT_SHA256,
                 "formal_output_root": str(formal_spec.SPEC_OUTPUT_ROOT),
-                "run_spec_path": str(
-                    (tmp_path / "daily-basic-run-spec.json").resolve()
-                ),
+                "run_spec_path": str((tmp_path / "daily-basic-run-spec.json").resolve()),
                 "run_root": str(planned_run_root),
             }
 
@@ -612,25 +583,18 @@ def test_real_chain_fixture_uses_trusted_dispatch_and_buffers_binding(
             module_name: str,
         ) -> Mapping[str, object]:
             relative_path = (
-                "app/__init__.py"
-                if module_name == "app"
-                else f"{module_name.replace('.', '/')}.py"
+                "app/__init__.py" if module_name == "app" else f"{module_name.replace('.', '/')}.py"
             )
             entry = {
                 "absolute_path": str(
-                    formal_spec.FORMAL_WORKTREE_ROOT
-                    / Path(*relative_path.split("/"))
+                    formal_spec.FORMAL_WORKTREE_ROOT / Path(*relative_path.split("/"))
                 ),
                 "byte_count": 1,
                 "is_package": module_name == "app",
-                "loader_identity": (
-                    "external-verified-source-loader/v1"
-                ),
+                "loader_identity": ("external-verified-source-loader/v1"),
                 "module_name": module_name,
                 "relative_path": relative_path,
-                "source_sha256": hashlib.sha256(
-                    module_name.encode()
-                ).hexdigest(),
+                "source_sha256": hashlib.sha256(module_name.encode()).hexdigest(),
             }
             ledger_entries.append(entry)
             return entry
@@ -709,24 +673,18 @@ def test_real_b805_attestation_builds_capability_free_250_plus_483_spec(
 ) -> None:
     output_root = (tmp_path / "frozen-attestation").resolve()
     output_root.mkdir()
-    publication = (
-        frozen.publish_factor_v3_feature_history_frozen_source_attestation(
-            frozen_source_root=frozen.FROZEN_SOURCE_ROOT,
-            expected_frozen_source_commit=frozen.FROZEN_SOURCE_COMMIT,
-            feature_history_run_spec_path=frozen.FROZEN_FEATURE_RUN_SPEC_PATH,
-            feature_history_run_root=frozen.FROZEN_FEATURE_RUN_ROOT,
-            output_root=output_root,
-        )
+    publication = frozen.publish_factor_v3_feature_history_frozen_source_attestation(
+        frozen_source_root=frozen.FROZEN_SOURCE_ROOT,
+        expected_frozen_source_commit=frozen.FROZEN_SOURCE_COMMIT,
+        feature_history_run_spec_path=frozen.FROZEN_FEATURE_RUN_SPEC_PATH,
+        feature_history_run_root=frozen.FROZEN_FEATURE_RUN_ROOT,
+        output_root=output_root,
     )
-    attestation_path = output_root / Path(
-        *publication["attestation_relative_path"].split("/")
-    )
+    attestation_path = output_root / Path(*publication["attestation_relative_path"].split("/"))
     exact_inputs = dict(formal_spec.EXACT_SET_AUTHORITY_INPUTS)
     exact_inputs.update(
         feature_history_frozen_source_attestation_path=str(attestation_path),
-        expected_feature_history_frozen_source_attestation_sha256=publication[
-            "attestation_sha256"
-        ],
+        expected_feature_history_frozen_source_attestation_sha256=publication["attestation_sha256"],
     )
 
     spec = runner.build_factor_v3_daily_basic_run_spec(
