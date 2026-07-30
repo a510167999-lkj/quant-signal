@@ -20,7 +20,6 @@ from tests.test_factor_v3_formal_bootstrap_renderer import (
     _file_sha256,
     _fixture_config,
     _git,
-    _run_rendered,
     _sha256,
     _sign,
     _source_entry,
@@ -132,10 +131,15 @@ def _authorization_payload(
     _execution_private_key, execution_public_der = _execution_test_key(tmp_path)
     execution_key_sha256 = _sha256(execution_public_der)
     authorization_nonce_sha256 = _sha256(f"authorization:{config['action']}".encode())
+    pycache_prefix = (tmp_path / "signed-empty-pycache").resolve()
+    pycache_prefix.mkdir(exist_ok=True)
     stdlib_policy = renderer._trusted_stdlib_policy_for_base_python(
-        Path(str(config["base_python_executable_path"]))
+        Path(str(config["base_python_executable_path"])),
+        pycache_prefix,
     )
-    config["_test_stdlib_inventory_root_sha256"] = stdlib_policy["inventory_root_sha256"]
+    stdlib_root_sha256 = renderer.stdlib_policy_root_sha256(stdlib_policy)
+    config["_test_stdlib_inventory_root_sha256"] = stdlib_root_sha256
+    config["_test_stdlib_pycache_prefix"] = str(pycache_prefix)
     return {
         "action": config["action"],
         "authorization_id_sha256": _sha256(
@@ -149,6 +153,7 @@ def _authorization_payload(
         "bootstrap_output_root": str(bootstrap_output_root),
         "builder_relative_path": config["builder_relative_path"],
         "builder_sha256": config["builder_sha256"],
+        "control_contract_descriptor_sha256": (renderer.control_contract_descriptor_sha256()),
         "expected_branch": config["expected_branch"],
         "expected_commit": config["expected_commit"],
         "execution_authorization_key_id": (f"sha256:{execution_key_sha256}"),
@@ -184,6 +189,7 @@ def _authorization_payload(
         "source_manifest": config["source_manifest"],
         "source_root_sha256": config["source_root_sha256"],
         "stdlib_policy": stdlib_policy,
+        "stdlib_policy_root_sha256": stdlib_root_sha256,
         "supervisor_protocol": renderer._supervisor_protocol_descriptor(),
     }
 
@@ -461,11 +467,11 @@ def _run_as_synthetic_supervisor(
             "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256": _sha256(
                 b"synthetic-supervisor-launch-envelope"
             ),
-            "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL": ("factor-v3-formal-supervisor-worker/v1"),
+            "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL": ("factor-v3-formal-supervisor-worker/v2"),
         }
     )
     if include_stdlib_prelock:
-        environment["FACTOR_V3_FORMAL_STDLIB_PRELOCKED_ROOT_SHA256"] = str(
+        environment["FACTOR_V3_FORMAL_STDLIB_INVENTORY_ROOT_SHA256"] = str(
             config["_test_stdlib_inventory_root_sha256"]
         )
     if selected_action in {"run", "resume"}:
@@ -476,6 +482,8 @@ def _run_as_synthetic_supervisor(
             "-I",
             "-B",
             "-S",
+            "-X",
+            f"pycache_prefix={config['_test_stdlib_pycache_prefix']}",
             str(bootstrap_path),
         ],
         check=False,
@@ -676,7 +684,9 @@ def test_renderer_publishes_bootstrap_and_receipt_with_safe_cas(
     )
 
     assert first == second
-    assert first["schema"] == ("factor-v3-formal-bootstrap-publication-completion/v1")
+    assert first["schema"] == ("factor-v3-formal-bootstrap-publication-completion/v2")
+    assert Path(first["stdlib_policy_path"]).read_bytes()
+    assert first["stdlib_inventory_root_sha256"] == payload["stdlib_policy_root_sha256"]
     root = Path(str(payload["bootstrap_output_root"]))
     bootstrap_path = root / Path(*str(first["bootstrap_relative_path"]).split("/"))
     receipt_path = root / Path(*str(first["receipt_relative_path"]).split("/"))
@@ -721,7 +731,7 @@ def test_fd_level_stdout_and_subprocess_stderr_bypass_is_rejected(
     ) = _authorized_fixture(tmp_path, dispatch_body=dispatch_body)
     rendered = _render_authorized(authorization_path, trusted_public_der)
 
-    completed = _run_rendered(rendered, config)
+    completed = _run_as_synthetic_supervisor(rendered, config, tmp_path)
 
     assert completed.returncode != 0
     assert completed.stdout == ""
@@ -741,6 +751,8 @@ def test_runtime_rejects_xoptions_before_repository_import(
         authorization_path,
         _trusted_public_der(tmp_path),
     )
+    bootstrap_path = (tmp_path / "xoptions-bootstrap.py").resolve()
+    bootstrap_path.write_bytes(rendered)
 
     completed = subprocess.run(
         [
@@ -750,8 +762,7 @@ def test_runtime_rejects_xoptions_before_repository_import(
             "-S",
             "-X",
             "dev",
-            "-c",
-            rendered.decode("utf-8"),
+            str(bootstrap_path),
         ],
         check=False,
         capture_output=True,
@@ -777,6 +788,8 @@ def test_runtime_rejects_additional_python_switch_before_repository_import(
         authorization_path,
         _trusted_public_der(tmp_path),
     )
+    bootstrap_path = (tmp_path / "additional-switch-bootstrap.py").resolve()
+    bootstrap_path.write_bytes(rendered)
 
     completed = subprocess.run(
         [
@@ -785,8 +798,7 @@ def test_runtime_rejects_additional_python_switch_before_repository_import(
             "-B",
             "-S",
             "-u",
-            "-c",
-            rendered.decode("utf-8"),
+            str(bootstrap_path),
         ],
         check=False,
         capture_output=True,
@@ -814,7 +826,7 @@ def test_run_spec_drift_after_render_is_rejected_before_repository_import(
     )
     Path(str(config["run_spec_path"])).write_bytes(b"tampered")
 
-    completed = _run_rendered(rendered, config)
+    completed = _run_as_synthetic_supervisor(rendered, config, tmp_path)
 
     assert completed.returncode != 0
     assert completed.stdout == ""
@@ -838,7 +850,7 @@ def test_runtime_rejects_import_boundary_mutation(tmp_path: Path) -> None:
     ) = _authorized_fixture(tmp_path, dispatch_body=dispatch_body)
     rendered = _render_authorized(authorization_path, trusted_public_der)
 
-    completed = _run_rendered(rendered, config)
+    completed = _run_as_synthetic_supervisor(rendered, config, tmp_path)
 
     assert completed.returncode != 0
     assert completed.stdout == ""

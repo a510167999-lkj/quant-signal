@@ -22,16 +22,29 @@ import sys
 from typing import Any, Mapping
 import zlib
 
+from app.factor_v3_formal_control_contract import (
+    EXECUTION_REPLAY_SCOPE,
+    PUBLICATION_COMPLETION_SCHEMA,
+    WORKER_PROTOCOL,
+    WORKER_TERMINAL_SCHEMA,
+    canonical_stdlib_policy,
+    control_contract_descriptor,
+    control_contract_descriptor_sha256,
+    stdlib_policy_root_sha256,
+    validate_stdlib_policy,
+    worker_protocol_descriptor,
+)
+
 
 class FormalBootstrapRenderError(RuntimeError):
     pass
 
 
 CONFIG_SCHEMA = "factor-v3-formal-bootstrap-render-config/v1"
-RUNTIME_TEMPLATE_SHA256 = "3d88ad2dd921db20a87d1d6bfa0f3eac72dac47d7aae7f5ecb49f85b97d410e9"
+RUNTIME_TEMPLATE_SHA256 = "1ab5c395b0223d100c4f39c16eae1483d67e50d466d0b693a659c7524eac0d9a"
 AUTHORIZATION_SCHEMA = "factor-v3-formal-bootstrap-execution-authorization/v2"
 PUBLICATION_RECEIPT_SCHEMA = "factor-v3-formal-bootstrap-publication-receipt/v1"
-COMPLETION_SCHEMA = "factor-v3-formal-bootstrap-publication-completion/v1"
+COMPLETION_SCHEMA = PUBLICATION_COMPLETION_SCHEMA
 PRODUCTION_EXECUTION_AUTHORIZATION_PUBLIC_KEY_PATH = Path(
     r"E:\AI workspace\quant-signal-lkj\.secrets"
     r"\factor_v3_execution_authorization_rsa3072_public.pem"
@@ -40,19 +53,20 @@ PRODUCTION_EXECUTION_AUTHORIZATION_SPKI_SHA256 = (
     "70c8ad8f74cddfe363175d76c433cb145aadcd7cbd8af669768e697d99cccce8"
 )
 _EXECUTION_AUTHORIZATION_KEY_ROLE = "factor-v3-bootstrap-execution-authorization"
-_REPLAY_SCOPE = "factor-v3-formal-bootstrap-execution/v1"
-_SUPERVISOR_PROTOCOL = "factor-v3-formal-supervisor-worker/v1"
-_WORKER_TERMINAL_SCHEMA = "factor-v3-formal-bootstrap-worker-terminal/v1"
+_REPLAY_SCOPE = EXECUTION_REPLAY_SCOPE
+_SUPERVISOR_PROTOCOL = WORKER_PROTOCOL
+_WORKER_TERMINAL_SCHEMA = WORKER_TERMINAL_SCHEMA
 _RUNTIME_TEMPLATE_NAME = "factor_v3_formal_bootstrap_runtime.py"
 _CONFIG_MARKER = b"_EMBEDDED_CONFIG_JSON: bytes | None = None"
 _RENDERED_CONFIG_PREFIX = b"_EMBEDDED_CONFIG_JSON: bytes = "
+_CONTROL_CONTRACT_MARKER = b"_EMBEDDED_CONTROL_CONTRACT_JSON: bytes | None = None"
+_RENDERED_CONTROL_CONTRACT_PREFIX = b"_EMBEDDED_CONTROL_CONTRACT_JSON: bytes = "
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _MAX_CONFIG_BYTES = 4 * 1024 * 1024
 _MAX_SOURCE_BYTES = 4 * 1024 * 1024
 _MAX_EXECUTABLE_BYTES = 64 * 1024 * 1024
 _MAX_RUNTIME_BYTES = 8 * 1024 * 1024
-_MAX_WINDOWS_C_COMMAND_BYTES = 30_000
 _MAX_EXECUTION_AUTHORIZATION_LIFETIME_SECONDS = 24 * 60 * 60
 _REPARSE_ATTRIBUTE = 0x00000400
 _WRAPPER_PREFIX = b"import base64,zlib;exec(compile(zlib.decompress(base64.b64decode(b'"
@@ -101,6 +115,7 @@ _AUTHORIZATION_FIELDS = {
     "bootstrap_output_root",
     "builder_relative_path",
     "builder_sha256",
+    "control_contract_descriptor_sha256",
     "expected_branch",
     "expected_commit",
     "execution_authorization_key_id",
@@ -136,6 +151,7 @@ _AUTHORIZATION_FIELDS = {
     "source_manifest",
     "source_root_sha256",
     "stdlib_policy",
+    "stdlib_policy_root_sha256",
     "supervisor_protocol",
 }
 _AUTHORIZED_CONFIG_FIELDS = _CONFIG_FIELDS | {
@@ -143,6 +159,7 @@ _AUTHORIZED_CONFIG_FIELDS = _CONFIG_FIELDS | {
     "authorization_issued_at_utc",
     "authorization_nonce_sha256",
     "bootstrap_output_root",
+    "control_contract_descriptor_sha256",
     "execution_authorization_path",
     "execution_authorization_sha256",
     "execution_authorization_public_key_spki_der_base64",
@@ -157,6 +174,7 @@ _AUTHORIZED_CONFIG_FIELDS = _CONFIG_FIELDS | {
     "run_spec_sha256",
     "runtime_template_sha256",
     "stdlib_policy",
+    "stdlib_policy_root_sha256",
     "supervisor_protocol",
 }
 
@@ -477,8 +495,7 @@ def _stdlib_inventory(
     allowed_suffixes = tuple(
         dict.fromkeys(
             (
-                *importlib.machinery.SOURCE_SUFFIXES,
-                *importlib.machinery.BYTECODE_SUFFIXES,
+                ".py",
                 *importlib.machinery.EXTENSION_SUFFIXES,
                 ".dll",
             )
@@ -534,9 +551,9 @@ def _stdlib_inventory_sha256(path: Path, *, kind: str) -> str:
 
 
 @lru_cache(maxsize=4)
-def _trusted_stdlib_policy_for_base_python(
+def _trusted_stdlib_inventory_for_base_python(
     base_python_executable: Path,
-) -> dict[str, Any]:
+) -> tuple[tuple[dict[str, str], ...], tuple[dict[str, Any], ...], str]:
     executable = _absolute_path(
         str(base_python_executable),
         label="base Python executable",
@@ -545,88 +562,74 @@ def _trusted_stdlib_policy_for_base_python(
         executable.parent,
         label="base Python root",
     )
-    roots = []
-    for kind, path in (
-        ("stdlib", base_root / "Lib"),
-        ("platstdlib", base_root / "DLLs"),
-        (
-            "stdlib_zip",
-            base_root / f"python{sys.version_info.major}{sys.version_info.minor}.zip",
-        ),
-    ):
-        entries, inventory_sha256 = _stdlib_inventory(path, kind=kind)
-        roots.append(
-            {
-                "entries": entries,
-                "inventory_sha256": inventory_sha256,
-                "kind": kind,
-                "path": str(path),
-            }
+    roots = [
+        {"path": str(base_root / "DLLs"), "role": "platstdlib"},
+        {"path": str(base_root / "Lib"), "role": "stdlib"},
+    ]
+    entries: list[dict[str, Any]] = []
+    for root in roots:
+        root_path = Path(root["path"])
+        inventory, _inventory_sha256 = _stdlib_inventory(
+            root_path,
+            kind=str(root["role"]),
         )
-    importer_policy = {
-        "bytecode_suffixes": list(importlib.machinery.BYTECODE_SUFFIXES),
-        "extension_suffixes": list(importlib.machinery.EXTENSION_SUFFIXES),
-        "finder": "FileFinder",
-        "source_suffixes": list(importlib.machinery.SOURCE_SUFFIXES),
-        "zip_finder": "zipimporter",
-    }
-    return {
-        "importer_policy_sha256": hashlib.sha256(_canonical_bytes(importer_policy)).hexdigest(),
-        "inventory_root_sha256": hashlib.sha256(_canonical_bytes(roots)).hexdigest(),
-        "roots": roots,
-        "schema": "factor-v3-bootstrap-stdlib-policy/v1",
-        "supervisor_prelocked": True,
-    }
+        for item in inventory:
+            if item["kind"] == "bytecode":
+                raise FormalBootstrapRenderError("stdlib bytecode inventory rejected")
+            relative_path = str(item["path"])
+            kind = str(item["kind"])
+            entries.append(
+                {
+                    "bytes": item["bytes"],
+                    "is_package": (
+                        kind != "dll" and relative_path.rsplit("/", 1)[-1].startswith("__init__.")
+                    ),
+                    "kind": kind,
+                    "module": None if kind == "dll" else item["module"],
+                    "path": str(root_path / Path(*relative_path.split("/"))),
+                    "relative_path": relative_path,
+                    "root": str(root_path),
+                    "sha256": item["sha256"],
+                }
+            )
+    absent_zip = base_root / f"python{sys.version_info.major}{sys.version_info.minor}.zip"
+    if absent_zip.exists():
+        raise FormalBootstrapRenderError("stdlib zip must be absent")
+    return tuple(roots), tuple(entries), str(absent_zip)
+
+
+def _trusted_stdlib_policy_for_base_python(
+    base_python_executable: Path,
+    pycache_prefix: Path,
+) -> dict[str, Any]:
+    roots, entries, absent_zip = _trusted_stdlib_inventory_for_base_python(base_python_executable)
+    cache_root = _safe_existing_directory(
+        _absolute_path(str(pycache_prefix), label="signed pycache prefix"),
+        label="signed pycache prefix",
+    )
+    if next(cache_root.iterdir(), None) is not None:
+        raise FormalBootstrapRenderError("signed pycache prefix is not empty")
+    try:
+        policy = canonical_stdlib_policy(
+            roots=roots,
+            entries=entries,
+            absent_paths=[absent_zip],
+            pycache_prefix=str(cache_root),
+        )
+        return validate_stdlib_policy(policy)
+    except ValueError as exc:
+        raise FormalBootstrapRenderError("stdlib policy rejected") from exc
 
 
 def _compact_stdlib_policy_binding(policy: Mapping[str, Any]) -> dict[str, Any]:
-    roots = [
-        {
-            "inventory_sha256": root["inventory_sha256"],
-            "kind": root["kind"],
-            "path": root["path"],
-        }
-        for root in policy["roots"]
-    ]
-    return {
-        "importer_policy_sha256": policy["importer_policy_sha256"],
-        "inventory_root_sha256": policy["inventory_root_sha256"],
-        "roots": roots,
-        "schema": "factor-v3-bootstrap-stdlib-binding/v1",
-        "supervisor_prelocked": True,
-    }
+    try:
+        return validate_stdlib_policy(dict(policy))
+    except ValueError as exc:
+        raise FormalBootstrapRenderError("stdlib policy rejected") from exc
 
 
 def _supervisor_protocol_descriptor() -> dict[str, Any]:
-    return {
-        "action_secret_environment": {
-            "build-spec": [],
-            "resume": ["JIAOCH_TOKEN"],
-            "run": ["JIAOCH_TOKEN"],
-            "verify": [],
-        },
-        "fixed_environment": [
-            "FACTOR_V3_FORMAL_LAUNCH_ACTION",
-            "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256",
-            "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL",
-            "FACTOR_V3_FORMAL_STDLIB_PRELOCKED_ROOT_SHA256",
-        ],
-        "protocol": _SUPERVISOR_PROTOCOL,
-        "public_environment": ["SYSTEMROOT", "TEMP", "TMP", "WINDIR"],
-        "terminal_fields": [
-            "artifacts",
-            "authorization_nonce_sha256",
-            "bootstrap_execution_authorization_sha256",
-            "launch_action",
-            "launch_authorization_sha256",
-            "result",
-            "schema",
-            "status",
-            "stdlib_inventory_root_sha256",
-            "worker_action",
-        ],
-        "terminal_schema": _WORKER_TERMINAL_SCHEMA,
-    }
+    return worker_protocol_descriptor()
 
 
 def _production_execution_authorization_public_key_der() -> bytes:
@@ -1109,6 +1112,7 @@ def _validated_execution_authorization(
         "base_python_executable_sha256",
         "bootstrap_claim_sha256",
         "builder_sha256",
+        "control_contract_descriptor_sha256",
         "feature_attestation_sha256",
         "formal_input_root_sha256",
         "formal_runner_sha256",
@@ -1122,6 +1126,7 @@ def _validated_execution_authorization(
         "runtime_template_sha256",
         "shim_sha256",
         "source_root_sha256",
+        "stdlib_policy_root_sha256",
     ):
         _require_sha256(payload.get(field), label=field.replace("_", " "))
     if payload["runtime_template_sha256"] != RUNTIME_TEMPLATE_SHA256:
@@ -1151,10 +1156,19 @@ def _validated_execution_authorization(
             )
         }
     )
+    supplied_policy = payload.get("stdlib_policy")
+    if type(supplied_policy) is not dict:
+        raise FormalBootstrapRenderError("stdlib policy rejected")
     expected_stdlib_policy = _trusted_stdlib_policy_for_base_python(
-        Path(str(payload["base_python_executable_path"]))
+        Path(str(payload["base_python_executable_path"])),
+        Path(str(supplied_policy.get("pycache_prefix"))),
     )
-    if payload.get("stdlib_policy") != expected_stdlib_policy:
+    if (
+        supplied_policy != expected_stdlib_policy
+        or payload.get("stdlib_policy_root_sha256")
+        != stdlib_policy_root_sha256(expected_stdlib_policy)
+        or payload.get("control_contract_descriptor_sha256") != control_contract_descriptor_sha256()
+    ):
         raise FormalBootstrapRenderError("stdlib policy rejected")
     if payload.get("supervisor_protocol") != _supervisor_protocol_descriptor():
         raise FormalBootstrapRenderError("supervisor protocol rejected")
@@ -1263,6 +1277,7 @@ def _authorized_config(
             "authorization_issued_at_utc": payload["issued_at_utc"],
             "authorization_nonce_sha256": payload["authorization_nonce_sha256"],
             "bootstrap_output_root": payload["bootstrap_output_root"],
+            "control_contract_descriptor_sha256": payload["control_contract_descriptor_sha256"],
             "execution_authorization_key_id": payload["execution_authorization_key_id"],
             "execution_authorization_key_role": payload["execution_authorization_key_role"],
             "expires_at_utc": payload["expires_at_utc"],
@@ -1271,6 +1286,7 @@ def _authorized_config(
             "run_spec_sha256": payload["run_spec_sha256"],
             "runtime_template_sha256": payload["runtime_template_sha256"],
             "stdlib_policy": _compact_stdlib_policy_binding(payload["stdlib_policy"]),
+            "stdlib_policy_root_sha256": payload["stdlib_policy_root_sha256"],
             "supervisor_protocol": payload["supervisor_protocol"],
         }
     )
@@ -1288,7 +1304,11 @@ def _runtime_template_bytes() -> bytes:
             max_bytes=1024 * 1024,
         )
     )
-    if hashlib.sha256(raw).hexdigest() != RUNTIME_TEMPLATE_SHA256 or raw.count(_CONFIG_MARKER) != 1:
+    if (
+        hashlib.sha256(raw).hexdigest() != RUNTIME_TEMPLATE_SHA256
+        or raw.count(_CONFIG_MARKER) != 1
+        or raw.count(_CONTROL_CONTRACT_MARKER) != 1
+    ):
         raise FormalBootstrapRenderError("bootstrap runtime template rejected")
     return raw
 
@@ -1310,9 +1330,14 @@ def _render_embedded_config(config: Mapping[str, Any]) -> bytes:
         raise FormalBootstrapRenderError("bootstrap configuration rejected")
     replacement = _RENDERED_CONFIG_PREFIX + repr(config_raw).encode("ascii")
     runtime = _runtime_template_bytes().replace(_CONFIG_MARKER, replacement)
+    control_raw = _canonical_bytes(control_contract_descriptor())
+    runtime = runtime.replace(
+        _CONTROL_CONTRACT_MARKER,
+        _RENDERED_CONTROL_CONTRACT_PREFIX + repr(control_raw).encode("ascii"),
+    )
     runtime = runtime.rstrip(b"\r\n")
     rendered = _WRAPPER_PREFIX + base64.b64encode(zlib.compress(runtime, level=9)) + _WRAPPER_SUFFIX
-    if not rendered or rendered.endswith(b"\n") or len(rendered) > _MAX_WINDOWS_C_COMMAND_BYTES:
+    if not rendered or rendered.endswith(b"\n") or len(rendered) > _MAX_RUNTIME_BYTES:
         raise FormalBootstrapRenderError("rendered bootstrap rejected")
     try:
         compile(rendered, "<factor-v3-formal-bootstrap>", "exec")
@@ -1860,7 +1885,7 @@ def _publication_materials(
     *,
     authorization_path: Path | str,
     trusted_public_key_spki_der: bytes,
-) -> tuple[dict[str, Any], bytes, bytes, dict[str, Any]]:
+) -> tuple[dict[str, Any], bytes, bytes, bytes, dict[str, Any]]:
     config = _authorized_config(
         authorization_path=authorization_path,
         trusted_public_key_spki_der=trusted_public_key_spki_der,
@@ -1883,6 +1908,11 @@ def _publication_materials(
     receipt_relative_path = (
         f"publication_receipts/sha256/{receipt_sha256[:2]}/{receipt_sha256}.json"
     )
+    stdlib_policy_raw = _canonical_bytes(config["stdlib_policy"])
+    stdlib_policy_sha256 = hashlib.sha256(stdlib_policy_raw).hexdigest()
+    stdlib_policy_relative_path = (
+        f"stdlib_policies/sha256/{stdlib_policy_sha256[:2]}/{stdlib_policy_sha256}.json"
+    )
     completion_payload = {
         "action": config["action"],
         "authorization_id_sha256": config["authorization_id_sha256"],
@@ -1891,6 +1921,7 @@ def _publication_materials(
         "bootstrap_relative_path": bootstrap_relative_path,
         "bootstrap_sha256": bootstrap_sha256,
         "bootstrap_output_root": config["bootstrap_output_root"],
+        "control_contract_descriptor_sha256": config["control_contract_descriptor_sha256"],
         "execution_authorization_sha256": config["execution_authorization_sha256"],
         "receipt_bytes": len(receipt_raw),
         "receipt_relative_path": receipt_relative_path,
@@ -1898,8 +1929,12 @@ def _publication_materials(
         "runtime_template_sha256": RUNTIME_TEMPLATE_SHA256,
         "schema": COMPLETION_SCHEMA,
         "status": "completed",
+        "stdlib_inventory_root_sha256": config["stdlib_policy_root_sha256"],
+        "stdlib_policy_bytes": len(stdlib_policy_raw),
+        "stdlib_policy_relative_path": stdlib_policy_relative_path,
+        "stdlib_policy_sha256": stdlib_policy_sha256,
     }
-    return config, rendered, receipt_raw, completion_payload
+    return config, rendered, receipt_raw, stdlib_policy_raw, completion_payload
 
 
 def _validated_completion_authorization(
@@ -1941,9 +1976,11 @@ def _plan_factor_v3_formal_bootstrap_publication_with_test_trust(
     authorization_path: Path | str,
     trusted_public_key_spki_der: bytes,
 ) -> dict[str, Any]:
-    _config, _rendered, _receipt_raw, completion_payload = _publication_materials(
-        authorization_path=authorization_path,
-        trusted_public_key_spki_der=trusted_public_key_spki_der,
+    _config, _rendered, _receipt_raw, _stdlib_policy_raw, completion_payload = (
+        _publication_materials(
+            authorization_path=authorization_path,
+            trusted_public_key_spki_der=trusted_public_key_spki_der,
+        )
     )
     return completion_payload
 
@@ -1963,10 +2000,12 @@ def _publish_prevalidated_completion_for_test(
     root: Path,
     bootstrap_raw: bytes,
     receipt_raw: bytes,
+    stdlib_policy_raw: bytes,
     completion_raw: bytes,
 ) -> dict[str, tuple[Path, str]]:
     bootstrap_sha256 = hashlib.sha256(bootstrap_raw).hexdigest()
     receipt_sha256 = hashlib.sha256(receipt_raw).hexdigest()
+    stdlib_policy_sha256 = hashlib.sha256(stdlib_policy_raw).hexdigest()
     completion_sha256 = hashlib.sha256(completion_raw).hexdigest()
     held_files: list[tuple[_HeldWin32PublishedFile, bytes]] = []
     with _held_publication_directory_tree(
@@ -1974,6 +2013,7 @@ def _publish_prevalidated_completion_for_test(
         targets=(
             ("bootstraps", bootstrap_sha256),
             ("publication_receipts", receipt_sha256),
+            ("stdlib_policies", stdlib_policy_sha256),
             ("completion_markers", completion_sha256),
         ),
     ) as directories:
@@ -1992,6 +2032,14 @@ def _publish_prevalidated_completion_for_test(
                 digest=receipt_sha256,
                 suffix=".json",
                 raw=receipt_raw,
+                held_files=held_files,
+            )
+            stdlib_policy = _safe_cas_publish(
+                root=root,
+                category="stdlib_policies",
+                digest=stdlib_policy_sha256,
+                suffix=".json",
+                raw=stdlib_policy_raw,
                 held_files=held_files,
             )
             completion = _safe_cas_publish(
@@ -2023,6 +2071,7 @@ def _publish_prevalidated_completion_for_test(
         "bootstrap": bootstrap,
         "completion": completion,
         "receipt": receipt,
+        "stdlib_policy": stdlib_policy,
     }
 
 
@@ -2032,7 +2081,7 @@ def _publish_factor_v3_formal_bootstrap_with_test_trust(
     completion_authorization_path: Path | str,
     trusted_public_key_spki_der: bytes,
 ) -> dict[str, Any]:
-    config, rendered, receipt_raw, completion_payload = _publication_materials(
+    config, rendered, receipt_raw, stdlib_policy_raw, completion_payload = _publication_materials(
         authorization_path=authorization_path,
         trusted_public_key_spki_der=trusted_public_key_spki_der,
     )
@@ -2049,14 +2098,17 @@ def _publish_factor_v3_formal_bootstrap_with_test_trust(
         root=root,
         bootstrap_raw=rendered,
         receipt_raw=receipt_raw,
+        stdlib_policy_raw=stdlib_policy_raw,
         completion_raw=completion_raw,
     )
     bootstrap_path, bootstrap_relative_path = published["bootstrap"]
     receipt_path, receipt_relative_path = published["receipt"]
     completion_path, completion_relative_path = published["completion"]
+    stdlib_policy_path, stdlib_policy_relative_path = published["stdlib_policy"]
     if (
         bootstrap_relative_path != completion_payload["bootstrap_relative_path"]
         or receipt_relative_path != completion_payload["receipt_relative_path"]
+        or stdlib_policy_relative_path != completion_payload["stdlib_policy_relative_path"]
     ):
         raise FormalBootstrapRenderError("publication path identity rejected")
     return {
@@ -2066,6 +2118,7 @@ def _publish_factor_v3_formal_bootstrap_with_test_trust(
         "completion_marker_path": str(completion_path),
         "completion_marker_relative_path": completion_relative_path,
         "receipt_path": str(receipt_path),
+        "stdlib_policy_path": str(stdlib_policy_path),
     }
 
 
@@ -2090,6 +2143,7 @@ def _validated_completion_marker_payload(value: Any) -> dict[str, Any]:
         "bootstrap_output_root",
         "bootstrap_relative_path",
         "bootstrap_sha256",
+        "control_contract_descriptor_sha256",
         "execution_authorization_sha256",
         "receipt_bytes",
         "receipt_relative_path",
@@ -2097,6 +2151,10 @@ def _validated_completion_marker_payload(value: Any) -> dict[str, Any]:
         "runtime_template_sha256",
         "schema",
         "status",
+        "stdlib_inventory_root_sha256",
+        "stdlib_policy_bytes",
+        "stdlib_policy_relative_path",
+        "stdlib_policy_sha256",
     }
     if (
         type(value) is not dict
@@ -2113,12 +2171,15 @@ def _validated_completion_marker_payload(value: Any) -> dict[str, Any]:
         "authorization_id_sha256",
         "authorization_nonce_sha256",
         "bootstrap_sha256",
+        "control_contract_descriptor_sha256",
         "execution_authorization_sha256",
         "receipt_sha256",
         "runtime_template_sha256",
+        "stdlib_inventory_root_sha256",
+        "stdlib_policy_sha256",
     ):
         _require_sha256(payload.get(field), label=f"completion marker {field}")
-    for field in ("bootstrap_bytes", "receipt_bytes"):
+    for field in ("bootstrap_bytes", "receipt_bytes", "stdlib_policy_bytes"):
         size = payload.get(field)
         if type(size) is not int or isinstance(size, bool) or not 0 < size <= _MAX_RUNTIME_BYTES:
             raise FormalBootstrapRenderError("completion marker payload rejected")
@@ -2133,9 +2194,15 @@ def _validated_completion_marker_payload(value: Any) -> dict[str, Any]:
         f"publication_receipts/sha256/{payload['receipt_sha256'][:2]}/"
         f"{payload['receipt_sha256']}.json"
     )
+    expected_stdlib_policy = (
+        f"stdlib_policies/sha256/{payload['stdlib_policy_sha256'][:2]}/"
+        f"{payload['stdlib_policy_sha256']}.json"
+    )
     if (
         payload.get("bootstrap_relative_path") != expected_bootstrap
         or payload.get("receipt_relative_path") != expected_receipt
+        or payload.get("stdlib_policy_relative_path") != expected_stdlib_policy
+        or payload.get("control_contract_descriptor_sha256") != control_contract_descriptor_sha256()
     ):
         raise FormalBootstrapRenderError("completion marker payload rejected")
     payload["bootstrap_output_root"] = str(root)
@@ -2290,7 +2357,7 @@ def validate_rendered_factor_v3_formal_bootstrap(raw: bytes) -> bytes:
         type(raw) is not bytes
         or not raw
         or raw.endswith(b"\n")
-        or len(raw) > _MAX_WINDOWS_C_COMMAND_BYTES
+        or len(raw) > _MAX_RUNTIME_BYTES
         or not raw.startswith(_WRAPPER_PREFIX)
         or not raw.endswith(_WRAPPER_SUFFIX)
     ):

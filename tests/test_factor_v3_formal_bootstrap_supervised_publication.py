@@ -5,18 +5,19 @@ import hashlib
 import inspect
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
 from app import factor_v3_formal_bootstrap_renderer as renderer
 from app import factor_v3_formal_bootstrap_runtime as runtime
+from app import factor_v3_formal_control_contract as contract
 from tests.test_factor_v3_formal_bootstrap_authorization import (
     _authorized_fixture,
     _render_authorized,
     _run_as_synthetic_supervisor,
     _write_completion_authorization,
 )
-from tests.test_factor_v3_formal_bootstrap_renderer import _run_rendered
 
 
 PRODUCTION_EXECUTION_PUBLIC_KEY_PATH = Path(
@@ -26,8 +27,8 @@ PRODUCTION_EXECUTION_PUBLIC_KEY_PATH = Path(
 PRODUCTION_EXECUTION_PUBLIC_KEY_SPKI_SHA256 = (
     "70c8ad8f74cddfe363175d76c433cb145aadcd7cbd8af669768e697d99cccce8"
 )
-SUPERVISOR_PROTOCOL = "factor-v3-formal-supervisor-worker/v1"
-WORKER_TERMINAL_SCHEMA = "factor-v3-formal-bootstrap-worker-terminal/v1"
+SUPERVISOR_PROTOCOL = contract.WORKER_PROTOCOL
+WORKER_TERMINAL_SCHEMA = contract.WORKER_TERMINAL_SCHEMA
 
 
 def test_production_renderer_has_a_fixed_execution_authorization_key() -> None:
@@ -107,46 +108,51 @@ def test_execution_authorization_replay_window_is_fail_closed() -> None:
             renderer._validated_replay_claim(window, now_utc=now_utc)
 
 
-def test_stdlib_policy_uses_exact_roots_and_content_inventory() -> None:
+def test_stdlib_policy_uses_exact_roots_and_content_inventory(tmp_path: Path) -> None:
+    pycache_prefix = (tmp_path / "pycache").resolve()
+    pycache_prefix.mkdir()
     policy = renderer._trusted_stdlib_policy_for_base_python(
-        Path(__import__("sys")._base_executable)
+        Path(__import__("sys")._base_executable),
+        pycache_prefix,
     )
 
-    assert policy["schema"] == "factor-v3-bootstrap-stdlib-policy/v1"
+    assert policy["schema"] == contract.STDLIB_POLICY_SCHEMA
     assert set(policy) == {
-        "importer_policy_sha256",
-        "inventory_root_sha256",
+        "absent_paths",
+        "entries",
+        "pycache_prefix",
         "roots",
         "schema",
-        "supervisor_prelocked",
     }
-    assert policy["supervisor_prelocked"] is True
-    assert [item["kind"] for item in policy["roots"]] == [
-        "stdlib",
+    assert [item["role"] for item in policy["roots"]] == [
         "platstdlib",
-        "stdlib_zip",
+        "stdlib",
     ]
-    assert all(
-        set(item)
-        == {
-            "entries",
-            "inventory_sha256",
-            "kind",
-            "path",
-        }
-        for item in policy["roots"]
-    )
-    assert all(len(item["inventory_sha256"]) == 64 for item in policy["roots"])
-    entries = [entry for root in policy["roots"] for entry in root["entries"]]
+    assert all(set(item) == {"path", "role"} for item in policy["roots"])
+    entries = policy["entries"]
     assert entries
-    assert all(set(entry) == {"bytes", "kind", "module", "path", "sha256"} for entry in entries)
     assert all(
-        isinstance(entry["module"], str)
-        and entry["module"]
-        and entry["kind"] in {"bytecode", "dll", "extension", "source"}
+        set(entry)
+        == {
+            "bytes",
+            "is_package",
+            "kind",
+            "module",
+            "path",
+            "relative_path",
+            "root",
+            "sha256",
+        }
+        for entry in entries
+    )
+    assert all(
+        (entry["kind"] == "dll" or isinstance(entry["module"], str))
+        and entry["kind"] in {"dll", "extension", "source"}
         and len(entry["sha256"]) == 64
         for entry in entries
     )
+    assert policy["absent_paths"]
+    assert policy["pycache_prefix"] == str(pycache_prefix)
 
 
 def _overlong_execution_replay_claim() -> dict[str, str]:
@@ -327,17 +333,19 @@ def test_completion_marker_is_the_last_and_only_selection_record(
         root=Path(r"C:\synthetic-publication-root"),
         bootstrap_raw=b"bootstrap",
         receipt_raw=b"receipt",
+        stdlib_policy_raw=b"stdlib-policy",
         completion_raw=b"completion",
     )
 
     assert categories == [
         "bootstraps",
         "publication_receipts",
+        "stdlib_policies",
         "completion_markers",
     ]
 
 
-def test_publication_holds_all_three_files_until_marker_terminal(
+def test_publication_holds_all_files_until_marker_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -396,11 +404,13 @@ def test_publication_holds_all_three_files_until_marker_terminal(
         "bootstraps": True,
         "completion_markers": True,
         "publication_receipts": True,
+        "stdlib_policies": True,
     }
     assert {
         Path(publication["bootstrap_path"]).parent,
         Path(publication["completion_marker_path"]).parent,
         Path(publication["receipt_path"]).parent,
+        Path(publication["stdlib_policy_path"]).parent,
     }.issubset(set(flushed))
 
 
@@ -471,7 +481,7 @@ def test_saved_stdout_descriptors_cannot_escape_worker_capture(
     ) = _authorized_fixture(tmp_path, dispatch_body=dispatch_body)
     rendered = _render_authorized(authorization_path, trusted_public_der)
 
-    completed = _run_rendered(rendered, config)
+    completed = _run_as_synthetic_supervisor(rendered, config, tmp_path)
 
     assert completed.returncode != 0
     assert completed.stdout == ""
@@ -479,39 +489,12 @@ def test_saved_stdout_descriptors_cannot_escape_worker_capture(
 
 
 def test_supervisor_protocol_and_terminal_frame_are_exact() -> None:
-    assert runtime._SUPERVISOR_PROTOCOL == SUPERVISOR_PROTOCOL
-    assert runtime._WORKER_TERMINAL_SCHEMA == WORKER_TERMINAL_SCHEMA
-    assert runtime._SUPERVISOR_PUBLIC_ENVIRONMENT == frozenset(
-        {"SYSTEMROOT", "WINDIR", "TEMP", "TMP"}
-    )
-    assert runtime._SUPERVISOR_FIXED_ENVIRONMENT == frozenset(
-        {
-            "FACTOR_V3_FORMAL_LAUNCH_ACTION",
-            "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256",
-            "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL",
-            "FACTOR_V3_FORMAL_STDLIB_PRELOCKED_ROOT_SHA256",
-        }
-    )
-    assert runtime._SUPERVISOR_ACTION_SECRET_ENVIRONMENT == {
-        "build-spec": frozenset(),
-        "resume": frozenset({"JIAOCH_TOKEN"}),
-        "run": frozenset({"JIAOCH_TOKEN"}),
-        "verify": frozenset(),
-    }
-    assert runtime._WORKER_TERMINAL_FIELDS == frozenset(
-        {
-            "artifacts",
-            "authorization_nonce_sha256",
-            "bootstrap_execution_authorization_sha256",
-            "launch_action",
-            "launch_authorization_sha256",
-            "result",
-            "schema",
-            "status",
-            "stdlib_inventory_root_sha256",
-            "worker_action",
-        }
-    )
+    descriptor = runtime._supervisor_protocol_descriptor()
+    assert descriptor == contract.worker_protocol_descriptor()
+    assert descriptor["protocol"] == SUPERVISOR_PROTOCOL
+    assert descriptor["terminal_schema"] == WORKER_TERMINAL_SCHEMA
+    assert descriptor["fixed_environment"] == contract.FIXED_ENVIRONMENT
+    assert descriptor["terminal_fields"] == contract.WORKER_TERMINAL_FIELDS
 
 
 def test_synthetic_supervisor_receives_one_canonical_terminal_frame(
@@ -536,7 +519,7 @@ def test_synthetic_supervisor_receives_one_canonical_terminal_frame(
     assert completed.stdout.endswith("\n")
     assert completed.stdout.count("\n") == 1
     frame = json.loads(completed.stdout)
-    assert set(frame) == runtime._WORKER_TERMINAL_FIELDS
+    assert set(frame) == set(contract.WORKER_TERMINAL_FIELDS)
     assert frame == {
         "artifacts": [],
         "authorization_nonce_sha256": payload["authorization_nonce_sha256"],
@@ -562,7 +545,7 @@ def test_synthetic_supervisor_receives_one_canonical_terminal_frame(
         },
         "schema": WORKER_TERMINAL_SCHEMA,
         "status": "completed",
-        "stdlib_inventory_root_sha256": payload["stdlib_policy"]["inventory_root_sha256"],
+        "stdlib_inventory_root_sha256": payload["stdlib_policy_root_sha256"],
         "worker_action": "verify",
     }
     assert completed.stdout.encode("utf-8") == (
@@ -676,8 +659,26 @@ def test_direct_worker_execution_requires_supervisor_context(
         trusted_public_der,
     ) = _authorized_fixture(tmp_path)
     rendered = _render_authorized(authorization_path, trusted_public_der)
+    bootstrap_path = (tmp_path / "direct-bootstrap.py").resolve()
+    bootstrap_path.write_bytes(rendered)
 
-    completed = _run_rendered(rendered, config)
+    completed = subprocess.run(
+        [
+            str(config["python_executable_path"]),
+            "-I",
+            "-B",
+            "-S",
+            "-X",
+            f"pycache_prefix={config['_test_stdlib_pycache_prefix']}",
+            str(bootstrap_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env={},
+        timeout=60,
+    )
 
     assert completed.returncode != 0
     assert completed.stdout == ""

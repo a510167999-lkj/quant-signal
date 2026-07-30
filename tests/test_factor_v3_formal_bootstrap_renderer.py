@@ -395,14 +395,17 @@ def _run_rendered(
     config: dict[str, object],
     *caller_args: str,
 ) -> subprocess.CompletedProcess[str]:
+    bootstrap_path = Path(str(config["run_root"])) / "direct-rendered-bootstrap.py"
+    bootstrap_path.write_bytes(source)
     return subprocess.run(
         [
             str(config["python_executable_path"]),
             "-I",
             "-B",
             "-S",
-            "-c",
-            source.decode("utf-8"),
+            "-X",
+            f"pycache_prefix={config['_test_stdlib_pycache_prefix']}",
+            str(bootstrap_path),
             *caller_args,
         ],
         check=False,
@@ -431,7 +434,7 @@ def test_renderer_is_deterministic_self_contained_and_has_no_placeholder(
     assert not first.endswith(b"\n")
     assert b"{{" not in first
     assert b"}}" not in first
-    assert len(first) <= 30_000
+    assert len(first) <= 8 * 1024 * 1024
     compile(first, "<factor-v3-formal-bootstrap>", "exec")
 
 

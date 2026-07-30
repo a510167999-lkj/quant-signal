@@ -21,41 +21,32 @@ import threading
 import time
 from typing import Any, Iterator
 
+from app.factor_v3_formal_control_contract import (
+    EXECUTION_REPLAY_SCOPE,
+    PUBLICATION_COMPLETION_SCHEMA,
+    STDLIB_POLICY_SCHEMA,
+    STDLIB_ROOT_ENVIRONMENT,
+    WORKER_ACTION_BY_LAUNCH_ACTION,
+    WORKER_PROTOCOL,
+    WORKER_TERMINAL_FIELDS,
+    WORKER_TERMINAL_SCHEMA,
+    control_contract_descriptor_sha256,
+    exact_worker_argv,
+    validate_stdlib_policy,
+    worker_environment_policy,
+)
+
 
 class FormalSupervisorError(RuntimeError):
     pass
 
 
 LAUNCH_AUTHORIZATION_SCHEMA = "factor-v3-formal-supervisor-launch-authorization/v1"
-WORKER_TERMINAL_SCHEMA = "factor-v3-formal-bootstrap-worker-terminal/v2"
 PUBLICATION_RECEIPT_SCHEMA = "factor-v3-formal-bootstrap-publication-receipt/v1"
-PUBLICATION_COMPLETION_SCHEMA = "factor-v3-formal-bootstrap-publication-completion/v1"
-STDLIB_INVENTORY_SCHEMA = "factor-v3-formal-supervisor-stdlib-inventory/v1"
+STDLIB_INVENTORY_SCHEMA = STDLIB_POLICY_SCHEMA
 CLAIM_SCHEMA = "factor-v3-formal-supervisor-execution-claim/v1"
 COMPLETED_SCHEMA = "factor-v3-formal-supervisor-execution-completed/v1"
-WORKER_PROTOCOL = "factor-v3-formal-supervisor-worker/v2"
-EXECUTION_REPLAY_SCOPE = "factor-v3-formal-bootstrap-execution/v1"
-WORKER_ENVIRONMENT_POLICY = {
-    "inherit_parent": False,
-    "marker_names": [
-        "FACTOR_V3_FORMAL_LAUNCH_ACTION",
-        "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256",
-        "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL",
-        "FACTOR_V3_FORMAL_STDLIB_INVENTORY_ROOT_SHA256",
-    ],
-    "public_passthrough_names": [
-        "SYSTEMROOT",
-        "TEMP",
-        "TMP",
-        "WINDIR",
-    ],
-    "required_secret_names_by_action": {
-        "build-spec": [],
-        "resume": ["JIAOCH_TOKEN"],
-        "run": ["JIAOCH_TOKEN"],
-        "verify": [],
-    },
-}
+WORKER_ENVIRONMENT_POLICY = worker_environment_policy()
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
@@ -77,9 +68,11 @@ _LAUNCH_FIELDS = {
     "base_python_executable_path",
     "base_python_executable_sha256",
     "bootstrap_execution_authorization_sha256",
+    "bootstrap_execution_authorization_path",
     "bootstrap_output_root",
     "bootstrap_worker_path",
     "bootstrap_worker_sha256",
+    "control_contract_descriptor_sha256",
     "environment_policy",
     "execution_key_id",
     "execution_ledger_root",
@@ -112,30 +105,19 @@ _LAUNCH_FIELDS = {
     "run_spec_sha256",
     "schema",
     "source_root_sha256",
-    "stdlib_inventory_manifest_path",
-    "stdlib_inventory_manifest_sha256",
     "stdlib_inventory_root_sha256",
-    "stdlib_inventory_schema",
+    "stdlib_policy_path",
+    "stdlib_policy_sha256",
     "supervisor_expected_commit",
     "supervisor_source_sha256",
     "worker_action",
     "worker_argv",
     "worker_protocol",
+    "worker_pycache_prefix",
     "worker_terminal_schema",
     "worker_timeout_seconds",
 }
-_TERMINAL_FIELDS = {
-    "artifacts",
-    "authorization_nonce_sha256",
-    "bootstrap_execution_authorization_sha256",
-    "launch_action",
-    "launch_authorization_sha256",
-    "result",
-    "schema",
-    "status",
-    "stdlib_inventory_root_sha256",
-    "worker_action",
-}
+_TERMINAL_FIELDS = set(WORKER_TERMINAL_FIELDS)
 
 
 @dataclass(frozen=True)
@@ -282,6 +264,7 @@ def _open_directory_handle(
     path: Path,
     *,
     desired_access: int = 0x80000000,
+    share_mode: int = 0x00000001 | 0x00000002,
 ) -> tuple[Any, tuple[int, int, int]]:
     kernel32 = _kernel32()
     create_file = kernel32.CreateFileW
@@ -298,7 +281,7 @@ def _open_directory_handle(
     handle = create_file(
         str(path),
         desired_access,
-        0x00000001 | 0x00000002,
+        share_mode,
         None,
         3,
         0x00200000 | 0x02000000,
@@ -338,9 +321,7 @@ class _HeldDirectoryChain:
             self._append_existing(anchor)
             for part in path.parts[1:]:
                 self._append_existing(self.path / part)
-            if os.path.normcase(str(self.path)) != os.path.normcase(
-                str(path.resolve(strict=True))
-            ):
+            if os.path.normcase(str(self.path)) != os.path.normcase(str(path.resolve(strict=True))):
                 raise FormalSupervisorError("held directory path rejected")
         except BaseException:
             self.close()
@@ -411,6 +392,87 @@ def _held_directory_chain(path: Path) -> Iterator[_HeldDirectoryChain]:
         chain.close()
 
 
+class _HeldFrozenDirectoryTree:
+    def __init__(self, paths: tuple[Path, ...]) -> None:
+        self._handles: list[tuple[Any, Path, tuple[int, int, int]]] = []
+        seen: set[str] = set()
+        try:
+            for root in paths:
+                candidates = [root]
+                if root.is_dir():
+                    for directory, names, _filenames in os.walk(root, topdown=True):
+                        current = Path(directory)
+                        names[:] = sorted(
+                            name
+                            for name in names
+                            if not (
+                                (current / name).is_symlink()
+                                or int(
+                                    getattr(
+                                        (current / name).lstat(),
+                                        "st_file_attributes",
+                                        0,
+                                    )
+                                )
+                                & _REPARSE_ATTRIBUTE
+                            )
+                        )
+                        candidates.append(current)
+                for candidate in candidates:
+                    normalized = os.path.normcase(str(candidate))
+                    if normalized in seen:
+                        continue
+                    handle, identity = _open_directory_handle(
+                        candidate,
+                        share_mode=0x00000001,
+                    )
+                    self._handles.append((handle, candidate, identity))
+                    seen.add(normalized)
+        except BaseException:
+            self.close()
+            raise
+
+    def postverify(self) -> None:
+        kernel32 = _kernel32()
+        get_information = kernel32.GetFileInformationByHandle
+        get_information.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(_ByHandleFileInformation),
+        )
+        get_information.restype = wintypes.BOOL
+        for handle, _path, expected in self._handles:
+            information = _ByHandleFileInformation()
+            if not get_information(handle, ctypes.byref(information)):
+                raise FormalSupervisorError("frozen stdlib directory drifted")
+            observed = (
+                int(information.dwVolumeSerialNumber),
+                int(information.nFileIndexHigh),
+                int(information.nFileIndexLow),
+            )
+            if observed != expected:
+                raise FormalSupervisorError("frozen stdlib directory drifted")
+
+    def close(self) -> None:
+        if not self._handles:
+            return
+        kernel32 = _kernel32()
+        while self._handles:
+            handle, _path, _identity = self._handles.pop()
+            kernel32.CloseHandle(handle)
+
+
+@contextmanager
+def _held_frozen_directory_tree(
+    paths: tuple[Path, ...],
+) -> Iterator[_HeldFrozenDirectoryTree]:
+    tree = _HeldFrozenDirectoryTree(paths)
+    try:
+        yield tree
+        tree.postverify()
+    finally:
+        tree.close()
+
+
 class _HeldFile:
     def __init__(
         self,
@@ -419,6 +481,7 @@ class _HeldFile:
         expected_sha256: str | None,
         label: str,
         max_bytes: int,
+        allow_empty: bool = False,
         allow_hardlinks: bool = False,
     ) -> None:
         self._chain = _HeldDirectoryChain(path.parent)
@@ -432,7 +495,8 @@ class _HeldFile:
         if (
             not stat.S_ISREG(before.st_mode)
             or int(getattr(before, "st_file_attributes", 0)) & _REPARSE_ATTRIBUTE
-            or before.st_size <= 0
+            or before.st_size < 0
+            or (before.st_size == 0 and not allow_empty)
             or before.st_size > max_bytes
             or (link_count < 1 if allow_hardlinks else link_count != 1)
         ):
@@ -686,8 +750,7 @@ def _verify_signature(payload: bytes, signature: bytes, *, public_der: bytes) ->
         raise FormalSupervisorError("launch authorization signature rejected")
     encoded = pow(signature_int, exponent, modulus).to_bytes(384, "big")
     digest_info = (
-        bytes.fromhex("3031300d060960864801650304020105000420")
-        + hashlib.sha256(payload).digest()
+        bytes.fromhex("3031300d060960864801650304020105000420") + hashlib.sha256(payload).digest()
     )
     expected = b"\x00\x01" + b"\xff" * (384 - len(digest_info) - 3) + b"\x00" + digest_info
     if not hmac.compare_digest(encoded, expected):
@@ -740,27 +803,7 @@ def _parse_utc(value: Any, *, label: str) -> datetime:
 
 
 def _fresh_environment_policy() -> dict[str, Any]:
-    return {
-        "inherit_parent": False,
-        "marker_names": [
-            "FACTOR_V3_FORMAL_LAUNCH_ACTION",
-            "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256",
-            "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL",
-            "FACTOR_V3_FORMAL_STDLIB_INVENTORY_ROOT_SHA256",
-        ],
-        "public_passthrough_names": [
-            "SYSTEMROOT",
-            "TEMP",
-            "TMP",
-            "WINDIR",
-        ],
-        "required_secret_names_by_action": {
-            "build-spec": [],
-            "resume": ["JIAOCH_TOKEN"],
-            "run": ["JIAOCH_TOKEN"],
-            "verify": [],
-        },
-    }
+    return worker_environment_policy()
 
 
 def _validate_pins(pins: _SupervisorPins) -> None:
@@ -808,10 +851,8 @@ def _validate_pins(pins: _SupervisorPins) -> None:
         raise FormalSupervisorError("embedded execution public key rejected") from None
     _parse_rsa3072_spki(public_der)
     if (
-        base64.b64encode(public_der).decode("ascii")
-        != pins.execution_public_key_spki_der_base64
-        or hashlib.sha256(public_der).hexdigest()
-        != pins.execution_public_key_spki_sha256
+        base64.b64encode(public_der).decode("ascii") != pins.execution_public_key_spki_der_base64
+        or hashlib.sha256(public_der).hexdigest() != pins.execution_public_key_spki_sha256
     ):
         raise FormalSupervisorError("embedded execution public key rejected")
 
@@ -827,8 +868,9 @@ def _validate_launch_payload(
         or set(value) != _LAUNCH_FIELDS
         or value.get("schema") != LAUNCH_AUTHORIZATION_SCHEMA
         or value.get("project_id") != "quant-signal-lkj"
-        or value.get("action") not in {"build-spec", "resume", "run", "verify"}
-        or value.get("worker_action") not in {"build-spec", "run", "verify"}
+        or value.get("action") not in WORKER_ACTION_BY_LAUNCH_ACTION
+        or value.get("worker_action")
+        != WORKER_ACTION_BY_LAUNCH_ACTION.get(str(value.get("action")))
         or value.get("environment_policy") != _fresh_environment_policy()
     ):
         raise FormalSupervisorError("launch authorization payload rejected")
@@ -839,6 +881,7 @@ def _validate_launch_payload(
         "base_python_executable_sha256",
         "bootstrap_execution_authorization_sha256",
         "bootstrap_worker_sha256",
+        "control_contract_descriptor_sha256",
         "formal_input_root_sha256",
         "git_executable_sha256",
         "publication_completion_marker_sha256",
@@ -846,32 +889,27 @@ def _validate_launch_payload(
         "review_public_key_spki_sha256",
         "run_spec_sha256",
         "source_root_sha256",
-        "stdlib_inventory_manifest_sha256",
         "stdlib_inventory_root_sha256",
+        "stdlib_policy_sha256",
         "supervisor_source_sha256",
     ):
         _require_sha256(payload.get(field), label=field)
     if (
-        payload["execution_key_id"]
-        != f"sha256:{pins.execution_public_key_spki_sha256}"
-        or payload["review_public_key_spki_sha256"]
-        == pins.execution_public_key_spki_sha256
-        or payload["publication_completion_marker_path"]
-        != pins.bootstrap_completion_marker_path
+        payload["execution_key_id"] != f"sha256:{pins.execution_public_key_spki_sha256}"
+        or payload["review_public_key_spki_sha256"] == pins.execution_public_key_spki_sha256
+        or payload["publication_completion_marker_path"] != pins.bootstrap_completion_marker_path
         or payload["publication_completion_marker_sha256"]
         != pins.bootstrap_completion_marker_sha256
-        or payload["publication_completion_schema"]
-        != pins.bootstrap_completion_schema
+        or payload["publication_completion_schema"] != pins.bootstrap_completion_schema
         or payload["worker_protocol"] != pins.worker_protocol
         or payload["worker_terminal_schema"] != pins.worker_terminal_schema
-        or payload["stdlib_inventory_schema"] != STDLIB_INVENTORY_SCHEMA
+        or payload["control_contract_descriptor_sha256"] != control_contract_descriptor_sha256()
         or payload["replay_scope"] != EXECUTION_REPLAY_SCOPE
     ):
         raise FormalSupervisorError("execution/review key role or protocol pins rejected")
     if (
         payload["base_python_executable_path"] != pins.base_python_executable_path
-        or payload["base_python_executable_sha256"]
-        != pins.base_python_executable_sha256
+        or payload["base_python_executable_sha256"] != pins.base_python_executable_sha256
         or payload["git_executable_path"] != pins.git_executable_path
         or payload["git_executable_sha256"] != pins.git_executable_sha256
         or payload["python_executable_path"] != pins.python_executable_path
@@ -886,6 +924,7 @@ def _validate_launch_payload(
         for field in (
             "bootstrap_output_root",
             "bootstrap_worker_path",
+            "bootstrap_execution_authorization_path",
             "execution_ledger_root",
             "formal_input_root_path",
             "formal_output_root",
@@ -893,16 +932,15 @@ def _validate_launch_payload(
             "repo_root",
             "run_root",
             "run_spec_path",
-            "stdlib_inventory_manifest_path",
+            "stdlib_policy_path",
+            "worker_pycache_prefix",
         )
     }
-    exact_argv = [
-        pins.python_executable_path,
-        "-I",
-        "-B",
-        "-S",
-        str(paths["bootstrap_worker_path"]),
-    ]
+    exact_argv = exact_worker_argv(
+        python_executable_path=pins.python_executable_path,
+        bootstrap_worker_path=str(paths["bootstrap_worker_path"]),
+        pycache_prefix=str(paths["worker_pycache_prefix"]),
+    )
     if payload.get("worker_argv") != exact_argv:
         raise FormalSupervisorError("exact worker argv rejected")
     if payload["action"] == "resume":
@@ -918,24 +956,27 @@ def _validate_launch_payload(
                 )
             )
             or payload.get("resume_of_replay_scope") != EXECUTION_REPLAY_SCOPE
+            or payload["authorization_id_sha256"] != payload["resume_of_authorization_id_sha256"]
+            or payload["authorization_nonce_sha256"]
+            != payload["resume_of_authorization_nonce_sha256"]
+            or payload["bootstrap_execution_authorization_sha256"]
+            != payload["resume_of_bootstrap_execution_authorization_sha256"]
+            or payload["replay_scope"] != payload["resume_of_replay_scope"]
             or _SHA256_RE.fullmatch(str(payload.get("resume_status_sha256"))) is None
             or type(payload.get("resume_status_path")) is not str
         ):
             raise FormalSupervisorError("resume authorization rejected")
         _absolute_path(payload["resume_status_path"], label="resume status path")
-    elif (
-        payload["worker_action"] != payload["action"]
-        or any(
-            payload.get(field) is not None
-            for field in (
-                "resume_of_authorization_id_sha256",
-                "resume_of_authorization_nonce_sha256",
-                "resume_of_authorization_sha256",
-                "resume_of_bootstrap_execution_authorization_sha256",
-                "resume_of_replay_scope",
-                "resume_status_path",
-                "resume_status_sha256",
-            )
+    elif any(
+        payload.get(field) is not None
+        for field in (
+            "resume_of_authorization_id_sha256",
+            "resume_of_authorization_nonce_sha256",
+            "resume_of_authorization_sha256",
+            "resume_of_bootstrap_execution_authorization_sha256",
+            "resume_of_replay_scope",
+            "resume_status_path",
+            "resume_status_sha256",
         )
     ):
         raise FormalSupervisorError("non-resume authorization rejected")
@@ -990,9 +1031,7 @@ def _worker_environment(
             "FACTOR_V3_FORMAL_LAUNCH_ACTION": str(payload["action"]),
             "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256": launch_authorization_sha256,
             "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL": WORKER_PROTOCOL,
-            "FACTOR_V3_FORMAL_STDLIB_INVENTORY_ROOT_SHA256": str(
-                payload["stdlib_inventory_root_sha256"]
-            ),
+            STDLIB_ROOT_ENVIRONMENT: str(payload["stdlib_inventory_root_sha256"]),
         }
     )
     allowed_names = (
@@ -1031,11 +1070,7 @@ def _git_head(pins: _SupervisorPins, snapshot: Mapping[str, str]) -> str:
         )
     except (OSError, subprocess.SubprocessError):
         raise FormalSupervisorError("supervisor commit verification rejected") from None
-    if (
-        completed.returncode != 0
-        or completed.stderr
-        or len(completed.stdout) > 128
-    ):
+    if completed.returncode != 0 or completed.stderr or len(completed.stdout) > 128:
         raise FormalSupervisorError("supervisor commit verification rejected")
     try:
         return completed.stdout.decode("ascii").strip()
@@ -1045,24 +1080,17 @@ def _git_head(pins: _SupervisorPins, snapshot: Mapping[str, str]) -> str:
 
 def claim_path_for_authorization(root: Path, authorization_sha256: str) -> Path:
     _require_sha256(authorization_sha256, label="launch authorization SHA")
-    return (
-        root
-        / "claims"
-        / "sha256"
-        / authorization_sha256[:2]
-        / f"{authorization_sha256}.json"
-    )
+    return root / "claims" / "sha256" / authorization_sha256[:2] / f"{authorization_sha256}.json"
 
 
 def completed_path_for_authorization(root: Path, authorization_sha256: str) -> Path:
     _require_sha256(authorization_sha256, label="launch authorization SHA")
-    return (
-        root
-        / "completed"
-        / "sha256"
-        / authorization_sha256[:2]
-        / f"{authorization_sha256}.json"
-    )
+    return root / "completed" / "sha256" / authorization_sha256[:2] / f"{authorization_sha256}.json"
+
+
+def _ledger_path(root: Path, category: str, identity_sha256: str) -> Path:
+    _require_sha256(identity_sha256, label="ledger identity")
+    return root / category / "sha256" / identity_sha256[:2] / f"{identity_sha256}.json"
 
 
 def _flush_directory(
@@ -1263,12 +1291,7 @@ def _parse_worker_terminal(
     payload: Mapping[str, Any],
     authorization_sha256: str,
 ) -> dict[str, Any]:
-    if (
-        not raw
-        or len(raw) > _MAX_CAPTURE_BYTES
-        or not raw.endswith(b"\n")
-        or raw.count(b"\n") != 1
-    ):
+    if not raw or len(raw) > _MAX_CAPTURE_BYTES or not raw.endswith(b"\n") or raw.count(b"\n") != 1:
         raise FormalSupervisorError("worker terminal frame rejected")
     frame = _strict_canonical_json(raw[:-1], label="worker terminal frame")
     if (
@@ -1280,10 +1303,8 @@ def _parse_worker_terminal(
         or frame.get("launch_authorization_sha256") != authorization_sha256
         or frame.get("bootstrap_execution_authorization_sha256")
         != payload["bootstrap_execution_authorization_sha256"]
-        or frame.get("authorization_nonce_sha256")
-        != payload["authorization_nonce_sha256"]
-        or frame.get("stdlib_inventory_root_sha256")
-        != payload["stdlib_inventory_root_sha256"]
+        or frame.get("authorization_nonce_sha256") != payload["authorization_nonce_sha256"]
+        or frame.get("stdlib_inventory_root_sha256") != payload["stdlib_inventory_root_sha256"]
         or type(frame.get("result")) is not dict
     ):
         raise FormalSupervisorError("worker terminal frame rejected")
@@ -1370,6 +1391,7 @@ def _validated_publication_completion(
         "bootstrap_relative_path",
         "bootstrap_sha256",
         "bootstrap_output_root",
+        "control_contract_descriptor_sha256",
         "execution_authorization_sha256",
         "receipt_bytes",
         "receipt_relative_path",
@@ -1377,6 +1399,10 @@ def _validated_publication_completion(
         "runtime_template_sha256",
         "schema",
         "status",
+        "stdlib_inventory_root_sha256",
+        "stdlib_policy_bytes",
+        "stdlib_policy_relative_path",
+        "stdlib_policy_sha256",
     }
     if (
         type(completion) is not dict
@@ -1384,24 +1410,32 @@ def _validated_publication_completion(
         or completion.get("schema") != payload["publication_completion_schema"]
         or completion.get("status") != "completed"
         or completion.get("action") != payload["worker_action"]
-        or completion.get("authorization_id_sha256")
-        != payload["authorization_id_sha256"]
-        or completion.get("authorization_nonce_sha256")
-        != payload["authorization_nonce_sha256"]
+        or completion.get("authorization_id_sha256") != payload["authorization_id_sha256"]
+        or completion.get("authorization_nonce_sha256") != payload["authorization_nonce_sha256"]
         or completion.get("bootstrap_output_root") != payload["bootstrap_output_root"]
         or completion.get("bootstrap_sha256") != payload["bootstrap_worker_sha256"]
         or completion.get("execution_authorization_sha256")
         != payload["bootstrap_execution_authorization_sha256"]
+        or completion.get("control_contract_descriptor_sha256")
+        != payload["control_contract_descriptor_sha256"]
+        or completion.get("stdlib_inventory_root_sha256") != payload["stdlib_inventory_root_sha256"]
+        or completion.get("stdlib_policy_sha256") != payload["stdlib_policy_sha256"]
         or type(completion.get("bootstrap_bytes")) is not int
         or isinstance(completion.get("bootstrap_bytes"), bool)
         or type(completion.get("receipt_bytes")) is not int
         or isinstance(completion.get("receipt_bytes"), bool)
+        or type(completion.get("stdlib_policy_bytes")) is not int
+        or isinstance(completion.get("stdlib_policy_bytes"), bool)
         or any(
             type(completion.get(field)) is not str
             or "\\" in completion[field]
             or completion[field].startswith("/")
             or ".." in completion[field].split("/")
-            for field in ("bootstrap_relative_path", "receipt_relative_path")
+            for field in (
+                "bootstrap_relative_path",
+                "receipt_relative_path",
+                "stdlib_policy_relative_path",
+            )
         )
         or _SHA256_RE.fullmatch(str(completion.get("receipt_sha256"))) is None
         or _SHA256_RE.fullmatch(str(completion.get("runtime_template_sha256"))) is None
@@ -1415,9 +1449,14 @@ def _validated_publication_completion(
     root = Path(str(payload["bootstrap_output_root"]))
     expected_worker = root / Path(*completion["bootstrap_relative_path"].split("/"))
     expected_receipt = root / Path(*completion["receipt_relative_path"].split("/"))
-    if os.path.normcase(str(expected_worker)) != os.path.normcase(
-        str(payload["bootstrap_worker_path"])
-    ) or expected_receipt.name != f"{completion['receipt_sha256']}.json":
+    expected_stdlib_policy = root / Path(*completion["stdlib_policy_relative_path"].split("/"))
+    if (
+        os.path.normcase(str(expected_worker))
+        != os.path.normcase(str(payload["bootstrap_worker_path"]))
+        or os.path.normcase(str(expected_stdlib_policy))
+        != os.path.normcase(str(payload["stdlib_policy_path"]))
+        or expected_receipt.name != f"{completion['receipt_sha256']}.json"
+    ):
         raise FormalSupervisorError("publication completion marker rejected")
     _validate_cas_path(
         expected_receipt,
@@ -1425,6 +1464,13 @@ def _validated_publication_completion(
         category="publication_receipts",
         suffix=".json",
         label="publication receipt",
+    )
+    _validate_cas_path(
+        expected_stdlib_policy,
+        str(completion["stdlib_policy_sha256"]),
+        category="stdlib_policies",
+        suffix=".json",
+        label="stdlib policy",
     )
     return dict(completion)
 
@@ -1440,9 +1486,7 @@ def _validate_publication_receipt(
         "bootstrap_bytes": completion["bootstrap_bytes"],
         "bootstrap_relative_path": completion["bootstrap_relative_path"],
         "bootstrap_sha256": completion["bootstrap_sha256"],
-        "execution_authorization_sha256": completion[
-            "execution_authorization_sha256"
-        ],
+        "execution_authorization_sha256": completion["execution_authorization_sha256"],
         "runtime_template_sha256": completion["runtime_template_sha256"],
         "schema": PUBLICATION_RECEIPT_SCHEMA,
     }
@@ -1454,70 +1498,104 @@ def _validate_publication_receipt(
         raise FormalSupervisorError("publication receipt rejected")
 
 
+def _validated_bootstrap_execution_authorization(
+    raw: bytes,
+    *,
+    payload: Mapping[str, Any],
+    public_der: bytes,
+) -> dict[str, Any]:
+    outer = _strict_canonical_json(raw, label="bootstrap execution authorization")
+    if set(outer) != {"payload", "signature_base64"}:
+        raise FormalSupervisorError("bootstrap execution authorization rejected")
+    authorization = outer.get("payload")
+    if type(authorization) is not dict:
+        raise FormalSupervisorError("bootstrap execution authorization rejected")
+    _verify_signature(
+        _canonical_bytes(authorization),
+        _decoded_signature(outer.get("signature_base64")),
+        public_der=public_der,
+    )
+    policy = authorization.get("stdlib_policy")
+    try:
+        normalized_policy = validate_stdlib_policy(
+            policy,
+            expected_root_sha256=str(payload["stdlib_inventory_root_sha256"]),
+            require_filesystem=True,
+        )
+    except ValueError as exc:
+        raise FormalSupervisorError("bootstrap stdlib policy rejected") from exc
+    expected = {
+        "action": payload["worker_action"],
+        "authorization_id_sha256": payload["authorization_id_sha256"],
+        "authorization_nonce_sha256": payload["authorization_nonce_sha256"],
+        "control_contract_descriptor_sha256": payload["control_contract_descriptor_sha256"],
+        "replay_scope": payload["replay_scope"],
+        "stdlib_policy_root_sha256": payload["stdlib_inventory_root_sha256"],
+        "supervisor_protocol": {
+            "protocol": payload["worker_protocol"],
+            "terminal_schema": payload["worker_terminal_schema"],
+        },
+    }
+    if (
+        any(
+            authorization.get(key) != value
+            for key, value in expected.items()
+            if key != "supervisor_protocol"
+        )
+        or type(authorization.get("supervisor_protocol")) is not dict
+        or authorization["supervisor_protocol"].get("protocol")
+        != expected["supervisor_protocol"]["protocol"]
+        or authorization["supervisor_protocol"].get("terminal_schema")
+        != expected["supervisor_protocol"]["terminal_schema"]
+        or normalized_policy["pycache_prefix"] != payload["worker_pycache_prefix"]
+    ):
+        raise FormalSupervisorError("bootstrap execution authorization binding rejected")
+    return dict(authorization)
+
+
 def _hold_stdlib_inventory(
     raw: bytes,
     *,
     payload: Mapping[str, Any],
+    authorization: Mapping[str, Any],
     stack: ExitStack,
 ) -> tuple[_HeldFile, ...]:
-    manifest = _strict_canonical_json(raw, label="stdlib inventory")
-    if (
-        set(manifest)
-        != {
-            "entries",
-            "root_sha256",
-            "schema",
-            "supervisor_preloaded_stdlib_tcb",
-        }
-        or manifest.get("schema") != payload["stdlib_inventory_schema"]
-        or manifest.get("supervisor_preloaded_stdlib_tcb") is not True
-        or manifest.get("root_sha256") != payload["stdlib_inventory_root_sha256"]
-        or type(manifest.get("entries")) is not list
-        or not manifest["entries"]
-        or hashlib.sha256(_canonical_bytes(manifest["entries"])).hexdigest()
-        != payload["stdlib_inventory_root_sha256"]
-    ):
-        raise FormalSupervisorError("stdlib inventory rejected")
+    policy = _strict_canonical_json(raw, label="stdlib policy")
+    if policy != authorization["stdlib_policy"]:
+        raise FormalSupervisorError("stdlib policy publication rejected")
+    try:
+        policy = validate_stdlib_policy(
+            policy,
+            expected_root_sha256=str(payload["stdlib_inventory_root_sha256"]),
+            require_filesystem=True,
+        )
+    except ValueError as exc:
+        raise FormalSupervisorError("stdlib policy rejected") from exc
+    frozen_directories = (
+        tuple(Path(str(item["path"])) for item in policy["roots"])
+        + tuple(Path(path).parent for path in policy["absent_paths"])
+        + (Path(str(policy["pycache_prefix"])),)
+    )
+    stack.enter_context(_held_frozen_directory_tree(frozen_directories))
     handles: list[_HeldFile] = []
-    normalized: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in manifest["entries"]:
-        if type(item) is not dict or set(item) != {"bytes", "path", "sha256"}:
-            raise FormalSupervisorError("stdlib inventory rejected")
+    for item in policy["entries"]:
         path = _absolute_path(item.get("path"), label="stdlib inventory path")
         byte_count = item.get("bytes")
         digest = _require_sha256(item.get("sha256"), label="stdlib inventory SHA")
-        if (
-            str(path) in seen
-            or type(byte_count) is not int
-            or isinstance(byte_count, bool)
-            or not 0 < byte_count <= _MAX_EXECUTABLE_BYTES
-        ):
+        if type(byte_count) is not int or not 0 <= byte_count <= _MAX_EXECUTABLE_BYTES:
             raise FormalSupervisorError("stdlib inventory rejected")
         held = _HeldFile(
             path,
             expected_sha256=digest,
             label="stdlib inventory file",
             max_bytes=_MAX_EXECUTABLE_BYTES,
+            allow_empty=True,
             allow_hardlinks=True,
         )
         stack.callback(held.close)
         if len(held.raw) != byte_count:
             raise FormalSupervisorError("stdlib inventory rejected")
         handles.append(held)
-        seen.add(str(path))
-        normalized.append(
-            {
-                "bytes": byte_count,
-                "path": str(path),
-                "sha256": digest,
-            }
-        )
-    if normalized != manifest["entries"] or normalized != sorted(
-        normalized,
-        key=lambda item: item["path"],
-    ):
-        raise FormalSupervisorError("stdlib inventory rejected")
     return tuple(handles)
 
 
@@ -1527,6 +1605,7 @@ def _validate_resume_status(
 ) -> None:
     if payload["action"] != "resume":
         return
+    _reject_completed_resume(payload)
     status_path = Path(str(payload["resume_status_path"]))
     expected_path = claim_path_for_authorization(
         Path(str(payload["execution_ledger_root"])),
@@ -1546,10 +1625,8 @@ def _validate_resume_status(
     if (
         status.get("schema") != CLAIM_SCHEMA
         or status.get("status") != "claimed"
-        or status.get("launch_authorization_sha256")
-        != payload["resume_of_authorization_sha256"]
-        or status.get("authorization_id_sha256")
-        != payload["resume_of_authorization_id_sha256"]
+        or status.get("launch_authorization_sha256") != payload["resume_of_authorization_sha256"]
+        or status.get("authorization_id_sha256") != payload["resume_of_authorization_id_sha256"]
         or status.get("authorization_nonce_sha256")
         != payload["resume_of_authorization_nonce_sha256"]
         or status.get("bootstrap_execution_authorization_sha256")
@@ -1557,6 +1634,56 @@ def _validate_resume_status(
         or status.get("replay_scope") != payload["resume_of_replay_scope"]
     ):
         raise FormalSupervisorError("resume status rejected")
+    nonce_key = hashlib.sha256(
+        _canonical_bytes(
+            {
+                "authorization_nonce_sha256": payload["resume_of_authorization_nonce_sha256"],
+                "replay_scope": payload["resume_of_replay_scope"],
+            }
+        )
+    ).hexdigest()
+    tuple_paths = (
+        _ledger_path(
+            Path(str(payload["execution_ledger_root"])),
+            "bootstrap_authorizations",
+            str(payload["resume_of_bootstrap_execution_authorization_sha256"]),
+        ),
+        _ledger_path(
+            Path(str(payload["execution_ledger_root"])),
+            "authorization_ids",
+            str(payload["resume_of_authorization_id_sha256"]),
+        ),
+        _ledger_path(
+            Path(str(payload["execution_ledger_root"])),
+            "authorization_nonces",
+            nonce_key,
+        ),
+    )
+    for tuple_path in tuple_paths:
+        tuple_handle = _HeldFile(
+            tuple_path,
+            expected_sha256=expected_sha256,
+            label="resume replay tuple",
+            max_bytes=_MAX_AUTHORIZATION_BYTES,
+        )
+        stack.callback(tuple_handle.close)
+        if tuple_handle.raw != held.raw:
+            raise FormalSupervisorError("resume replay tuple rejected")
+
+
+def _reject_completed_resume(payload: Mapping[str, Any]) -> None:
+    if payload.get("action") != "resume":
+        return
+    ledger_root = _absolute_path(
+        payload.get("execution_ledger_root"),
+        label="execution ledger root",
+    )
+    original_sha256 = _require_sha256(
+        payload.get("resume_of_authorization_sha256"),
+        label="resume original authorization",
+    )
+    if completed_path_for_authorization(ledger_root, original_sha256).exists():
+        raise FormalSupervisorError("completed authorization cannot be resumed")
 
 
 def _supervise_with_pins(
@@ -1660,9 +1787,7 @@ def _supervise_with_pins(
             "formal_output_root",
             "run_root",
         ):
-            stack.enter_context(
-                _held_directory_chain(Path(str(payload[field])))
-            )
+            stack.enter_context(_held_directory_chain(Path(str(payload[field]))))
         worker_handle = _HeldFile(
             Path(str(payload["bootstrap_worker_path"])),
             expected_sha256=str(payload["bootstrap_worker_sha256"]),
@@ -1684,13 +1809,20 @@ def _supervise_with_pins(
             max_bytes=_MAX_AUTHORIZATION_BYTES,
         )
         stack.callback(run_spec_handle.close)
-        stdlib_manifest_handle = _HeldFile(
-            Path(str(payload["stdlib_inventory_manifest_path"])),
-            expected_sha256=str(payload["stdlib_inventory_manifest_sha256"]),
-            label="stdlib inventory manifest",
+        bootstrap_authorization_handle = _HeldFile(
+            Path(str(payload["bootstrap_execution_authorization_path"])),
+            expected_sha256=str(payload["bootstrap_execution_authorization_sha256"]),
+            label="bootstrap execution authorization",
             max_bytes=_MAX_AUTHORIZATION_BYTES,
         )
-        stack.callback(stdlib_manifest_handle.close)
+        stack.callback(bootstrap_authorization_handle.close)
+        stdlib_policy_handle = _HeldFile(
+            Path(str(payload["stdlib_policy_path"])),
+            expected_sha256=str(payload["stdlib_policy_sha256"]),
+            label="stdlib policy",
+            max_bytes=_MAX_AUTHORIZATION_BYTES,
+        )
+        stack.callback(stdlib_policy_handle.close)
         _validate_cas_path(
             Path(str(payload["bootstrap_worker_path"])),
             str(payload["bootstrap_worker_sha256"]),
@@ -1706,11 +1838,18 @@ def _supervise_with_pins(
             label="publication completion marker",
         )
         _validate_cas_path(
-            Path(str(payload["stdlib_inventory_manifest_path"])),
-            str(payload["stdlib_inventory_manifest_sha256"]),
-            category="stdlib_inventories",
+            Path(str(payload["bootstrap_execution_authorization_path"])),
+            str(payload["bootstrap_execution_authorization_sha256"]),
+            category="execution-authorizations",
             suffix=".json",
-            label="stdlib inventory manifest",
+            label="bootstrap execution authorization",
+        )
+        _validate_cas_path(
+            Path(str(payload["stdlib_policy_path"])),
+            str(payload["stdlib_policy_sha256"]),
+            category="stdlib_policies",
+            suffix=".json",
+            label="stdlib policy",
         )
         bootstrap_root = Path(str(payload["bootstrap_output_root"]))
         expected_worker_path = (
@@ -1727,13 +1866,10 @@ def _supervise_with_pins(
             / str(payload["publication_completion_marker_sha256"])[:2]
             / f"{payload['publication_completion_marker_sha256']}.json"
         )
-        if (
-            os.path.normcase(str(expected_worker_path))
-            != os.path.normcase(str(payload["bootstrap_worker_path"]))
-            or os.path.normcase(str(expected_completion_path))
-            != os.path.normcase(
-                str(payload["publication_completion_marker_path"])
-            )
+        if os.path.normcase(str(expected_worker_path)) != os.path.normcase(
+            str(payload["bootstrap_worker_path"])
+        ) or os.path.normcase(str(expected_completion_path)) != os.path.normcase(
+            str(payload["publication_completion_marker_path"])
         ):
             raise FormalSupervisorError("bootstrap publication root rejected")
         completion = _validated_publication_completion(
@@ -1741,9 +1877,7 @@ def _supervise_with_pins(
             payload=payload,
             public_der=public_der,
         )
-        receipt_path = bootstrap_root / Path(
-            *str(completion["receipt_relative_path"]).split("/")
-        )
+        receipt_path = bootstrap_root / Path(*str(completion["receipt_relative_path"]).split("/"))
         receipt_handle = _HeldFile(
             receipt_path,
             expected_sha256=str(completion["receipt_sha256"]),
@@ -1755,11 +1889,19 @@ def _supervise_with_pins(
             receipt_handle.raw,
             completion=completion,
         )
-        if completion["bootstrap_bytes"] != len(worker_handle.raw):
+        if completion["bootstrap_bytes"] != len(worker_handle.raw) or completion[
+            "stdlib_policy_bytes"
+        ] != len(stdlib_policy_handle.raw):
             raise FormalSupervisorError("publication completion marker rejected")
-        stdlib_handles = _hold_stdlib_inventory(
-            stdlib_manifest_handle.raw,
+        authorization = _validated_bootstrap_execution_authorization(
+            bootstrap_authorization_handle.raw,
             payload=payload,
+            public_der=public_der,
+        )
+        stdlib_handles = _hold_stdlib_inventory(
+            stdlib_policy_handle.raw,
+            payload=payload,
+            authorization=authorization,
             stack=stack,
         )
         _validate_resume_status(payload, stack)
@@ -1822,9 +1964,7 @@ def _supervise_with_pins(
                     hashlib.sha256(
                         _canonical_bytes(
                             {
-                                "authorization_nonce_sha256": payload[
-                                    "authorization_nonce_sha256"
-                                ],
+                                "authorization_nonce_sha256": payload["authorization_nonce_sha256"],
                                 "replay_scope": payload["replay_scope"],
                             }
                         )
@@ -1848,6 +1988,7 @@ def _supervise_with_pins(
             environment=worker_environment,
             timeout_seconds=int(payload["worker_timeout_seconds"]),
         )
+        _reject_completed_resume(payload)
         if (
             _contains_secret(
                 stdout + stderr,
@@ -1881,7 +2022,8 @@ def _supervise_with_pins(
             completion_handle,
             receipt_handle,
             run_spec_handle,
-            stdlib_manifest_handle,
+            bootstrap_authorization_handle,
+            stdlib_policy_handle,
             *stdlib_handles,
             *artifact_handles,
             *ledger_handles,
@@ -1910,6 +2052,7 @@ def _supervise_with_pins(
         for handle in terminal_handles:
             handle.postverify()
         ledger_chain.postverify()
+        _reject_completed_resume(payload)
         _write_all(1, stdout, writer=output_writer)
         for handle in terminal_handles:
             handle.postverify()

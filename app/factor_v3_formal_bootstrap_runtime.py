@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Iterator, Mapping
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout
 import ctypes
 from ctypes import wintypes
 from datetime import datetime, timezone
@@ -25,10 +25,10 @@ import sys
 import tempfile
 from types import MappingProxyType, ModuleType
 from typing import Any
-import zipimport
 
 
 _EMBEDDED_CONFIG_JSON: bytes | None = None
+_EMBEDDED_CONTROL_CONTRACT_JSON: bytes | None = None
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _LOADER_IDENTITY = "factor-v3-verified-source-loader/v1"
@@ -44,39 +44,6 @@ _MAX_OUTPUT_BYTES = 1024 * 1024
 _MAX_EXECUTION_AUTHORIZATION_LIFETIME_SECONDS = 24 * 60 * 60
 _REPARSE_ATTRIBUTE = 0x00000400
 _EXECUTION_AUTHORIZATION_KEY_ROLE = "factor-v3-bootstrap-execution-authorization"
-_EXECUTION_REPLAY_SCOPE = "factor-v3-formal-bootstrap-execution/v1"
-_STDLIB_POLICY_SCHEMA = "factor-v3-bootstrap-stdlib-binding/v1"
-_SUPERVISOR_PROTOCOL = "factor-v3-formal-supervisor-worker/v1"
-_WORKER_TERMINAL_SCHEMA = "factor-v3-formal-bootstrap-worker-terminal/v1"
-_SUPERVISOR_PUBLIC_ENVIRONMENT = frozenset({"SYSTEMROOT", "WINDIR", "TEMP", "TMP"})
-_SUPERVISOR_FIXED_ENVIRONMENT = frozenset(
-    {
-        "FACTOR_V3_FORMAL_LAUNCH_ACTION",
-        "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256",
-        "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL",
-        "FACTOR_V3_FORMAL_STDLIB_PRELOCKED_ROOT_SHA256",
-    }
-)
-_SUPERVISOR_ACTION_SECRET_ENVIRONMENT = {
-    "build-spec": frozenset(),
-    "resume": frozenset({"JIAOCH_TOKEN"}),
-    "run": frozenset({"JIAOCH_TOKEN"}),
-    "verify": frozenset(),
-}
-_WORKER_TERMINAL_FIELDS = frozenset(
-    {
-        "artifacts",
-        "authorization_nonce_sha256",
-        "bootstrap_execution_authorization_sha256",
-        "launch_action",
-        "launch_authorization_sha256",
-        "result",
-        "schema",
-        "status",
-        "stdlib_inventory_root_sha256",
-        "worker_action",
-    }
-)
 _OS_WRITE = os.write
 _OS_CLOSE = os.close
 _OS_DUP2 = os.dup2
@@ -84,6 +51,17 @@ _OS_DUP2 = os.dup2
 
 class _BootstrapError(RuntimeError):
     pass
+
+
+def _control_contract() -> dict[str, Any]:
+    if _EMBEDDED_CONTROL_CONTRACT_JSON is None:
+        from app.factor_v3_formal_control_contract import control_contract_descriptor
+
+        return control_contract_descriptor()
+    return _strict_canonical_json(
+        _EMBEDDED_CONTROL_CONTRACT_JSON,
+        label="embedded control contract",
+    )
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -204,7 +182,7 @@ def _validated_replay_claim(
     expires = _parsed_utc(value.get("expires_at_utc"), label="expires at")
     current = datetime.now(timezone.utc) if now_utc is None else now_utc
     if (
-        value.get("replay_scope") != _EXECUTION_REPLAY_SCOPE
+        value.get("replay_scope") != _control_contract()["execution_replay_scope"]
         or not_before < issued
         or expires <= not_before
         or current < not_before
@@ -256,22 +234,29 @@ def _validated_supervisor_environment(
         if normalized in canonical:
             raise _BootstrapError("supervisor environment rejected")
         canonical[normalized] = value
+    descriptor = _control_contract()
+    protocol = descriptor["worker_protocol"]
+    action_mapping = descriptor["worker_action_by_launch_action"]
+    fixed_environment = frozenset(protocol["fixed_environment"])
+    public_environment = frozenset(protocol["public_environment"])
+    action_secrets = {
+        key: frozenset(value) for key, value in protocol["action_secret_environment"].items()
+    }
     launch_action = canonical.get("FACTOR_V3_FORMAL_LAUNCH_ACTION")
-    expected_worker_action = "run" if launch_action == "resume" else launch_action
+    expected_worker_action = action_mapping.get(str(launch_action))
     if expected_worker_action != worker_action:
         raise _BootstrapError("supervisor environment action rejected")
-    expected_secrets = _SUPERVISOR_ACTION_SECRET_ENVIRONMENT.get(str(launch_action))
+    expected_secrets = action_secrets.get(str(launch_action))
     if expected_secrets is None:
         raise _BootstrapError("supervisor environment action rejected")
     names = set(canonical)
-    allowed = _SUPERVISOR_PUBLIC_ENVIRONMENT | _SUPERVISOR_FIXED_ENVIRONMENT | expected_secrets
+    allowed = public_environment | fixed_environment | expected_secrets
     if (
-        not _SUPERVISOR_FIXED_ENVIRONMENT.issubset(names)
+        not fixed_environment.issubset(names)
         or names - allowed
         or names & {"JIAOCH_TOKEN"} != expected_secrets
-        or canonical.get("FACTOR_V3_FORMAL_LAUNCH_PROTOCOL") != _SUPERVISOR_PROTOCOL
-        or _SHA256_RE.fullmatch(str(canonical.get("FACTOR_V3_FORMAL_STDLIB_PRELOCKED_ROOT_SHA256")))
-        is None
+        or canonical.get("FACTOR_V3_FORMAL_LAUNCH_PROTOCOL") != protocol["protocol"]
+        or _SHA256_RE.fullmatch(str(canonical.get(descriptor["stdlib_root_environment"]))) is None
         or _SHA256_RE.fullmatch(str(canonical.get("FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256")))
         is None
     ):
@@ -370,29 +355,19 @@ def _canonical_worker_terminal_frame(
             "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256"
         ],
         "result": result,
-        "schema": _WORKER_TERMINAL_SCHEMA,
+        "schema": _control_contract()["worker_protocol"]["terminal_schema"],
         "status": "completed",
-        "stdlib_inventory_root_sha256": config["stdlib_policy"]["inventory_root_sha256"],
+        "stdlib_inventory_root_sha256": config["stdlib_policy_root_sha256"],
         "worker_action": config["action"],
     }
-    if set(frame) != _WORKER_TERMINAL_FIELDS:
+    if set(frame) != set(_control_contract()["worker_protocol"]["terminal_fields"]):
         raise _BootstrapError("worker terminal frame rejected")
     _reject_credential_shape(frame)
     return _canonical_bytes(frame) + b"\n"
 
 
 def _supervisor_protocol_descriptor() -> dict[str, Any]:
-    return {
-        "action_secret_environment": {
-            key: sorted(value)
-            for key, value in sorted(_SUPERVISOR_ACTION_SECRET_ENVIRONMENT.items())
-        },
-        "fixed_environment": sorted(_SUPERVISOR_FIXED_ENVIRONMENT),
-        "protocol": _SUPERVISOR_PROTOCOL,
-        "public_environment": sorted(_SUPERVISOR_PUBLIC_ENVIRONMENT),
-        "terminal_fields": sorted(_WORKER_TERMINAL_FIELDS),
-        "terminal_schema": _WORKER_TERMINAL_SCHEMA,
-    }
+    return dict(_control_contract()["worker_protocol"])
 
 
 def _is_reparse(path: Path) -> bool:
@@ -828,6 +803,7 @@ class _TrustedBootstrapContext:
         *,
         action_config: _FrozenActionConfig,
         finder: _VerifiedSourceFinder,
+        stdlib_finder: _ManifestStdlibFinder,
         handles: list[_HeldFile],
         loaded_ledger: dict[str, dict[str, Any]],
         module_entries: Mapping[str, Mapping[str, Any]],
@@ -842,6 +818,7 @@ class _TrustedBootstrapContext:
         self._action_config = action_config
         self._action_config_sha256 = action_config._sha256
         self._finder = finder
+        self._stdlib_finder = stdlib_finder
         self._handles = handles
         self._loaded_ledger = loaded_ledger
         self._module_entries = {key: dict(value) for key, value in module_entries.items()}
@@ -919,7 +896,7 @@ class _TrustedBootstrapContext:
             self._finder,
             importlib.machinery.BuiltinImporter,
             importlib.machinery.FrozenImporter,
-            importlib.machinery.PathFinder,
+            self._stdlib_finder,
         )
         if tuple(sys.meta_path) != expected_meta_path:
             raise _BootstrapError("verified import policy drifted")
@@ -1208,61 +1185,97 @@ def _validated_stdlib_policy(
     value: Any,
     *,
     base_python_executable: Path,
+    expected_root_sha256: str,
 ) -> dict[str, Any]:
     base_root = _safe_existing_directory(
         base_python_executable.parent,
         label="base Python root",
     )
-    expected_paths = (
-        ("stdlib", base_root / "Lib"),
-        ("platstdlib", base_root / "DLLs"),
-        (
-            "stdlib_zip",
-            base_root / f"python{sys.version_info.major}{sys.version_info.minor}.zip",
-        ),
-    )
-    importer_policy = {
-        "bytecode_suffixes": list(importlib.machinery.BYTECODE_SUFFIXES),
-        "extension_suffixes": list(importlib.machinery.EXTENSION_SUFFIXES),
-        "finder": "FileFinder",
-        "source_suffixes": list(importlib.machinery.SOURCE_SUFFIXES),
-        "zip_finder": "zipimporter",
-    }
-    roots = []
-    for kind, path in expected_paths:
-        entries, inventory_sha256 = _stdlib_inventory(path, kind=kind)
-        roots.append(
-            {
-                "entries": entries,
-                "inventory_sha256": inventory_sha256,
-                "kind": kind,
-                "path": str(path),
-            }
-        )
-    authorization_policy = {
-        "importer_policy_sha256": hashlib.sha256(_canonical_bytes(importer_policy)).hexdigest(),
-        "inventory_root_sha256": hashlib.sha256(_canonical_bytes(roots)).hexdigest(),
-        "roots": roots,
-        "schema": "factor-v3-bootstrap-stdlib-policy/v1",
-        "supervisor_prelocked": True,
-    }
-    expected = {
-        "importer_policy_sha256": hashlib.sha256(_canonical_bytes(importer_policy)).hexdigest(),
-        "inventory_root_sha256": authorization_policy["inventory_root_sha256"],
-        "roots": [
-            {
-                "inventory_sha256": root["inventory_sha256"],
-                "kind": root["kind"],
-                "path": root["path"],
-            }
-            for root in roots
-        ],
-        "schema": _STDLIB_POLICY_SCHEMA,
-        "supervisor_prelocked": True,
-    }
-    if value != expected:
+    if (
+        type(value) is not dict
+        or set(value) != {"absent_paths", "entries", "pycache_prefix", "roots", "schema"}
+        or value.get("schema") != _control_contract()["stdlib_policy_schema"]
+        or type(value.get("roots")) is not list
+        or type(value.get("entries")) is not list
+        or type(value.get("absent_paths")) is not list
+        or hashlib.sha256(_canonical_bytes(value)).hexdigest() != expected_root_sha256
+    ):
         raise _BootstrapError("stdlib policy rejected")
-    return authorization_policy
+    expected_roots = [
+        {"path": str(base_root / "DLLs"), "role": "platstdlib"},
+        {"path": str(base_root / "Lib"), "role": "stdlib"},
+    ]
+    expected_roots.sort(key=lambda item: (os.path.normcase(item["path"]), item["path"]))
+    if value["roots"] != expected_roots:
+        raise _BootstrapError("stdlib roots rejected")
+    root_paths = {item["path"] for item in expected_roots}
+    normalized_entries: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    seen_modules: set[str] = set()
+    for item in value["entries"]:
+        if type(item) is not dict or set(item) != {
+            "bytes",
+            "is_package",
+            "kind",
+            "module",
+            "path",
+            "relative_path",
+            "root",
+            "sha256",
+        }:
+            raise _BootstrapError("stdlib entry rejected")
+        root = str(item.get("root"))
+        path = _safe_absolute_path(item.get("path"), label="stdlib entry path")
+        relative_path = item.get("relative_path")
+        kind = item.get("kind")
+        module = item.get("module")
+        byte_count = item.get("bytes")
+        is_package = item.get("is_package")
+        digest = item.get("sha256")
+        if (
+            root not in root_paths
+            or type(relative_path) is not str
+            or not relative_path
+            or "\\" in relative_path
+            or any(part in {"", ".", ".."} for part in relative_path.split("/"))
+            or os.path.normcase(str(Path(root) / Path(*relative_path.split("/"))))
+            != os.path.normcase(str(path))
+            or kind not in {"dll", "extension", "source"}
+            or type(byte_count) is not int
+            or isinstance(byte_count, bool)
+            or byte_count < 0
+            or type(is_package) is not bool
+            or _SHA256_RE.fullmatch(str(digest)) is None
+            or os.path.normcase(str(path)) in seen_paths
+        ):
+            raise _BootstrapError("stdlib entry rejected")
+        if kind == "dll":
+            if module is not None or is_package:
+                raise _BootstrapError("stdlib DLL entry rejected")
+        elif type(module) is not str or not module or module in seen_modules:
+            raise _BootstrapError("stdlib module entry rejected")
+        raw = _read_inventory_file(path, label="stdlib entry")
+        if len(raw) != byte_count or hashlib.sha256(raw).hexdigest() != digest:
+            raise _BootstrapError("stdlib entry identity rejected")
+        normalized_entries.append(dict(item))
+        seen_paths.add(os.path.normcase(str(path)))
+        if module is not None:
+            seen_modules.add(str(module))
+    if not normalized_entries or normalized_entries != sorted(
+        normalized_entries,
+        key=lambda item: (os.path.normcase(str(item["path"])), str(item["path"])),
+    ):
+        raise _BootstrapError("stdlib entry ordering rejected")
+    expected_zip = base_root / f"python{sys.version_info.major}{sys.version_info.minor}.zip"
+    if value["absent_paths"] != [str(expected_zip)] or expected_zip.exists():
+        raise _BootstrapError("stdlib absent path rejected")
+    pycache = _safe_existing_directory(
+        _safe_absolute_path(value.get("pycache_prefix"), label="signed pycache prefix"),
+        label="signed pycache prefix",
+    )
+    if next(pycache.iterdir(), None) is not None:
+        raise _BootstrapError("signed pycache prefix rejected")
+    return dict(value)
 
 
 def _validated_config() -> dict[str, Any]:
@@ -1286,6 +1299,7 @@ def _validated_config() -> dict[str, Any]:
         "bootstrap_output_root",
         "builder_relative_path",
         "builder_sha256",
+        "control_contract_descriptor_sha256",
         "expected_branch",
         "expected_commit",
         "execution_authorization_path",
@@ -1324,6 +1338,7 @@ def _validated_config() -> dict[str, Any]:
         "source_manifest",
         "source_root_sha256",
         "stdlib_policy",
+        "stdlib_policy_root_sha256",
         "supervisor_protocol",
     }
     _reject_credential_shape(config)
@@ -1349,6 +1364,7 @@ def _validated_config() -> dict[str, Any]:
         "authorization_nonce_sha256",
         "bootstrap_claim_sha256",
         "builder_sha256",
+        "control_contract_descriptor_sha256",
         "execution_authorization_public_key_spki_sha256",
         "execution_authorization_sha256",
         "feature_attestation_sha256",
@@ -1364,6 +1380,7 @@ def _validated_config() -> dict[str, Any]:
         "runtime_template_sha256",
         "shim_sha256",
         "source_root_sha256",
+        "stdlib_policy_root_sha256",
     ):
         _require_sha256(config.get(field), label=field)
     _validated_replay_claim(
@@ -1425,11 +1442,14 @@ def _validated_config() -> dict[str, Any]:
             config["review_public_key_spki_sha256"],
         )
         or config.get("supervisor_protocol") != _supervisor_protocol_descriptor()
+        or config.get("control_contract_descriptor_sha256")
+        != hashlib.sha256(_canonical_bytes(_control_contract())).hexdigest()
     ):
         raise _BootstrapError("embedded authorization policy rejected")
     config["_authorization_stdlib_policy"] = _validated_stdlib_policy(
         config.get("stdlib_policy"),
         base_python_executable=Path(str(config["base_python_executable_path"])),
+        expected_root_sha256=str(config["stdlib_policy_root_sha256"]),
     )
     return config
 
@@ -1637,6 +1657,7 @@ def _validate_execution_authorization(
         "bootstrap_output_root": config["bootstrap_output_root"],
         "builder_relative_path": config["builder_relative_path"],
         "builder_sha256": config["builder_sha256"],
+        "control_contract_descriptor_sha256": config["control_contract_descriptor_sha256"],
         "expected_branch": config["expected_branch"],
         "expected_commit": config["expected_commit"],
         "execution_authorization_key_id": config["execution_authorization_key_id"],
@@ -1672,6 +1693,7 @@ def _validate_execution_authorization(
         "source_manifest": config["source_manifest"],
         "source_root_sha256": config["source_root_sha256"],
         "stdlib_policy": config["_authorization_stdlib_policy"],
+        "stdlib_policy_root_sha256": config["stdlib_policy_root_sha256"],
         "supervisor_protocol": config["supervisor_protocol"],
     }
     if outer.get("payload") != expected_payload:
@@ -1726,65 +1748,116 @@ def _module_entries(
     return entries, source_bytes
 
 
+class _ManifestSourceLoader(importlib.abc.Loader):
+    def __init__(self, entry: Mapping[str, Any], raw: bytes) -> None:
+        self._entry = dict(entry)
+        self._raw = raw
+
+    def create_module(self, spec: Any) -> None:
+        return None
+
+    def exec_module(self, module: ModuleType) -> None:
+        path = str(self._entry["path"])
+        try:
+            code = compile(self._raw, path, "exec", dont_inherit=True, optimize=0)
+        except (SyntaxError, ValueError) as exc:
+            raise _BootstrapError("manifest stdlib source rejected") from exc
+        module.__file__ = path
+        module.__loader__ = self
+        if self._entry["is_package"]:
+            module.__package__ = str(self._entry["module"])
+            module.__path__ = [str(Path(path).parent)]
+        exec(code, module.__dict__)
+
+
+class _ManifestStdlibFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, entries: tuple[Mapping[str, Any], ...]) -> None:
+        self._entries = {
+            str(entry["module"]): dict(entry) for entry in entries if entry["module"] is not None
+        }
+
+    def find_spec(
+        self,
+        fullname: str,
+        path: object = None,
+        target: object = None,
+    ) -> Any:
+        del path, target
+        entry = self._entries.get(fullname)
+        if entry is None:
+            return None
+        entry_path = Path(str(entry["path"]))
+        raw = _read_inventory_file(entry_path, label="manifest stdlib import")
+        if len(raw) != entry["bytes"] or hashlib.sha256(raw).hexdigest() != entry["sha256"]:
+            raise _BootstrapError("manifest stdlib import identity rejected")
+        if entry["kind"] == "source":
+            loader = _ManifestSourceLoader(entry, raw)
+            return importlib.util.spec_from_loader(
+                fullname,
+                loader,
+                origin=str(entry_path),
+                is_package=bool(entry["is_package"]),
+            )
+        if entry["kind"] == "extension":
+            loader = importlib.machinery.ExtensionFileLoader(fullname, str(entry_path))
+            return importlib.util.spec_from_file_location(
+                fullname,
+                str(entry_path),
+                loader=loader,
+            )
+        return None
+
+
+def _validate_preloaded_stdlib_tcb(stdlib_policy: Mapping[str, Any]) -> None:
+    roots = tuple(Path(str(item["path"])) for item in stdlib_policy["roots"])
+    entries = {os.path.normcase(str(item["path"])): item for item in stdlib_policy["entries"]}
+    for name, module in tuple(sys.modules.items()):
+        if module is None or name == "__main__":
+            continue
+        spec = getattr(module, "__spec__", None)
+        origin = getattr(spec, "origin", None)
+        loader = getattr(module, "__loader__", None)
+        if origin in {"built-in", "frozen"} or loader in {
+            importlib.machinery.BuiltinImporter,
+            importlib.machinery.FrozenImporter,
+        }:
+            continue
+        module_file = getattr(module, "__file__", None)
+        if type(module_file) is not str:
+            continue
+        path = Path(module_file)
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError:
+            raise _BootstrapError("preloaded stdlib TCB rejected") from None
+        if not any(_path_within(resolved, (root,)) for root in roots):
+            raise _BootstrapError("preloaded filesystem module rejected")
+        entry = entries.get(os.path.normcase(str(resolved)))
+        raw = _read_inventory_file(resolved, label="preloaded stdlib TCB")
+        if (
+            entry is None
+            or len(raw) != entry["bytes"]
+            or hashlib.sha256(raw).hexdigest() != entry["sha256"]
+        ):
+            raise _BootstrapError("preloaded stdlib TCB rejected")
+
+
 def _freeze_stdlib_import_boundary(
     *,
     stdlib_policy: Mapping[str, Any],
-) -> tuple[tuple[str, ...], tuple[Any, ...], dict[str, Any]]:
+) -> tuple[_ManifestStdlibFinder, tuple[str, ...], tuple[Any, ...], dict[str, Any]]:
     if (
         type(stdlib_policy) is not dict
-        or stdlib_policy.get("schema") != _STDLIB_POLICY_SCHEMA
-        or type(stdlib_policy.get("roots")) is not list
+        or stdlib_policy.get("schema") != _control_contract()["stdlib_policy_schema"]
+        or type(stdlib_policy.get("entries")) is not list
     ):
         raise _BootstrapError("stdlib import policy rejected")
-    root_entries = tuple(stdlib_policy["roots"])
-    if [item.get("kind") for item in root_entries] != [
-        "stdlib",
-        "platstdlib",
-        "stdlib_zip",
-    ]:
-        raise _BootstrapError("stdlib import policy rejected")
-    roots = tuple(
-        Path(str(item["path"]))
-        for item in root_entries
-        if item["kind"] != "stdlib_zip" or Path(str(item["path"])).is_file()
-    )
-    if not roots:
-        raise _BootstrapError("stdlib import roots rejected")
-    file_finder_hook = importlib.machinery.FileFinder.path_hook(
-        (
-            importlib.machinery.SourceFileLoader,
-            importlib.machinery.SOURCE_SUFFIXES,
-        ),
-        (
-            importlib.machinery.SourcelessFileLoader,
-            importlib.machinery.BYTECODE_SUFFIXES,
-        ),
-        (
-            importlib.machinery.ExtensionFileLoader,
-            importlib.machinery.EXTENSION_SUFFIXES,
-        ),
-    )
-    hooks = (zipimport.zipimporter, file_finder_hook)
-    import_path = tuple(str(path) for path in roots)
-    cache: dict[str, Any] = {}
-    for entry, path in zip(
-        (
-            item
-            for item in root_entries
-            if item["kind"] != "stdlib_zip" or Path(str(item["path"])).is_file()
-        ),
-        roots,
-        strict=True,
-    ):
-        if entry["kind"] == "stdlib_zip":
-            cache[str(path)] = zipimport.zipimporter(str(path))
-        else:
-            cache[str(path)] = file_finder_hook(str(path))
-    sys.path = list(import_path)
-    sys.path_hooks = list(hooks)
+    _validate_preloaded_stdlib_tcb(stdlib_policy)
+    finder = _ManifestStdlibFinder(tuple(stdlib_policy["entries"]))
+    sys.path = []
+    sys.path_hooks = []
     sys.path_importer_cache.clear()
-    sys.path_importer_cache.update(cache)
-    return import_path, hooks, cache
+    return finder, (), (), {}
 
 
 def _capture_fd_output(callback: Any) -> Any:
@@ -1921,10 +1994,12 @@ def _trusted_run() -> bytes:
         or type(sys.argv) is not list
         or len(sys.argv) != 1
         or type(sys.orig_argv) is not list
-        or len(sys.orig_argv) != 5
-        or sys.orig_argv[1:4] != ["-I", "-B", "-S"]
-        or type(sys.orig_argv[4]) is not str
-        or sys.argv != [sys.orig_argv[4]]
+        or len(sys.orig_argv) != 7
+        or sys.orig_argv[1:5] != ["-I", "-B", "-S", "-X"]
+        or type(sys.orig_argv[5]) is not str
+        or not sys.orig_argv[5].startswith("pycache_prefix=")
+        or type(sys.orig_argv[6]) is not str
+        or sys.argv != [sys.orig_argv[6]]
         or sys.flags.isolated != 1
         or sys.flags.ignore_environment != 1
         or sys.flags.no_user_site != 1
@@ -1942,7 +2017,7 @@ def _trusted_run() -> bytes:
         or sys.flags.dont_write_bytecode != 1
         or sys.dont_write_bytecode is not True
         or sys.flags.no_site != 1
-        or sys._xoptions != {}
+        or set(sys._xoptions) != {"pycache_prefix"}
         or sys.warnoptions != []
         or any(
             name == "app"
@@ -1960,8 +2035,8 @@ def _trusted_run() -> bytes:
         worker_action=str(config["action"]),
     )
     if (
-        supervisor_environment["FACTOR_V3_FORMAL_STDLIB_PRELOCKED_ROOT_SHA256"]
-        != config["stdlib_policy"]["inventory_root_sha256"]
+        supervisor_environment[_control_contract()["stdlib_root_environment"]]
+        != config["stdlib_policy_root_sha256"]
     ):
         raise _BootstrapError("stdlib supervisor prelock rejected")
     python_path = Path(str(config["python_executable_path"]))
@@ -2021,14 +2096,20 @@ def _trusted_run() -> bytes:
         raise _BootstrapError("embedded public key rejected") from None
     handles: list[_HeldFile] = []
     result: bytes | None = None
-    with tempfile.TemporaryDirectory(prefix="factor-v3-external-bootstrap-pycache-") as temporary:
+    signed_pycache_prefix = str(config["stdlib_policy"]["pycache_prefix"])
+    if (
+        sys.orig_argv[5] != f"pycache_prefix={signed_pycache_prefix}"
+        or sys._xoptions != {"pycache_prefix": signed_pycache_prefix}
+        or sys.pycache_prefix != signed_pycache_prefix
+    ):
+        raise _BootstrapError("signed pycache runtime rejected")
+    with nullcontext(signed_pycache_prefix) as temporary:
         cache_root = _safe_existing_directory(
             Path(temporary),
             label="isolated pycache",
         )
         if next(cache_root.iterdir(), None) is not None:
             raise _BootstrapError("isolated pycache rejected")
-        sys.pycache_prefix = str(cache_root)
         with ExitStack() as stack:
             _open_held(
                 stack,
@@ -2191,21 +2272,25 @@ def _trusted_run() -> bytes:
                 nonce=nonce,
                 source_registry=source_registry,
             )
+            (
+                stdlib_finder,
+                import_path,
+                path_hooks,
+                importer_cache,
+            ) = _freeze_stdlib_import_boundary(stdlib_policy=config["stdlib_policy"])
             sys.meta_path = [
                 finder,
                 importlib.machinery.BuiltinImporter,
                 importlib.machinery.FrozenImporter,
-                importlib.machinery.PathFinder,
+                stdlib_finder,
             ]
-            import_path, path_hooks, importer_cache = _freeze_stdlib_import_boundary(
-                stdlib_policy=config["stdlib_policy"]
-            )
             stdout_sink = _BoundedTextSink()
             stderr_sink = _BoundedTextSink()
             action_config = _FrozenActionConfig(config)
             context = _TrustedBootstrapContext(
                 action_config=action_config,
                 finder=finder,
+                stdlib_finder=stdlib_finder,
                 handles=handles,
                 loaded_ledger=loaded_ledger,
                 module_entries=entries,

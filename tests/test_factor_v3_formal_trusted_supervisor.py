@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from app import factor_v3_formal_trusted_supervisor as supervisor
+from app import factor_v3_formal_control_contract as contract
 from tests.test_factor_v3_formal_bootstrap_renderer import _GIT, _OPENSSL
 
 
@@ -237,29 +238,71 @@ def _fixture(
     artifact_raw = _canonical_bytes({"status": "verified"})
     authorization_id_sha256 = _sha256(b"supervisor-test-authorization-id")
     authorization_nonce_sha256 = _sha256(b"supervisor-test-nonce")
-    bootstrap_execution_authorization_sha256 = _sha256(b"bootstrap-execution-authorization")
     replay_scope = "factor-v3-formal-bootstrap-execution/v1"
-    stdlib_path = (tmp_path / "frozen-stdlib-fixture.py").resolve()
+    fake_python_root = (tmp_path / "fake-python").resolve()
+    stdlib_root = fake_python_root / "Lib"
+    platstdlib_root = fake_python_root / "DLLs"
+    pycache_prefix = (tmp_path / "signed-empty-pycache").resolve()
+    for directory in (stdlib_root, platstdlib_root, pycache_prefix):
+        directory.mkdir(parents=True)
+    stdlib_path = (stdlib_root / "frozen_stdlib_fixture.py").resolve()
     stdlib_path.write_bytes(b"STDLIB_FIXTURE = True\n")
     stdlib_entry = {
         "bytes": stdlib_path.stat().st_size,
+        "is_package": False,
+        "kind": "source",
+        "module": "frozen_stdlib_fixture",
         "path": str(stdlib_path),
+        "relative_path": "frozen_stdlib_fixture.py",
+        "root": str(stdlib_root),
         "sha256": _file_sha256(stdlib_path),
     }
-    stdlib_entries = [stdlib_entry]
-    stdlib_inventory_root_sha256 = _sha256(_canonical_bytes(stdlib_entries))
-    stdlib_manifest_raw = _canonical_bytes(
+    stdlib_policy = contract.canonical_stdlib_policy(
+        roots=[
+            {"path": str(platstdlib_root), "role": "platstdlib"},
+            {"path": str(stdlib_root), "role": "stdlib"},
+        ],
+        entries=[stdlib_entry],
+        absent_paths=[str(fake_python_root / "python311.zip")],
+        pycache_prefix=str(pycache_prefix),
+    )
+    stdlib_inventory_root_sha256 = contract.stdlib_policy_root_sha256(stdlib_policy)
+    stdlib_policy_raw = _canonical_bytes(stdlib_policy)
+    stdlib_policy_path, stdlib_policy_sha256 = _cas_write(
+        bootstrap_output_root,
+        "stdlib_policies",
+        stdlib_policy_raw,
+        ".json",
+    )
+    bootstrap_authorization_payload = {
+        "action": worker_action,
+        "authorization_id_sha256": authorization_id_sha256,
+        "authorization_nonce_sha256": authorization_nonce_sha256,
+        "control_contract_descriptor_sha256": (contract.control_contract_descriptor_sha256()),
+        "replay_scope": replay_scope,
+        "stdlib_policy": stdlib_policy,
+        "stdlib_policy_root_sha256": stdlib_inventory_root_sha256,
+        "supervisor_protocol": contract.worker_protocol_descriptor(),
+    }
+    bootstrap_authorization_raw = _canonical_bytes(
         {
-            "entries": stdlib_entries,
-            "root_sha256": stdlib_inventory_root_sha256,
-            "schema": "factor-v3-formal-supervisor-stdlib-inventory/v1",
-            "supervisor_preloaded_stdlib_tcb": True,
+            "payload": bootstrap_authorization_payload,
+            "signature_base64": base64.b64encode(
+                _sign(
+                    execution_private,
+                    _canonical_bytes(bootstrap_authorization_payload),
+                    tmp_path / "execution-key",
+                )
+            ).decode("ascii"),
         }
     )
-    stdlib_manifest_path, stdlib_manifest_sha256 = _cas_write(
+    (
+        bootstrap_execution_authorization_path,
+        bootstrap_execution_authorization_sha256,
+    ) = _cas_write(
         tmp_path,
-        "stdlib_inventories",
-        stdlib_manifest_raw,
+        "execution-authorizations",
+        bootstrap_authorization_raw,
         ".json",
     )
     worker_raw = _worker_source(
@@ -300,20 +343,23 @@ def _fixture(
         "authorization_id_sha256": authorization_id_sha256,
         "authorization_nonce_sha256": authorization_nonce_sha256,
         "bootstrap_bytes": len(worker_raw),
-        "bootstrap_relative_path": worker_path.relative_to(
-            bootstrap_output_root
-        ).as_posix(),
+        "bootstrap_relative_path": worker_path.relative_to(bootstrap_output_root).as_posix(),
         "bootstrap_sha256": worker_sha256,
         "bootstrap_output_root": str(bootstrap_output_root),
+        "control_contract_descriptor_sha256": (contract.control_contract_descriptor_sha256()),
         "execution_authorization_sha256": bootstrap_execution_authorization_sha256,
         "receipt_bytes": publication_path.stat().st_size,
-        "receipt_relative_path": publication_path.relative_to(
-            bootstrap_output_root
-        ).as_posix(),
+        "receipt_relative_path": publication_path.relative_to(bootstrap_output_root).as_posix(),
         "receipt_sha256": publication_sha256,
         "runtime_template_sha256": publication_payload["runtime_template_sha256"],
-        "schema": "factor-v3-formal-bootstrap-publication-completion/v1",
+        "schema": contract.PUBLICATION_COMPLETION_SCHEMA,
         "status": "completed",
+        "stdlib_inventory_root_sha256": stdlib_inventory_root_sha256,
+        "stdlib_policy_bytes": len(stdlib_policy_raw),
+        "stdlib_policy_relative_path": stdlib_policy_path.relative_to(
+            bootstrap_output_root
+        ).as_posix(),
+        "stdlib_policy_sha256": stdlib_policy_sha256,
     }
     completion_raw = _canonical_bytes(
         {
@@ -338,12 +384,8 @@ def _fixture(
         base_python_executable_sha256=_file_sha256(base_python_path),
         bootstrap_completion_marker_path=str(completion_path),
         bootstrap_completion_marker_sha256=completion_sha256,
-        bootstrap_completion_schema=(
-            "factor-v3-formal-bootstrap-publication-completion/v1"
-        ),
-        execution_public_key_spki_der_base64=base64.b64encode(
-            execution_public_der
-        ).decode("ascii"),
+        bootstrap_completion_schema=contract.PUBLICATION_COMPLETION_SCHEMA,
+        execution_public_key_spki_der_base64=base64.b64encode(execution_public_der).decode("ascii"),
         execution_public_key_spki_sha256=_sha256(execution_public_der),
         git_executable_path=str(git_path),
         git_executable_sha256=_file_sha256(git_path),
@@ -353,8 +395,8 @@ def _fixture(
         supervisor_expected_commit=supervisor_expected_commit,
         supervisor_source_relative_path="app/factor_v3_formal_trusted_supervisor.py",
         supervisor_source_sha256=supervisor_source_sha256,
-        worker_protocol="factor-v3-formal-supervisor-worker/v2",
-        worker_terminal_schema="factor-v3-formal-bootstrap-worker-terminal/v2",
+        worker_protocol=contract.WORKER_PROTOCOL,
+        worker_terminal_schema=contract.WORKER_TERMINAL_SCHEMA,
     )
     now = datetime(2026, 7, 30, 12, 0, 0, tzinfo=timezone.utc)
     payload = {
@@ -363,12 +405,12 @@ def _fixture(
         "authorization_nonce_sha256": authorization_nonce_sha256,
         "base_python_executable_path": str(base_python_path),
         "base_python_executable_sha256": pins.base_python_executable_sha256,
-        "bootstrap_execution_authorization_sha256": (
-            bootstrap_execution_authorization_sha256
-        ),
+        "bootstrap_execution_authorization_sha256": (bootstrap_execution_authorization_sha256),
+        "bootstrap_execution_authorization_path": str(bootstrap_execution_authorization_path),
         "bootstrap_output_root": str(bootstrap_output_root),
         "bootstrap_worker_path": str(worker_path),
         "bootstrap_worker_sha256": worker_sha256,
+        "control_contract_descriptor_sha256": (contract.control_contract_descriptor_sha256()),
         "environment_policy": supervisor.WORKER_ENVIRONMENT_POLICY,
         "execution_key_id": f"sha256:{pins.execution_public_key_spki_sha256}",
         "execution_ledger_root": str(ledger_root),
@@ -401,12 +443,9 @@ def _fixture(
         "run_spec_sha256": _sha256(run_spec_raw),
         "schema": "factor-v3-formal-supervisor-launch-authorization/v1",
         "source_root_sha256": _sha256(b"reviewed-source-root"),
-        "stdlib_inventory_manifest_path": str(stdlib_manifest_path),
-        "stdlib_inventory_manifest_sha256": stdlib_manifest_sha256,
         "stdlib_inventory_root_sha256": stdlib_inventory_root_sha256,
-        "stdlib_inventory_schema": (
-            "factor-v3-formal-supervisor-stdlib-inventory/v1"
-        ),
+        "stdlib_policy_path": str(stdlib_policy_path),
+        "stdlib_policy_sha256": stdlib_policy_sha256,
         "supervisor_expected_commit": pins.supervisor_expected_commit,
         "supervisor_source_sha256": pins.supervisor_source_sha256,
         "worker_action": worker_action,
@@ -415,8 +454,11 @@ def _fixture(
             "-I",
             "-B",
             "-S",
+            "-X",
+            f"pycache_prefix={pycache_prefix}",
             str(worker_path),
         ],
+        "worker_pycache_prefix": str(pycache_prefix),
         "worker_protocol": pins.worker_protocol,
         "worker_terminal_schema": pins.worker_terminal_schema,
         "worker_timeout_seconds": 60,
@@ -489,9 +531,7 @@ def _rewrite_authorization(
 
 
 def test_public_entrypoint_has_no_key_or_argv_parameter() -> None:
-    parameters = inspect.signature(
-        supervisor.supervise_factor_v3_formal_execution
-    ).parameters
+    parameters = inspect.signature(supervisor.supervise_factor_v3_formal_execution).parameters
 
     assert tuple(parameters) == ("authorization_path",)
 
@@ -531,8 +571,9 @@ def test_supervisor_executes_exact_worker_and_publishes_one_terminal_frame(
     assert len(writes) == 1
     frame = json.loads(writes[0])
     assert frame["launch_authorization_sha256"] == result["launch_authorization_sha256"]
-    assert frame["bootstrap_execution_authorization_sha256"] == (
-        payload["bootstrap_execution_authorization_sha256"]
+    assert (
+        frame["bootstrap_execution_authorization_sha256"]
+        == (payload["bootstrap_execution_authorization_sha256"])
     )
     assert frame["status"] == "completed"
     assert "fixture-secret-must-never-be-logged" not in writes[0].decode("utf-8")
@@ -640,9 +681,7 @@ def test_signed_completion_marker_is_the_only_publication_selection_record(
 ) -> None:
     pins, payload, _authorization_path, environment, writes = _fixture(tmp_path)
     receipt_path = next(
-        Path(str(payload["bootstrap_output_root"])).glob(
-            "publication_receipts/sha256/*/*.json"
-        )
+        Path(str(payload["bootstrap_output_root"])).glob("publication_receipts/sha256/*/*.json")
     )
     payload["publication_completion_marker_path"] = str(receipt_path)
     payload["publication_completion_marker_sha256"] = _file_sha256(receipt_path)
@@ -752,10 +791,8 @@ def test_artifact_claim_and_completed_files_remain_held_through_success_output(
         ledger_root,
         authorization_sha256,
     )
-    stdlib_manifest = json.loads(
-        Path(str(payload["stdlib_inventory_manifest_path"])).read_text(encoding="utf-8")
-    )
-    stdlib_path = Path(str(stdlib_manifest["entries"][0]["path"]))
+    stdlib_policy = json.loads(Path(str(payload["stdlib_policy_path"])).read_text(encoding="utf-8"))
+    stdlib_path = Path(str(stdlib_policy["entries"][0]["path"]))
     blocked: list[bool] = []
 
     def writer(_descriptor: int, raw: bytes | memoryview) -> int:
@@ -786,7 +823,7 @@ def test_artifact_claim_and_completed_files_remain_held_through_success_output(
 @pytest.mark.parametrize(
     "field",
     (
-        "stdlib_inventory_manifest_sha256",
+        "stdlib_policy_sha256",
         "stdlib_inventory_root_sha256",
         "worker_protocol",
         "worker_terminal_schema",
