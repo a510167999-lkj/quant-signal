@@ -2082,6 +2082,19 @@ cleanup:
     return ok;
 }
 
+static void digest_to_ascii(
+    const unsigned char digest[32],
+    char output[65]
+) {
+    static const char digits[] = "0123456789abcdef";
+    size_t index;
+    for (index = 0; index < 32; ++index) {
+        output[index * 2] = digits[digest[index] >> 4];
+        output[index * 2 + 1] = digits[digest[index] & 15];
+    }
+    output[64] = '\0';
+}
+
 static int parse_production_candidate(
     const unsigned char *raw,
     DWORD raw_size,
@@ -2895,6 +2908,470 @@ static int validate_current_launch_payload(
         );
 }
 
+static int json_top_plain_string(
+    const unsigned char *payload,
+    size_t payload_size,
+    const char *name,
+    ByteSlice *value
+) {
+    ByteSlice json_value;
+    if (!json_top_field(payload, payload_size, name, &json_value)
+        || json_value.length < 2
+        || json_value.value[0] != '"'
+        || json_value.value[json_value.length - 1] != '"'
+        || memchr(
+            json_value.value + 1,
+            '\\',
+            json_value.length - 2
+        ) != NULL) {
+        return 0;
+    }
+    value->value = json_value.value + 1;
+    value->length = json_value.length - 2;
+    return 1;
+}
+
+static int json_top_strings_equal(
+    const SignedEnvelope *left,
+    const char *left_name,
+    const SignedEnvelope *right,
+    const char *right_name
+) {
+    ByteSlice left_value;
+    ByteSlice right_value;
+    return left != NULL
+        && right != NULL
+        && json_top_plain_string(
+            left->payload,
+            left->payload_size,
+            left_name,
+            &left_value
+        )
+        && json_top_plain_string(
+            right->payload,
+            right->payload_size,
+            right_name,
+            &right_value
+        )
+        && left_value.length == right_value.length
+        && memcmp(left_value.value, right_value.value, left_value.length) == 0;
+}
+
+static int validate_original_launch_payload(
+    const SignedEnvelope *original,
+    const ProductionCandidate *candidate
+) {
+    char credential[32768 * 3];
+    size_t credential_length = 0;
+    int ok = original != NULL
+        && candidate != NULL
+        && wide_path_to_utf8(
+            F3_BROKER_CREDENTIAL_SLOT_PATH,
+            credential,
+            sizeof(credential),
+            &credential_length
+        )
+        && json_top_string_matches(
+            original->payload,
+            original->payload_size,
+            "schema",
+            "factor-v3-formal-supervisor-launch-authorization/v2",
+            strlen("factor-v3-formal-supervisor-launch-authorization/v2")
+        )
+        && json_top_string_matches(
+            original->payload,
+            original->payload_size,
+            "action",
+            "run",
+            strlen("run")
+        )
+        && json_top_string_matches(
+            original->payload,
+            original->payload_size,
+            "bootstrap_execution_authorization_path",
+            candidate->authorization_path.value,
+            candidate->authorization_path.length
+        )
+        && json_top_string_matches(
+            original->payload,
+            original->payload_size,
+            "publication_completion_marker_path",
+            candidate->completion_marker_path.value,
+            candidate->completion_marker_path.length
+        )
+        && json_top_string_matches(
+            original->payload,
+            original->payload_size,
+            "supervisor_publication_receipt_path",
+            candidate->publication_receipt_path.value,
+            candidate->publication_receipt_path.length
+        )
+        && json_top_string_matches(
+            original->payload,
+            original->payload_size,
+            "execution_ledger_root",
+            candidate->execution_ledger_root.value,
+            candidate->execution_ledger_root.length
+        )
+        && json_top_string_matches(
+            original->payload,
+            original->payload_size,
+            "credential_path",
+            credential,
+            credential_length
+        )
+        && json_top_string_matches(
+            original->payload,
+            original->payload_size,
+            "credential_slot_id",
+            F3_CREDENTIAL_SLOT_ID,
+            strlen(F3_CREDENTIAL_SLOT_ID)
+        )
+        && json_top_is_null(
+            original->payload,
+            original->payload_size,
+            "resume_of_authorization_sha256"
+        )
+        && json_top_is_null(
+            original->payload,
+            original->payload_size,
+            "resume_status_path"
+        )
+        && verify_execution_signature(original);
+    SecureZeroMemory(credential, sizeof(credential));
+    return ok;
+}
+
+static int expected_ledger_path(
+    ByteSlice ledger_root,
+    const char *category,
+    const char authorization_sha256[65],
+    wchar_t *output,
+    size_t capacity
+) {
+    wchar_t root[32768];
+    wchar_t wide_category[64];
+    wchar_t wide_sha256[65];
+    int category_length;
+    int sha_length;
+    int written;
+    if (!byte_slice_to_wide(
+            ledger_root,
+            root,
+            sizeof(root) / sizeof(root[0])
+        )
+        || category == NULL
+        || authorization_sha256 == NULL
+        || output == NULL
+        || capacity == 0
+        || capacity > INT_MAX) {
+        return 0;
+    }
+    category_length = MultiByteToWideChar(
+        CP_UTF8,
+        MB_ERR_INVALID_CHARS,
+        category,
+        -1,
+        wide_category,
+        (int)(sizeof(wide_category) / sizeof(wide_category[0]))
+    );
+    sha_length = MultiByteToWideChar(
+        CP_UTF8,
+        MB_ERR_INVALID_CHARS,
+        authorization_sha256,
+        -1,
+        wide_sha256,
+        (int)(sizeof(wide_sha256) / sizeof(wide_sha256[0]))
+    );
+    if (category_length <= 1 || sha_length != 65) {
+        return 0;
+    }
+    written = _snwprintf_s(
+        output,
+        capacity,
+        _TRUNCATE,
+        L"%ls\\%ls\\sha256\\%lc%lc\\%ls.json",
+        root,
+        wide_category,
+        wide_sha256[0],
+        wide_sha256[1],
+        wide_sha256
+    );
+    SecureZeroMemory(root, sizeof(root));
+    SecureZeroMemory(wide_category, sizeof(wide_category));
+    SecureZeroMemory(wide_sha256, sizeof(wide_sha256));
+    return written > 0
+        && (size_t)written < capacity
+        && strict_windows_candidate_path(output);
+}
+
+static int validate_resume_status(
+    const unsigned char *status,
+    DWORD status_size,
+    const SignedEnvelope *original,
+    const char original_sha256[65]
+) {
+    SignedEnvelope status_view;
+    memset(&status_view, 0, sizeof(status_view));
+    status_view.payload = status;
+    status_view.payload_size = status_size;
+    return status != NULL
+        && status_size > 0
+        && json_top_string_matches(
+            status,
+            status_size,
+            "schema",
+            "factor-v3-formal-supervisor-execution-claim/v1",
+            strlen("factor-v3-formal-supervisor-execution-claim/v1")
+        )
+        && json_top_string_matches(
+            status,
+            status_size,
+            "status",
+            "claimed",
+            strlen("claimed")
+        )
+        && json_top_string_matches(
+            status,
+            status_size,
+            "action",
+            "run",
+            strlen("run")
+        )
+        && json_top_string_matches(
+            status,
+            status_size,
+            "launch_authorization_sha256",
+            original_sha256,
+            64
+        )
+        && json_top_strings_equal(
+            &status_view,
+            "authorization_id_sha256",
+            original,
+            "authorization_id_sha256"
+        )
+        && json_top_strings_equal(
+            &status_view,
+            "authorization_nonce_sha256",
+            original,
+            "authorization_nonce_sha256"
+        )
+        && json_top_strings_equal(
+            &status_view,
+            "bootstrap_execution_authorization_sha256",
+            original,
+            "bootstrap_execution_authorization_sha256"
+        )
+        && json_top_strings_equal(
+            &status_view,
+            "replay_scope",
+            original,
+            "replay_scope"
+        );
+}
+
+static int validate_resume_lineage(
+    const ProductionCandidate *candidate,
+    const SignedEnvelope *current
+) {
+    HeldFile original_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile status_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    unsigned char original_digest[32];
+    unsigned char status_digest[32];
+    unsigned char *original_raw = NULL;
+    unsigned char *status_raw = NULL;
+    DWORD original_size = 0;
+    DWORD status_size = 0;
+    SignedEnvelope original;
+    wchar_t original_path[32768];
+    wchar_t status_path[32768];
+    wchar_t expected_status_path[32768];
+    wchar_t completed_path[32768];
+    char original_sha256[65];
+    char status_sha256[65];
+    DWORD completed_attributes;
+    int ok = 0;
+    memset(&original, 0, sizeof(original));
+    memset(original_path, 0, sizeof(original_path));
+    memset(status_path, 0, sizeof(status_path));
+    memset(expected_status_path, 0, sizeof(expected_status_path));
+    memset(completed_path, 0, sizeof(completed_path));
+    memset(original_sha256, 0, sizeof(original_sha256));
+    memset(status_sha256, 0, sizeof(status_sha256));
+#ifdef F3_BROKER_TESTING
+    f3_test_production_validation_stage = 41;
+#endif
+    if (candidate == NULL
+        || current == NULL
+        || candidate->action != ACTION_RESUME
+        || !byte_slice_to_wide(
+            candidate->resume_authorization_path,
+            original_path,
+            sizeof(original_path) / sizeof(original_path[0])
+        )
+        || !open_held_file(
+            original_path,
+            F3_MAX_AUTHORIZATION_BYTES,
+            &original_file
+        )
+        || !hash_held_file(&original_file, original_digest)
+        || !filename_matches_digest_suffix(
+            original_path,
+            original_digest,
+            L".json"
+        )
+        || !read_candidate(&original_file, &original_raw, &original_size)
+        || !parse_signed_envelope(original_raw, original_size, &original)
+        || !validate_original_launch_payload(&original, candidate)) {
+        goto cleanup;
+    }
+    digest_to_ascii(original_digest, original_sha256);
+#ifdef F3_BROKER_TESTING
+    f3_test_production_validation_stage = 42;
+#endif
+    if (!json_top_string_matches(
+            current->payload,
+            current->payload_size,
+            "resume_of_authorization_sha256",
+            original_sha256,
+            64
+        )
+        || !json_top_strings_equal(
+            current,
+            "authorization_id_sha256",
+            &original,
+            "authorization_id_sha256"
+        )
+        || !json_top_strings_equal(
+            current,
+            "authorization_nonce_sha256",
+            &original,
+            "authorization_nonce_sha256"
+        )
+        || !json_top_strings_equal(
+            current,
+            "resume_of_authorization_id_sha256",
+            &original,
+            "authorization_id_sha256"
+        )
+        || !json_top_strings_equal(
+            current,
+            "resume_of_authorization_nonce_sha256",
+            &original,
+            "authorization_nonce_sha256"
+        )
+        || !json_top_strings_equal(
+            current,
+            "bootstrap_execution_authorization_sha256",
+            &original,
+            "bootstrap_execution_authorization_sha256"
+        )
+        || !json_top_strings_equal(
+            current,
+            "resume_of_bootstrap_execution_authorization_sha256",
+            &original,
+            "bootstrap_execution_authorization_sha256"
+        )
+        || !json_top_strings_equal(
+            current,
+            "replay_scope",
+            &original,
+            "replay_scope"
+        )
+        || !json_top_strings_equal(
+            current,
+            "resume_of_replay_scope",
+            &original,
+            "replay_scope"
+        )
+        || !byte_slice_to_wide(
+            candidate->resume_status_path,
+            status_path,
+            sizeof(status_path) / sizeof(status_path[0])
+        )) {
+        goto cleanup;
+    }
+#ifdef F3_BROKER_TESTING
+    f3_test_production_validation_stage = 43;
+#endif
+    if (!expected_ledger_path(
+            candidate->execution_ledger_root,
+            "claims",
+            original_sha256,
+            expected_status_path,
+            sizeof(expected_status_path) / sizeof(expected_status_path[0])
+        )
+        || _wcsicmp(status_path, expected_status_path) != 0
+        || !open_held_file(
+            status_path,
+            F3_MAX_AUTHORIZATION_BYTES,
+            &status_file
+        )
+        || !hash_held_file(&status_file, status_digest)
+        || !read_candidate(&status_file, &status_raw, &status_size)) {
+        goto cleanup;
+    }
+    digest_to_ascii(status_digest, status_sha256);
+#ifdef F3_BROKER_TESTING
+    f3_test_production_validation_stage = 44;
+#endif
+    if (!json_top_string_matches(
+            current->payload,
+            current->payload_size,
+            "resume_status_sha256",
+            status_sha256,
+            64
+        )
+        || !validate_resume_status(
+            status_raw,
+            status_size,
+            &original,
+            original_sha256
+        )
+        || !expected_ledger_path(
+            candidate->execution_ledger_root,
+            "completed",
+            original_sha256,
+            completed_path,
+            sizeof(completed_path) / sizeof(completed_path[0])
+        )) {
+        goto cleanup;
+    }
+    SetLastError(ERROR_SUCCESS);
+    completed_attributes = GetFileAttributesW(completed_path);
+    if (completed_attributes != INVALID_FILE_ATTRIBUTES
+        || (GetLastError() != ERROR_FILE_NOT_FOUND
+            && GetLastError() != ERROR_PATH_NOT_FOUND)
+        || !held_unchanged(&status_file, NULL)
+        || !held_unchanged(&original_file, NULL)) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (status_raw != NULL) {
+        SecureZeroMemory(status_raw, (SIZE_T)status_size + 1);
+        HeapFree(GetProcessHeap(), 0, status_raw);
+    }
+    if (original_raw != NULL) {
+        SecureZeroMemory(original_raw, (SIZE_T)original_size + 1);
+        HeapFree(GetProcessHeap(), 0, original_raw);
+    }
+    close_held(&status_file);
+    close_held(&original_file);
+    SecureZeroMemory(original_digest, sizeof(original_digest));
+    SecureZeroMemory(status_digest, sizeof(status_digest));
+    SecureZeroMemory(&original, sizeof(original));
+    SecureZeroMemory(original_path, sizeof(original_path));
+    SecureZeroMemory(status_path, sizeof(status_path));
+    SecureZeroMemory(expected_status_path, sizeof(expected_status_path));
+    SecureZeroMemory(completed_path, sizeof(completed_path));
+    SecureZeroMemory(original_sha256, sizeof(original_sha256));
+    SecureZeroMemory(status_sha256, sizeof(status_sha256));
+    return ok;
+}
+
 int f3_broker_validate_production_candidate(const wchar_t *candidate_path) {
     HeldFile candidate_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile launch_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
@@ -2964,7 +3441,9 @@ int f3_broker_validate_production_candidate(const wchar_t *candidate_path) {
 #ifdef F3_BROKER_TESTING
     f3_test_production_validation_stage = 4;
 #endif
-    if (!validate_current_launch_payload(&envelope, &candidate)) {
+    if (!validate_current_launch_payload(&envelope, &candidate)
+        || (candidate.action == ACTION_RESUME
+            && !validate_resume_lineage(&candidate, &envelope))) {
         goto cleanup;
     }
 #ifdef F3_BROKER_TESTING
@@ -3047,19 +3526,6 @@ static int test_protected_file_chain(const wchar_t *path) {
     }
     close_held_directory_chain(&chain);
     return ok;
-}
-
-static void digest_to_ascii(
-    const unsigned char digest[32],
-    char output[65]
-) {
-    static const char digits[] = "0123456789abcdef";
-    size_t index;
-    for (index = 0; index < 32; ++index) {
-        output[index * 2] = digits[digest[index] >> 4];
-        output[index * 2 + 1] = digits[digest[index] & 15];
-    }
-    output[64] = '\0';
 }
 
 static int exact_sha256_ascii(const char *value) {
