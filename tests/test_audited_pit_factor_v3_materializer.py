@@ -5,6 +5,7 @@ from datetime import date, timedelta
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -723,6 +724,20 @@ def test_pinned_descriptor_and_every_source_snapshot_are_replayed_offline(
             expected_input_authority_descriptor_sha256=clean_descriptor_sha256,
             output_root=tmp_path / "unbound-source",
         )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory-handle guarantee")
+def test_windows_output_lock_blocks_directory_replacement_until_release(tmp_path: Path) -> None:
+    output_root = tmp_path / "output-root"
+    replacement = tmp_path / "replacement-root"
+    output_root.mkdir()
+
+    with materializer._locked_output_directory(output_root, label="test output root"):
+        with pytest.raises(OSError):
+            output_root.rename(replacement)
+
+    output_root.rename(replacement)
+    assert replacement.is_dir()
 
 
 def test_create_only_post_verifier_and_unsafe_inputs_fail_closed(
