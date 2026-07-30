@@ -15,6 +15,7 @@ from typing import Any, Mapping, Sequence
 import uuid
 
 from app import jiaoch_points_collection_set as points_collection
+from app import jiaoch_daily_basic_collection_set as daily_basic_collection
 from app import jiaoch_points_raw_authority as raw_authority
 from app import research_security_code_transition as code_transition
 from app.jiaoch_points_response_normalization import (
@@ -43,8 +44,9 @@ _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _RECEIPT_PATH_PATTERN = re.compile(
     r"daily_basic_exact_set_coverage_candidates/sha256/([0-9a-f]{2})/([0-9a-f]{64})\.json"
 )
-_COLLECTION_PATH_PATTERN = re.compile(
-    r"points_collection_sets/sha256/([0-9a-f]{2})/([0-9a-f]{64})\.json"
+_COLLECTION_PATH_PATTERNS = (
+    re.compile(r"points_collection_sets/sha256/([0-9a-f]{2})/([0-9a-f]{64})\.json"),
+    re.compile(r"daily_basic_collection_sets/sha256/([0-9a-f]{2})/([0-9a-f]{64})\.json"),
 )
 _SUPPORTED_SEGMENTS = (
     "BSE",
@@ -190,6 +192,7 @@ _POLICY_SHA256 = hashlib.sha256(
 ).hexdigest()
 _PRODUCER_FILES = (
     "jiaoch_daily_basic_exact_set_authority.py",
+    "jiaoch_daily_basic_collection_set.py",
     "jiaoch_points_collection_set.py",
     "jiaoch_points_raw_authority.py",
     "jiaoch_points_response_normalization.py",
@@ -550,8 +553,11 @@ def _validated_collection_refs(
         relative = raw.get("collection_set_relative_path")
         if type(relative) is not str:
             raise ValueError("collection set path rejected")
-        match = _COLLECTION_PATH_PATTERN.fullmatch(relative)
-        if match is None or match.group(1) != digest[:2] or match.group(2) != digest:
+        matches = [pattern.fullmatch(relative) for pattern in _COLLECTION_PATH_PATTERNS]
+        if not any(
+            match is not None and match.group(1) == digest[:2] and match.group(2) == digest
+            for match in matches
+        ):
             raise ValueError("collection set path rejected")
         normalized.append(
             {
@@ -1142,11 +1148,19 @@ def _load_daily_basic_partition(
     points_output_root: str | Path,
     collection_ref: Mapping[str, str],
 ) -> DailyBasicPartition:
-    payload = points_collection._verify_and_load_collection_set(
-        output_root=points_output_root,
-        collection_set_relative_path=collection_ref["collection_set_relative_path"],
-        expected_collection_set_sha256=collection_ref["collection_set_sha256"],
-    )
+    relative_path = collection_ref["collection_set_relative_path"]
+    if type(relative_path) is str and relative_path.startswith("daily_basic_collection_sets/"):
+        payload = daily_basic_collection._load_and_verify(
+            output_root=points_output_root,
+            collection_set_relative_path=relative_path,
+            expected_collection_set_sha256=collection_ref["collection_set_sha256"],
+        )
+    else:
+        payload = points_collection._verify_and_load_collection_set(
+            output_root=points_output_root,
+            collection_set_relative_path=relative_path,
+            expected_collection_set_sha256=collection_ref["collection_set_sha256"],
+        )
     if payload.get("trade_date") != collection_ref["trade_date"]:
         raise ValueError("daily_basic collection trade_date rejected")
     attempts = payload.get("attempts")

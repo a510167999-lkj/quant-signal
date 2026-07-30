@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from datetime import date
 import hashlib
 import json
 import os
@@ -237,7 +238,7 @@ def _validate_sessions(value: Any, *, expected_count: int | None = None) -> list
         raise FactorV3DailyBasicRunnerError("factor-v3 daily-basic requires exact ordered 733 sessions")
     for item in value:
         try:
-            if __import__("datetime").date.fromisoformat(item).isoformat() != item:
+            if date.fromisoformat(item).isoformat() != item:
                 raise ValueError
         except ValueError as exc:
             raise FactorV3DailyBasicRunnerError("factor-v3 daily-basic sessions rejected") from exc

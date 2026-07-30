@@ -143,3 +143,98 @@ def test_failed_collection_never_calls_exact_set_publication(
     state = json.loads((tmp_path / "run" / "state.json").read_text(encoding="utf-8"))
     assert state["status"] == "failed"
     assert state["receipt"] is None
+
+
+def test_resume_only_collects_the_missing_session_and_keeps_one_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    spec = _spec(monkeypatch, tmp_path)
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(spec, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    paths = runner._paths(tmp_path / "run", create=True)
+    refs = [
+        {
+            "trade_date": session,
+            "collection_set_relative_path": f"sets/{index}",
+            "collection_set_sha256": f"{index:064x}",
+        }
+        for index, session in enumerate(spec["sessions"][:-1])
+    ]
+    generation = str(uuid.uuid4())
+    runner._load_or_initialize(paths, spec, allow_initialize=True)
+    runner._atomic_json(
+        paths["state"],
+        runner._state_payload(
+            run_spec_sha256=spec["run_spec_sha256"],
+            status="collecting",
+            completed_session_count=len(refs),
+            credential_generation_id=generation,
+            collection_set_refs=refs,
+        ),
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(runner, "_verify_one_daily_basic", lambda **kwargs: dict(kwargs["ref"]))
+    monkeypatch.setattr(runner, "_assert_complete_points_output", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runner,
+        "_collect_one_daily_basic",
+        lambda **kwargs: calls.append(kwargs["trade_date"])
+        or {
+            "trade_date": kwargs["trade_date"],
+            "collection_set_relative_path": "sets/final",
+            "collection_set_sha256": "f" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "_publish_exact_set_coverage",
+        lambda **_kwargs: {
+            "authority_root_sha256": "a" * 64,
+            "publication_status": "DURABLE_POSTVERIFIED_AND_RETURNED",
+            "receipt_created": True,
+            "receipt_relative_path": "receipt.json",
+            "receipt_sha256": "b" * 64,
+            "schema": "daily-basic-exact-set-publication/v1",
+        },
+    )
+
+    result = runner._run_factor_v3_daily_basic_collection_with_route_credential(
+        run_spec_path=spec_path,
+        run_root=tmp_path / "run",
+        credential="test-only-credential",
+        source_generation_id=generation,
+        daily_basic_policy_descriptor=runner.FACTOR_V3_DAILY_BASIC_COLLECTION_POLICY_DESCRIPTOR,
+    )
+
+    assert calls == [spec["sessions"][-1]]
+    assert result["status"] == "verified"
+    assert result["completed_session_count"] == 733
+
+
+def test_partial_run_rejects_different_sealed_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    spec = _spec(monkeypatch, tmp_path)
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(spec, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    paths = runner._paths(tmp_path / "run", create=True)
+    runner._load_or_initialize(paths, spec, allow_initialize=True)
+    runner._atomic_json(
+        paths["state"],
+        runner._state_payload(
+            run_spec_sha256=spec["run_spec_sha256"],
+            status="collecting",
+            completed_session_count=0,
+            credential_generation_id=str(uuid.uuid4()),
+            collection_set_refs=[],
+        ),
+    )
+
+    with pytest.raises(runner.FactorV3DailyBasicRunnerError, match="generation drifted"):
+        runner._run_factor_v3_daily_basic_collection_with_route_credential(
+            run_spec_path=spec_path,
+            run_root=tmp_path / "run",
+            credential="test-only-credential",
+            source_generation_id=str(uuid.uuid4()),
+            daily_basic_policy_descriptor=runner.FACTOR_V3_DAILY_BASIC_COLLECTION_POLICY_DESCRIPTOR,
+        )

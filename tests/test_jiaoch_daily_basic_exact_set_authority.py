@@ -630,6 +630,7 @@ def test_publishes_full_market_exact_set_then_derives_target_scope(
     assert verified["production_recommendation_eligible"] is False
     assert {item["path"] for item in verified["producer_binding"]["entries"]} == {
         "app/jiaoch_daily_basic_exact_set_authority.py",
+        "app/jiaoch_daily_basic_collection_set.py",
         "app/jiaoch_points_collection_set.py",
         "app/jiaoch_points_raw_authority.py",
         "app/jiaoch_points_response_normalization.py",
@@ -637,6 +638,25 @@ def test_publishes_full_market_exact_set_then_derives_target_scope(
         "app/research_scope.py",
         "app/research_security_code_transition.py",
     }
+
+
+def test_collection_ref_validation_accepts_the_bounded_daily_basic_only_manifest() -> None:
+    digest = "a" * 64
+
+    refs = authority._validated_collection_refs(
+        [
+            {
+                "collection_set_relative_path": (
+                    f"daily_basic_collection_sets/sha256/{digest[:2]}/{digest}.json"
+                ),
+                "collection_set_sha256": digest,
+                "trade_date": "2025-02-14",
+            }
+        ],
+        required_dates=["2025-02-14"],
+    )
+
+    assert refs[0]["collection_set_sha256"] == digest
 
 
 def test_authoritative_transition_backfill_is_excluded_before_exact_set_comparison(
