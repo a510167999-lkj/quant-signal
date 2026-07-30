@@ -9,7 +9,7 @@ production authority.
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import date
 import hashlib
@@ -25,6 +25,7 @@ from app.research_scope import is_mainboard_chinext_symbol
 
 
 INPUT_BUNDLE_SCHEMA = "audited-pit-factor-v3-development-input-bundle/v1"
+INPUT_AUTHORITY_DESCRIPTOR_SCHEMA = "audited-pit-factor-v3-development-input-authority/v1"
 CANDIDATE_SCHEMA = "audited-pit-factor-v3-development-candidate/v1"
 RECEIPT_SCHEMA = "audited-pit-factor-v3-development-materialization-receipt/v1"
 _CANDIDATE_DIRECTORY = "factor-v3-development-candidates"
@@ -34,7 +35,9 @@ _REQUIRED_IDENTITIES = frozenset(
     {
         "factor_v2_parent_producer_root_sha256",
         "extended_trading_calendar_descriptor_root_sha256",
+        "extended_trading_calendar_receipt_sha256",
         "feature_history_source_authority_root_sha256",
+        "factor_v3_feature_history_verification_receipt_sha256",
         "daily_basic_normalized_row_authority_root_sha256",
         "daily_basic_coverage_receipt_sha256",
         "daily_traded_cross_section_root_sha256",
@@ -60,6 +63,73 @@ _ALLOWED_EXCLUSION_REASONS = (
     "observed_trading_records_less_than_120_in_250_market_session_window",
     "unresolved_authoritative_security_code_transition",
 )
+_SOURCE_DESCRIPTOR_NAMES = frozenset(
+    {
+        "factor_v2_parent",
+        "calendar",
+        "daily_basic",
+        "daily_traded_cross_section",
+        "listing_membership",
+        "suspensions",
+        "security_code_transitions",
+        "upstream_board_ledger",
+        "factor_v2_evaluation",
+        "feature_history_receipt",
+        "daily_basic_exact_set_receipt",
+    }
+)
+_SENSITIVE_FIELD_TERMS = (
+    "capability",
+    "token",
+    "secret",
+    "password",
+    "credential",
+    "authorization",
+    "api_key",
+)
+_SOURCE_DESCRIPTOR_IDENTITY_BINDINGS = {
+    "factor_v2_parent": (None, "factor_v2_parent_producer_root_sha256"),
+    "calendar": (
+        "extended_trading_calendar_receipt_sha256",
+        "extended_trading_calendar_descriptor_root_sha256",
+    ),
+    "daily_basic": (
+        "daily_basic_coverage_receipt_sha256",
+        "daily_basic_normalized_row_authority_root_sha256",
+    ),
+    "daily_traded_cross_section": (
+        "daily_basic_coverage_receipt_sha256",
+        "daily_traded_cross_section_root_sha256",
+    ),
+    "listing_membership": (
+        "pit_listing_membership_root_sha256",
+        "pit_listing_membership_root_sha256",
+    ),
+    "suspensions": (
+        "pit_suspension_root_sha256",
+        "pit_suspension_root_sha256",
+    ),
+    "security_code_transitions": (
+        "security_code_transition_evidence_root_sha256",
+        "security_code_transition_contract_sha256",
+    ),
+    "upstream_board_ledger": (
+        "daily_basic_coverage_receipt_sha256",
+        "daily_basic_normalized_row_authority_root_sha256",
+    ),
+    "factor_v2_evaluation": (
+        "factor_v2_evaluator_descriptor_sha256",
+        "factor_v2_evaluator_descriptor_sha256",
+    ),
+    "feature_history_receipt": (
+        "factor_v3_feature_history_verification_receipt_sha256",
+        "feature_history_source_authority_root_sha256",
+    ),
+    "daily_basic_exact_set_receipt": (
+        "daily_basic_coverage_receipt_sha256",
+        "daily_basic_normalized_row_authority_root_sha256",
+    ),
+}
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -81,6 +151,35 @@ def _sha256_bytes(raw: bytes) -> str:
 
 def _canonical_sha256(value: Any) -> str:
     return _sha256_bytes(_canonical_bytes(value))
+
+
+def _file_sha256(path: Path) -> str:
+    _assert_safe_existing_path(path, label="producer source file")
+    if not path.is_file():
+        raise ValueError("producer source file is not regular")
+    return _sha256_bytes(_read_regular_bytes_no_follow(path, label="producer source file"))
+
+
+def factor_v3_materializer_producer_binding() -> dict[str, Any]:
+    """Content-address the only code modules that determine this candidate's semantics."""
+
+    modules = {
+        "materializer": Path(__file__),
+        "points_contract": Path(str(points.__file__)),
+    }
+    repository_root = Path(__file__).resolve().parents[1]
+    files = {
+        name: {
+            "relative_path": path.resolve().relative_to(repository_root).as_posix(),
+            "sha256": _file_sha256(path),
+        }
+        for name, path in modules.items()
+    }
+    unsigned = {
+        "schema_version": "audited-pit-factor-v3-materializer-producer-binding/v1",
+        "files": files,
+    }
+    return {**unsigned, "root_sha256": _canonical_sha256(unsigned)}
 
 
 def _strict_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -139,14 +238,191 @@ def _assert_no_live_store_sidecars(path: Path, *, label: str) -> None:
         raise ValueError(f"{label} must not be a live store")
 
 
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+        and left.st_ino == right.st_ino
+        and left.st_dev == right.st_dev
+    )
+
+
+def _read_regular_bytes_no_follow(path: Path, *, label: str) -> bytes:
+    _assert_safe_existing_path(path, label=label)
+    if not path.is_file():
+        raise ValueError(f"{label} must be a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(str(path), flags)
+    try:
+        opened = os.fstat(descriptor)
+        resolved = path.stat()
+        if _is_reparse_point(path) or not _same_file_identity(opened, resolved):
+            raise ValueError(f"{label} changed to a reparse point during open")
+        chunks: list[bytes] = []
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValueError(f"{label} changed while being read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) != opened.st_size or not _same_file_identity(opened, path.stat()):
+            raise ValueError(f"{label} changed while being read")
+        return raw
+    finally:
+        os.close(descriptor)
+
+
 def _read_snapshot_bundle(path_value: str | Path) -> tuple[Path, dict[str, Any], str]:
     path = Path(path_value)
     _assert_safe_existing_path(path, label="input bundle")
     _assert_no_live_store_sidecars(path, label="input bundle")
     if not path.is_file() or path.suffix.lower() != ".json":
         raise ValueError("input bundle must be a regular immutable JSON snapshot")
-    raw = path.read_bytes()
+    raw = _read_regular_bytes_no_follow(path, label="input bundle")
     return path, _strict_json_loads(raw, label="input bundle"), _sha256_bytes(raw)
+
+
+def _file_fingerprint(path: Path) -> tuple[int, int, str]:
+    _assert_safe_existing_path(path, label="immutable source snapshot")
+    if not path.is_file():
+        raise ValueError("immutable source snapshot must be a regular file")
+    stat = path.stat()
+    return stat.st_size, stat.st_mtime_ns, _sha256_bytes(
+        _read_regular_bytes_no_follow(path, label="immutable source snapshot")
+    )
+
+
+def _assert_fingerprints_unchanged(fingerprints: Mapping[Path, tuple[int, int, str]]) -> None:
+    for path, expected in fingerprints.items():
+        if _file_fingerprint(path) != expected:
+            raise ValueError("immutable source snapshot changed during offline verification")
+
+
+def _safe_relative_snapshot_path(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not value or Path(value).name != value:
+        raise ValueError(f"{label} must be a plain snapshot filename")
+    if Path(value).suffix.lower() != ".json":
+        raise ValueError(f"{label} must reference canonical JSON")
+    return value
+
+
+def _read_json_snapshot(path: Path, *, label: str) -> tuple[dict[str, Any], str]:
+    _assert_safe_existing_path(path, label=label)
+    _assert_no_live_store_sidecars(path, label=label)
+    if not path.is_file() or path.suffix.lower() != ".json":
+        raise ValueError(f"{label} must be a regular immutable JSON snapshot")
+    raw = _read_regular_bytes_no_follow(path, label=label)
+    return _strict_json_loads(raw, label=label), _sha256_bytes(raw)
+
+
+def _load_pinned_input_authority(
+    *,
+    input_authority_descriptor_path: str | Path,
+    expected_input_authority_descriptor_sha256: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[Path, tuple[int, int, str]]]:
+    descriptor_path = Path(input_authority_descriptor_path)
+    descriptor, descriptor_file_sha256 = _read_json_snapshot(
+        descriptor_path,
+        label="input authority descriptor",
+    )
+    expected_descriptor_sha256 = _strict_sha256(
+        expected_input_authority_descriptor_sha256,
+        label="expected input authority descriptor SHA",
+    )
+    if descriptor_file_sha256 != expected_descriptor_sha256:
+        raise ValueError("input authority descriptor content address drifted")
+    _assert_no_capability(descriptor, path="input authority descriptor")
+    if (
+        descriptor.get("schema_version") != INPUT_AUTHORITY_DESCRIPTOR_SCHEMA
+        or descriptor.get("authority_status") != "VERIFIED_CONCRETE_IMMUTABLE_INPUT_SNAPSHOT"
+        or descriptor.get("development_only") is not True
+    ):
+        raise ValueError("input authority descriptor is not a development-only verified snapshot")
+    root = descriptor_path.parent
+    _assert_safe_existing_path(root, label="input authority snapshot root")
+    descriptors = _strict_mapping(descriptor.get("source_descriptors"), label="source descriptors")
+    if set(descriptors) != _SOURCE_DESCRIPTOR_NAMES:
+        raise ValueError("input authority descriptor source set is incomplete")
+    source_payloads: dict[str, dict[str, Any]] = {}
+    fingerprints: dict[Path, tuple[int, int, str]] = {
+        descriptor_path: _file_fingerprint(descriptor_path)
+    }
+    allowed_names = {descriptor_path.name}
+    for name in sorted(_SOURCE_DESCRIPTOR_NAMES):
+        source_descriptor = _strict_mapping(descriptors[name], label=f"{name} source descriptor")
+        if set(source_descriptor) != {
+            "relative_path",
+            "file_sha256",
+            "receipt_sha256",
+            "producer_root_sha256",
+        }:
+            raise ValueError(f"{name} source descriptor fields are invalid")
+        filename = _safe_relative_snapshot_path(
+            source_descriptor["relative_path"],
+            label=f"{name} relative_path",
+        )
+        source_path = root / filename
+        payload, file_sha256 = _read_json_snapshot(source_path, label=f"{name} source snapshot")
+        if file_sha256 != _strict_sha256(source_descriptor["file_sha256"], label=f"{name} file SHA"):
+            raise ValueError(f"{name} source snapshot content address drifted")
+        _strict_sha256(source_descriptor["receipt_sha256"], label=f"{name} receipt SHA")
+        _strict_sha256(source_descriptor["producer_root_sha256"], label=f"{name} producer root")
+        _assert_no_capability(payload, path=f"{name} source snapshot")
+        source_payloads[name] = payload
+        fingerprints[source_path] = _file_fingerprint(source_path)
+        allowed_names.add(filename)
+    for member in root.rglob("*"):
+        if _is_reparse_point(member):
+            raise ValueError("input authority snapshot must not contain a symlink or reparse point")
+        if member.is_file() and member.name not in allowed_names:
+            raise ValueError("input authority snapshot contains an unbound file")
+        if member.name.endswith(("-wal", "-shm")) or member.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
+            raise ValueError("input authority snapshot must not contain a live store or WAL/SHM")
+    identities = _strict_mapping(descriptor.get("authority_identities"), label="descriptor authority identities")
+    if set(identities) != _REQUIRED_IDENTITIES:
+        raise ValueError("input authority descriptor identities are incomplete")
+    normalized_identities = {
+        name: _strict_sha256(value, label=f"descriptor authority identity {name}")
+        for name, value in identities.items()
+    }
+    for name, (receipt_identity, producer_identity) in _SOURCE_DESCRIPTOR_IDENTITY_BINDINGS.items():
+        source_descriptor = _strict_mapping(descriptors[name], label=f"{name} source descriptor")
+        expected_receipt = (
+            source_payloads["factor_v2_parent"].get("factor_v2_common_eligible_receipt_sha256")
+            if receipt_identity is None
+            else normalized_identities[receipt_identity]
+        )
+        if (
+            source_descriptor["receipt_sha256"] != expected_receipt
+            or source_descriptor["producer_root_sha256"] != normalized_identities[producer_identity]
+        ):
+            raise ValueError(f"{name} descriptor receipt or producer binding drifted")
+    bundle = {
+        "schema_version": INPUT_BUNDLE_SCHEMA,
+        "points_contract_sha256": descriptor.get("points_contract_sha256"),
+        "authority_identities": normalized_identities,
+        "factor_v2_parent": source_payloads["factor_v2_parent"],
+        "calendar": source_payloads["calendar"],
+        "daily_basic": source_payloads["daily_basic"],
+        "daily_traded_cross_section": source_payloads["daily_traded_cross_section"],
+        "listing_membership": source_payloads["listing_membership"],
+        "suspensions": source_payloads["suspensions"],
+        "security_code_transitions": source_payloads["security_code_transitions"],
+        "upstream_board_ledger": source_payloads["upstream_board_ledger"],
+        "factor_v2_evaluation": source_payloads["factor_v2_evaluation"],
+    }
+    descriptor_context = {
+        "descriptor_file_sha256": descriptor_file_sha256,
+        "source_descriptors": deepcopy(dict(descriptors)),
+        "parent_payload_fields": list(
+            _strict_sequence(descriptor.get("parent_payload_fields"), label="parent payload fields")
+        ),
+        "feature_history_receipt": source_payloads["feature_history_receipt"],
+        "daily_basic_receipt": source_payloads["daily_basic_exact_set_receipt"],
+    }
+    return bundle, descriptor_context, fingerprints
 
 
 def _strict_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
@@ -193,8 +469,8 @@ def _assert_no_capability(value: Any, *, path: str = "input") -> None:
         for key, nested in value.items():
             if not isinstance(key, str):
                 raise ValueError(f"{path} contains a non-string key")
-            if "capability" in key.lower():
-                raise ValueError("publication capability must never persist in a materializer input")
+            if any(term in key.lower() for term in _SENSITIVE_FIELD_TERMS):
+                raise ValueError("sensitive capability or credential data must never persist")
             _assert_no_capability(nested, path=f"{path}.{key}")
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         for index, nested in enumerate(value):
@@ -253,7 +529,11 @@ def _validate_authority_identities(bundle: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
-def _validate_calendar(bundle: Mapping[str, Any], contract: Mapping[str, Any]) -> dict[str, Any]:
+def _validate_calendar(
+    bundle: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    identities: Mapping[str, str],
+) -> dict[str, Any]:
     calendar = _strict_mapping(bundle.get("calendar"), label="calendar")
     all_sessions = _validated_dates(calendar.get("all_market_sessions"), label="all market sessions")
     prewindow = _validated_dates(calendar.get("prewindow_sessions"), label="prewindow sessions")
@@ -269,6 +549,10 @@ def _validate_calendar(bundle: Mapping[str, Any], contract: Mapping[str, Any]) -
     ):
         if _canonical_sha256(dates) != _strict_sha256(calendar.get(field), label=field):
             raise ValueError(f"{field} drifted")
+    if calendar.get("authority_receipt_sha256") != identities[
+        "extended_trading_calendar_receipt_sha256"
+    ]:
+        raise ValueError("extended trading calendar receipt identity drifted")
     expected = _strict_mapping(
         _strict_mapping(contract.get("preregistered_parent_expectation"), label="parent expectation").get("sessions"),
         label="frozen development sessions",
@@ -294,6 +578,7 @@ def _validate_parent(
     bundle: Mapping[str, Any],
     contract: Mapping[str, Any],
     development_sessions: Sequence[str],
+    parent_payload_fields: Sequence[Any],
 ) -> list[dict[str, Any]]:
     parent = _strict_mapping(bundle.get("factor_v2_parent"), label="factor-v2 parent")
     expectation = _strict_mapping(
@@ -309,7 +594,22 @@ def _validate_parent(
     identities: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
     development_set = set(development_sessions)
+    if (
+        not parent_payload_fields
+        or any(
+            not isinstance(field, str)
+            or not field
+            or field in {"candidate_key", "signal_date", "ts_code"}
+            or any(term in field.lower() for term in _SENSITIVE_FIELD_TERMS)
+            for field in parent_payload_fields
+        )
+        or len(set(parent_payload_fields)) != len(parent_payload_fields)
+    ):
+        raise ValueError("parent payload field whitelist is invalid")
+    expected_fields = {"candidate_key", "signal_date", "ts_code", *parent_payload_fields}
     for row in rows:
+        if set(row) != expected_fields:
+            raise ValueError("parent payload fields differ from the pinned whitelist")
         candidate_key = row.get("candidate_key")
         signal_date = _strict_date(row.get("signal_date"), label="parent signal_date")
         ts_code = row.get("ts_code")
@@ -330,24 +630,33 @@ def _validate_parent(
         identities.append({"candidate_key": candidate_key, "signal_date": signal_date})
     if parent.get("candidate_identity_root_sha256") != _canonical_sha256(identities):
         raise ValueError("factor-v2 parent candidate identity root drifted")
+    if (
+        expectation["common_eligible_candidate_keys_sha256"]
+        != _canonical_sha256([row["candidate_key"] for row in normalized])
+        or expectation["common_eligible_source_feature_rows_sha256"]
+        != _canonical_sha256(normalized)
+    ):
+        raise ValueError("factor-v2 parent rows do not replay the frozen common-eligible roots")
     return normalized
 
 
 def _validate_verification_receipts(
     *,
-    feature_history: Callable[[], Mapping[str, Any]],
-    daily_basic: Callable[[], Mapping[str, Any]],
+    feature_history: Mapping[str, Any],
+    daily_basic: Mapping[str, Any],
     identities: Mapping[str, str],
     calendar: Mapping[str, Any],
 ) -> dict[str, Mapping[str, Any]]:
-    if not callable(feature_history) or not callable(daily_basic):
-        raise ValueError("verified input bundle requires offline authority verifier callables")
-    history_receipt = _strict_mapping(feature_history(), label="feature-history verification receipt")
-    daily_receipt = _strict_mapping(daily_basic(), label="daily-basic verification receipt")
+    history_receipt = _strict_mapping(feature_history, label="feature-history verification receipt")
+    daily_receipt = _strict_mapping(daily_basic, label="daily-basic verification receipt")
     _assert_no_capability(history_receipt, path="feature-history verification receipt")
     _assert_no_capability(daily_receipt, path="daily-basic verification receipt")
     if history_receipt.get("verified") is not True:
         raise ValueError("feature-history authority is not verified")
+    if history_receipt.get("receipt_sha256") != identities[
+        "factor_v3_feature_history_verification_receipt_sha256"
+    ]:
+        raise ValueError("feature-history verification receipt identity drifted")
     if history_receipt.get("source_authority_root_sha256") != identities[
         "feature_history_source_authority_root_sha256"
     ]:
@@ -454,14 +763,32 @@ def _validate_source_rows(
 
 def _validate_listing_and_transitions(bundle: Mapping[str, Any]) -> dict[str, Any]:
     listing = _strict_mapping(bundle.get("listing_membership"), label="listing and membership")
-    listings: dict[str, str] = {}
+    listings: dict[str, dict[str, str]] = {}
     for row in _strict_sequence(listing.get("rows"), label="listing rows"):
         entry = _strict_mapping(row, label="listing row")
         security_id = entry.get("security_id")
         listing_date = _strict_date(entry.get("listing_date"), label="listing date")
-        if not isinstance(security_id, str) or not security_id or security_id in listings:
+        membership_start = _strict_date(
+            entry.get("membership_start"),
+            label="listing membership_start",
+        )
+        membership_end = _strict_date(
+            entry.get("membership_end"),
+            label="listing membership_end",
+        )
+        if (
+            not isinstance(security_id, str)
+            or not security_id
+            or security_id in listings
+            or membership_start > listing_date
+            or listing_date > membership_end
+        ):
             raise ValueError("listing identity is invalid or duplicated")
-        listings[security_id] = listing_date
+        listings[security_id] = {
+            "listing_date": listing_date,
+            "membership_start": membership_start,
+            "membership_end": membership_end,
+        }
     transitions = _strict_mapping(bundle.get("security_code_transitions"), label="security code transitions")
     transition_rows = _validate_sha_bound_rows(
         transitions,
@@ -493,7 +820,12 @@ def _validate_listing_and_transitions(bundle: Mapping[str, Any]) -> dict[str, An
     return {"listings": listings, "transitions": normalized}
 
 
-def _validate_upstream_ledger(bundle: Mapping[str, Any]) -> dict[str, Any]:
+def _validate_upstream_ledger(
+    bundle: Mapping[str, Any],
+    *,
+    source_dates: Sequence[str],
+    daily_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
     ledger = _strict_mapping(bundle.get("upstream_board_ledger"), label="upstream board ledger")
     if ledger.get("preserved_before_target_scope_filter") is not True:
         raise ValueError("BSE/STAR must be preserved before downstream target filtering")
@@ -505,10 +837,49 @@ def _validate_upstream_ledger(bundle: Mapping[str, Any]) -> dict[str, Any]:
         for value in counts.values()
     ):
         raise ValueError("upstream board ledger counts are invalid")
+    per_date = list(_strict_sequence(ledger.get("per_date"), label="upstream per-date board ledger"))
+    if len(per_date) != len(source_dates):
+        raise ValueError("upstream board ledger must cover the exact source-date union")
+    normalized_per_date: list[dict[str, Any]] = []
+    for expected_date, raw in zip(source_dates, per_date):
+        entry = _strict_mapping(raw, label="upstream per-date board row")
+        if set(entry) != {
+            "trade_date",
+            "raw_source_rows_sha256",
+            "normalized_rows_sha256",
+            "segment_counts",
+        } or _strict_date(entry["trade_date"], label="upstream board trade_date") != expected_date:
+            raise ValueError("upstream board ledger date sequence drifted")
+        segment_counts = _strict_mapping(entry["segment_counts"], label="upstream per-date segment counts")
+        if set(segment_counts) != set(_UPSTREAM_SEGMENTS) or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in segment_counts.values()
+        ):
+            raise ValueError("upstream per-date BSE/STAR proof is incomplete")
+        normalized_per_date.append(
+            {
+                "trade_date": expected_date,
+                "raw_source_rows_sha256": _strict_sha256(
+                    entry["raw_source_rows_sha256"], label="upstream raw rows root"
+                ),
+                "normalized_rows_sha256": _strict_sha256(
+                    entry["normalized_rows_sha256"], label="upstream normalized rows root"
+                ),
+                "segment_counts": {name: int(segment_counts[name]) for name in _UPSTREAM_SEGMENTS},
+            }
+        )
+    per_date_root = _canonical_sha256(normalized_per_date)
+    if (
+        ledger.get("per_date_board_ledger_root_sha256") != per_date_root
+        or daily_receipt.get("upstream_board_ledger_root_sha256") != per_date_root
+    ):
+        raise ValueError("daily-basic exact-set receipt does not bind the BSE/STAR board ledger")
     return {
         "preserved_before_target_scope_filter": True,
         "source_segments": list(_UPSTREAM_SEGMENTS),
         "pre_filter_segment_counts": {name: int(counts[name]) for name in _UPSTREAM_SEGMENTS},
+        "per_date": normalized_per_date,
+        "per_date_board_ledger_root_sha256": per_date_root,
         "downstream_scope_filter": "mainboard_chinext_candidate_join_only",
     }
 
@@ -531,32 +902,49 @@ def _validate_evaluator(bundle: Mapping[str, Any], identities: Mapping[str, str]
 
 def preverify_factor_v3_development_input_bundle(
     *,
-    input_bundle_path: str | Path,
-    verify_feature_history: Callable[[], Mapping[str, Any]],
-    verify_daily_basic: Callable[[], Mapping[str, Any]],
+    input_authority_descriptor_path: str | Path,
+    expected_input_authority_descriptor_sha256: str,
 ) -> dict[str, Any]:
     """Validate a concrete offline bundle before any candidate output is written."""
 
-    _path, bundle, bundle_sha256 = _read_snapshot_bundle(input_bundle_path)
+    bundle, descriptor_context, fingerprints = _load_pinned_input_authority(
+        input_authority_descriptor_path=input_authority_descriptor_path,
+        expected_input_authority_descriptor_sha256=(
+            expected_input_authority_descriptor_sha256
+        ),
+    )
     _assert_no_capability(bundle)
     if bundle.get("schema_version") != INPUT_BUNDLE_SCHEMA:
         raise ValueError("input bundle schema is invalid")
     contract = _validate_frozen_points_contract(bundle)
     identities = _validate_authority_identities(bundle)
-    calendar = _validate_calendar(bundle, contract)
-    parent_rows = _validate_parent(bundle, contract, calendar["development"])
+    calendar = _validate_calendar(bundle, contract, identities)
+    parent_rows = _validate_parent(
+        bundle,
+        contract,
+        calendar["development"],
+        descriptor_context["parent_payload_fields"],
+    )
     verification_receipts = _validate_verification_receipts(
-        feature_history=verify_feature_history,
-        daily_basic=verify_daily_basic,
+        feature_history=descriptor_context["feature_history_receipt"],
+        daily_basic=descriptor_context["daily_basic_receipt"],
         identities=identities,
         calendar=calendar,
     )
     source_rows = _validate_source_rows(bundle, source_dates=calendar["source_dates"])
     listing_transition = _validate_listing_and_transitions(bundle)
-    upstream_board_ledger = _validate_upstream_ledger(bundle)
+    upstream_board_ledger = _validate_upstream_ledger(
+        bundle,
+        source_dates=calendar["source_dates"],
+        daily_receipt=verification_receipts["daily_basic"],
+    )
     evaluator = _validate_evaluator(bundle, identities)
+    _assert_fingerprints_unchanged(fingerprints)
     return {
-        "input_bundle_sha256": bundle_sha256,
+        "input_authority_descriptor_file_sha256": descriptor_context[
+            "descriptor_file_sha256"
+        ],
+        "source_descriptors": descriptor_context["source_descriptors"],
         "points_contract_sha256": points.FACTOR_V3_POINTS_CONTRACT_SHA256,
         "identities": identities,
         "calendar": calendar,
@@ -569,6 +957,7 @@ def preverify_factor_v3_development_input_bundle(
         "transitions": listing_transition["transitions"],
         "upstream_board_ledger": upstream_board_ledger,
         "factor_v2_evaluation": evaluator,
+        "input_fingerprints": fingerprints,
     }
 
 
@@ -666,9 +1055,12 @@ def _build_candidate_payload(preverified: Mapping[str, Any]) -> dict[str, Any]:
                 }
             )
             continue
-        listing_date = listings.get(security_id)
-        if not isinstance(listing_date, str):
+        listing = listings.get(security_id)
+        if not isinstance(listing, Mapping):
             raise ValueError("PIT listing authority is missing for a resolved parent security")
+        listing_date = str(listing["listing_date"])
+        if not str(listing["membership_start"]) <= signal_date <= str(listing["membership_end"]):
+            raise ValueError("PIT listing membership does not cover a parent signal date")
         if signal_date < _add_calendar_months(listing_date, 6):
             reason = "ipo_age_less_than_6_calendar_months"
             exclusions.append(
@@ -685,6 +1077,8 @@ def _build_candidate_payload(preverified: Mapping[str, Any]) -> dict[str, Any]:
         if len(window) != 250:
             raise ValueError("candidate does not have the exact 250-session PIT window")
         observed: list[float] = []
+        short_window_dates = set(window[-20:])
+        short_observed: list[float] = []
         transition_unresolved = False
         for source_date in window:
             expected_code = _active_transition_code(
@@ -707,7 +1101,10 @@ def _build_candidate_payload(preverified: Mapping[str, Any]) -> dict[str, Any]:
             if cross["ts_code"] != expected_code or daily["ts_code"] != expected_code:
                 transition_unresolved = True
                 break
-            observed.append(_strict_number(daily["turnover_rate_f"], label="observed turnover_rate_f"))
+            value = _strict_number(daily["turnover_rate_f"], label="observed turnover_rate_f")
+            observed.append(value)
+            if source_date in short_window_dates:
+                short_observed.append(value)
         if transition_unresolved:
             reason = "unresolved_authoritative_security_code_transition"
             exclusions.append(
@@ -719,7 +1116,7 @@ def _build_candidate_payload(preverified: Mapping[str, Any]) -> dict[str, Any]:
                 }
             )
             continue
-        if len(observed[-20:]) < 15:
+        if len(short_observed) < 15:
             reason = "observed_trading_records_less_than_15_in_20_market_session_window"
             exclusions.append(
                 {
@@ -749,7 +1146,7 @@ def _build_candidate_payload(preverified: Mapping[str, Any]) -> dict[str, Any]:
             daily_index[t_minus_one_key]["turnover_rate_f"],
             label="T-1 turnover_rate_f",
         )
-        mean_20 = sum(observed[-20:]) / len(observed[-20:])
+        mean_20 = sum(short_observed) / len(short_observed)
         mean_250 = sum(observed) / len(observed)
         abnormal = math.log(mean_20 / mean_250)
         eligible_raw.append(
@@ -795,6 +1192,22 @@ def _build_candidate_payload(preverified: Mapping[str, Any]) -> dict[str, Any]:
         }
         for row in exclusions
     ]
+    eligible_candidate_keys = [row["candidate_key"] for row in output_rows]
+    excluded_candidate_keys = [row["candidate_key"] for row in exclusions]
+    exclusion_reason_buckets = [
+        {
+            "reason": reason,
+            "excluded_row_count": sum(1 for row in exclusions if row["reason"] == reason),
+            "candidate_keys_sha256": _canonical_sha256(
+                [row["candidate_key"] for row in exclusions if row["reason"] == reason]
+            ),
+            "identity_rows_sha256": _canonical_sha256(
+                [row for row in exclusion_identity_rows if row["reason"] == reason]
+            ),
+        }
+        for reason in _ALLOWED_EXCLUSION_REASONS
+        if any(row["reason"] == reason for row in exclusions)
+    ]
     per_signal_ledger = []
     for signal_date in development:
         parent_count = sum(1 for row in preverified["parent_rows"] if row["signal_date"] == signal_date)
@@ -833,7 +1246,12 @@ def _build_candidate_payload(preverified: Mapping[str, Any]) -> dict[str, Any]:
         "production_profile_registered": False,
         "production_recommendation_eligible": False,
         "points_contract_sha256": preverified["points_contract_sha256"],
-        "input_bundle_sha256": preverified["input_bundle_sha256"],
+        "frozen_points_formal_materializer_implemented": False,
+        "producer_binding": factor_v3_materializer_producer_binding(),
+        "input_authority_descriptor_file_sha256": preverified[
+            "input_authority_descriptor_file_sha256"
+        ],
+        "source_descriptors": deepcopy(preverified["source_descriptors"]),
         "authority_identities": dict(preverified["identities"]),
         "calendar": {
             "development_session_count": len(development),
@@ -851,9 +1269,15 @@ def _build_candidate_payload(preverified: Mapping[str, Any]) -> dict[str, Any]:
         "history_eligible_row_count": len(output_rows),
         "history_eligible_identity_root_sha256": output_identity_root,
         "output_identity_root_sha256": output_identity_root,
+        "eligible_candidate_keys_sha256": _canonical_sha256(eligible_candidate_keys),
+        "eligible_identity_rows_sha256": output_identity_root,
         "excluded_row_count": len(exclusions),
+        "excluded_candidate_keys_sha256": _canonical_sha256(excluded_candidate_keys),
         "exclusion_ledger": exclusions,
         "exclusion_ledger_sha256": _canonical_sha256(exclusion_identity_rows),
+        "exclusion_reason_rows_sha256": _canonical_sha256(exclusion_identity_rows),
+        "exclusion_reason_buckets": exclusion_reason_buckets,
+        "exclusion_reason_buckets_sha256": _canonical_sha256(exclusion_reason_buckets),
         "per_signal_ledger": per_signal_ledger,
         "per_signal_ledger_sha256": _canonical_sha256(per_signal_ledger),
         "arms": arms,
@@ -889,10 +1313,17 @@ def _write_create_only(path: Path, raw: bytes, *, label: str) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     _assert_safe_existing_path(path.parent, label=f"{label} parent")
     try:
-        descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_BINARY)
+        descriptor = os.open(
+            str(path),
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
     except FileExistsError:
         _assert_safe_existing_path(path, label=label)
-        if not path.is_file() or path.read_bytes() != raw:
+        if not path.is_file() or _read_regular_bytes_no_follow(path, label=label) != raw:
             raise ValueError(f"{label} content-addressed candidate already exists with different bytes")
         return False
     try:
@@ -902,7 +1333,11 @@ def _write_create_only(path: Path, raw: bytes, *, label: str) -> bool:
             os.fsync(handle.fileno())
     except Exception:
         raise
-    if not path.is_file() or _is_reparse_point(path) or path.read_bytes() != raw:
+    if (
+        not path.is_file()
+        or _is_reparse_point(path)
+        or _read_regular_bytes_no_follow(path, label=label) != raw
+    ):
         raise ValueError(f"{label} create-only write did not preserve canonical bytes")
     return True
 
@@ -924,7 +1359,12 @@ def _candidate_with_hash(payload: Mapping[str, Any]) -> tuple[dict[str, Any], st
     return candidate, artifact_sha256, _canonical_bytes(candidate)
 
 
-def _receipt_payload(*, candidate: Mapping[str, Any], artifact_sha256: str) -> tuple[dict[str, Any], str, bytes]:
+def _receipt_payload(
+    *,
+    candidate: Mapping[str, Any],
+    artifact_sha256: str,
+    candidate_file_sha256: str,
+) -> tuple[dict[str, Any], str, bytes]:
     unsigned = {
         "schema_version": RECEIPT_SCHEMA,
         "temporal_role": "development_4",
@@ -938,15 +1378,29 @@ def _receipt_payload(*, candidate: Mapping[str, Any], artifact_sha256: str) -> t
         "production_profile_registered": False,
         "production_recommendation_eligible": False,
         "artifact_sha256": artifact_sha256,
+        "candidate_file_sha256": _strict_sha256(
+            candidate_file_sha256,
+            label="candidate file SHA",
+        ),
         "points_contract_sha256": candidate["points_contract_sha256"],
-        "input_bundle_sha256": candidate["input_bundle_sha256"],
+        "frozen_points_formal_materializer_implemented": False,
+        "producer_binding": deepcopy(candidate["producer_binding"]),
+        "input_authority_descriptor_file_sha256": candidate[
+            "input_authority_descriptor_file_sha256"
+        ],
+        "source_descriptors": deepcopy(candidate["source_descriptors"]),
         "authority_identities": deepcopy(candidate["authority_identities"]),
         "factor_v2_evaluation": deepcopy(candidate["factor_v2_evaluation"]),
         "output_identity_root_sha256": candidate["output_identity_root_sha256"],
         "history_eligible_row_count": candidate["history_eligible_row_count"],
         "excluded_row_count": candidate["excluded_row_count"],
         "rows_sha256": candidate["rows_sha256"],
+        "eligible_candidate_keys_sha256": candidate["eligible_candidate_keys_sha256"],
+        "eligible_identity_rows_sha256": candidate["eligible_identity_rows_sha256"],
+        "excluded_candidate_keys_sha256": candidate["excluded_candidate_keys_sha256"],
         "exclusion_ledger_sha256": candidate["exclusion_ledger_sha256"],
+        "exclusion_reason_rows_sha256": candidate["exclusion_reason_rows_sha256"],
+        "exclusion_reason_buckets_sha256": candidate["exclusion_reason_buckets_sha256"],
         "per_signal_ledger_sha256": candidate["per_signal_ledger_sha256"],
     }
     receipt_sha256 = _canonical_sha256(unsigned)
@@ -958,11 +1412,10 @@ def verify_factor_v3_development_candidate(
     *,
     candidate_path: str | Path,
     receipt_path: str | Path,
-    input_bundle_path: str | Path,
+    input_authority_descriptor_path: str | Path,
+    expected_input_authority_descriptor_sha256: str,
     expected_artifact_sha256: str,
     expected_receipt_sha256: str,
-    verify_feature_history: Callable[[], Mapping[str, Any]],
-    verify_daily_basic: Callable[[], Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Replay a development candidate from immutable JSON snapshots without writing."""
 
@@ -994,28 +1447,56 @@ def verify_factor_v3_development_candidate(
         "receipt": (receipt_file.stat().st_size, receipt_file.stat().st_mtime_ns, receipt_file_sha256),
     }
     preverified = preverify_factor_v3_development_input_bundle(
-        input_bundle_path=input_bundle_path,
-        verify_feature_history=verify_feature_history,
-        verify_daily_basic=verify_daily_basic,
+        input_authority_descriptor_path=input_authority_descriptor_path,
+        expected_input_authority_descriptor_sha256=(
+            expected_input_authority_descriptor_sha256
+        ),
     )
     rebuilt_payload = _build_candidate_payload(preverified)
+    _assert_fingerprints_unchanged(preverified["input_fingerprints"])
     rebuilt_candidate, rebuilt_artifact_sha256, rebuilt_raw = _candidate_with_hash(rebuilt_payload)
     rebuilt_receipt, rebuilt_receipt_sha256, rebuilt_receipt_raw = _receipt_payload(
         candidate=rebuilt_candidate,
         artifact_sha256=rebuilt_artifact_sha256,
+        candidate_file_sha256=_sha256_bytes(rebuilt_raw),
     )
     if (
         rebuilt_artifact_sha256 != expected_artifact
         or rebuilt_receipt_sha256 != expected_receipt
-        or rebuilt_raw != candidate_file.read_bytes()
-        or rebuilt_receipt_raw != receipt_file.read_bytes()
+        or rebuilt_raw != _read_regular_bytes_no_follow(
+            candidate_file,
+            label="materialization candidate",
+        )
+        or receipt.get("candidate_file_sha256") != candidate_file_sha256
+        or rebuilt_receipt_raw != _read_regular_bytes_no_follow(
+            receipt_file,
+            label="materialization receipt",
+        )
         or rebuilt_candidate != candidate
         or rebuilt_receipt != receipt
     ):
         raise ValueError("materialization post-verifier replay drifted")
     after = {
-        "candidate": (candidate_file.stat().st_size, candidate_file.stat().st_mtime_ns, _sha256_bytes(candidate_file.read_bytes())),
-        "receipt": (receipt_file.stat().st_size, receipt_file.stat().st_mtime_ns, _sha256_bytes(receipt_file.read_bytes())),
+        "candidate": (
+            candidate_file.stat().st_size,
+            candidate_file.stat().st_mtime_ns,
+            _sha256_bytes(
+                _read_regular_bytes_no_follow(
+                    candidate_file,
+                    label="materialization candidate",
+                )
+            ),
+        ),
+        "receipt": (
+            receipt_file.stat().st_size,
+            receipt_file.stat().st_mtime_ns,
+            _sha256_bytes(
+                _read_regular_bytes_no_follow(
+                    receipt_file,
+                    label="materialization receipt",
+                )
+            ),
+        ),
     }
     if before != after:
         raise ValueError("materialization verifier modified an immutable candidate or receipt")
@@ -1023,6 +1504,8 @@ def verify_factor_v3_development_candidate(
         "verified": True,
         "artifact_sha256": expected_artifact,
         "receipt_sha256": expected_receipt,
+        "candidate_file_sha256": candidate_file_sha256,
+        "receipt_file_sha256": receipt_file_sha256,
         "history_eligible_row_count": candidate["history_eligible_row_count"],
         "excluded_row_count": candidate["excluded_row_count"],
     }
@@ -1030,23 +1513,26 @@ def verify_factor_v3_development_candidate(
 
 def materialize_factor_v3_development_candidate(
     *,
-    input_bundle_path: str | Path,
+    input_authority_descriptor_path: str | Path,
+    expected_input_authority_descriptor_sha256: str,
     output_root: str | Path,
-    verify_feature_history: Callable[[], Mapping[str, Any]],
-    verify_daily_basic: Callable[[], Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Create and post-verify one development-only candidate, or fail closed."""
 
     preverified = preverify_factor_v3_development_input_bundle(
-        input_bundle_path=input_bundle_path,
-        verify_feature_history=verify_feature_history,
-        verify_daily_basic=verify_daily_basic,
+        input_authority_descriptor_path=input_authority_descriptor_path,
+        expected_input_authority_descriptor_sha256=(
+            expected_input_authority_descriptor_sha256
+        ),
     )
     payload = _build_candidate_payload(preverified)
+    _assert_fingerprints_unchanged(preverified["input_fingerprints"])
     candidate, artifact_sha256, candidate_raw = _candidate_with_hash(payload)
+    candidate_file_sha256 = _sha256_bytes(candidate_raw)
     receipt, receipt_sha256, receipt_raw = _receipt_payload(
         candidate=candidate,
         artifact_sha256=artifact_sha256,
+        candidate_file_sha256=candidate_file_sha256,
     )
     destination = _safe_output_root(output_root)
     candidate_file = _candidate_path(destination, artifact_sha256=artifact_sha256)
@@ -1056,16 +1542,19 @@ def materialize_factor_v3_development_candidate(
     verification = verify_factor_v3_development_candidate(
         candidate_path=candidate_file,
         receipt_path=receipt_file,
-        input_bundle_path=input_bundle_path,
+        input_authority_descriptor_path=input_authority_descriptor_path,
+        expected_input_authority_descriptor_sha256=(
+            expected_input_authority_descriptor_sha256
+        ),
         expected_artifact_sha256=artifact_sha256,
         expected_receipt_sha256=receipt_sha256,
-        verify_feature_history=verify_feature_history,
-        verify_daily_basic=verify_daily_basic,
     )
     return {
         "candidate_path": str(candidate_file),
         "receipt_path": str(receipt_file),
         "artifact_sha256": artifact_sha256,
         "receipt_sha256": receipt_sha256,
+        "candidate_file_sha256": candidate_file_sha256,
+        "receipt_file_sha256": _sha256_bytes(receipt_raw),
         "verification": verification,
     }

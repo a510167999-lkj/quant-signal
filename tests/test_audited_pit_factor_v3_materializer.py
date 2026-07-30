@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import date, timedelta
 import hashlib
+import inspect
 import json
 from pathlib import Path
 from typing import Any
@@ -354,6 +355,19 @@ def _write_input_authority_descriptor(
         ],
         "daily_basic_exact_set_receipt": roots["daily_basic_coverage_receipt_sha256"],
     }
+    producer_root_sha256 = {
+        "factor_v2_parent": roots["factor_v2_parent_producer_root_sha256"],
+        "calendar": roots["extended_trading_calendar_descriptor_root_sha256"],
+        "daily_basic": roots["daily_basic_normalized_row_authority_root_sha256"],
+        "daily_traded_cross_section": roots["daily_traded_cross_section_root_sha256"],
+        "listing_membership": roots["pit_listing_membership_root_sha256"],
+        "suspensions": roots["pit_suspension_root_sha256"],
+        "security_code_transitions": roots["security_code_transition_contract_sha256"],
+        "upstream_board_ledger": roots["daily_basic_normalized_row_authority_root_sha256"],
+        "factor_v2_evaluation": roots["factor_v2_evaluator_descriptor_sha256"],
+        "feature_history_receipt": roots["feature_history_source_authority_root_sha256"],
+        "daily_basic_exact_set_receipt": roots["daily_basic_normalized_row_authority_root_sha256"],
+    }
     descriptors: dict[str, dict[str, str]] = {}
     for name, payload in source_payloads.items():
         path = root / f"{name}.json"
@@ -369,7 +383,7 @@ def _write_input_authority_descriptor(
             "relative_path": path.name,
             "file_sha256": hashlib.sha256(raw).hexdigest(),
             "receipt_sha256": receipt_sha256[name],
-            "producer_root_sha256": receipt_sha256[name],
+            "producer_root_sha256": producer_root_sha256[name],
         }
     descriptor = {
         "schema_version": "audited-pit-factor-v3-development-input-authority/v1",
@@ -478,6 +492,19 @@ def test_materializes_only_development_candidate_with_exact_pit_ledger(
     assert candidate["upstream_board_ledger"]["per_date_board_ledger_root_sha256"] == _sha(
         candidate["upstream_board_ledger"]["per_date"]
     )
+    assert set(candidate["source_descriptors"]) == {
+        "factor_v2_parent",
+        "calendar",
+        "daily_basic",
+        "daily_traded_cross_section",
+        "listing_membership",
+        "suspensions",
+        "security_code_transitions",
+        "upstream_board_ledger",
+        "factor_v2_evaluation",
+        "feature_history_receipt",
+        "daily_basic_exact_set_receipt",
+    }
     assert receipt["factor_v2_evaluation"] == bundle["factor_v2_evaluation"]
     assert candidate["producer_binding"]["root_sha256"] == receipt["producer_binding"]["root_sha256"]
     assert "publication_capability" not in candidate_path.read_text(encoding="utf-8")
@@ -642,6 +669,55 @@ def test_parent_payload_cannot_persist_sensitive_or_unregistered_fields(
 
     with pytest.raises(ValueError, match="sensitive|parent payload"):
         _materialize(tmp_path, bundle, verified)
+
+
+def test_pinned_descriptor_and_every_source_snapshot_are_replayed_offline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle, verified = _bundle(monkeypatch)
+    descriptor_path, descriptor_sha256 = _write_input_authority_descriptor(
+        tmp_path,
+        bundle,
+        verified,
+    )
+    materialize = materializer.materialize_factor_v3_development_candidate
+    assert "verify_feature_history" not in inspect.signature(materialize).parameters
+    assert "verify_daily_basic" not in inspect.signature(materialize).parameters
+    with pytest.raises(ValueError, match="descriptor content address"):
+        materialize(
+            input_authority_descriptor_path=descriptor_path,
+            expected_input_authority_descriptor_sha256=_sha("foreign-descriptor"),
+            output_root=tmp_path / "wrong-descriptor",
+        )
+
+    ledger_path = descriptor_path.parent / "upstream_board_ledger.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    ledger["per_date"][0]["segment_counts"]["BSE"] = 999
+    ledger_path.write_text(
+        json.dumps(ledger, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="source snapshot content address"):
+        materialize(
+            input_authority_descriptor_path=descriptor_path,
+            expected_input_authority_descriptor_sha256=descriptor_sha256,
+            output_root=tmp_path / "tampered-source",
+        )
+
+    clean_descriptor_path, clean_descriptor_sha256 = _write_input_authority_descriptor(
+        tmp_path / "fresh",
+        bundle,
+        verified,
+    )
+    extra_path = clean_descriptor_path.parent / "unbound.json"
+    extra_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="unbound file"):
+        materialize(
+            input_authority_descriptor_path=clean_descriptor_path,
+            expected_input_authority_descriptor_sha256=clean_descriptor_sha256,
+            output_root=tmp_path / "unbound-source",
+        )
 
 
 def test_create_only_post_verifier_and_unsafe_inputs_fail_closed(
