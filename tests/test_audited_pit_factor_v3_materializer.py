@@ -272,6 +272,7 @@ def _bundle(monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, Any], dict[str, 
 
 
 def _write_bundle(tmp_path: Path, bundle: dict[str, Any]) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / "input-bundle.json"
     path.write_text(
         json.dumps(bundle, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
@@ -339,10 +340,13 @@ def test_materializes_only_development_candidate_with_exact_pit_ledger(
     assert [row["turnover_rate_f_rank"] for row in rows] == pytest.approx(
         [-1 / 3, 1 / 3]
     )
-    assert [row["abnormal_turnover_rate_f_20_to_250_rank"] for row in rows] == pytest.approx(
+    assert [row["abnormal_turnover_rate_f_20_to_250_rank"] for row in rows] == pytest.approx([0.0, 0.0])
+    assert [row["frozen_target"] for row in rows] == [0.01, -0.01]
+    last_date = bundle["calendar"]["development_sessions"][-1]
+    last_rows = [row for row in candidate["rows"] if row["signal_date"] == last_date]
+    assert [row["abnormal_turnover_rate_f_20_to_250_rank"] for row in last_rows] == pytest.approx(
         [-1 / 3, 1 / 3]
     )
-    assert [row["frozen_target"] for row in rows] == [0.01, -0.01]
     assert candidate["upstream_board_ledger"]["preserved_before_target_scope_filter"] is True
     assert candidate["upstream_board_ledger"]["source_segments"][:3] == [
         "BSE",
