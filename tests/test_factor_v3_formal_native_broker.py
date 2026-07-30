@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import time
 
 import pytest
 
@@ -105,9 +106,11 @@ int wmain(int argc, wchar_t **argv) {
     BOOL in_job = FALSE;
     FILE *output;
     wchar_t protocol[128] = L"";
+    int hold_for_job_kill;
     if (argc != 2 || !IsProcessInJob(GetCurrentProcess(), NULL, &in_job)) {
         return 40;
     }
+    hold_for_job_kill = wcsstr(argv[1], L"job-kill-child") != NULL;
     if (_wfopen_s(&output, argv[1], L"wb") != 0 || output == NULL) {
         return 41;
     }
@@ -125,7 +128,13 @@ int wmain(int argc, wchar_t **argv) {
         "PROTOCOL_OK=%d\n",
         wcscmp(protocol, L"factor-v3-formal-native-broker-child/v1") == 0
     );
+    if (hold_for_job_kill) {
+        fprintf(output, "PID=%lu\n", GetCurrentProcessId());
+    }
     fclose(output);
+    if (hold_for_job_kill) {
+        Sleep(30000);
+    }
     return 0;
 }
 """
@@ -197,6 +206,20 @@ def _publish_candidate(tmp_path: Path, raw: bytes) -> Path:
     return path
 
 
+def _write_raw_candidate(root: Path, raw: bytes) -> Path:
+    digest = hashlib.sha256(raw).hexdigest()
+    path = (
+        root
+        / "candidates"
+        / "sha256"
+        / digest[:2]
+        / f"{digest}.candidate"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_bytes(raw)
+    return path
+
+
 def test_candidate_api_has_no_secret_path_parameters_and_is_deterministic(
     tmp_path: Path,
 ) -> None:
@@ -229,6 +252,84 @@ def test_nonsecret_actions_bind_no_credential_slot(tmp_path: Path) -> None:
     assert b"credential_slot_id=none\n" in raw
 
 
+def test_candidate_builder_rejects_invalid_action_paths_and_resume_shape(
+    tmp_path: Path,
+) -> None:
+    broker = _broker_module()
+    paths = _public_paths(tmp_path)
+    with pytest.raises(Exception, match="action"):
+        broker.build_factor_v3_formal_native_broker_candidate(
+            action="trade",
+            **paths,
+        )
+    with pytest.raises(Exception, match="path"):
+        broker.build_factor_v3_formal_native_broker_candidate(
+            action="verify",
+            **{**paths, "authorization_path": Path("relative.json")},
+        )
+    with pytest.raises(Exception, match="path"):
+        broker.build_factor_v3_formal_native_broker_candidate(
+            action="verify",
+            **{**paths, "authorization_path": str(tmp_path / "bad\npath")},
+        )
+    with pytest.raises(Exception, match="resume"):
+        broker.build_factor_v3_formal_native_broker_candidate(
+            action="resume",
+            **paths,
+        )
+    with pytest.raises(Exception, match="resume"):
+        broker.build_factor_v3_formal_native_broker_candidate(
+            action="run",
+            resume_authorization_path=tmp_path / "resume.json",
+            **paths,
+        )
+
+
+def test_resume_candidate_binds_only_public_resume_paths(tmp_path: Path) -> None:
+    broker = _broker_module()
+    paths = _public_paths(tmp_path)
+    resume_authorization = tmp_path / "resume authorization.json"
+    resume_status = tmp_path / "resume status.json"
+    raw = broker.build_factor_v3_formal_native_broker_candidate(
+        action="resume",
+        resume_authorization_path=resume_authorization,
+        resume_status_path=resume_status,
+        **paths,
+    )
+    text = raw.decode("utf-8")
+    assert f"resume_authorization_path={resume_authorization}\n" in text
+    assert f"resume_status_path={resume_status}\n" in text
+    assert "credential_slot_id=points-primary\n" in text
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        lambda raw: b"",
+        lambda raw: raw.replace(b"schema=", b"wrong=", 1),
+        lambda raw: raw.replace(b"\n", b"\r\n", 1),
+        lambda raw: raw[:-1],
+        lambda raw: raw.replace(b"credential_slot_id=points-primary", b"credential_slot_id=none"),
+        lambda raw: raw.replace(
+            b"runtime_manifest_schema=factor-v3-formal-native-broker-runtime-manifest/v1",
+            b"runtime_manifest_schema=wrong",
+        ),
+        lambda raw: b"\xff" + raw[1:],
+    ],
+)
+def test_candidate_parser_rejects_noncanonical_or_drifted_bytes(
+    tmp_path: Path,
+    mutator,
+) -> None:
+    broker = _broker_module()
+    raw, _paths = _candidate(tmp_path)
+    with pytest.raises(Exception, match="candidate"):
+        broker.publish_factor_v3_formal_native_broker_candidate(
+            candidate_output_root=tmp_path / "candidate output",
+            candidate=mutator(raw),
+        )
+
+
 def test_candidate_publication_is_content_addressed_and_immutable(
     tmp_path: Path,
 ) -> None:
@@ -244,6 +345,7 @@ def test_candidate_publication_is_content_addressed_and_immutable(
         / f"{digest}.candidate"
     )
     assert path.read_bytes() == raw
+    assert _publish_candidate(tmp_path, raw) == path
     with pytest.raises(Exception, match="candidate"):
         _broker_module().publish_factor_v3_formal_native_broker_candidate(
             candidate_output_root=tmp_path / "candidate output",
@@ -289,6 +391,77 @@ def test_native_broker_compiles_and_launches_with_sanitized_environment_and_job(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_native_broker_job_kills_child_when_last_job_handle_closes(
+    tmp_path: Path,
+) -> None:
+    native, _helper = _compile_fixture_broker(tmp_path)
+    raw, _paths = _candidate(tmp_path)
+    candidate_path = _publish_candidate(tmp_path, raw)
+    output = tmp_path / "job-kill-child.txt"
+    completed = subprocess.run(
+        [str(native), "--test-job-kill", str(candidate_path), str(output)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    child_pid = int(
+        next(
+            line.removeprefix("PID=")
+            for line in output.read_text(encoding="ascii").splitlines()
+            if line.startswith("PID=")
+        )
+    )
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        probe = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"if (Get-Process -Id {child_pid} -ErrorAction SilentlyContinue) {{ exit 1 }}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if probe.returncode == 0:
+            break
+        time.sleep(0.05)
+    assert probe.returncode == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_native_broker_holds_candidate_ancestor_identity_through_child_lifetime(
+    tmp_path: Path,
+) -> None:
+    native, _helper = _compile_fixture_broker(tmp_path)
+    raw, _paths = _candidate(tmp_path)
+    candidate_root = tmp_path / "held-candidate-root"
+    candidate_path = _publish_candidate(candidate_root, raw)
+    output = tmp_path / "job-kill-child-held-boundary.txt"
+    process = subprocess.Popen(
+        [str(native), "--test-launch", str(candidate_path), str(output)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not output.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert output.exists()
+        with pytest.raises(OSError):
+            candidate_root.rename(tmp_path / "replaced-candidate-root")
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+    assert not (tmp_path / "replaced-candidate-root").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
 def test_native_broker_rejects_hardlinked_candidate(tmp_path: Path) -> None:
     native, _helper = _compile_fixture_broker(tmp_path)
     raw, _paths = _candidate(tmp_path)
@@ -304,6 +477,65 @@ def test_native_broker_rejects_hardlinked_candidate(tmp_path: Path) -> None:
     )
     assert completed.returncode != 0
     assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_native_broker_rejects_relative_public_path_in_untrusted_candidate(
+    tmp_path: Path,
+) -> None:
+    native, _helper = _compile_fixture_broker(tmp_path)
+    raw, paths = _candidate(tmp_path)
+    drifted = raw.replace(
+        f"authorization_path={paths['authorization_path']}\n".encode("utf-8"),
+        b"authorization_path=relative.json\n",
+    )
+    assert drifted != raw
+    candidate_path = _write_raw_candidate(tmp_path / "untrusted", drifted)
+    completed = subprocess.run(
+        [str(native), "--validate-candidate", str(candidate_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode != 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_native_broker_rejects_hardlinked_fixed_source_and_credential_slots(
+    tmp_path: Path,
+) -> None:
+    native, _helper = _compile_fixture_broker(tmp_path)
+    raw, _paths = _candidate(tmp_path)
+    candidate_path = _publish_candidate(tmp_path, raw)
+    source_hardlink = tmp_path / "reviewed-source-hardlink.txt"
+    os.link(tmp_path / "reviewed-source.txt", source_hardlink)
+    rejected_source = subprocess.run(
+        [str(native), "--test-launch", str(candidate_path), str(tmp_path / "source-out")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert rejected_source.returncode != 0
+    source_hardlink.unlink()
+
+    credential_hardlink = tmp_path / "credential-hardlink.slot"
+    os.link(tmp_path / "dummy-credential.slot", credential_hardlink)
+    rejected_credential = subprocess.run(
+        [
+            str(native),
+            "--test-launch",
+            str(candidate_path),
+            str(tmp_path / "credential-out"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert rejected_credential.returncode != 0
+    assert not (tmp_path / "credential-out").exists()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
@@ -357,3 +589,17 @@ def test_default_binary_is_compileable_but_production_launch_fails_closed(
     assert completed.returncode != 0
     assert completed.stdout == ""
     assert "unprovisioned" in completed.stderr.lower()
+    test_mode = subprocess.run(
+        [
+            str(native),
+            "--test-launch",
+            str(tmp_path / "missing.candidate"),
+            str(tmp_path / "missing.out"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert test_mode.returncode != 0
+    assert "invocation rejected" in test_mode.stderr.lower()
