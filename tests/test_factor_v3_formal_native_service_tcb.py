@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import uuid
 
 import pytest
@@ -15,6 +16,9 @@ BROKER_SOURCE = BROKER_ROOT / "factor_v3_formal_native_broker.c"
 BROKER_MANIFEST = BROKER_ROOT / "factor_v3_formal_native_broker_manifest.h"
 SERVICE_INSTALLER = (
     REPO_ROOT / "scripts" / "install_factor_v3_formal_native_broker_service.ps1"
+)
+HANDOFF_CHILD_SOURCE = (
+    REPO_ROOT / "tests" / "native" / "factor_v3_credential_handoff_child.c"
 )
 
 
@@ -61,6 +65,238 @@ def _run(binary: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=30,
     )
+
+
+def _c_wide(path: Path) -> str:
+    return str(path.resolve()).replace("\\", "/").replace('"', '\\"')
+
+
+def _compile_source(
+    *,
+    source: Path,
+    output: Path,
+    includes: list[Path],
+    definitions: list[str],
+    libraries: list[str],
+) -> None:
+    gcc = shutil.which("gcc")
+    if gcc is None:
+        pytest.skip("Win32 GCC is unavailable")
+    completed = subprocess.run(
+        [
+            gcc,
+            "-std=c11",
+            "-DUNICODE",
+            "-D_UNICODE",
+            "-municode",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            *definitions,
+            *(f"-I{path}" for path in includes),
+            str(source),
+            "-o",
+            str(output),
+            "-ladvapi32",
+            "-lbcrypt",
+            *libraries,
+        ],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def _replace_acl_with_broker_only(path: Path) -> None:
+    account = f"{os.environ['USERDOMAIN']}\\{os.environ['USERNAME']}"
+    completed = subprocess.run(
+        [
+            "icacls",
+            str(path),
+            "/inheritance:r",
+            "/grant:r",
+            f"{account}:(OI)(CI)(F)",
+            "*S-1-5-18:(OI)(CI)(F)",
+            "*S-1-5-32-544:(OI)(CI)(F)",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def _build_handoff_fixture(root: Path) -> tuple[Path, Path, Path, Path, bytes, str]:
+    from app import factor_v3_formal_native_broker as broker
+
+    public = root / "public"
+    provisional_root = public / "provisional"
+    completed_root = root / "broker-completed"
+    secret_root = root / "broker-secret"
+    for path in (public, provisional_root, completed_root, secret_root):
+        path.mkdir(parents=True)
+    _replace_acl_with_broker_only(completed_root)
+    _replace_acl_with_broker_only(secret_root)
+
+    secret_value = f"disposable-credential-{uuid.uuid4()}".encode("ascii")
+    credential = secret_root / "points-primary.slot"
+    credential.write_bytes(secret_value)
+    _replace_acl_with_broker_only(credential)
+
+    paths = {
+        "authorization_path": public / "bootstrap-authorization.json",
+        "completion_marker_path": public / "bootstrap-completion.json",
+        "publication_receipt_path": public / "supervisor-publication.json",
+        "execution_ledger_root": completed_root,
+    }
+    for name, path in paths.items():
+        if name != "execution_ledger_root":
+            path.write_bytes(f"{name}\n".encode("ascii"))
+    candidate = broker.build_factor_v3_formal_native_broker_candidate(
+        action="run",
+        **paths,
+    )
+    publication = broker.publish_factor_v3_formal_native_broker_candidate(
+        candidate_output_root=public,
+        candidate=candidate,
+    )
+    candidate_path = Path(publication["candidate_path"])
+    candidate_sha256 = publication["candidate_sha256"]
+
+    original_schema = "factor-v3-formal-supervisor-launch-authorization/v2"
+    original_action = "run"
+    original_envelope_sha256 = "1" * 64
+    original_signature_sha256 = "2" * 64
+    original_cas_sha256 = "3" * 64
+    claim_fields = (
+        f"original_schema={original_schema}\n"
+        f"original_action={original_action}\n"
+        f"original_envelope_sha256={original_envelope_sha256}\n"
+        f"original_signature_sha256={original_signature_sha256}\n"
+        f"original_cas_sha256={original_cas_sha256}\n"
+        f"candidate_sha256={candidate_sha256}\n"
+    ).encode("ascii")
+    claim_sha256 = __import__("hashlib").sha256(claim_fields).hexdigest()
+
+    provisional = provisional_root / "worker.provisional"
+    completed = completed_root / "broker.completed"
+    child_manifest = root / "handoff_child_manifest.h"
+    child_manifest.write_text(
+        "\n".join(
+            (
+                '#define F3_HANDOFF_SECRET_PATH L"' + _c_wide(credential) + '"',
+                '#define F3_HANDOFF_COMPLETED_PATH L"' + _c_wide(completed) + '"',
+                (
+                    '#define F3_HANDOFF_EXPECTED_SECRET_SHA256 L"'
+                    + __import__("hashlib").sha256(secret_value).hexdigest()
+                    + '"'
+                ),
+                f'#define F3_HANDOFF_ORIGINAL_SCHEMA "{original_schema}"',
+                f'#define F3_HANDOFF_ORIGINAL_ACTION "{original_action}"',
+                (
+                    '#define F3_HANDOFF_ORIGINAL_ENVELOPE_SHA256 "'
+                    + original_envelope_sha256
+                    + '"'
+                ),
+                (
+                    '#define F3_HANDOFF_ORIGINAL_SIGNATURE_SHA256 "'
+                    + original_signature_sha256
+                    + '"'
+                ),
+                (
+                    '#define F3_HANDOFF_ORIGINAL_CAS_SHA256 "'
+                    + original_cas_sha256
+                    + '"'
+                ),
+                f'#define F3_HANDOFF_CANDIDATE_SHA256 "{candidate_sha256}"',
+                f'#define F3_HANDOFF_CLAIM_SHA256 "{claim_sha256}"',
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    child = public / "factor_v3_credential_handoff_child.exe"
+    _compile_source(
+        source=HANDOFF_CHILD_SOURCE,
+        output=child,
+        includes=[root],
+        definitions=[
+            '-DF3_HANDOFF_MANIFEST_HEADER="handoff_child_manifest.h"',
+        ],
+        libraries=[],
+    )
+
+    reviewed_source = public / "reviewed-source.txt"
+    reviewed_source.write_bytes(b"reviewed disposable native handoff source\n")
+    broker_manifest = root / "handoff_broker_manifest.h"
+    broker_manifest.write_text(
+        "\n".join(
+            (
+                '#define F3_BROKER_RUNTIME_PATH L"' + _c_wide(child) + '"',
+                (
+                    '#define F3_BROKER_RUNTIME_SHA256 L"'
+                    + __import__("hashlib").sha256(child.read_bytes()).hexdigest()
+                    + '"'
+                ),
+                '#define F3_BROKER_SOURCE_PATH L"' + _c_wide(reviewed_source) + '"',
+                (
+                    '#define F3_BROKER_SOURCE_SHA256 L"'
+                    + __import__("hashlib").sha256(
+                        reviewed_source.read_bytes()
+                    ).hexdigest()
+                    + '"'
+                ),
+                '#define F3_BROKER_CREDENTIAL_SLOT_PATH L"'
+                + _c_wide(credential)
+                + '"',
+                (
+                    '#define F3_BROKER_CNG_PROVIDER '
+                    'L"Microsoft Software Key Storage Provider"'
+                ),
+                '#define F3_BROKER_CNG_KEY_NAME L"unused-disposable-test-key"',
+                "#define F3_BROKER_CNG_ALGORITHM NCRYPT_RSA_ALGORITHM",
+                '#define F3_BROKER_SERVICE_NAME L"DisposableFixtureService"',
+                '#define F3_BROKER_SERVICE_SID L"S-1-5-18"',
+                '#define F3_BROKER_RESTRICTING_SID L"S-1-5-32-545"',
+                f'#define F3_BROKER_HANDOFF_ORIGINAL_SCHEMA "{original_schema}"',
+                f'#define F3_BROKER_HANDOFF_ORIGINAL_ACTION "{original_action}"',
+                (
+                    '#define F3_BROKER_HANDOFF_ORIGINAL_ENVELOPE_SHA256 "'
+                    + original_envelope_sha256
+                    + '"'
+                ),
+                (
+                    '#define F3_BROKER_HANDOFF_ORIGINAL_SIGNATURE_SHA256 "'
+                    + original_signature_sha256
+                    + '"'
+                ),
+                (
+                    '#define F3_BROKER_HANDOFF_ORIGINAL_CAS_SHA256 "'
+                    + original_cas_sha256
+                    + '"'
+                ),
+                "#define F3_BROKER_TESTING 1",
+                "#define F3_BROKER_DISPOSABLE_TEST_MANIFEST 1",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    native = public / "factor_v3_formal_native_broker-handoff-test.exe"
+    _compile_source(
+        source=BROKER_SOURCE,
+        output=native,
+        includes=[root, BROKER_ROOT],
+        definitions=[
+            '-DF3_BROKER_MANIFEST_HEADER="handoff_broker_manifest.h"',
+        ],
+        libraries=["-lncrypt"],
+    )
+    return native, candidate_path, provisional, completed, secret_value, claim_sha256
 
 
 def test_native_manifest_uses_fixed_cng_identity_and_no_private_key_file_slot() -> None:
@@ -142,3 +378,65 @@ def test_service_installer_is_explicit_dry_run_and_documents_external_tcb() -> N
     assert "ACL" in script
     assert "CNG" in script
     assert "exit 1" in script
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_restricted_child_gets_credential_only_after_bound_ready_and_broker_completes(
+    tmp_path: Path,
+) -> None:
+    program_data = Path(os.environ["ProgramData"])
+    root = Path(
+        tempfile.mkdtemp(
+            prefix="quant-signal-lkj-disposable-handoff-",
+            dir=program_data,
+        )
+    )
+    try:
+        native, candidate, provisional, completed, secret, claim_sha256 = (
+            _build_handoff_fixture(root)
+        )
+        key_name = f"quant-signal-lkj-disposable-test-{uuid.uuid4()}"
+        launched = _run(
+            native,
+            "--test-credential-handoff",
+            str(candidate),
+            str(provisional),
+            str(completed),
+            key_name,
+        )
+        assert launched.returncode == 0, launched.stderr
+        assert launched.stdout == ""
+        assert launched.stderr == ""
+        assert provisional.read_text(encoding="ascii") == (
+            "schema=factor-v3-formal-native-broker-provisional/v1\n"
+            "restricted_token=1\n"
+            "pre_claim_secret_open_denied=1\n"
+            "credential_handle_read_ok=1\n"
+            "post_claim_secret_reopen_denied=1\n"
+            "completed_path_write_denied=1\n"
+            "status=provisional\n"
+        )
+        ledger = completed.read_bytes()
+        assert b"schema=factor-v3-formal-native-broker-completed/v1\n" in ledger
+        assert b"status=completed\n" in ledger
+        assert f"claim_sha256={claim_sha256}\n".encode("ascii") in ledger
+        assert b"signature_algorithm=RSA-PKCS1-SHA256\n" in ledger
+        assert b"signature_verified_before_key_delete=1\n" in ledger
+        assert secret not in provisional.read_bytes()
+        assert secret not in ledger
+        assert secret not in launched.stdout.encode()
+        assert secret not in launched.stderr.encode()
+
+        absent = _run(native, "--test-cng-key-absent", key_name)
+        assert absent.returncode == 0, absent.stderr
+        source = BROKER_SOURCE.read_text(encoding="utf-8")
+        assert "CreateRestrictedToken" in source
+        assert "CreateProcessAsUserW" in source
+        assert "PROC_THREAD_ATTRIBUTE_HANDLE_LIST" in source
+        assert "DuplicateHandle" in source
+        assert source.index("validate_bound_ready") < source.index(
+            "F3_BROKER_CREDENTIAL_SLOT_PATH",
+            source.index("validate_bound_ready"),
+        )
+    finally:
+        shutil.rmtree(root)
