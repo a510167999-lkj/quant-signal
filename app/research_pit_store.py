@@ -104,6 +104,12 @@ def _cninfo_parser_code_path() -> Path:
     return Path(parser.__code__.co_filename)
 
 
+def _normalized_python_source_sha256(path: Path) -> str:
+    source = path.read_bytes()
+    normalized = source.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(normalized).hexdigest()
+
+
 STORE_SCHEMA_VERSION = "pit-receipt-store/v4"
 LEGACY_STORE_SCHEMA_VERSIONS = {"pit-receipt-store/v2", "pit-receipt-store/v3"}
 PARSER_VERSION = "tushare-native-v2"
@@ -675,9 +681,9 @@ def _coverage_verifier_contract_sha256(
             "schema_version": CNINFO_SUSPENSION_EVIDENCE_SCHEMA_VERSION,
             "parser_version": CNINFO_SUSPENSION_PARSER_VERSION,
             "supported_parser_versions": sorted(parser_versions),
-            "parser_code_sha256": hashlib.sha256(
-                _cninfo_parser_code_path().read_bytes()
-            ).hexdigest(),
+            "parser_code_sha256": _normalized_python_source_sha256(
+                _cninfo_parser_code_path()
+            ),
             "source_profile": CNINFO_SOURCE_PROFILE,
             "interval_policy": "full_session_half_open_start_inclusive_resume_exclusive_v1",
             "use_policy": "explain_missing_daily_only_never_synthesize_market_rows_v1",

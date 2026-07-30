@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -76,6 +77,9 @@ PLANNED_RUN_ROOT = (
     / "data"
     / "research_runs"
     / "audited_pit_factor_v3_daily_basic_collection_v2_development_733"
+)
+FEATURE_HISTORY_ATTESTATION_SHA256 = (
+    "4f73e1e0515d7c7932ba2e8b5c8885dac56645f83c5ed3d1c6570fbdd24f184c"
 )
 EXACT_SET_AUTHORITY_INPUTS = {
     "feature_history_frozen_source_attestation_path": str(
@@ -161,12 +165,28 @@ def _script_worktree_root() -> Path:
 
 
 def _git_output(*args: str) -> str:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
     completed = subprocess.run(
-        ["git", "-C", str(FORMAL_WORKTREE_ROOT), *args],
+        [str(GIT_EXECUTABLE), "-C", str(FORMAL_WORKTREE_ROOT), *args],
         check=True,
         capture_output=True,
         text=True,
         encoding="utf-8",
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        timeout=60,
     )
     return completed.stdout.strip()
 
@@ -182,7 +202,12 @@ def _is_reparse(path: Path) -> bool:
     )
 
 
-def verify_formal_worktree() -> None:
+def verify_formal_worktree(*, expected_reviewed_commit: str) -> None:
+    if (
+        type(expected_reviewed_commit) is not str
+        or _COMMIT_RE.fullmatch(expected_reviewed_commit) is None
+    ):
+        raise FormalRunSpecError("formal worktree reviewed commit rejected")
     script_root = _script_worktree_root()
     if (
         script_root != FORMAL_WORKTREE_ROOT
@@ -192,12 +217,19 @@ def verify_formal_worktree() -> None:
         raise FormalRunSpecError("formal worktree root drifted")
     try:
         git_root = Path(_git_output("rev-parse", "--show-toplevel")).resolve()
+        commit = _git_output("rev-parse", "HEAD")
         branch = _git_output("branch", "--show-current")
         dirty = _git_output("status", "--porcelain=v1", "--untracked-files=all")
-    except (OSError, subprocess.CalledProcessError) as exc:
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ) as exc:
         raise FormalRunSpecError("formal worktree git identity unavailable") from exc
     if git_root != FORMAL_WORKTREE_ROOT or branch != EXPECTED_BRANCH:
         raise FormalRunSpecError("formal worktree branch drifted")
+    if commit != expected_reviewed_commit:
+        raise FormalRunSpecError("formal worktree reviewed commit drifted")
     if dirty:
         raise FormalRunSpecError("formal worktree is dirty")
 
@@ -399,8 +431,11 @@ def _load_runner() -> ModuleType:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--write", action="store_true")
+    parser.add_argument("--expected-reviewed-commit", required=True)
     args = parser.parse_args(argv)
-    verify_formal_worktree()
+    verify_formal_worktree(
+        expected_reviewed_commit=args.expected_reviewed_commit,
+    )
     verify_planned_run_root()
     candidate, content = build_and_verify_candidate(_load_runner())
     if args.write:

@@ -6,10 +6,12 @@ from collections.abc import Mapping, Sequence
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
-from typing import Any
+import stat
+from typing import Any, BinaryIO
 import uuid
 
 from app import audited_pit_factor_v3_feature_history_authority as history_authority
@@ -228,6 +230,118 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _open_database_read_lock(path: Path) -> BinaryIO:
+    candidate = raw_authority._safe_existing_file(
+        path,
+        "factor-v3 daily-basic feature-history database",
+    )
+    before = candidate.lstat()
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        handle = create_file(
+            str(candidate),
+            0x80000000,
+            0x00000001,
+            None,
+            3,
+            0x00000080 | 0x08000000,
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle in (None, invalid):
+            error = ctypes.get_last_error()
+            raise ValueError(
+                "factor-v3 daily-basic feature-history database lock rejected"
+            ) from OSError(error, ctypes.FormatError(error), str(candidate))
+        try:
+            descriptor = msvcrt.open_osfhandle(
+                int(handle),
+                os.O_RDONLY | getattr(os, "O_BINARY", 0),
+            )
+        except BaseException:
+            kernel32.CloseHandle(handle)
+            raise
+    else:
+        descriptor = os.open(
+            candidate,
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    stream = os.fdopen(descriptor, "rb")
+    opened = os.fstat(stream.fileno())
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or int(getattr(opened, "st_nlink", 1)) != 1
+        or not os.path.samestat(before, opened)
+    ):
+        stream.close()
+        raise ValueError(
+            "factor-v3 daily-basic feature-history database identity rejected"
+        )
+    return stream
+
+
+def _locked_file_sha256(handle: BinaryIO) -> str:
+    before = os.fstat(handle.fileno())
+    handle.seek(0)
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+    handle.seek(0)
+    after = os.fstat(handle.fileno())
+    if not os.path.samestat(before, after) or before.st_size != after.st_size:
+        raise ValueError(
+            "factor-v3 daily-basic feature-history database drifted"
+        )
+    return digest.hexdigest()
+
+
+def _postverify_database_lock(
+    path: Path,
+    handle: BinaryIO,
+    *,
+    expected_sha256: str,
+) -> None:
+    opened = os.fstat(handle.fileno())
+    try:
+        terminal_path = raw_authority._safe_existing_file(
+            path,
+            "factor-v3 daily-basic feature-history database",
+        )
+        path_after = terminal_path.lstat()
+    except (OSError, ValueError):
+        raise ValueError(
+            "factor-v3 daily-basic feature-history database drifted"
+        ) from None
+    if (
+        raw_authority._path_is_link_or_reparse(path)
+        or not os.path.samestat(opened, path_after)
+        or not hmac.compare_digest(
+            _locked_file_sha256(handle),
+            expected_sha256,
+        )
+    ):
+        raise ValueError(
+            "factor-v3 daily-basic feature-history database drifted"
+        )
+
+
 def _load_feature_history_prewindow_authority(
     *,
     feature_history_run_spec_path: str | Path,
@@ -272,116 +386,196 @@ def _load_feature_history_prewindow_authority(
     receipt = state.get("receipt")
     if type(receipt) is not dict or receipt.get("verified") is not True:
         raise ValueError("factor-v3 daily-basic feature-history receipt rejected")
+    sessions_sha256 = _canonical_sha256(sessions)
+    if (
+        verified.get("receipt_sha256") != receipt.get("receipt_sha256")
+        or verified.get("sessions_sha256") != receipt.get("sessions_sha256")
+        or verified.get("sessions_sha256") != sessions_sha256
+    ):
+        raise ValueError(
+            "factor-v3 daily-basic feature-history attestation binding rejected"
+        )
+    state_before = _canonical_bytes(state)
     publication = history_runner._validated_publication(state["collection_publication"])
     manifest = history_authority._read_collection_manifest(
         output_root=paths["publication_root"],
         publication=publication,
     )
+    manifest_before = _canonical_bytes(manifest)
     refs = manifest.get("session_authority_refs")
     if type(refs) is not list or len(refs) != 250:
         raise ValueError("factor-v3 daily-basic feature-history refs rejected")
     ref_by_date = {str(item["trade_date"]): item for item in refs}
     if list(ref_by_date) != sessions:
         raise ValueError("factor-v3 daily-basic feature-history refs rejected")
+    refs_before = _canonical_bytes(refs)
     database = paths["store"] / "metadata.sqlite3"
-    if (
-        database.is_symlink()
-        or not database.is_file()
-        or any(Path(f"{database}{suffix}").exists() for suffix in ("-wal", "-shm"))
-        or _file_sha256(database) != receipt.get("pit_store_database_sha256")
-    ):
+    expected_database_sha256 = receipt.get("pit_store_database_sha256")
+    if type(expected_database_sha256) is not str:
         raise ValueError("factor-v3 daily-basic feature-history database rejected")
-    connection = sqlite3.connect(
-        f"{database.resolve(strict=True).as_uri()}?mode=ro&immutable=1",
-        uri=True,
-    )
-    try:
-        generations = {
-            str(row[0]): {
-                "generation_id": str(row[1]),
-                "published_at": str(row[2]),
-                "source_vintage": str(row[3]),
-                "manifest_sha256": str(row[4]),
-                "lineage_sha256": str(row[5]),
+    with _open_database_read_lock(database) as database_handle:
+        if (
+            any(
+                os.path.lexists(f"{database}{suffix}")
+                for suffix in ("-wal", "-shm", "-journal")
+            )
+            or not hmac.compare_digest(
+                _locked_file_sha256(database_handle),
+                expected_database_sha256,
+            )
+        ):
+            raise ValueError(
+                "factor-v3 daily-basic feature-history database rejected"
+            )
+        connection = sqlite3.connect(
+            f"{database.resolve(strict=True).as_uri()}?mode=ro&immutable=1",
+            uri=True,
+        )
+        try:
+            generations = {
+                str(row[0]): {
+                    "generation_id": str(row[1]),
+                    "published_at": str(row[2]),
+                    "source_vintage": str(row[3]),
+                    "manifest_sha256": str(row[4]),
+                    "lineage_sha256": str(row[5]),
+                }
+                for row in connection.execute(
+                    """
+                    SELECT trade_date, generation_id, terminal_at, vintage,
+                           manifest_sha256, lineage_sha256
+                    FROM market_session_generations
+                    WHERE status = 'published'
+                    ORDER BY trade_date
+                    """
+                )
+            }
+            codes_by_date: dict[str, list[str]] = {
+                session: [] for session in sessions
             }
             for row in connection.execute(
                 """
-                SELECT trade_date, generation_id, terminal_at, vintage,
-                       manifest_sha256, lineage_sha256
-                FROM market_session_generations
-                WHERE status = 'published'
-                ORDER BY trade_date
+                SELECT trade_date, generation_id, ts_code
+                FROM market_session_generation_rows_daily
+                ORDER BY trade_date, ts_code
                 """
-            )
-        }
-        codes_by_date: dict[str, list[str]] = {session: [] for session in sessions}
-        for row in connection.execute(
-            """
-            SELECT trade_date, generation_id, ts_code
-            FROM market_session_generation_rows_daily
-            ORDER BY trade_date, ts_code
-            """
-        ):
-            session, generation_id, code = map(str, row)
-            if (
-                session not in codes_by_date
-                or generations.get(session, {}).get("generation_id") != generation_id
             ):
-                raise ValueError("factor-v3 daily-basic feature-history rows rejected")
-            codes_by_date[session].append(code)
-    finally:
-        connection.close()
-    partitions = []
-    for session in sessions:
-        generation = generations.get(session)
-        ref = ref_by_date.get(session)
-        codes = codes_by_date.get(session)
-        if (
-            generation is None
-            or ref is None
-            or not codes
-            or codes != sorted(set(codes))
-            or generation["source_vintage"]
-            not in {"live_forward", "historical_backfill"}
-            or generation["generation_id"] != ref.get("market_generation_id")
-            or generation["manifest_sha256"]
-            != ref.get("market_generation_manifest_sha256")
-            or generation["lineage_sha256"]
-            != ref.get("market_generation_lineage_sha256")
-        ):
-            raise ValueError("factor-v3 daily-basic feature-history partition rejected")
-        partitions.append(
-            legacy.AuthoritativeDailyPartition(
-                trade_date=session,
-                generation_id=generation["generation_id"],
-                generation_manifest_sha256=generation["manifest_sha256"],
-                generation_lineage_sha256=generation["lineage_sha256"],
-                vintage=generation["published_at"],
-                ts_codes=tuple(codes),
+                session, generation_id, code = map(str, row)
+                if (
+                    session not in codes_by_date
+                    or generations.get(session, {}).get("generation_id")
+                    != generation_id
+                ):
+                    raise ValueError(
+                        "factor-v3 daily-basic feature-history rows rejected"
+                    )
+                codes_by_date[session].append(code)
+        finally:
+            connection.close()
+        partitions = []
+        for session in sessions:
+            generation = generations.get(session)
+            ref = ref_by_date.get(session)
+            codes = codes_by_date.get(session)
+            if (
+                generation is None
+                or ref is None
+                or not codes
+                or codes != sorted(set(codes))
+                or generation["source_vintage"]
+                not in {"live_forward", "historical_backfill"}
+                or generation["generation_id"]
+                != ref.get("market_generation_id")
+                or generation["manifest_sha256"]
+                != ref.get("market_generation_manifest_sha256")
+                or generation["lineage_sha256"]
+                != ref.get("market_generation_lineage_sha256")
+            ):
+                raise ValueError(
+                    "factor-v3 daily-basic feature-history partition rejected"
+                )
+            partitions.append(
+                legacy.AuthoritativeDailyPartition(
+                    trade_date=session,
+                    generation_id=generation["generation_id"],
+                    generation_manifest_sha256=generation[
+                        "manifest_sha256"
+                    ],
+                    generation_lineage_sha256=generation[
+                        "lineage_sha256"
+                    ],
+                    vintage=generation["published_at"],
+                    ts_codes=tuple(codes),
+                )
             )
+        terminal_state = history_runner._validated_state(
+            history_runner._read_json_file(
+                paths["state"],
+                label="run state",
+                max_bytes=history_runner._MAX_STATE_BYTES,
+            ),
+            run_spec_sha256=spec["run_spec_sha256"],
         )
-    partition_tuple = tuple(partitions)
-    refs_for_root = _partition_refs(partition_tuple)
-    return legacy.AuditedDailyAuthority(
-        manifest_file_sha256=publication["authority_manifest_sha256"],
-        manifest_sha256=receipt["collection_publication_manifest_sha256"],
-        bundle_sha256=receipt["snapshot_index_sha256"],
-        artifact_root_sha256=receipt["source_authority_root_sha256"],
-        sqlite_sha256=receipt["pit_store_database_sha256"],
-        coverage_audit_sha256=receipt["session_authority_refs_sha256"],
-        temporal_contract_sha256=spec["temporal_partition_contract"]["contract_sha256"],
-        temporal_role="development",
-        daily_table_rows=sum(len(item.ts_codes) for item in partition_tuple),
-        daily_table_sha256=_canonical_sha256(
-            [
-                {"trade_date": item.trade_date, "ts_codes": list(item.ts_codes)}
-                for item in partition_tuple
-            ]
-        ),
-        market_generation_count=250,
-        market_generation_root_sha256=_canonical_sha256(refs_for_root),
-        partitions=partition_tuple,
-    )
+        terminal_manifest = history_authority._read_collection_manifest(
+            output_root=paths["publication_root"],
+            publication=publication,
+        )
+        if (
+            _canonical_bytes(terminal_state) != state_before
+            or _canonical_bytes(terminal_manifest) != manifest_before
+            or _canonical_bytes(
+                terminal_manifest.get("session_authority_refs")
+            )
+            != refs_before
+            or any(
+                os.path.lexists(f"{database}{suffix}")
+                for suffix in ("-wal", "-shm", "-journal")
+            )
+        ):
+            raise ValueError(
+                "factor-v3 daily-basic feature-history terminal evidence drifted"
+            )
+        _postverify_database_lock(
+            database,
+            database_handle,
+            expected_sha256=expected_database_sha256,
+        )
+        partition_tuple = tuple(partitions)
+        refs_for_root = _partition_refs(partition_tuple)
+        authority = legacy.AuditedDailyAuthority(
+            manifest_file_sha256=publication["authority_manifest_sha256"],
+            manifest_sha256=receipt[
+                "collection_publication_manifest_sha256"
+            ],
+            bundle_sha256=receipt["snapshot_index_sha256"],
+            artifact_root_sha256=receipt["source_authority_root_sha256"],
+            sqlite_sha256=receipt["pit_store_database_sha256"],
+            coverage_audit_sha256=receipt[
+                "session_authority_refs_sha256"
+            ],
+            temporal_contract_sha256=spec[
+                "temporal_partition_contract"
+            ]["contract_sha256"],
+            temporal_role="development",
+            daily_table_rows=sum(
+                len(item.ts_codes) for item in partition_tuple
+            ),
+            daily_table_sha256=_canonical_sha256(
+                [
+                    {
+                        "trade_date": item.trade_date,
+                        "ts_codes": list(item.ts_codes),
+                    }
+                    for item in partition_tuple
+                ]
+            ),
+            market_generation_count=250,
+            market_generation_root_sha256=_canonical_sha256(
+                refs_for_root
+            ),
+            partitions=partition_tuple,
+        )
+    return authority
 
 
 def _load_development_authority(

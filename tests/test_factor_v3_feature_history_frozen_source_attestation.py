@@ -1259,6 +1259,47 @@ def test_frozen_result_rejects_noncanonical_producer_binding(
         frozen._validated_frozen_result(result)
 
 
+def test_pinned_executable_rejects_reparse_in_any_parent_component(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "blocked-parent"
+    parent.mkdir()
+    executable = parent / "python.exe"
+    executable.write_bytes(b"fixed executable")
+    original = raw_authority._path_is_link_or_reparse
+    monkeypatch.setattr(
+        raw_authority,
+        "_path_is_link_or_reparse",
+        lambda candidate: Path(candidate) == parent or original(Path(candidate)),
+    )
+
+    with pytest.raises(ValueError, match="link|reparse|executable"):
+        frozen._read_pinned_executable(
+            executable,
+            expected_sha256=_sha(executable.read_bytes()),
+            label="python",
+        )
+
+
+def test_frozen_result_rejects_noncanonical_producer_binding(
+    tmp_path: Path,
+) -> None:
+    spec_path = tmp_path / "feature-spec.json"
+    spec_path.write_bytes(b"{}")
+    run_root = tmp_path / "feature-run"
+    run_root.mkdir()
+    result = _safe_verifier_result(
+        source_root=tmp_path,
+        spec_path=spec_path,
+        run_root=run_root,
+    )
+    result["producer_binding"]["extra"] = "unbound"
+
+    with pytest.raises(ValueError, match="producer binding"):
+        frozen._validated_frozen_result(result)
+
+
 def test_direct_file_read_rejects_reparse_in_any_parent_component(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

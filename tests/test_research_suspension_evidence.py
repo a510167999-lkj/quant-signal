@@ -468,3 +468,42 @@ def test_v1_only_coverage_contract_keeps_published_artifact_identity():
     assert _coverage_verifier_contract_sha256(
         ["cninfo-suspension-pdf/v1"]
     ) == "56a2b8169fc55cbef0bfb1e744fd743b7d8e096302ab8ebc5e8aeca35ffb3e56"
+
+
+def test_v2_coverage_contract_normalizes_source_line_endings(
+    tmp_path, monkeypatch
+):
+    lf_path = tmp_path / "parser_lf.py"
+    crlf_path = tmp_path / "parser_crlf.py"
+    changed_path = tmp_path / "parser_changed.py"
+    lf_path.write_bytes(b"def parse():\n    return 1\n")
+    crlf_path.write_bytes(b"def parse():\r\n    return 1\r\n")
+    changed_path.write_bytes(b"def parse():\n    return 2\n")
+
+    monkeypatch.setattr(
+        pit_store_module, "_cninfo_parser_code_path", lambda: lf_path
+    )
+    lf_contract = _coverage_verifier_contract_sha256(
+        ["cninfo-suspension-pdf/v2"]
+    )
+    monkeypatch.setattr(
+        pit_store_module, "_cninfo_parser_code_path", lambda: crlf_path
+    )
+    crlf_contract = _coverage_verifier_contract_sha256(
+        ["cninfo-suspension-pdf/v2"]
+    )
+    monkeypatch.setattr(
+        pit_store_module, "_cninfo_parser_code_path", lambda: changed_path
+    )
+    changed_contract = _coverage_verifier_contract_sha256(
+        ["cninfo-suspension-pdf/v2"]
+    )
+
+    assert crlf_contract == lf_contract
+    assert changed_contract != lf_contract
+
+
+def test_v2_coverage_contract_keeps_published_artifact_identity():
+    assert _coverage_verifier_contract_sha256(
+        ["cninfo-suspension-pdf/v2"]
+    ) == "e8dccad5a7f1fee29431230f650f5ae3470bd33393f1b6a6090f7ab4a96d9ea2"

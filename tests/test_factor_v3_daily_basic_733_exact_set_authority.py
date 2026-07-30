@@ -433,6 +433,29 @@ def test_prewindow_loader_binds_attestation_receipt_and_sessions_to_state(
         )
 
 
+def test_feature_history_database_lock_denies_write_and_replacement(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "metadata.sqlite3"
+    database.write_bytes(b"locked-database")
+    replacement = tmp_path / "replacement.sqlite3"
+    replacement.write_bytes(b"replacement")
+
+    handle = authority._open_database_read_lock(database)
+    try:
+        with pytest.raises(PermissionError):
+            database.write_bytes(b"drift")
+        with pytest.raises(PermissionError):
+            replacement.replace(database)
+        authority._postverify_database_lock(
+            database,
+            handle,
+            expected_sha256=hashlib.sha256(b"locked-database").hexdigest(),
+        )
+    finally:
+        handle.close()
+
+
 def test_v2_publisher_and_capability_free_verifier_rebuild_exact_733_union(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
