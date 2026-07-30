@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import time
+import ctypes
 
 import pytest
 
@@ -284,6 +285,21 @@ def _write_raw_candidate(root: Path, raw: bytes) -> Path:
     return path
 
 
+def _windows_command_line_to_argv(command_line: str) -> list[str]:
+    argc = ctypes.c_int()
+    parser = ctypes.windll.shell32.CommandLineToArgvW
+    parser.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+    parser.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    argv = parser(command_line, ctypes.byref(argc))
+    assert argv
+    try:
+        return [argv[index] for index in range(argc.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(
+            ctypes.cast(argv, ctypes.c_void_p)
+        )
+
+
 def test_candidate_api_has_no_secret_path_parameters_and_is_deterministic(
     tmp_path: Path,
 ) -> None:
@@ -556,6 +572,45 @@ def test_native_broker_assigns_job_atomically_before_child_resume(
     source = BROKER_SOURCE.read_text(encoding="utf-8")
     assert "PROC_THREAD_ATTRIBUTE_JOB_LIST" in source
     assert "AssignProcessToJobObject" not in source
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+@pytest.mark.parametrize(
+    "argument",
+    [
+        "C:\\plain",
+        "C:\\ends-with-backslash\\",
+        "C:\\space dir\\ends-with-backslash\\",
+    ],
+)
+def test_native_broker_quotes_closing_backslashes_without_argv_drift(
+    tmp_path: Path,
+    argument: str,
+) -> None:
+    native = tmp_path / "factor_v3_formal_native_broker-quote-test.exe"
+    _compile(
+        source=BROKER_SOURCE,
+        output=native,
+        extra=[
+            "-DF3_BROKER_TESTING=1",
+            "-DF3_BROKER_DISPOSABLE_TEST_MANIFEST=1",
+            f"-I{BROKER_INCLUDE}",
+        ],
+    )
+    executable = r"C:\runtime path\python.exe"
+    completed = subprocess.run(
+        [str(native), "--test-quote-command", executable, argument],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert _windows_command_line_to_argv(completed.stdout) == [
+        executable,
+        argument,
+    ]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
