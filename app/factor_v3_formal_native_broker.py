@@ -14,6 +14,7 @@ class FactorV3FormalNativeBrokerError(RuntimeError):
 
 
 BROKER_CANDIDATE_SCHEMA = "factor-v3-formal-native-broker-candidate/v1"
+BROKER_CANDIDATE_SCHEMA_V2 = "factor-v3-formal-native-broker-candidate/v2"
 BROKER_CHILD_PROTOCOL = "factor-v3-formal-native-broker-child/v1"
 RUNTIME_MANIFEST_SCHEMA = "factor-v3-formal-native-broker-runtime-manifest/v1"
 SOURCE_MANIFEST_SCHEMA = "factor-v3-formal-native-broker-source-manifest/v1"
@@ -27,6 +28,21 @@ _CANDIDATE_FIELDS = (
     "authorization_path",
     "completion_marker_path",
     "publication_receipt_path",
+    "execution_ledger_root",
+    "resume_authorization_path",
+    "resume_status_path",
+    "signing_key_slot_id",
+    "credential_slot_id",
+    "runtime_manifest_schema",
+    "source_manifest_schema",
+)
+_CANDIDATE_FIELDS_V2 = (
+    "schema",
+    "action",
+    "authorization_path",
+    "completion_marker_path",
+    "publication_receipt_path",
+    "launch_authorization_path",
     "execution_ledger_root",
     "resume_authorization_path",
     "resume_status_path",
@@ -80,14 +96,17 @@ def _path_text(value: Path | str, *, label: str) -> str:
 
 
 def _candidate_bytes(fields: dict[str, str]) -> bytes:
-    if tuple(fields) != _CANDIDATE_FIELDS:
+    expected_fields = (
+        _CANDIDATE_FIELDS_V2
+        if fields.get("schema") == BROKER_CANDIDATE_SCHEMA_V2
+        else _CANDIDATE_FIELDS
+    )
+    if tuple(fields) != expected_fields:
         raise FactorV3FormalNativeBrokerError("native broker candidate fields rejected")
     for value in fields.values():
         if type(value) is not str or any(marker in value for marker in ("\x00", "\r", "\n")):
             raise FactorV3FormalNativeBrokerError("native broker candidate value rejected")
-    return "".join(f"{name}={fields[name]}\n" for name in _CANDIDATE_FIELDS).encode(
-        "utf-8"
-    )
+    return "".join(f"{name}={fields[name]}\n" for name in expected_fields).encode("utf-8")
 
 
 def _validated_candidate(raw: bytes) -> dict[str, str]:
@@ -100,10 +119,15 @@ def _validated_candidate(raw: bytes) -> dict[str, str]:
     if "\r" in text or "\x00" in text or not text.endswith("\n"):
         raise FactorV3FormalNativeBrokerError("native broker candidate rejected")
     lines = text[:-1].split("\n")
-    if len(lines) != len(_CANDIDATE_FIELDS):
+    expected_fields = (
+        _CANDIDATE_FIELDS_V2
+        if lines and lines[0] == f"schema={BROKER_CANDIDATE_SCHEMA_V2}"
+        else _CANDIDATE_FIELDS
+    )
+    if len(lines) != len(expected_fields):
         raise FactorV3FormalNativeBrokerError("native broker candidate rejected")
     fields: dict[str, str] = {}
-    for expected, line in zip(_CANDIDATE_FIELDS, lines, strict=True):
+    for expected, line in zip(expected_fields, lines, strict=True):
         name, separator, value = line.partition("=")
         if separator != "=" or name != expected:
             raise FactorV3FormalNativeBrokerError("native broker candidate rejected")
@@ -111,7 +135,8 @@ def _validated_candidate(raw: bytes) -> dict[str, str]:
     if _candidate_bytes(fields) != raw:
         raise FactorV3FormalNativeBrokerError("native broker candidate rejected")
     if (
-        fields["schema"] != BROKER_CANDIDATE_SCHEMA
+        fields["schema"]
+        not in {BROKER_CANDIDATE_SCHEMA, BROKER_CANDIDATE_SCHEMA_V2}
         or fields["action"] not in _ACTIONS
         or fields["signing_key_slot_id"] != SIGNING_KEY_SLOT_ID
         or fields["runtime_manifest_schema"] != RUNTIME_MANIFEST_SCHEMA
@@ -131,6 +156,14 @@ def _validated_candidate(raw: bytes) -> dict[str, str]:
     ):
         if _path_text(fields[name], label=name) != fields[name]:
             raise FactorV3FormalNativeBrokerError("native broker candidate rejected")
+    if fields["schema"] == BROKER_CANDIDATE_SCHEMA_V2 and (
+        _path_text(
+            fields["launch_authorization_path"],
+            label="launch authorization",
+        )
+        != fields["launch_authorization_path"]
+    ):
+        raise FactorV3FormalNativeBrokerError("native broker candidate rejected")
     resume_fields = (
         fields["resume_authorization_path"],
         fields["resume_status_path"],
@@ -155,6 +188,7 @@ def build_factor_v3_formal_native_broker_candidate(
     completion_marker_path: Path | str,
     publication_receipt_path: Path | str,
     execution_ledger_root: Path | str,
+    launch_authorization_path: Path | str | None = None,
     resume_authorization_path: Path | str | None = None,
     resume_status_path: Path | str | None = None,
 ) -> bytes:
@@ -177,36 +211,49 @@ def build_factor_v3_formal_native_broker_candidate(
             )
         resume_authorization = ""
         resume_status = ""
-    raw = _candidate_bytes(
-        {
-            "schema": BROKER_CANDIDATE_SCHEMA,
-            "action": action,
-            "authorization_path": _path_text(
-                authorization_path,
-                label="bootstrap authorization",
-            ),
-            "completion_marker_path": _path_text(
-                completion_marker_path,
-                label="bootstrap completion",
-            ),
-            "publication_receipt_path": _path_text(
-                publication_receipt_path,
-                label="supervisor publication",
-            ),
-            "execution_ledger_root": _path_text(
-                execution_ledger_root,
-                label="execution ledger",
-            ),
-            "resume_authorization_path": resume_authorization,
-            "resume_status_path": resume_status,
-            "signing_key_slot_id": SIGNING_KEY_SLOT_ID,
-            "credential_slot_id": (
-                CREDENTIAL_SLOT_ID if action in {"run", "resume"} else "none"
-            ),
-            "runtime_manifest_schema": RUNTIME_MANIFEST_SCHEMA,
-            "source_manifest_schema": SOURCE_MANIFEST_SCHEMA,
-        }
-    )
+    if launch_authorization_path is None:
+        schema = BROKER_CANDIDATE_SCHEMA
+        launch_authorization = None
+    else:
+        schema = BROKER_CANDIDATE_SCHEMA_V2
+        launch_authorization = _path_text(
+            launch_authorization_path,
+            label="launch authorization",
+        )
+    fields = {
+        "schema": schema,
+        "action": action,
+        "authorization_path": _path_text(
+            authorization_path,
+            label="bootstrap authorization",
+        ),
+        "completion_marker_path": _path_text(
+            completion_marker_path,
+            label="bootstrap completion",
+        ),
+        "publication_receipt_path": _path_text(
+            publication_receipt_path,
+            label="supervisor publication",
+        ),
+        **(
+            {"launch_authorization_path": launch_authorization}
+            if launch_authorization is not None
+            else {}
+        ),
+        "execution_ledger_root": _path_text(
+            execution_ledger_root,
+            label="execution ledger",
+        ),
+        "resume_authorization_path": resume_authorization,
+        "resume_status_path": resume_status,
+        "signing_key_slot_id": SIGNING_KEY_SLOT_ID,
+        "credential_slot_id": (
+            CREDENTIAL_SLOT_ID if action in {"run", "resume"} else "none"
+        ),
+        "runtime_manifest_schema": RUNTIME_MANIFEST_SCHEMA,
+        "source_manifest_schema": SOURCE_MANIFEST_SCHEMA,
+    }
+    raw = _candidate_bytes(fields)
     _validated_candidate(raw)
     return raw
 

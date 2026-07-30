@@ -40,6 +40,12 @@
 #ifndef F3_BROKER_HANDOFF_ORIGINAL_CAS_SHA256
 #define F3_BROKER_HANDOFF_ORIGINAL_CAS_SHA256 ""
 #endif
+#ifndef F3_BROKER_EXECUTION_PUBLIC_MODULUS_HEX
+#define F3_BROKER_EXECUTION_PUBLIC_MODULUS_HEX ""
+#endif
+#ifndef F3_BROKER_EXECUTION_PUBLIC_EXPONENT
+#define F3_BROKER_EXECUTION_PUBLIC_EXPONENT 0u
+#endif
 
 #ifdef F3_BROKER_TESTING
 #ifndef F3_BROKER_DISPOSABLE_TEST_MANIFEST
@@ -54,6 +60,7 @@
 #endif
 
 #define F3_CANDIDATE_SCHEMA "factor-v3-formal-native-broker-candidate/v1"
+#define F3_CANDIDATE_SCHEMA_V2 "factor-v3-formal-native-broker-candidate/v2"
 #define F3_RUNTIME_MANIFEST_SCHEMA "factor-v3-formal-native-broker-runtime-manifest/v1"
 #define F3_SOURCE_MANIFEST_SCHEMA "factor-v3-formal-native-broker-source-manifest/v1"
 #define F3_SIGNING_KEY_SLOT_ID "factor-v3-execution-authorization"
@@ -66,7 +73,9 @@
 #define F3_MAX_CANDIDATE_BYTES (64u * 1024u)
 #define F3_MAX_MANIFEST_FILE_BYTES (64u * 1024u * 1024u)
 #define F3_MAX_SECRET_SLOT_BYTES (64u * 1024u)
+#define F3_MAX_AUTHORIZATION_BYTES (4u * 1024u * 1024u)
 #define F3_RSA_BITS 2048u
+#define F3_EXECUTION_RSA_BITS 3072u
 #define F3_DISPOSABLE_KEY_PREFIX L"quant-signal-lkj-disposable-test-"
 #define F3_MAX_HELD_DIRECTORIES 128u
 
@@ -103,6 +112,32 @@ typedef enum CandidateAction {
     ACTION_RUN,
     ACTION_VERIFY
 } CandidateAction;
+
+typedef struct ByteSlice {
+    const char *value;
+    size_t length;
+} ByteSlice;
+
+typedef struct ProductionCandidate {
+    CandidateAction action;
+    ByteSlice authorization_path;
+    ByteSlice completion_marker_path;
+    ByteSlice publication_receipt_path;
+    ByteSlice launch_authorization_path;
+    ByteSlice execution_ledger_root;
+    ByteSlice resume_authorization_path;
+    ByteSlice resume_status_path;
+} ProductionCandidate;
+
+typedef struct SignedEnvelope {
+    const unsigned char *payload;
+    DWORD payload_size;
+    unsigned char signature[384];
+} SignedEnvelope;
+
+#ifdef F3_BROKER_TESTING
+static int f3_test_production_validation_stage = 0;
+#endif
 
 static void close_held(HeldFile *held) {
     if (held != NULL && held->handle != INVALID_HANDLE_VALUE) {
@@ -2003,6 +2038,963 @@ static int attribute_init_failure_cleanup_test(void) {
 }
 #endif
 
+static int hash_memory(
+    const unsigned char *data,
+    DWORD size,
+    unsigned char digest[32]
+) {
+    BCRYPT_ALG_HANDLE algorithm = NULL;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    NTSTATUS status;
+    int ok = 0;
+    status = BCryptOpenAlgorithmProvider(
+        &algorithm,
+        BCRYPT_SHA256_ALGORITHM,
+        NULL,
+        0
+    );
+    if (status < 0) {
+        goto cleanup;
+    }
+    status = BCryptCreateHash(
+        algorithm,
+        &hash,
+        NULL,
+        0,
+        NULL,
+        0,
+        0
+    );
+    if (status < 0
+        || BCryptHashData(hash, (PUCHAR)data, size, 0) < 0
+        || BCryptFinishHash(hash, digest, 32, 0) < 0) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (hash != NULL) {
+        BCryptDestroyHash(hash);
+    }
+    if (algorithm != NULL) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+    }
+    return ok;
+}
+
+static int parse_production_candidate(
+    const unsigned char *raw,
+    DWORD raw_size,
+    ProductionCandidate *candidate
+) {
+    static const char *names[] = {
+        "schema",
+        "action",
+        "authorization_path",
+        "completion_marker_path",
+        "publication_receipt_path",
+        "launch_authorization_path",
+        "execution_ledger_root",
+        "resume_authorization_path",
+        "resume_status_path",
+        "signing_key_slot_id",
+        "credential_slot_id",
+        "runtime_manifest_schema",
+        "source_manifest_schema"
+    };
+    const char *values[13];
+    size_t lengths[13];
+    size_t offset = 0;
+    size_t field;
+    CandidateAction action = ACTION_INVALID;
+    if (raw == NULL
+        || candidate == NULL
+        || raw_size == 0
+        || raw[raw_size - 1] != '\n') {
+        return 0;
+    }
+    memset(candidate, 0, sizeof(*candidate));
+    for (field = 0; field < raw_size; ++field) {
+        if (raw[field] == '\0' || raw[field] == '\r') {
+            return 0;
+        }
+    }
+    for (field = 0; field < 13; ++field) {
+        size_t end = offset;
+        while (end < raw_size && raw[end] != '\n') {
+            ++end;
+        }
+        if (end >= raw_size
+            || !exact_line(
+                raw + offset,
+                end - offset,
+                names[field],
+                &values[field],
+                &lengths[field]
+            )) {
+            return 0;
+        }
+        offset = end + 1;
+    }
+    if (offset != raw_size
+        || !value_equals(values[0], lengths[0], F3_CANDIDATE_SCHEMA_V2)
+        || !candidate_absolute_path(values[2], lengths[2])
+        || !candidate_absolute_path(values[3], lengths[3])
+        || !candidate_absolute_path(values[4], lengths[4])
+        || !candidate_absolute_path(values[5], lengths[5])
+        || !candidate_absolute_path(values[6], lengths[6])
+        || !value_equals(values[9], lengths[9], F3_SIGNING_KEY_SLOT_ID)
+        || !value_equals(values[10], lengths[10], F3_CREDENTIAL_SLOT_ID)
+        || !value_equals(values[11], lengths[11], F3_RUNTIME_MANIFEST_SCHEMA)
+        || !value_equals(values[12], lengths[12], F3_SOURCE_MANIFEST_SCHEMA)) {
+        return 0;
+    }
+    if (value_equals(values[1], lengths[1], "run")) {
+        action = ACTION_RUN;
+        if (lengths[7] != 0 || lengths[8] != 0) {
+            return 0;
+        }
+    } else if (value_equals(values[1], lengths[1], "resume")) {
+        action = ACTION_RESUME;
+        if (!candidate_absolute_path(values[7], lengths[7])
+            || !candidate_absolute_path(values[8], lengths[8])) {
+            return 0;
+        }
+    } else {
+        return 0;
+    }
+    candidate->action = action;
+    candidate->authorization_path.value = values[2];
+    candidate->authorization_path.length = lengths[2];
+    candidate->completion_marker_path.value = values[3];
+    candidate->completion_marker_path.length = lengths[3];
+    candidate->publication_receipt_path.value = values[4];
+    candidate->publication_receipt_path.length = lengths[4];
+    candidate->launch_authorization_path.value = values[5];
+    candidate->launch_authorization_path.length = lengths[5];
+    candidate->execution_ledger_root.value = values[6];
+    candidate->execution_ledger_root.length = lengths[6];
+    candidate->resume_authorization_path.value = values[7];
+    candidate->resume_authorization_path.length = lengths[7];
+    candidate->resume_status_path.value = values[8];
+    candidate->resume_status_path.length = lengths[8];
+    return 1;
+}
+
+static int byte_slice_to_wide(
+    ByteSlice value,
+    wchar_t *output,
+    size_t capacity
+) {
+    int required;
+    int written;
+    if (value.value == NULL
+        || value.length == 0
+        || value.length > INT_MAX
+        || output == NULL
+        || capacity == 0
+        || capacity > INT_MAX) {
+        return 0;
+    }
+    required = MultiByteToWideChar(
+        CP_UTF8,
+        MB_ERR_INVALID_CHARS,
+        value.value,
+        (int)value.length,
+        NULL,
+        0
+    );
+    if (required <= 0 || (size_t)required + 1 > capacity) {
+        return 0;
+    }
+    written = MultiByteToWideChar(
+        CP_UTF8,
+        MB_ERR_INVALID_CHARS,
+        value.value,
+        (int)value.length,
+        output,
+        required
+    );
+    if (written != required) {
+        return 0;
+    }
+    output[required] = L'\0';
+    return strict_windows_candidate_path(output);
+}
+
+static int wide_path_to_utf8(
+    const wchar_t *value,
+    char *output,
+    size_t capacity,
+    size_t *length
+) {
+    wchar_t normalized[32768];
+    int required;
+    int written;
+    if (value == NULL
+        || output == NULL
+        || capacity == 0
+        || capacity > INT_MAX
+        || length == NULL) {
+        return 0;
+    }
+    if (!canonical_path(
+            value,
+            normalized,
+            (DWORD)(sizeof(normalized) / sizeof(normalized[0]))
+        )
+        || !strict_windows_candidate_path(normalized)) {
+        return 0;
+    }
+    required = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        normalized,
+        -1,
+        NULL,
+        0,
+        NULL,
+        NULL
+    );
+    if (required <= 1 || (size_t)required > capacity) {
+        return 0;
+    }
+    written = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        normalized,
+        -1,
+        output,
+        required,
+        NULL,
+        NULL
+    );
+    if (written != required) {
+        SecureZeroMemory(normalized, sizeof(normalized));
+        return 0;
+    }
+    *length = (size_t)required - 1;
+    SecureZeroMemory(normalized, sizeof(normalized));
+    return 1;
+}
+
+static int filename_matches_digest_suffix(
+    const wchar_t *path,
+    const unsigned char digest[32],
+    const wchar_t *suffix
+) {
+    const wchar_t *filename = wcsrchr(path, L'\\');
+    wchar_t expected[65];
+    static const wchar_t digits[] = L"0123456789abcdef";
+    size_t index;
+    if (path == NULL || suffix == NULL || digest == NULL) {
+        return 0;
+    }
+    filename = filename == NULL ? path : filename + 1;
+    if (wcslen(filename) != 64 + wcslen(suffix)) {
+        return 0;
+    }
+    for (index = 0; index < 32; ++index) {
+        expected[index * 2] = digits[digest[index] >> 4];
+        expected[index * 2 + 1] = digits[digest[index] & 15];
+    }
+    expected[64] = L'\0';
+    return wcsncmp(filename, expected, 64) == 0
+        && wcscmp(filename + 64, suffix) == 0;
+}
+
+static int base64_value(unsigned char value) {
+    if (value >= 'A' && value <= 'Z') {
+        return value - 'A';
+    }
+    if (value >= 'a' && value <= 'z') {
+        return value - 'a' + 26;
+    }
+    if (value >= '0' && value <= '9') {
+        return value - '0' + 52;
+    }
+    if (value == '+') {
+        return 62;
+    }
+    if (value == '/') {
+        return 63;
+    }
+    return -1;
+}
+
+static int decode_rsa3072_signature(
+    const unsigned char *encoded,
+    size_t encoded_size,
+    unsigned char output[384]
+) {
+    size_t input_offset;
+    size_t output_offset = 0;
+    if (encoded == NULL || output == NULL || encoded_size != 512) {
+        return 0;
+    }
+    for (input_offset = 0; input_offset < encoded_size; input_offset += 4) {
+        int first = base64_value(encoded[input_offset]);
+        int second = base64_value(encoded[input_offset + 1]);
+        int third = base64_value(encoded[input_offset + 2]);
+        int fourth = base64_value(encoded[input_offset + 3]);
+        if (first < 0 || second < 0 || third < 0 || fourth < 0) {
+            SecureZeroMemory(output, 384);
+            return 0;
+        }
+        output[output_offset++] =
+            (unsigned char)((first << 2) | (second >> 4));
+        output[output_offset++] =
+            (unsigned char)((second << 4) | (third >> 2));
+        output[output_offset++] =
+            (unsigned char)((third << 6) | fourth);
+    }
+    return output_offset == 384;
+}
+
+static int parse_signed_envelope(
+    const unsigned char *raw,
+    DWORD raw_size,
+    SignedEnvelope *envelope
+) {
+    static const unsigned char prefix[] = "{\"payload\":";
+    static const unsigned char marker[] = ",\"signature_base64\":\"";
+    static const unsigned char suffix[] = "\"}";
+    size_t marker_offset;
+    size_t expected_size;
+    if (raw == NULL
+        || envelope == NULL
+        || raw_size <= sizeof(prefix) - 1 + sizeof(marker) - 1 + 512 + 2
+        || memcmp(raw, prefix, sizeof(prefix) - 1) != 0) {
+        return 0;
+    }
+    marker_offset = (size_t)raw_size - (sizeof(marker) - 1 + 512 + sizeof(suffix) - 1);
+    expected_size = marker_offset
+        + sizeof(marker) - 1
+        + 512
+        + sizeof(suffix) - 1;
+    if (expected_size != raw_size
+        || marker_offset <= sizeof(prefix) - 1
+        || memcmp(raw + marker_offset, marker, sizeof(marker) - 1) != 0
+        || memcmp(
+            raw + raw_size - (sizeof(suffix) - 1),
+            suffix,
+            sizeof(suffix) - 1
+        ) != 0
+        || raw[sizeof(prefix) - 1] != '{'
+        || raw[marker_offset - 1] != '}'
+        || !decode_rsa3072_signature(
+            raw + marker_offset + sizeof(marker) - 1,
+            512,
+            envelope->signature
+        )) {
+        SecureZeroMemory(envelope, sizeof(*envelope));
+        return 0;
+    }
+    envelope->payload = raw + sizeof(prefix) - 1;
+    envelope->payload_size = (DWORD)(marker_offset - (sizeof(prefix) - 1));
+    return 1;
+}
+
+static int json_hex(unsigned char value) {
+    return (value >= '0' && value <= '9')
+        || (value >= 'a' && value <= 'f')
+        || (value >= 'A' && value <= 'F');
+}
+
+static int json_skip_string(
+    const unsigned char *raw,
+    size_t size,
+    size_t *offset
+) {
+    size_t cursor;
+    if (raw == NULL
+        || offset == NULL
+        || *offset >= size
+        || raw[*offset] != '"') {
+        return 0;
+    }
+    cursor = *offset + 1;
+    while (cursor < size) {
+        unsigned char value = raw[cursor++];
+        if (value == '"') {
+            *offset = cursor;
+            return 1;
+        }
+        if (value < 0x20) {
+            return 0;
+        }
+        if (value == '\\') {
+            unsigned char escaped;
+            if (cursor >= size) {
+                return 0;
+            }
+            escaped = raw[cursor++];
+            if (escaped == 'u') {
+                size_t index;
+                if (cursor + 4 > size) {
+                    return 0;
+                }
+                for (index = 0; index < 4; ++index) {
+                    if (!json_hex(raw[cursor + index])) {
+                        return 0;
+                    }
+                }
+                cursor += 4;
+            } else if (escaped != '"'
+                && escaped != '\\'
+                && escaped != '/'
+                && escaped != 'b'
+                && escaped != 'f'
+                && escaped != 'n'
+                && escaped != 'r'
+                && escaped != 't') {
+                return 0;
+            }
+        }
+    }
+    return 0;
+}
+
+static int json_skip_value(
+    const unsigned char *raw,
+    size_t size,
+    size_t *offset,
+    unsigned int depth
+) {
+    size_t cursor;
+    if (raw == NULL || offset == NULL || *offset >= size || depth > 64) {
+        return 0;
+    }
+    cursor = *offset;
+    if (raw[cursor] == '"') {
+        return json_skip_string(raw, size, offset);
+    }
+    if (raw[cursor] == '{') {
+        ++cursor;
+        if (cursor < size && raw[cursor] == '}') {
+            *offset = cursor + 1;
+            return 1;
+        }
+        for (;;) {
+            if (!json_skip_string(raw, size, &cursor)
+                || cursor >= size
+                || raw[cursor++] != ':'
+                || !json_skip_value(raw, size, &cursor, depth + 1)
+                || cursor >= size) {
+                return 0;
+            }
+            if (raw[cursor] == '}') {
+                *offset = cursor + 1;
+                return 1;
+            }
+            if (raw[cursor++] != ',') {
+                return 0;
+            }
+        }
+    }
+    if (raw[cursor] == '[') {
+        ++cursor;
+        if (cursor < size && raw[cursor] == ']') {
+            *offset = cursor + 1;
+            return 1;
+        }
+        for (;;) {
+            if (!json_skip_value(raw, size, &cursor, depth + 1)
+                || cursor >= size) {
+                return 0;
+            }
+            if (raw[cursor] == ']') {
+                *offset = cursor + 1;
+                return 1;
+            }
+            if (raw[cursor++] != ',') {
+                return 0;
+            }
+        }
+    }
+    if (cursor + 4 <= size
+        && (memcmp(raw + cursor, "true", 4) == 0
+            || memcmp(raw + cursor, "null", 4) == 0)) {
+        *offset = cursor + 4;
+        return 1;
+    }
+    if (cursor + 5 <= size && memcmp(raw + cursor, "false", 5) == 0) {
+        *offset = cursor + 5;
+        return 1;
+    }
+    if (raw[cursor] == '-') {
+        ++cursor;
+        if (cursor >= size) {
+            return 0;
+        }
+    }
+    if (raw[cursor] == '0') {
+        ++cursor;
+        if (cursor < size && raw[cursor] >= '0' && raw[cursor] <= '9') {
+            return 0;
+        }
+    } else if (raw[cursor] >= '1' && raw[cursor] <= '9') {
+        do {
+            ++cursor;
+        } while (cursor < size && raw[cursor] >= '0' && raw[cursor] <= '9');
+    } else {
+        return 0;
+    }
+    if (cursor < size && raw[cursor] == '.') {
+        ++cursor;
+        if (cursor >= size || raw[cursor] < '0' || raw[cursor] > '9') {
+            return 0;
+        }
+        do {
+            ++cursor;
+        } while (cursor < size && raw[cursor] >= '0' && raw[cursor] <= '9');
+    }
+    if (cursor < size && (raw[cursor] == 'e' || raw[cursor] == 'E')) {
+        ++cursor;
+        if (cursor < size && (raw[cursor] == '+' || raw[cursor] == '-')) {
+            ++cursor;
+        }
+        if (cursor >= size || raw[cursor] < '0' || raw[cursor] > '9') {
+            return 0;
+        }
+        do {
+            ++cursor;
+        } while (cursor < size && raw[cursor] >= '0' && raw[cursor] <= '9');
+    }
+    *offset = cursor;
+    return 1;
+}
+
+static int json_top_field(
+    const unsigned char *payload,
+    size_t payload_size,
+    const char *name,
+    ByteSlice *value
+) {
+    size_t cursor = 1;
+    size_t name_length = strlen(name);
+    char previous[128];
+    size_t previous_length = 0;
+    int found = 0;
+    if (payload == NULL
+        || name == NULL
+        || value == NULL
+        || payload_size < 2
+        || payload[0] != '{'
+        || payload[payload_size - 1] != '}') {
+        return 0;
+    }
+    memset(previous, 0, sizeof(previous));
+    memset(value, 0, sizeof(*value));
+    if (cursor == payload_size - 1) {
+        return 0;
+    }
+    for (;;) {
+        size_t key_start;
+        size_t key_end;
+        size_t value_start;
+        size_t value_end;
+        size_t key_length;
+        size_t common;
+        int order = 0;
+        if (cursor >= payload_size - 1 || payload[cursor] != '"') {
+            return 0;
+        }
+        key_start = cursor + 1;
+        if (!json_skip_string(payload, payload_size, &cursor)) {
+            return 0;
+        }
+        key_end = cursor - 1;
+        key_length = key_end - key_start;
+        if (key_length == 0
+            || key_length >= sizeof(previous)
+            || memchr(payload + key_start, '\\', key_length) != NULL
+            || cursor >= payload_size
+            || payload[cursor++] != ':') {
+            return 0;
+        }
+        if (previous_length != 0) {
+            common = previous_length < key_length ? previous_length : key_length;
+            order = memcmp(previous, payload + key_start, common);
+            if (order > 0 || (order == 0 && previous_length >= key_length)) {
+                return 0;
+            }
+        }
+        memcpy(previous, payload + key_start, key_length);
+        previous[key_length] = '\0';
+        previous_length = key_length;
+        value_start = cursor;
+        if (!json_skip_value(payload, payload_size, &cursor, 0)) {
+            return 0;
+        }
+        value_end = cursor;
+        if (key_length == name_length
+            && memcmp(payload + key_start, name, name_length) == 0) {
+            value->value = (const char *)payload + value_start;
+            value->length = value_end - value_start;
+            found = 1;
+        }
+        if (cursor >= payload_size) {
+            return 0;
+        }
+        if (payload[cursor] == '}') {
+            return found && cursor == payload_size - 1;
+        }
+        if (payload[cursor++] != ',') {
+            return 0;
+        }
+    }
+}
+
+static int json_string_matches(
+    ByteSlice json_value,
+    const char *expected,
+    size_t expected_length
+) {
+    size_t input = 1;
+    size_t output = 0;
+    if (json_value.value == NULL
+        || expected == NULL
+        || json_value.length < 2
+        || json_value.value[0] != '"'
+        || json_value.value[json_value.length - 1] != '"') {
+        return 0;
+    }
+    while (input + 1 < json_value.length) {
+        unsigned char value = (unsigned char)json_value.value[input++];
+        if (value == '\\') {
+            if (input + 1 > json_value.length
+                || json_value.value[input++] != '\\') {
+                return 0;
+            }
+            value = '\\';
+        } else if (value == '"') {
+            return 0;
+        }
+        if (output >= expected_length
+            || value != (unsigned char)expected[output++]) {
+            return 0;
+        }
+    }
+    return output == expected_length;
+}
+
+static int json_top_string_matches(
+    const unsigned char *payload,
+    size_t payload_size,
+    const char *name,
+    const char *expected,
+    size_t expected_length
+) {
+    ByteSlice value;
+    return json_top_field(payload, payload_size, name, &value)
+        && json_string_matches(value, expected, expected_length);
+}
+
+static int json_top_is_null(
+    const unsigned char *payload,
+    size_t payload_size,
+    const char *name
+) {
+    ByteSlice value;
+    return json_top_field(payload, payload_size, name, &value)
+        && value.length == 4
+        && memcmp(value.value, "null", 4) == 0;
+}
+
+static int hex_value(char value) {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
+}
+
+static int verify_execution_signature(const SignedEnvelope *envelope) {
+    BCRYPT_ALG_HANDLE algorithm = NULL;
+    BCRYPT_KEY_HANDLE key = NULL;
+    BCRYPT_PKCS1_PADDING_INFO padding = {BCRYPT_SHA256_ALGORITHM};
+    unsigned char digest[32];
+    unsigned char blob[
+        sizeof(BCRYPT_RSAKEY_BLOB) + sizeof(DWORD) + F3_EXECUTION_RSA_BITS / 8
+    ];
+    BCRYPT_RSAKEY_BLOB *header = (BCRYPT_RSAKEY_BLOB *)blob;
+    unsigned char *exponent_bytes = blob + sizeof(*header);
+    unsigned char *modulus = exponent_bytes + sizeof(DWORD);
+    DWORD exponent = F3_BROKER_EXECUTION_PUBLIC_EXPONENT;
+    size_t index;
+    int ok = 0;
+    if (envelope == NULL
+        || strlen(F3_BROKER_EXECUTION_PUBLIC_MODULUS_HEX)
+            != (F3_EXECUTION_RSA_BITS / 8) * 2
+        || exponent < 3
+        || (exponent & 1u) == 0
+        || !hash_memory(
+            envelope->payload,
+            envelope->payload_size,
+            digest
+        )) {
+        return 0;
+    }
+    memset(blob, 0, sizeof(blob));
+    header->Magic = BCRYPT_RSAPUBLIC_MAGIC;
+    header->BitLength = F3_EXECUTION_RSA_BITS;
+    header->cbPublicExp = sizeof(DWORD);
+    header->cbModulus = F3_EXECUTION_RSA_BITS / 8;
+    exponent_bytes[0] = (unsigned char)(exponent >> 24);
+    exponent_bytes[1] = (unsigned char)(exponent >> 16);
+    exponent_bytes[2] = (unsigned char)(exponent >> 8);
+    exponent_bytes[3] = (unsigned char)exponent;
+    for (index = 0; index < F3_EXECUTION_RSA_BITS / 8; ++index) {
+        int high = hex_value(F3_BROKER_EXECUTION_PUBLIC_MODULUS_HEX[index * 2]);
+        int low = hex_value(F3_BROKER_EXECUTION_PUBLIC_MODULUS_HEX[index * 2 + 1]);
+        if (high < 0 || low < 0) {
+            goto cleanup;
+        }
+        modulus[index] = (unsigned char)((high << 4) | low);
+    }
+    if (BCryptOpenAlgorithmProvider(
+            &algorithm,
+            BCRYPT_RSA_ALGORITHM,
+            NULL,
+            0
+        ) < 0
+        || BCryptImportKeyPair(
+            algorithm,
+            NULL,
+            BCRYPT_RSAPUBLIC_BLOB,
+            &key,
+            blob,
+            sizeof(blob),
+            0
+        ) < 0
+        || BCryptVerifySignature(
+            key,
+            &padding,
+            digest,
+            sizeof(digest),
+            (PUCHAR)envelope->signature,
+            sizeof(envelope->signature),
+            BCRYPT_PAD_PKCS1
+        ) < 0) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (key != NULL) {
+        BCryptDestroyKey(key);
+    }
+    if (algorithm != NULL) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+    }
+    SecureZeroMemory(digest, sizeof(digest));
+    SecureZeroMemory(blob, sizeof(blob));
+    return ok;
+}
+
+static int validate_current_launch_payload(
+    const SignedEnvelope *envelope,
+    const ProductionCandidate *candidate
+) {
+    const char *action = candidate->action == ACTION_RUN ? "run" : "resume";
+    char credential[32768 * 3];
+    size_t credential_length = 0;
+    if (envelope == NULL
+        || candidate == NULL
+        || !wide_path_to_utf8(
+            F3_BROKER_CREDENTIAL_SLOT_PATH,
+            credential,
+            sizeof(credential),
+            &credential_length
+        )
+        || !json_top_string_matches(
+            envelope->payload,
+            envelope->payload_size,
+            "schema",
+            "factor-v3-formal-supervisor-launch-authorization/v2",
+            strlen("factor-v3-formal-supervisor-launch-authorization/v2")
+        )
+        || !json_top_string_matches(
+            envelope->payload,
+            envelope->payload_size,
+            "action",
+            action,
+            strlen(action)
+        )
+        || !json_top_string_matches(
+            envelope->payload,
+            envelope->payload_size,
+            "bootstrap_execution_authorization_path",
+            candidate->authorization_path.value,
+            candidate->authorization_path.length
+        )
+        || !json_top_string_matches(
+            envelope->payload,
+            envelope->payload_size,
+            "publication_completion_marker_path",
+            candidate->completion_marker_path.value,
+            candidate->completion_marker_path.length
+        )
+        || !json_top_string_matches(
+            envelope->payload,
+            envelope->payload_size,
+            "supervisor_publication_receipt_path",
+            candidate->publication_receipt_path.value,
+            candidate->publication_receipt_path.length
+        )
+        || !json_top_string_matches(
+            envelope->payload,
+            envelope->payload_size,
+            "execution_ledger_root",
+            candidate->execution_ledger_root.value,
+            candidate->execution_ledger_root.length
+        )
+        || !json_top_string_matches(
+            envelope->payload,
+            envelope->payload_size,
+            "credential_path",
+            credential,
+            credential_length
+        )
+        || !json_top_string_matches(
+            envelope->payload,
+            envelope->payload_size,
+            "credential_slot_id",
+            F3_CREDENTIAL_SLOT_ID,
+            strlen(F3_CREDENTIAL_SLOT_ID)
+        )
+        || !verify_execution_signature(envelope)) {
+        SecureZeroMemory(credential, sizeof(credential));
+        return 0;
+    }
+    SecureZeroMemory(credential, sizeof(credential));
+    if (candidate->action == ACTION_RUN) {
+        return json_top_is_null(
+                envelope->payload,
+                envelope->payload_size,
+                "resume_of_authorization_sha256"
+            )
+            && json_top_is_null(
+                envelope->payload,
+                envelope->payload_size,
+                "resume_status_path"
+            );
+    }
+    return json_top_string_matches(
+            envelope->payload,
+            envelope->payload_size,
+            "resume_status_path",
+            candidate->resume_status_path.value,
+            candidate->resume_status_path.length
+        );
+}
+
+int f3_broker_validate_production_candidate(const wchar_t *candidate_path) {
+    HeldFile candidate_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile launch_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    unsigned char candidate_digest[32];
+    unsigned char launch_digest[32];
+    unsigned char *candidate_raw = NULL;
+    unsigned char *launch_raw = NULL;
+    DWORD candidate_size = 0;
+    DWORD launch_size = 0;
+    ProductionCandidate candidate;
+    SignedEnvelope envelope;
+    wchar_t launch_path[32768];
+    int ok = 0;
+    memset(&candidate, 0, sizeof(candidate));
+    memset(&envelope, 0, sizeof(envelope));
+    memset(launch_path, 0, sizeof(launch_path));
+#ifdef F3_BROKER_TESTING
+    f3_test_production_validation_stage = 1;
+#endif
+    if (!open_held_file(
+            candidate_path,
+            F3_MAX_CANDIDATE_BYTES,
+            &candidate_file
+        )
+        || !hash_held_file(&candidate_file, candidate_digest)
+        || !filename_matches_candidate_digest(candidate_path, candidate_digest)
+        || !read_candidate(
+            &candidate_file,
+            &candidate_raw,
+            &candidate_size
+        )
+        || !parse_production_candidate(
+            candidate_raw,
+            candidate_size,
+            &candidate
+        )) {
+        goto cleanup;
+    }
+#ifdef F3_BROKER_TESTING
+    f3_test_production_validation_stage = 2;
+#endif
+    if (!byte_slice_to_wide(
+            candidate.launch_authorization_path,
+            launch_path,
+            sizeof(launch_path) / sizeof(launch_path[0])
+        )
+        || !open_held_file(
+            launch_path,
+            F3_MAX_AUTHORIZATION_BYTES,
+            &launch_file
+        )
+        || !hash_held_file(&launch_file, launch_digest)
+        || !filename_matches_digest_suffix(
+            launch_path,
+            launch_digest,
+            L".json"
+        )
+        || !read_candidate(&launch_file, &launch_raw, &launch_size)) {
+        goto cleanup;
+    }
+#ifdef F3_BROKER_TESTING
+    f3_test_production_validation_stage = 3;
+#endif
+    if (!parse_signed_envelope(launch_raw, launch_size, &envelope)) {
+        goto cleanup;
+    }
+#ifdef F3_BROKER_TESTING
+    f3_test_production_validation_stage = 4;
+#endif
+    if (!validate_current_launch_payload(&envelope, &candidate)) {
+        goto cleanup;
+    }
+#ifdef F3_BROKER_TESTING
+    f3_test_production_validation_stage = 5;
+#endif
+    if (!held_unchanged(&launch_file, NULL)
+        || !held_unchanged(&candidate_file, NULL)) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (launch_raw != NULL) {
+        SecureZeroMemory(launch_raw, (SIZE_T)launch_size + 1);
+        HeapFree(GetProcessHeap(), 0, launch_raw);
+    }
+    if (candidate_raw != NULL) {
+        SecureZeroMemory(candidate_raw, (SIZE_T)candidate_size + 1);
+        HeapFree(GetProcessHeap(), 0, candidate_raw);
+    }
+    close_held(&launch_file);
+    close_held(&candidate_file);
+    SecureZeroMemory(candidate_digest, sizeof(candidate_digest));
+    SecureZeroMemory(launch_digest, sizeof(launch_digest));
+    SecureZeroMemory(&candidate, sizeof(candidate));
+    SecureZeroMemory(&envelope, sizeof(envelope));
+    SecureZeroMemory(launch_path, sizeof(launch_path));
+    return ok;
+}
+
 static int validate_candidate_only(const wchar_t *candidate_path) {
     HeldFile runtime = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile source = {INVALID_HANDLE_VALUE, 0, 0, {0}};
@@ -2054,50 +3046,6 @@ static int test_protected_file_chain(const wchar_t *path) {
         CloseHandle(file);
     }
     close_held_directory_chain(&chain);
-    return ok;
-}
-
-static int hash_memory(
-    const unsigned char *data,
-    DWORD size,
-    unsigned char digest[32]
-) {
-    BCRYPT_ALG_HANDLE algorithm = NULL;
-    BCRYPT_HASH_HANDLE hash = NULL;
-    NTSTATUS status;
-    int ok = 0;
-    status = BCryptOpenAlgorithmProvider(
-        &algorithm,
-        BCRYPT_SHA256_ALGORITHM,
-        NULL,
-        0
-    );
-    if (status < 0) {
-        goto cleanup;
-    }
-    status = BCryptCreateHash(
-        algorithm,
-        &hash,
-        NULL,
-        0,
-        NULL,
-        0,
-        0
-    );
-    if (status < 0
-        || BCryptHashData(hash, (PUCHAR)data, size, 0) < 0
-        || BCryptFinishHash(hash, digest, 32, 0) < 0) {
-        goto cleanup;
-    }
-    ok = 1;
-
-cleanup:
-    if (hash != NULL) {
-        BCryptDestroyHash(hash);
-    }
-    if (algorithm != NULL) {
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-    }
     return ok;
 }
 
@@ -3051,6 +3999,23 @@ int wmain(int argc, wchar_t **argv) {
     }
 #ifdef F3_BROKER_TESTING
     if (
+        argc == 3
+        && wcscmp(
+            argv[1],
+            L"--test-validate-production-candidate"
+        ) == 0
+    ) {
+        if (!f3_broker_validate_production_candidate(argv[2])) {
+            fwprintf(
+                stderr,
+                L"native broker production candidate rejected stage=%d\n",
+                f3_test_production_validation_stage
+            );
+            return 37;
+        }
+        return 0;
+    }
+    if (
         argc == 2
         && wcscmp(
             argv[1],
@@ -3191,6 +4156,13 @@ int wmain(int argc, wchar_t **argv) {
             )) {
             fwprintf(stderr, L"native broker production namespace rejected\n");
             return 36;
+        }
+        if (!f3_broker_validate_production_candidate(argv[2])) {
+            close_held_directory_chain(&credential_chain);
+            close_held_directory_chain(&source_chain);
+            close_held_directory_chain(&runtime_chain);
+            fwprintf(stderr, L"native broker production candidate rejected\n");
+            return 37;
         }
         close_held_directory_chain(&credential_chain);
         close_held_directory_chain(&source_chain);
