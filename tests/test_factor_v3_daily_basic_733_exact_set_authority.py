@@ -381,6 +381,7 @@ def test_prewindow_loader_binds_attestation_receipt_and_sessions_to_state(
             "session_count": 250,
             "sessions_sha256": _sha("different-sessions"),
             "verified": True,
+            "authority_binding": {},
         },
     )
     monkeypatch.setattr(

@@ -353,13 +353,11 @@ def test_formal_worktree_requires_exact_branch_and_clean_status(
     reviewed_source = "f" * 64
     monkeypatch.setattr(
         formal,
-        "FORMAL_REVIEW_SOURCE_ROOT_SHA256",
-        reviewed_source,
-    )
-    monkeypatch.setattr(
-        formal,
         "_validated_formal_review_receipt",
-        lambda: {"reviewed_source_root_sha256": reviewed_source},
+        lambda: {
+            "reviewed_commit": reviewed_commit,
+            "reviewed_source_root_sha256": reviewed_source,
+        },
     )
     monkeypatch.setattr(
         formal,
@@ -439,7 +437,9 @@ def test_rsa3072_pkcs1_v1_5_sha256_verifier_accepts_only_exact_signature(
 
 
 def test_signed_review_receipt_contract_rejects_attacker_controlled_shapes() -> None:
-    source = inspect.getsource(formal._validated_formal_review_receipt)
+    source = inspect.getsource(
+        formal._validated_formal_review_receipt
+    ) + inspect.getsource(formal._validated_signed_review_receipt)
 
     assert "signature_base64" in source
     assert "reviewed_commit" in source
@@ -558,7 +558,10 @@ def test_signed_review_receipt_rejects_replay_mutation_and_attacker_key(
         )
     )
     for rejected in mutations:
-        with pytest.raises(formal.FormalRunSpecError, match="review|signature"):
+        with pytest.raises(
+            formal.FormalRunSpecError,
+            match="review|signature|credential",
+        ):
             formal._validated_signed_review_receipt(
                 rejected,
                 expected_commit=commit,

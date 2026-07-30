@@ -366,6 +366,7 @@ def _load_feature_history_prewindow_authority(
         type(verified) is not dict
         or verified.get("verified") is not True
         or verified.get("session_count") != 250
+        or type(verified.get("authority_binding")) is not dict
     ):
         raise ValueError("factor-v3 daily-basic feature-history authority rejected")
     spec = history_runner.load_factor_v3_feature_history_run_spec(
@@ -541,6 +542,31 @@ def _load_feature_history_prewindow_authority(
             database_handle,
             expected_sha256=expected_database_sha256,
         )
+        terminal_attested_context = (
+            frozen_attestation._validated_attested_replay_context(
+                attestation_path=(
+                    feature_history_frozen_source_attestation_path
+                ),
+                expected_attestation_sha256=(
+                    expected_feature_history_frozen_source_attestation_sha256
+                ),
+                frozen_source_root=feature_history_frozen_source_root,
+                expected_frozen_source_commit=(
+                    expected_feature_history_frozen_source_commit
+                ),
+                feature_history_run_spec_path=(
+                    feature_history_run_spec_path
+                ),
+                feature_history_run_root=feature_history_run_root,
+            )
+        )
+        if (
+            terminal_attested_context.get("authority_binding")
+            != verified["authority_binding"]
+        ):
+            raise ValueError(
+                "factor-v3 daily-basic feature-history attestation binding drifted"
+            )
         partition_tuple = tuple(partitions)
         refs_for_root = _partition_refs(partition_tuple)
         authority = legacy.AuditedDailyAuthority(
