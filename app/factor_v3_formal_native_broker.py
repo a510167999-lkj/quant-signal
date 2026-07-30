@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import string
 from typing import Any
 
 
@@ -54,7 +55,7 @@ def _path_text(value: Path | str, *, label: str) -> str:
     if (
         original != text
         or len(text) < 4
-        or not text[0].isalpha()
+        or text[0] not in string.ascii_letters
         or text[1:3] != ":\\"
         or "/" in text
         or ":" in text[2:]
@@ -66,8 +67,12 @@ def _path_text(value: Path | str, *, label: str) -> str:
         or component in {".", ".."}
         or component[-1] in {".", " "}
         or "~" in component
+        or any(character in '*?"<>|' for character in component)
         or any(ord(character) < 32 or ord(character) == 127 for character in component)
-        or component.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES
+        or component.split(".", 1)[0]
+        .upper()
+        .translate(str.maketrans({"¹": "1", "²": "2", "³": "3"}))
+        in _WINDOWS_RESERVED_NAMES
         for component in components
     ):
         raise FactorV3FormalNativeBrokerError(f"{label} candidate path rejected")

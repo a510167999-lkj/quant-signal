@@ -883,8 +883,12 @@ static int reserved_windows_component(
     }
     return ((first == L'C' && second == L'O' && third == L'M')
             || (first == L'L' && second == L'P' && third == L'T'))
-        && component[3] >= L'1'
-        && component[3] <= L'9';
+        && (
+            (component[3] >= L'1' && component[3] <= L'9')
+            || component[3] == 0x00b9
+            || component[3] == 0x00b2
+            || component[3] == 0x00b3
+        );
 }
 
 static int strict_windows_candidate_path(const wchar_t *path) {
@@ -903,6 +907,12 @@ static int strict_windows_candidate_path(const wchar_t *path) {
         if (value == L'/'
             || value == L':'
             || value == L'~'
+            || value == L'*'
+            || value == L'?'
+            || value == L'"'
+            || value == L'<'
+            || value == L'>'
+            || value == L'|'
             || (value != L'\0' && (value < 32 || value == 127))) {
             return 0;
         }
@@ -1380,6 +1390,7 @@ static int launch_test_child(
     wchar_t *environment = NULL;
     DWORD exit_code = 1;
     BOOL process_in_job = FALSE;
+    int attributes_initialized = 0;
     int ok = 0;
     memset(&startup, 0, sizeof(startup));
     memset(&process, 0, sizeof(process));
@@ -1430,8 +1441,11 @@ static int launch_test_child(
             1,
             0,
             &attributes_size
-        )
-        || !UpdateProcThreadAttribute(
+        )) {
+        goto cleanup;
+    }
+    attributes_initialized = 1;
+    if (!UpdateProcThreadAttribute(
             attributes,
             0,
             PROC_THREAD_ATTRIBUTE_JOB_LIST,
@@ -1519,8 +1533,10 @@ cleanup:
     if (job != NULL) {
         CloseHandle(job);
     }
-    if (attributes != NULL) {
+    if (attributes_initialized) {
         DeleteProcThreadAttributeList(attributes);
+    }
+    if (attributes != NULL) {
         HeapFree(GetProcessHeap(), 0, attributes);
     }
     if (environment != NULL) {
@@ -1530,6 +1546,36 @@ cleanup:
     SecureZeroMemory(command_line, sizeof(command_line));
     SecureZeroMemory(runtime_directory, sizeof(runtime_directory));
     return ok;
+}
+
+static int attribute_init_failure_cleanup_test(void) {
+    SIZE_T attributes_size = 1;
+    PPROC_THREAD_ATTRIBUTE_LIST attributes =
+        (PPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(
+            GetProcessHeap(),
+            HEAP_ZERO_MEMORY,
+            attributes_size
+        );
+    int attributes_initialized = 0;
+    int expected_failure = 0;
+    if (attributes == NULL) {
+        return 0;
+    }
+    if (InitializeProcThreadAttributeList(
+            attributes,
+            2,
+            0,
+            &attributes_size
+        )) {
+        attributes_initialized = 1;
+    } else {
+        expected_failure = GetLastError() == ERROR_INSUFFICIENT_BUFFER;
+    }
+    if (attributes_initialized) {
+        DeleteProcThreadAttributeList(attributes);
+    }
+    HeapFree(GetProcessHeap(), 0, attributes);
+    return expected_failure && !attributes_initialized;
 }
 #endif
 
@@ -2550,6 +2596,19 @@ int wmain(int argc, wchar_t **argv) {
         return 0;
     }
 #ifdef F3_BROKER_TESTING
+    if (
+        argc == 2
+        && wcscmp(
+            argv[1],
+            L"--test-attribute-init-failure-cleanup"
+        ) == 0
+    ) {
+        if (!attribute_init_failure_cleanup_test()) {
+            fwprintf(stderr, L"native broker attribute cleanup rejected\n");
+            return 34;
+        }
+        return 0;
+    }
     if (
         argc == 6
         && wcscmp(argv[1], L"--test-credential-handoff") == 0
