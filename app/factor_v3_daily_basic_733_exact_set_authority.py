@@ -14,6 +14,7 @@ import uuid
 
 from app import audited_pit_factor_v3_feature_history_authority as history_authority
 from app import factor_v3_feature_history_runner as history_runner
+from app import factor_v3_feature_history_frozen_source_attestation as frozen_attestation
 from app import jiaoch_daily_basic_exact_set_authority as legacy
 from app import jiaoch_points_raw_authority as raw_authority
 
@@ -46,6 +47,7 @@ _PRODUCER_FILES = (
     "audited_pit_factor_v3_feature_history_authority.py",
     "durable_io.py",
     "factor_v3_daily_basic_733_exact_set_authority.py",
+    "factor_v3_feature_history_frozen_source_attestation.py",
     "factor_v3_feature_history_runner.py",
     "jiaoch_daily_basic_collection_set.py",
     "jiaoch_daily_basic_exact_set_authority.py",
@@ -230,18 +232,27 @@ def _load_feature_history_prewindow_authority(
     *,
     feature_history_run_spec_path: str | Path,
     feature_history_run_root: str | Path,
+    feature_history_frozen_source_attestation_path: str | Path,
+    expected_feature_history_frozen_source_attestation_sha256: str,
+    feature_history_frozen_source_root: str | Path,
+    expected_feature_history_frozen_source_commit: str,
 ) -> legacy.AuditedDailyAuthority:
-    verified = history_runner.verify_factor_v3_feature_history_run(
-        run_spec_path=feature_history_run_spec_path,
-        run_root=feature_history_run_root,
+    verified = frozen_attestation.verify_factor_v3_feature_history_frozen_source_attestation(
+        attestation_path=feature_history_frozen_source_attestation_path,
+        expected_attestation_sha256=(
+            expected_feature_history_frozen_source_attestation_sha256
+        ),
+        frozen_source_root=feature_history_frozen_source_root,
+        expected_frozen_source_commit=expected_feature_history_frozen_source_commit,
+        feature_history_run_spec_path=feature_history_run_spec_path,
+        feature_history_run_root=feature_history_run_root,
     )
     if (
         type(verified) is not dict
-        or verified.get("status") != "verified"
-        or type(verified.get("receipt")) is not dict
+        or verified.get("verified") is not True
+        or verified.get("session_count") != 250
     ):
         raise ValueError("factor-v3 daily-basic feature-history authority rejected")
-    receipt = verified["receipt"]
     spec = history_runner.load_factor_v3_feature_history_run_spec(
         feature_history_run_spec_path
     )
@@ -258,6 +269,9 @@ def _load_feature_history_prewindow_authority(
         ),
         run_spec_sha256=spec["run_spec_sha256"],
     )
+    receipt = state.get("receipt")
+    if type(receipt) is not dict or receipt.get("verified") is not True:
+        raise ValueError("factor-v3 daily-basic feature-history receipt rejected")
     publication = history_runner._validated_publication(state["collection_publication"])
     manifest = history_authority._read_collection_manifest(
         output_root=paths["publication_root"],
@@ -522,6 +536,18 @@ def _load_733_authority(**kwargs: Any) -> tuple[legacy.AuditedDailyAuthority, di
     prewindow = _load_feature_history_prewindow_authority(
         feature_history_run_spec_path=kwargs["feature_history_run_spec_path"],
         feature_history_run_root=kwargs["feature_history_run_root"],
+        feature_history_frozen_source_attestation_path=kwargs[
+            "feature_history_frozen_source_attestation_path"
+        ],
+        expected_feature_history_frozen_source_attestation_sha256=kwargs[
+            "expected_feature_history_frozen_source_attestation_sha256"
+        ],
+        feature_history_frozen_source_root=kwargs[
+            "feature_history_frozen_source_root"
+        ],
+        expected_feature_history_frozen_source_commit=kwargs[
+            "expected_feature_history_frozen_source_commit"
+        ],
     )
     development = _load_development_authority(
         audited_development_universe_sqlite_path=kwargs[
@@ -947,6 +973,10 @@ def _source_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
         for key in (
             "feature_history_run_spec_path",
             "feature_history_run_root",
+            "feature_history_frozen_source_attestation_path",
+            "expected_feature_history_frozen_source_attestation_sha256",
+            "feature_history_frozen_source_root",
+            "expected_feature_history_frozen_source_commit",
             "audited_development_universe_sqlite_path",
             "expected_development_coverage_audit_sha256",
             "expected_development_artifact_root_sha256",
@@ -961,6 +991,10 @@ def publish_factor_v3_daily_basic_733_exact_set_coverage(
     *,
     feature_history_run_spec_path: str | Path,
     feature_history_run_root: str | Path,
+    feature_history_frozen_source_attestation_path: str | Path,
+    expected_feature_history_frozen_source_attestation_sha256: str,
+    feature_history_frozen_source_root: str | Path,
+    expected_feature_history_frozen_source_commit: str,
     audited_development_universe_sqlite_path: str | Path,
     expected_development_coverage_audit_sha256: str,
     expected_development_artifact_root_sha256: str,
@@ -1070,6 +1104,10 @@ def verify_factor_v3_daily_basic_733_exact_set_coverage(
     *,
     feature_history_run_spec_path: str | Path,
     feature_history_run_root: str | Path,
+    feature_history_frozen_source_attestation_path: str | Path,
+    expected_feature_history_frozen_source_attestation_sha256: str,
+    feature_history_frozen_source_root: str | Path,
+    expected_feature_history_frozen_source_commit: str,
     audited_development_universe_sqlite_path: str | Path,
     expected_development_coverage_audit_sha256: str,
     expected_development_artifact_root_sha256: str,

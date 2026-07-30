@@ -52,6 +52,7 @@ _POLICY_DOCUMENT_SCHEMA = "jiaoch-credential-factor-v3-daily-basic-routing-polic
 _MAX_RUN_SPEC_BYTES = 4 * 1024 * 1024
 _MAX_STATE_BYTES = 2 * 1024 * 1024
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _UUID4_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 _RUN_SPEC_FIELDS = frozenset(
     {
@@ -87,6 +88,10 @@ _EXACT_INPUT_FIELDS = frozenset(
         "expected_development_temporal_contract_sha256",
         "expected_development_temporal_role",
         "expected_security_code_transition_contract_sha256",
+        "expected_feature_history_frozen_source_attestation_sha256",
+        "expected_feature_history_frozen_source_commit",
+        "feature_history_frozen_source_attestation_path",
+        "feature_history_frozen_source_root",
         "feature_history_run_root",
         "feature_history_run_spec_path",
         "security_code_transition_evidence_root",
@@ -317,6 +322,8 @@ def _validated_exact_inputs(value: Any) -> dict[str, Any]:
         "audited_development_universe_sqlite_path",
         "feature_history_run_root",
         "feature_history_run_spec_path",
+        "feature_history_frozen_source_attestation_path",
+        "feature_history_frozen_source_root",
         "security_code_transition_evidence_root",
     ):
         if type(output[field]) is not str or not Path(output[field]).is_absolute():
@@ -325,11 +332,27 @@ def _validated_exact_inputs(value: Any) -> dict[str, Any]:
         "expected_development_artifact_root_sha256",
         "expected_development_coverage_audit_sha256",
         "expected_development_temporal_contract_sha256",
+        "expected_feature_history_frozen_source_attestation_sha256",
         "expected_security_code_transition_contract_sha256",
     ):
         _require_sha256(output[field], label=field)
     if output["expected_development_temporal_role"] != "development_4":
         raise FactorV3DailyBasicRunnerError("factor-v3 daily-basic temporal role rejected")
+    from app import factor_v3_feature_history_frozen_source_attestation as frozen
+
+    if (
+        output["feature_history_frozen_source_root"]
+        != str(frozen.FROZEN_SOURCE_ROOT)
+        or output["expected_feature_history_frozen_source_commit"]
+        != frozen.FROZEN_SOURCE_COMMIT
+        or _COMMIT_RE.fullmatch(
+            output["expected_feature_history_frozen_source_commit"]
+        )
+        is None
+    ):
+        raise FactorV3DailyBasicRunnerError(
+            "factor-v3 daily-basic frozen source identity rejected"
+        )
     return output
 
 
@@ -345,6 +368,18 @@ def _verified_733_sources(
         source, identity = authority._load_733_authority(
             feature_history_run_spec_path=inputs["feature_history_run_spec_path"],
             feature_history_run_root=inputs["feature_history_run_root"],
+            feature_history_frozen_source_attestation_path=inputs[
+                "feature_history_frozen_source_attestation_path"
+            ],
+            expected_feature_history_frozen_source_attestation_sha256=inputs[
+                "expected_feature_history_frozen_source_attestation_sha256"
+            ],
+            feature_history_frozen_source_root=inputs[
+                "feature_history_frozen_source_root"
+            ],
+            expected_feature_history_frozen_source_commit=inputs[
+                "expected_feature_history_frozen_source_commit"
+            ],
             audited_development_universe_sqlite_path=inputs[
                 "audited_development_universe_sqlite_path"
             ],
@@ -673,6 +708,18 @@ def _exact_set_kwargs(
     return {
         "feature_history_run_spec_path": validated["feature_history_run_spec_path"],
         "feature_history_run_root": validated["feature_history_run_root"],
+        "feature_history_frozen_source_attestation_path": validated[
+            "feature_history_frozen_source_attestation_path"
+        ],
+        "expected_feature_history_frozen_source_attestation_sha256": validated[
+            "expected_feature_history_frozen_source_attestation_sha256"
+        ],
+        "feature_history_frozen_source_root": validated[
+            "feature_history_frozen_source_root"
+        ],
+        "expected_feature_history_frozen_source_commit": validated[
+            "expected_feature_history_frozen_source_commit"
+        ],
         "audited_development_universe_sqlite_path": validated[
             "audited_development_universe_sqlite_path"
         ],

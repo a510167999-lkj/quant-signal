@@ -9,6 +9,7 @@ import uuid
 import pytest
 
 from app import factor_v3_daily_basic_runner as runner
+from app import factor_v3_feature_history_frozen_source_attestation as frozen
 
 
 def _hold_run_lock(lock_path: str, acquired: object, release: object) -> None:
@@ -57,6 +58,14 @@ def _authority_inputs(tmp_path: Path) -> dict[str, object]:
         "expected_development_temporal_contract_sha256": "f" * 64,
         "expected_development_temporal_role": "development_4",
         "expected_security_code_transition_contract_sha256": "e" * 64,
+        "expected_feature_history_frozen_source_attestation_sha256": "b" * 64,
+        "expected_feature_history_frozen_source_commit": (
+            frozen.FROZEN_SOURCE_COMMIT
+        ),
+        "feature_history_frozen_source_attestation_path": str(
+            (tmp_path / "frozen-attestation" / f"{'b' * 64}.json").resolve()
+        ),
+        "feature_history_frozen_source_root": str(frozen.FROZEN_SOURCE_ROOT),
         "feature_history_run_root": str((tmp_path / "feature-history-run").resolve()),
         "feature_history_run_spec_path": str(
             (tmp_path / "feature-history-spec.json").resolve()
@@ -105,6 +114,36 @@ def test_run_spec_rejects_overlapping_or_handwritten_source_sessions(
     with pytest.raises(runner.FactorV3DailyBasicRunnerError, match="733"):
         runner.build_factor_v3_daily_basic_run_spec(
             exact_set_authority_inputs=_authority_inputs(tmp_path),
+            timeout_seconds=30,
+            max_attempts=3,
+        )
+
+
+def test_run_spec_requires_exact_frozen_source_attestation_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _sources(monkeypatch)
+    missing = _authority_inputs(tmp_path)
+    missing.pop("expected_feature_history_frozen_source_attestation_sha256")
+    with pytest.raises(
+        runner.FactorV3DailyBasicRunnerError,
+        match="exact-set inputs",
+    ):
+        runner.build_factor_v3_daily_basic_run_spec(
+            exact_set_authority_inputs=missing,
+            timeout_seconds=30,
+            max_attempts=3,
+        )
+
+    replaced = _authority_inputs(tmp_path)
+    replaced["expected_feature_history_frozen_source_commit"] = "0" * 40
+    with pytest.raises(
+        runner.FactorV3DailyBasicRunnerError,
+        match="frozen source identity",
+    ):
+        runner.build_factor_v3_daily_basic_run_spec(
+            exact_set_authority_inputs=replaced,
             timeout_seconds=30,
             max_attempts=3,
         )

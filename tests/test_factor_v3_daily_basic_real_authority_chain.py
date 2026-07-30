@@ -12,6 +12,7 @@ import pytest
 from app import factor_v3_daily_basic_733_exact_set_authority as authority
 from app import factor_v3_daily_basic_runner as runner
 from app import factor_v3_feature_history_runner as history_runner
+from app import factor_v3_feature_history_frozen_source_attestation as frozen
 from app import jiaoch_daily_basic_collection_set as daily_collection
 from app import research_security_code_transition as code_transition
 from app.research_partitions import load_temporal_partition_contract
@@ -438,6 +439,14 @@ def test_real_250_plus_483_authority_chain_runs_and_cli_reverifies(
     exact_inputs = {
         "feature_history_run_spec_path": str(feature_spec_path),
         "feature_history_run_root": str(feature_run_root),
+        "feature_history_frozen_source_attestation_path": str(
+            (tmp_path / "synthetic-frozen-attestation.json").resolve()
+        ),
+        "expected_feature_history_frozen_source_attestation_sha256": "a" * 64,
+        "feature_history_frozen_source_root": str(frozen.FROZEN_SOURCE_ROOT),
+        "expected_feature_history_frozen_source_commit": (
+            frozen.FROZEN_SOURCE_COMMIT
+        ),
         "audited_development_universe_sqlite_path": str(artifact["path"]),
         "expected_development_coverage_audit_sha256": artifact[
             "coverage_audit_sha256"
@@ -452,6 +461,19 @@ def test_real_250_plus_483_authority_chain_runs_and_cli_reverifies(
         "security_code_transition_evidence_root": str(evidence_root),
         "expected_security_code_transition_contract_sha256": transition_sha256,
     }
+    monkeypatch.setattr(
+        frozen,
+        "verify_factor_v3_feature_history_frozen_source_attestation",
+        lambda **kwargs: {
+            "receipt_sha256": history_runner.verify_factor_v3_feature_history_run(
+                run_spec_path=kwargs["feature_history_run_spec_path"],
+                run_root=kwargs["feature_history_run_root"],
+            )["receipt"]["receipt_sha256"],
+            "session_count": 250,
+            "sessions_sha256": "f" * 64,
+            "verified": True,
+        },
+    )
     spec = runner.build_factor_v3_daily_basic_run_spec(
         exact_set_authority_inputs=exact_inputs,
         timeout_seconds=30,

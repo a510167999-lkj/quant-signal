@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from app import factor_v3_daily_basic_733_exact_set_authority as authority
+from app import factor_v3_feature_history_frozen_source_attestation as frozen
 from app import jiaoch_daily_basic_exact_set_authority as legacy
 from app.jiaoch_points_response_normalization import NormalizedDailyBasicRow
 
@@ -213,6 +214,16 @@ def _kwargs(
             tmp_path / "feature-history-spec.json"
         ).resolve(),
         feature_history_run_root=(tmp_path / "feature-history-run").resolve(),
+        feature_history_frozen_source_attestation_path=(
+            tmp_path / "frozen-attestation.json"
+        ).resolve(),
+        expected_feature_history_frozen_source_attestation_sha256=_sha(
+            "frozen-attestation"
+        ),
+        feature_history_frozen_source_root=frozen.FROZEN_SOURCE_ROOT,
+        expected_feature_history_frozen_source_commit=(
+            frozen.FROZEN_SOURCE_COMMIT
+        ),
         audited_development_universe_sqlite_path=(
             tmp_path / "development" / "metadata.sqlite3"
         ).resolve(),
@@ -230,6 +241,16 @@ def _kwargs(
     kwargs = {
         "feature_history_run_spec_path": (tmp_path / "feature-history-spec.json").resolve(),
         "feature_history_run_root": (tmp_path / "feature-history-run").resolve(),
+        "feature_history_frozen_source_attestation_path": (
+            tmp_path / "frozen-attestation.json"
+        ).resolve(),
+        "expected_feature_history_frozen_source_attestation_sha256": _sha(
+            "frozen-attestation"
+        ),
+        "feature_history_frozen_source_root": frozen.FROZEN_SOURCE_ROOT,
+        "expected_feature_history_frozen_source_commit": (
+            frozen.FROZEN_SOURCE_COMMIT
+        ),
         "audited_development_universe_sqlite_path": (
             tmp_path / "development" / "metadata.sqlite3"
         ).resolve(),

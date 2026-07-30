@@ -3518,6 +3518,7 @@ def _validated_collection_manifest(
     *,
     publication: Mapping[str, Any],
     sessions: Sequence[str],
+    expected_producer_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     manifest = _strict_mapping(
         value,
@@ -3601,7 +3602,12 @@ def _validated_collection_manifest(
         expected_capability_sha256,
     ):
         raise ValueError("factor-v3 feature history collection publication capability rejected")
-    if manifest.get("producer_binding") != _producer_binding():
+    producer_binding = (
+        _producer_binding()
+        if expected_producer_binding is None
+        else deepcopy(dict(expected_producer_binding))
+    )
+    if manifest.get("producer_binding") != producer_binding:
         raise ValueError("factor-v3 feature history collection producer binding rejected")
     _validated_feature_history_route_policy_descriptor(
         manifest.get("feature_history_route_policy_descriptor")
@@ -3766,7 +3772,7 @@ def _publish_factor_v3_feature_history_collection_candidate(
     return publication
 
 
-def verify_factor_v3_feature_history_collection_authority(
+def _verify_factor_v3_feature_history_collection_authority(
     *,
     collection_publication: Mapping[str, Any],
     collection_publication_output_root: str | Path,
@@ -3775,6 +3781,7 @@ def verify_factor_v3_feature_history_collection_authority(
     temporal_partition_contract: Mapping[str, Any],
     trade_cal_output_root: str | Path,
     trade_cal_publication: Mapping[str, Any],
+    expected_producer_binding: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """Grant feature-history-only authority from a sealed collection publication."""
 
@@ -3794,6 +3801,7 @@ def verify_factor_v3_feature_history_collection_authority(
         ),
         publication=publication,
         sessions=sessions,
+        expected_producer_binding=expected_producer_binding,
     )
     _validated_collection_publication_issuance(
         output_root=collection_publication_output_root,
@@ -3866,7 +3874,7 @@ def verify_factor_v3_feature_history_collection_authority(
             "source_authority_root_sha256"
         ],
         "upstream_scope_root_sha256": replay["upstream_scope_root_sha256"],
-        "producer_code_root_sha256": producer_before["root_sha256"],
+        "producer_code_root_sha256": manifest["producer_binding"]["root_sha256"],
         "exact_nonempty_bak_basic_session_count": len(sessions),
         "daily_generation_session_count": len(sessions),
         "suspend_d_authority_session_count": len(sessions),
@@ -3883,3 +3891,59 @@ def verify_factor_v3_feature_history_collection_authority(
         "production_recommendation_eligible": False,
     }
     return {**unsigned, "receipt_sha256": canonical_sha256(unsigned)}
+
+
+def verify_factor_v3_feature_history_collection_authority(
+    *,
+    collection_publication: Mapping[str, Any],
+    collection_publication_output_root: str | Path,
+    collection_plan: Mapping[str, Any],
+    development_session_refs: Sequence[Mapping[str, Any]],
+    temporal_partition_contract: Mapping[str, Any],
+    trade_cal_output_root: str | Path,
+    trade_cal_publication: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Grant feature-history-only authority from a sealed collection publication."""
+
+    return _verify_factor_v3_feature_history_collection_authority(
+        collection_publication=collection_publication,
+        collection_publication_output_root=collection_publication_output_root,
+        collection_plan=collection_plan,
+        development_session_refs=development_session_refs,
+        temporal_partition_contract=temporal_partition_contract,
+        trade_cal_output_root=trade_cal_output_root,
+        trade_cal_publication=trade_cal_publication,
+        expected_producer_binding=None,
+    )
+
+
+def _verify_feature_history_with_attested_producer_binding(
+    *,
+    expected_producer_binding: Mapping[str, Any],
+    attestation_capability: object,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    from app import factor_v3_feature_history_frozen_source_attestation as frozen
+
+    if attestation_capability is not frozen._ATTESTED_REPLAY_CAPABILITY:
+        raise ValueError("factor-v3 feature history attestation gate rejected")
+    current_shape = _producer_binding()
+    if (
+        type(expected_producer_binding) is not dict
+        or set(expected_producer_binding) != set(current_shape)
+        or expected_producer_binding.get("schema_version")
+        != "factor-v3-feature-history-producer-binding/v2"
+        or expected_producer_binding.get("root_sha256")
+        != canonical_sha256(
+            {
+                key: value
+                for key, value in expected_producer_binding.items()
+                if key != "root_sha256"
+            }
+        )
+    ):
+        raise ValueError("factor-v3 feature history attested producer binding rejected")
+    return _verify_factor_v3_feature_history_collection_authority(
+        **kwargs,
+        expected_producer_binding=expected_producer_binding,
+    )
