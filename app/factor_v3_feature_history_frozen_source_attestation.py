@@ -767,31 +767,15 @@ def _locked_physical_frozen_source_binding(source_root: str | Path):
                 max_bytes=_MAX_SOURCE_BYTES,
             )
             digest = _sha256(raw)
-            commit_raw = _git_blob_bytes(
-                root,
-                FROZEN_SOURCE_COMMIT,
-                relative_path,
-            )
-            if not hmac.compare_digest(raw, commit_raw):
-                raise ValueError(
-                    "factor-v3 frozen-source commit source binding rejected"
-                )
             entries.append(
-                {
-                    "physical_bytes": len(raw),
-                    "physical_sha256": digest,
-                    "relative_path": relative_path,
-                }
+                _frozen_physical_source_entry(
+                    root=root,
+                    relative_path=relative_path,
+                    physical_raw=raw,
+                )
             )
             locked.append((candidate, handle, digest, len(raw)))
-        identity = {
-            "physical_files": entries,
-            "schema": "factor-v3-feature-history-frozen-physical-source/v1",
-        }
-        binding = {
-            **identity,
-            "producer_binding_root_sha256": _canonical_sha256(identity),
-        }
+        binding = _frozen_physical_binding(entries)
         yield binding
         for candidate, handle, digest, size in locked:
             _postverify_pinned_file(
