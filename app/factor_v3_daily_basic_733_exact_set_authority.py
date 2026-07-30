@@ -44,11 +44,16 @@ _KINDS = {
 }
 _PRODUCER_FILES = (
     "audited_pit_factor_v3_feature_history_authority.py",
+    "durable_io.py",
     "factor_v3_daily_basic_733_exact_set_authority.py",
     "factor_v3_feature_history_runner.py",
     "jiaoch_daily_basic_collection_set.py",
     "jiaoch_daily_basic_exact_set_authority.py",
+    "jiaoch_points_response_normalization.py",
     "jiaoch_points_raw_authority.py",
+    "research_pit_store.py",
+    "research_scope.py",
+    "research_security_code_transition.py",
 )
 _PUBLICATION_FIELDS = frozenset(
     {

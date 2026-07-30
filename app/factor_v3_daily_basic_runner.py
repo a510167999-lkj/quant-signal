@@ -514,33 +514,100 @@ def _load_or_initialize(paths: Mapping[str, Path], spec: Mapping[str, Any], *, a
     return _validated_state(_read_json(paths["state"], label="run state", max_bytes=_MAX_STATE_BYTES), spec=spec)
 
 
+def _validate_open_lock_identity(path: Path, descriptor: int) -> None:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    try:
+        parent_stat = path.parent.lstat()
+        descriptor_stat = os.fstat(descriptor)
+        path_stat = path.lstat()
+        if (
+            path.parent.is_symlink()
+            or not stat.S_ISDIR(parent_stat.st_mode)
+            or getattr(parent_stat, "st_file_attributes", 0) & reparse_flag
+            or path.is_symlink()
+            or not stat.S_ISREG(descriptor_stat.st_mode)
+            or not stat.S_ISREG(path_stat.st_mode)
+            or descriptor_stat.st_nlink != 1
+            or path_stat.st_nlink != 1
+            or getattr(descriptor_stat, "st_file_attributes", 0) & reparse_flag
+            or getattr(path_stat, "st_file_attributes", 0) & reparse_flag
+            or (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            != (path_stat.st_dev, path_stat.st_ino)
+        ):
+            raise OSError
+    except OSError as exc:
+        raise FactorV3DailyBasicRunnerError(
+            "factor-v3 daily-basic lock unavailable"
+        ) from exc
+
+
 @contextmanager
 def _run_lock(path: Path) -> Iterator[None]:
-    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_BINARY", 0)
-    descriptor = os.open(str(path), flags, 0o600)
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
-        with os.fdopen(descriptor, "a+b", closefd=True) as handle:
-            try:
-                if _fcntl is not None:
-                    _fcntl.flock(handle.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-                elif _msvcrt is not None:
-                    handle.seek(0)
-                    if handle.tell() == 0:
-                        handle.write(b"0")
-                        handle.flush()
-                    handle.seek(0)
-                    _msvcrt.locking(handle.fileno(), _msvcrt.LK_NBLCK, 1)
-                else:
-                    raise OSError("no lock backend")
-            except OSError as exc:
-                raise FactorV3DailyBasicRunnerError("factor-v3 daily-basic run is already locked") from exc
-            yield
+        parent_stat = path.parent.lstat()
+        if (
+            path.parent.is_symlink()
+            or not stat.S_ISDIR(parent_stat.st_mode)
+            or getattr(parent_stat, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            or path.is_symlink()
+        ):
+            raise OSError
+    except OSError as exc:
+        raise FactorV3DailyBasicRunnerError(
+            "factor-v3 daily-basic lock unavailable"
+        ) from exc
+    try:
+        descriptor = os.open(str(path), flags, 0o600)
+    except OSError as exc:
+        raise FactorV3DailyBasicRunnerError(
+            "factor-v3 daily-basic lock unavailable"
+        ) from exc
+    try:
+        _validate_open_lock_identity(path, descriptor)
+    except FactorV3DailyBasicRunnerError:
+        os.close(descriptor)
+        raise
+    try:
+        if _fcntl is not None:
+            _fcntl.flock(descriptor, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        elif _msvcrt is not None:
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+                os.fsync(descriptor)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            _msvcrt.locking(descriptor, _msvcrt.LK_NBLCK, 1)
+        else:
+            raise FactorV3DailyBasicRunnerError(
+                "factor-v3 daily-basic advisory locking is unavailable"
+            )
+        _validate_open_lock_identity(path, descriptor)
+    except (OSError, FactorV3DailyBasicRunnerError) as exc:
+        os.close(descriptor)
+        raise FactorV3DailyBasicRunnerError(
+            "factor-v3 daily-basic run is already locked"
+        ) from exc
+    try:
+        yield
     finally:
         try:
-            path.unlink(missing_ok=True)
-            fsync_directory(path.parent)
-        except OSError:
-            pass
+            if _fcntl is not None:
+                _fcntl.flock(descriptor, _fcntl.LOCK_UN)
+            elif _msvcrt is not None:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                _msvcrt.locking(descriptor, _msvcrt.LK_UNLCK, 1)
+        except OSError as exc:
+            raise FactorV3DailyBasicRunnerError(
+                "factor-v3 daily-basic lock cleanup failed"
+            ) from exc
+        finally:
+            os.close(descriptor)
 
 
 def _run_credential_generation_id(*, run_spec_path: str | Path, run_root: str | Path) -> str:
