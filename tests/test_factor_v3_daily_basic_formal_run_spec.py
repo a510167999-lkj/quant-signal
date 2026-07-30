@@ -230,8 +230,10 @@ def test_planned_run_root_must_be_absent_or_strictly_empty_without_sidecars(
 def test_formal_worktree_requires_exact_branch_and_clean_status(
     monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    reviewed_commit = "d" * 40
     responses = {
         ("rev-parse", "--show-toplevel"): str(formal.FORMAL_WORKTREE_ROOT),
+        ("rev-parse", "HEAD"): reviewed_commit,
         ("branch", "--show-current"): formal.EXPECTED_BRANCH,
         ("status", "--porcelain=v1", "--untracked-files=all"): "",
     }
@@ -241,11 +243,20 @@ def test_formal_worktree_requires_exact_branch_and_clean_status(
         "_script_worktree_root",
         lambda: formal.FORMAL_WORKTREE_ROOT,
     )
-    formal.verify_formal_worktree()
+    formal.verify_formal_worktree(
+        expected_reviewed_commit=reviewed_commit,
+    )
+
+    with pytest.raises(formal.FormalRunSpecError, match="commit"):
+        formal.verify_formal_worktree(
+            expected_reviewed_commit="e" * 40,
+        )
 
     responses[("status", "--porcelain=v1", "--untracked-files=all")] = " M unsafe.py"
     with pytest.raises(formal.FormalRunSpecError, match="dirty"):
-        formal.verify_formal_worktree()
+        formal.verify_formal_worktree(
+            expected_reviewed_commit=reviewed_commit,
+        )
 
 
 def test_isolated_cli_shim_delegates_verify_without_import_path_leak(

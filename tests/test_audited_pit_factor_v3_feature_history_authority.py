@@ -1226,6 +1226,39 @@ def test_formal_collection_authority_replays_real_store_and_grants_only_feature_
     assert (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns)
 
 
+def test_private_authority_core_rejects_caller_supplied_old_producer_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, publication, _sessions, store, _refs, _database_sha256 = (
+        _real_store_fixture(
+            tmp_path,
+            monkeypatch,
+        )
+    )
+    output_root, collection_publication = _publish_source_bound(
+        plan=plan,
+        publication=publication,
+        store=store,
+    )
+
+    with pytest.raises(TypeError, match="expected_producer_binding"):
+        history_authority._verify_factor_v3_feature_history_collection_authority(
+            collection_publication=collection_publication,
+            collection_publication_output_root=output_root,
+            collection_plan=plan,
+            development_session_refs=_development_refs(
+                plan["development_sessions"]["sessions"]
+            ),
+            temporal_partition_contract=load_temporal_partition_contract(
+                PARTITION_V1_PATH
+            ),
+            trade_cal_output_root=Path("synthetic-trade-cal-root"),
+            trade_cal_publication=publication,
+            expected_producer_binding=history_authority._producer_binding(),
+        )
+
+
 def test_formal_authority_rejects_semantic_empty_instead_of_exact_bak_basic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

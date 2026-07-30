@@ -1317,6 +1317,44 @@ def test_attestation_cas_rejects_intermediate_reparse_and_postverifies(
     assert reads >= 1
 
 
+def test_attestation_cas_rejects_intermediate_reparse_and_postverifies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = (tmp_path / "attestations").resolve()
+    output_root.mkdir()
+    kind_root = output_root / frozen._ATTESTATION_KIND
+    original_reparse = raw_authority._path_is_link_or_reparse
+    monkeypatch.setattr(
+        raw_authority,
+        "_path_is_link_or_reparse",
+        lambda candidate: (
+            Path(candidate) == kind_root
+            or original_reparse(Path(candidate))
+        ),
+    )
+
+    with pytest.raises(ValueError, match="link|reparse"):
+        frozen._write_attestation(output_root, {"safe": True})
+
+    monkeypatch.setattr(
+        raw_authority,
+        "_path_is_link_or_reparse",
+        original_reparse,
+    )
+    reads = 0
+    original_read = raw_authority._read_safe_file
+
+    def counted_read(*args: Any, **kwargs: Any) -> bytes:
+        nonlocal reads
+        reads += 1
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(raw_authority, "_read_safe_file", counted_read)
+    frozen._write_attestation(output_root, {"safe": True})
+    assert reads >= 1
+
+
 def test_daily_authority_binds_attestation_helper_as_producer_dependency() -> None:
     assert (
         "factor_v3_feature_history_frozen_source_attestation.py" in daily_authority._PRODUCER_FILES

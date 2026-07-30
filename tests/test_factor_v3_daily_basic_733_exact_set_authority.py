@@ -5,6 +5,7 @@ from datetime import date, timedelta
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 from typing import Any
 
 import pytest
@@ -273,6 +274,163 @@ def _verify_kwargs(kwargs: dict[str, Any], publication: dict[str, Any]) -> dict[
         **kwargs,
         "publication": publication,
     }
+
+
+def test_prewindow_loader_binds_attestation_receipt_and_sessions_to_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _development = _sessions()
+    store_root = tmp_path / "pit-store"
+    store_root.mkdir()
+    database = store_root / "metadata.sqlite3"
+    connection = sqlite3.connect(database)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE market_session_generations (
+                trade_date TEXT NOT NULL,
+                generation_id TEXT NOT NULL,
+                terminal_at TEXT NOT NULL,
+                vintage TEXT NOT NULL,
+                manifest_sha256 TEXT NOT NULL,
+                lineage_sha256 TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE market_session_generation_rows_daily (
+                trade_date TEXT NOT NULL,
+                generation_id TEXT NOT NULL,
+                ts_code TEXT NOT NULL
+            );
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO market_session_generations
+            VALUES (?, ?, ?, ?, ?, ?, 'published')
+            """,
+            [
+                (
+                    session,
+                    f"generation-{index}",
+                    f"{session}T15:00:00+00:00",
+                    "historical_backfill",
+                    _sha(f"manifest-{index}"),
+                    _sha(f"lineage-{index}"),
+                )
+                for index, session in enumerate(sessions)
+            ],
+        )
+        connection.executemany(
+            """
+            INSERT INTO market_session_generation_rows_daily
+            VALUES (?, ?, ?)
+            """,
+            [
+                (session, f"generation-{index}", "600001.SH")
+                for index, session in enumerate(sessions)
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    database_sha256 = hashlib.sha256(database.read_bytes()).hexdigest()
+    refs = [
+        {
+            "trade_date": session,
+            "market_generation_id": f"generation-{index}",
+            "market_generation_manifest_sha256": _sha(f"manifest-{index}"),
+            "market_generation_lineage_sha256": _sha(f"lineage-{index}"),
+        }
+        for index, session in enumerate(sessions)
+    ]
+    receipt = {
+        "verified": True,
+        "receipt_sha256": _sha("state-receipt"),
+        "sessions_sha256": _canonical_sha(sessions),
+        "pit_store_database_sha256": database_sha256,
+        "collection_publication_manifest_sha256": _sha("manifest"),
+        "snapshot_index_sha256": _sha("snapshot"),
+        "source_authority_root_sha256": _sha("source"),
+        "session_authority_refs_sha256": _canonical_sha(refs),
+    }
+    state = {
+        "receipt": receipt,
+        "collection_publication": {
+            "authority_manifest_sha256": _sha("manifest-file"),
+        },
+    }
+    spec = {
+        "run_spec_sha256": _sha("spec"),
+        "collection_plan": {},
+        "temporal_partition_contract": {
+            "contract_sha256": _sha("temporal")
+        },
+    }
+    paths = {
+        "state": tmp_path / "state.json",
+        "publication_root": tmp_path / "publication",
+        "store": store_root,
+    }
+    monkeypatch.setattr(
+        frozen,
+        "verify_factor_v3_feature_history_frozen_source_attestation",
+        lambda **_kwargs: {
+            "receipt_sha256": _sha("different-receipt"),
+            "session_count": 250,
+            "sessions_sha256": _sha("different-sessions"),
+            "verified": True,
+        },
+    )
+    monkeypatch.setattr(
+        authority.history_runner,
+        "load_factor_v3_feature_history_run_spec",
+        lambda _path: spec,
+    )
+    monkeypatch.setattr(
+        authority.history_runner,
+        "_validated_segments",
+        lambda _plan: [{"sessions": sessions}],
+    )
+    monkeypatch.setattr(
+        authority.history_runner,
+        "_run_paths",
+        lambda _root, *, create: paths,
+    )
+    monkeypatch.setattr(
+        authority.history_runner,
+        "_read_json_file",
+        lambda *_args, **_kwargs: state,
+    )
+    monkeypatch.setattr(
+        authority.history_runner,
+        "_validated_state",
+        lambda value, **_kwargs: value,
+    )
+    monkeypatch.setattr(
+        authority.history_runner,
+        "_validated_publication",
+        lambda value: value,
+    )
+    monkeypatch.setattr(
+        authority.history_authority,
+        "_read_collection_manifest",
+        lambda **_kwargs: {"session_authority_refs": refs},
+    )
+
+    with pytest.raises(ValueError, match="attestation.*binding"):
+        authority._load_feature_history_prewindow_authority(
+            feature_history_run_spec_path=tmp_path / "spec.json",
+            feature_history_run_root=tmp_path / "run",
+            feature_history_frozen_source_attestation_path=(
+                tmp_path / "attestation.json"
+            ),
+            expected_feature_history_frozen_source_attestation_sha256=_sha(
+                "attestation"
+            ),
+            feature_history_frozen_source_root=tmp_path / "frozen",
+            expected_feature_history_frozen_source_commit="b" * 40,
+        )
 
 
 def test_v2_publisher_and_capability_free_verifier_rebuild_exact_733_union(

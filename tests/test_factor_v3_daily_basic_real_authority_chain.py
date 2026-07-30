@@ -22,6 +22,7 @@ from app.research_pit_store import (
     NORMALIZED_FIELDS,
     PITReceiptStore,
 )
+from scripts import build_factor_v3_daily_basic_formal_run_spec as formal_spec
 from tests import test_audited_pit_factor_v3_feature_history_authority as history_fixture
 from tests import test_research_pit_store as pit_fixture
 from tests import test_research_security_code_transition as transition_fixture
@@ -531,6 +532,46 @@ def test_real_250_plus_483_authority_chain_runs_and_cli_reverifies(
         )
         == 2
     )
+
+
+def test_real_b805_attestation_builds_capability_free_250_plus_483_spec(
+    tmp_path: Path,
+) -> None:
+    output_root = (tmp_path / "frozen-attestation").resolve()
+    output_root.mkdir()
+    publication = (
+        frozen.publish_factor_v3_feature_history_frozen_source_attestation(
+            frozen_source_root=frozen.FROZEN_SOURCE_ROOT,
+            expected_frozen_source_commit=frozen.FROZEN_SOURCE_COMMIT,
+            feature_history_run_spec_path=frozen.FROZEN_FEATURE_RUN_SPEC_PATH,
+            feature_history_run_root=frozen.FROZEN_FEATURE_RUN_ROOT,
+            output_root=output_root,
+        )
+    )
+    attestation_path = output_root / Path(
+        *publication["attestation_relative_path"].split("/")
+    )
+    exact_inputs = dict(formal_spec.EXACT_SET_AUTHORITY_INPUTS)
+    exact_inputs.update(
+        feature_history_frozen_source_attestation_path=str(attestation_path),
+        expected_feature_history_frozen_source_attestation_sha256=publication[
+            "attestation_sha256"
+        ],
+    )
+
+    spec = runner.build_factor_v3_daily_basic_run_spec(
+        exact_set_authority_inputs=exact_inputs,
+        timeout_seconds=30,
+        max_attempts=3,
+    )
+
+    raw = attestation_path.read_bytes().lower()
+    assert spec["session_count"] == 733
+    assert spec["sessions"][0] == "2023-06-26"
+    assert spec["sessions"][-1] == "2026-07-03"
+    assert b'"publication_capability":' not in raw
+    assert b'"token":' not in raw
+    assert b'"secret":' not in raw
 
 
 def authority_tests_sessions() -> tuple[list[str], list[str]]:
