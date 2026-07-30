@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import inspect
@@ -89,6 +90,37 @@ AUXILIARY_POLICY_DOCUMENT = {
         }
     ],
     "schema": "jiaoch-credential-auxiliary-routing-policy/v1",
+}
+LEGACY_PRODUCER_BINDING = {
+    "collector_version": "app.jiaoch_trade_cal_authority/1",
+    "entries": [
+        {
+            "path": "app/durable_io.py",
+            "sha256": "60bca0dbdfbcb2ad2d4cd04824d92c633bb014d05205fed69cf7b2acc01bed6e",
+        },
+        {
+            "path": "app/jiaoch_credential_slots.py",
+            "sha256": "40a1005f0eb71f76d85333c2b6a680b461b770f2bb3e75da86f1b2430c3bcb07",
+        },
+        {
+            "path": "app/jiaoch_points_raw_authority.py",
+            "sha256": "850eb62fa27272dfbad945c187cb857bde07a5896761457f1fd1a6b175d41cfe",
+        },
+        {
+            "path": "app/jiaoch_trade_cal_authority.py",
+            "sha256": "33bf8d191d2aae47267e99bc4929bd19956f8710798eae8d7d5710fe18b717bb",
+        },
+        {
+            "path": "app/research_provider_pit_tail_v2.py",
+            "sha256": "ba65c19f089f6222e53b9ff7ccb4e79d9afee70df08f0144bfd45143356cf1ee",
+        },
+        {
+            "path": "app/research_pit_transport.py",
+            "sha256": "888dc65c3705e22c4b65f4715589eec58577760e354ea969eeb031417bd2365f",
+        },
+    ],
+    "root_sha256": "9547226832515de3ab079bc1093f471e1c945a19c4c8d511b16480b9e2d37614",
+    "schema": "jiaoch-trade-cal-producer/v1",
 }
 
 
@@ -228,6 +260,30 @@ def _write_forged_manifest(root: Path, payload: dict) -> tuple[str, str]:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(raw)
     return relative, digest
+
+
+def _write_manifest_with_producer_binding(
+    root: Path,
+    publication: dict,
+    producer_binding: dict,
+) -> tuple[str, str]:
+    manifest = _manifest(root, publication)
+    attempt = json.loads((root / manifest["attempt"]["attempt_relative_path"]).read_bytes())
+    attempt["collection_binding"]["producer_root_sha256"] = producer_binding[
+        "root_sha256"
+    ]
+    attempt_raw = _canonical_bytes(attempt)
+    attempt_digest = hashlib.sha256(attempt_raw).hexdigest()
+    attempt_relative_path = (
+        f"trade_cal_attempts/sha256/{attempt_digest[:2]}/{attempt_digest}.json"
+    )
+    attempt_path = root / attempt_relative_path
+    attempt_path.parent.mkdir(parents=True, exist_ok=True)
+    attempt_path.write_bytes(attempt_raw)
+    manifest["producer_binding"] = producer_binding
+    manifest["attempt"]["attempt_relative_path"] = attempt_relative_path
+    manifest["attempt"]["attempt_sha256"] = attempt_digest
+    return _write_forged_manifest(root, manifest)
 
 
 def _open_sessions_root() -> str:
@@ -908,6 +964,92 @@ def test_offline_verifier_never_constructs_transport(
     )
 
     assert _verify_publication(tmp_path, publication)["verified"] is True
+
+
+def test_offline_verifier_accepts_only_the_sealed_legacy_producer_binding(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    publication, _, _ = _collect(tmp_path, monkeypatch)
+    relative, digest = _write_manifest_with_producer_binding(
+        tmp_path,
+        publication,
+        copy.deepcopy(LEGACY_PRODUCER_BINDING),
+    )
+
+    verified = _verify_publication(
+        tmp_path,
+        publication,
+        relative_path=relative,
+        digest=digest,
+    )
+
+    assert verified["verified"] is True
+
+
+@pytest.mark.parametrize("mutation", ["root", "entry", "unknown"])
+def test_offline_verifier_rejects_tampered_or_unknown_legacy_producer_binding(
+    tmp_path: Path,
+    monkeypatch,
+    mutation: str,
+) -> None:
+    publication, _, _ = _collect(tmp_path, monkeypatch)
+    binding = copy.deepcopy(LEGACY_PRODUCER_BINDING)
+    if mutation == "entry":
+        binding["entries"][0]["sha256"] = "0" * 64
+    else:
+        binding["root_sha256"] = "0" * 64 if mutation == "root" else "1" * 64
+    relative, digest = _write_manifest_with_producer_binding(
+        tmp_path,
+        publication,
+        binding,
+    )
+
+    with pytest.raises(ValueError, match="producer binding"):
+        _verify_publication(
+            tmp_path,
+            publication,
+            relative_path=relative,
+            digest=digest,
+        )
+
+
+def test_collector_still_emits_current_producer_binding_only(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    publication, _, _ = _collect(tmp_path, monkeypatch)
+
+    assert _manifest(tmp_path, publication)["producer_binding"] == (
+        jiaoch_trade_cal_authority._producer_binding()
+    )
+    assert _manifest(tmp_path, publication)["producer_binding"] != LEGACY_PRODUCER_BINDING
+
+
+def test_collector_rejects_legacy_producer_binding_before_transport(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    transport = RecordingTransport([_entity(_response_body())])
+    monkeypatch.setattr(
+        jiaoch_trade_cal_authority,
+        "_producer_binding",
+        lambda: copy.deepcopy(LEGACY_PRODUCER_BINDING),
+    )
+    monkeypatch.setattr(jiaoch_trade_cal_authority, "_transport_factory", lambda: transport)
+
+    with pytest.raises(ValueError, match="trade calendar collection failed"):
+        collect_jiaoch_trade_cal_authority(
+            generation=_generation(),
+            output_root=tmp_path,
+            start_date=START_DATE,
+            end_date=END_DATE,
+        )
+
+    assert transport.calls == []
+    assert not (tmp_path / "trade_cal_raw").exists()
+    assert not (tmp_path / "trade_cal_attempts").exists()
+    assert not (tmp_path / "trade_cal_manifest_candidates").exists()
 
 
 def test_manifest_tamper_path_traversal_hardlink_and_reparse_are_rejected(

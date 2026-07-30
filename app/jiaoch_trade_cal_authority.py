@@ -150,6 +150,37 @@ _PRODUCER_FILES = (
     "research_provider_pit_tail_v2.py",
     "research_pit_transport.py",
 )
+_LEGACY_PRODUCER_BINDING = {
+    "collector_version": "app.jiaoch_trade_cal_authority/1",
+    "entries": [
+        {
+            "path": "app/durable_io.py",
+            "sha256": "60bca0dbdfbcb2ad2d4cd04824d92c633bb014d05205fed69cf7b2acc01bed6e",
+        },
+        {
+            "path": "app/jiaoch_credential_slots.py",
+            "sha256": "40a1005f0eb71f76d85333c2b6a680b461b770f2bb3e75da86f1b2430c3bcb07",
+        },
+        {
+            "path": "app/jiaoch_points_raw_authority.py",
+            "sha256": "850eb62fa27272dfbad945c187cb857bde07a5896761457f1fd1a6b175d41cfe",
+        },
+        {
+            "path": "app/jiaoch_trade_cal_authority.py",
+            "sha256": "33bf8d191d2aae47267e99bc4929bd19956f8710798eae8d7d5710fe18b717bb",
+        },
+        {
+            "path": "app/research_provider_pit_tail_v2.py",
+            "sha256": "ba65c19f089f6222e53b9ff7ccb4e79d9afee70df08f0144bfd45143356cf1ee",
+        },
+        {
+            "path": "app/research_pit_transport.py",
+            "sha256": "888dc65c3705e22c4b65f4715589eec58577760e354ea969eeb031417bd2365f",
+        },
+    ],
+    "root_sha256": "9547226832515de3ab079bc1093f471e1c945a19c4c8d511b16480b9e2d37614",
+    "schema": "jiaoch-trade-cal-producer/v1",
+}
 
 
 def _transport_factory() -> UrllibTushareTransport:
@@ -408,6 +439,10 @@ def _producer_binding() -> dict[str, Any]:
         "schema": _PRODUCER_SCHEMA,
     }
     return {**identity, "root_sha256": _sha256(_canonical_json(identity))}
+
+
+def _accepted_producer_binding(producer: Any) -> bool:
+    return producer == _producer_binding() or producer == _LEGACY_PRODUCER_BINDING
 
 
 def _collection_binding(
@@ -924,7 +959,7 @@ def _verify_manifest_payload(*, root: Path, payload: Any) -> dict[str, Any]:
     }:
         raise ValueError("Jiaoch trade calendar credential binding rejected")
     producer = payload.get("producer_binding")
-    if producer != _producer_binding():
+    if not _accepted_producer_binding(producer):
         raise ValueError("Jiaoch trade calendar producer binding rejected")
     attempt_descriptor = payload.get("attempt")
     if (
@@ -1037,6 +1072,8 @@ def _collect_jiaoch_trade_cal_with_route_credential(
     request = _request_semantics(start, end)
     call_id = str(uuid.uuid4())
     producer = _producer_binding()
+    if producer == _LEGACY_PRODUCER_BINDING:
+        raise ValueError("Jiaoch trade calendar legacy producer collection rejected")
     binding = _collection_binding(
         collection_call_id=call_id,
         generation_id=generation,
