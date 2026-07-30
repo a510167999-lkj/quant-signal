@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <aclapi.h>
 #include <bcrypt.h>
 #include <limits.h>
 #include <stdint.h>
@@ -129,6 +130,125 @@ static int reject_reparse_chain(const wchar_t *path) {
     }
     return 1;
 }
+
+#ifdef F3_BROKER_TESTING
+static int current_token_cannot_mutate_directory(const wchar_t *path) {
+    static const DWORD mutation_rights =
+        FILE_ADD_FILE
+        | FILE_ADD_SUBDIRECTORY
+        | FILE_DELETE_CHILD
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | DELETE
+        | WRITE_DAC
+        | WRITE_OWNER;
+    BY_HANDLE_FILE_INFORMATION information;
+    FILE_ATTRIBUTE_TAG_INFO tag;
+    GENERIC_MAPPING mapping = {
+        FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE,
+        FILE_GENERIC_EXECUTE,
+        FILE_ALL_ACCESS
+    };
+    BYTE privilege_buffer[4096];
+    PRIVILEGE_SET *privileges = (PRIVILEGE_SET *)privilege_buffer;
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    PACL dacl = NULL;
+    HANDLE directory = INVALID_HANDLE_VALUE;
+    HANDLE primary_token = NULL;
+    HANDLE impersonation_token = NULL;
+    DWORD privilege_size = sizeof(privilege_buffer);
+    DWORD granted = 0;
+    DWORD desired = MAXIMUM_ALLOWED;
+    BOOL access_status = FALSE;
+    wchar_t expected[32768];
+    int immutable = 0;
+
+    if (!reject_reparse_chain(path)
+        || !canonical_path(
+            path,
+            expected,
+            (DWORD)(sizeof(expected) / sizeof(expected[0]))
+        )) {
+        goto cleanup;
+    }
+    directory = CreateFileW(
+        expected,
+        READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        NULL
+    );
+    if (directory == INVALID_HANDLE_VALUE
+        || !GetFileInformationByHandle(directory, &information)
+        || !GetFileInformationByHandleEx(
+            directory,
+            FileAttributeTagInfo,
+            &tag,
+            sizeof(tag)
+        )
+        || (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+        || (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || GetSecurityInfo(
+            directory,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | GROUP_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION,
+            NULL,
+            NULL,
+            &dacl,
+            NULL,
+            &descriptor
+        ) != ERROR_SUCCESS
+        || dacl == NULL
+        || !OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_DUPLICATE,
+            &primary_token
+        )
+        || !DuplicateToken(
+            primary_token,
+            SecurityImpersonation,
+            &impersonation_token
+        )) {
+        goto cleanup;
+    }
+    MapGenericMask(&desired, &mapping);
+    if (!AccessCheck(
+            descriptor,
+            impersonation_token,
+            desired,
+            &mapping,
+            privileges,
+            &privilege_size,
+            &granted,
+            &access_status
+        )
+        || !access_status) {
+        goto cleanup;
+    }
+    immutable = (granted & mutation_rights) == 0;
+
+cleanup:
+    if (impersonation_token != NULL) {
+        CloseHandle(impersonation_token);
+    }
+    if (primary_token != NULL) {
+        CloseHandle(primary_token);
+    }
+    if (descriptor != NULL) {
+        LocalFree(descriptor);
+    }
+    if (directory != INVALID_HANDLE_VALUE) {
+        CloseHandle(directory);
+    }
+    SecureZeroMemory(privilege_buffer, sizeof(privilege_buffer));
+    return immutable;
+}
+#endif
 
 static int open_held_file(
     const wchar_t *path,
@@ -945,6 +1065,16 @@ int wmain(int argc, wchar_t **argv) {
         return 0;
     }
 #ifdef F3_BROKER_TESTING
+    if (
+        argc == 3
+        && wcscmp(argv[1], L"--test-current-token-readonly-root") == 0
+    ) {
+        if (!current_token_cannot_mutate_directory(argv[2])) {
+            fwprintf(stderr, L"native broker namespace mutable by caller\n");
+            return 25;
+        }
+        return 0;
+    }
     if (argc == 4 && wcscmp(argv[1], L"--test-launch") == 0) {
         if (!test_launch(argv[2], argv[3], 0)) {
             fwprintf(stderr, L"native broker test boundary rejected\n");
