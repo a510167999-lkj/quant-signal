@@ -910,6 +910,62 @@ def test_native_credential_provider_is_not_called_for_invalid_signed_payload(
     assert writes == []
 
 
+def test_native_supervisor_terminal_contains_only_bound_public_hashes(
+    tmp_path: Path,
+) -> None:
+    pins, payload, authorization_path, environment, _writes = _fixture(tmp_path)
+    credential_path = Path(str(payload["credential_path"]))
+    terminal: list[bytes] = []
+
+    def provide_handle() -> int:
+        kernel32 = supervisor._kernel32()
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        )
+        create_file.restype = ctypes.c_void_p
+        handle = create_file(
+            str(credential_path),
+            0x80000000,
+            0x00000001,
+            None,
+            3,
+            0x00200000 | 0x08000000,
+            None,
+        )
+        assert handle not in (None, ctypes.c_void_p(-1).value)
+        return int(handle)
+
+    result = supervisor._supervise_with_native_broker(
+        authorization_path=authorization_path,
+        pins=pins,
+        now_utc=datetime(2026, 7, 30, 12, 1, 0, tzinfo=timezone.utc),
+        environment_snapshot=environment,
+        native_credential_provider=provide_handle,
+        terminal_writer=_writer(terminal),
+        trusted_executed_supervisor_path=payload["executed_supervisor_path"],
+        trusted_executed_supervisor_sha256=payload["executed_supervisor_sha256"],
+        trusted_supervisor_loader_path=payload["supervisor_loader_path"],
+        trusted_supervisor_loader_sha256=payload["supervisor_loader_sha256"],
+    )
+
+    expected = (
+        "COMPLETED factor-v3-formal-native-broker-supervisor/v1\n"
+        f"launch_authorization_sha256={result['launch_authorization_sha256']}\n"
+        f"claim_sha256={result['claim_sha256']}\n"
+        f"supervisor_completed_sha256={result['completed_sha256']}\n"
+        f"worker_terminal_sha256={result['worker_terminal_sha256']}\n"
+    ).encode("ascii")
+    assert terminal == [expected]
+    assert b"fixture-secret-must-never-be-logged" not in terminal[0]
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     (
