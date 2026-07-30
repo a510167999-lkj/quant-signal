@@ -102,6 +102,52 @@ static int present(const wchar_t *name) {
     return size != 0 || GetLastError() != ERROR_ENVVAR_NOT_FOUND;
 }
 
+static int current_directory_is_module_directory(void) {
+    wchar_t current[32768];
+    wchar_t module[32768];
+    wchar_t *separator;
+    DWORD current_length = GetCurrentDirectoryW(
+        (DWORD)(sizeof(current) / sizeof(current[0])),
+        current
+    );
+    DWORD module_length = GetModuleFileNameW(
+        NULL,
+        module,
+        (DWORD)(sizeof(module) / sizeof(module[0]))
+    );
+    if (current_length == 0
+        || current_length >= sizeof(current) / sizeof(current[0])
+        || module_length == 0
+        || module_length >= sizeof(module) / sizeof(module[0])) {
+        return 0;
+    }
+    separator = wcsrchr(module, L'\\');
+    if (separator == NULL) {
+        return 0;
+    }
+    *separator = L'\0';
+    return _wcsicmp(current, module) == 0;
+}
+
+static int system_root_is_os_directory(void) {
+    wchar_t actual[32768];
+    wchar_t observed[32768];
+    UINT actual_length = GetSystemWindowsDirectoryW(
+        actual,
+        (UINT)(sizeof(actual) / sizeof(actual[0]))
+    );
+    DWORD observed_length = GetEnvironmentVariableW(
+        L"SYSTEMROOT",
+        observed,
+        (DWORD)(sizeof(observed) / sizeof(observed[0]))
+    );
+    return actual_length != 0
+        && actual_length < sizeof(actual) / sizeof(actual[0])
+        && observed_length != 0
+        && observed_length < sizeof(observed) / sizeof(observed[0])
+        && _wcsicmp(actual, observed) == 0;
+}
+
 int wmain(int argc, wchar_t **argv) {
     BOOL in_job = FALSE;
     FILE *output;
@@ -123,6 +169,14 @@ int wmain(int argc, wchar_t **argv) {
     fprintf(output, "HAS_JIAOCH_TOKEN=%d\n", present(L"JIAOCH_TOKEN"));
     fprintf(output, "HAS_PATH=%d\n", present(L"PATH"));
     fprintf(output, "HAS_PYTHONPATH=%d\n", present(L"PYTHONPATH"));
+    fprintf(output, "HAS_TEMP=%d\n", present(L"TEMP"));
+    fprintf(output, "HAS_TMP=%d\n", present(L"TMP"));
+    fprintf(
+        output,
+        "CWD_IS_RUNTIME_DIR=%d\n",
+        current_directory_is_module_directory()
+    );
+    fprintf(output, "SYSTEMROOT_IS_OS=%d\n", system_root_is_os_directory());
     fprintf(
         output,
         "PROTOCOL_OK=%d\n",
@@ -368,6 +422,10 @@ def test_native_broker_compiles_and_launches_with_sanitized_environment_and_job(
             "JIAOCH_TOKEN": "must-not-cross-native-boundary",
             "PYTHONPATH": str(tmp_path / "attacker"),
             "FACTOR_V3_ATTACKER_MARKER": "must-not-cross-native-boundary",
+            "SYSTEMROOT": str(tmp_path / "attacker-systemroot"),
+            "WINDIR": str(tmp_path / "attacker-windir"),
+            "TEMP": str(tmp_path / "attacker-temp"),
+            "TMP": str(tmp_path / "attacker-tmp"),
         }
     )
     completed = subprocess.run(
@@ -386,6 +444,10 @@ def test_native_broker_compiles_and_launches_with_sanitized_environment_and_job(
         "HAS_JIAOCH_TOKEN=0\n"
         "HAS_PATH=0\n"
         "HAS_PYTHONPATH=0\n"
+        "HAS_TEMP=0\n"
+        "HAS_TMP=0\n"
+        "CWD_IS_RUNTIME_DIR=1\n"
+        "SYSTEMROOT_IS_OS=1\n"
         "PROTOCOL_OK=1\n"
     )
 
