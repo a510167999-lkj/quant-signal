@@ -4,7 +4,6 @@ import base64
 from copy import deepcopy
 import hashlib
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -45,6 +44,8 @@ def _git(repo: Path, *args: str) -> str:
             "user.name=Factor V3 Bootstrap Test",
             "-c",
             "user.email=factor-v3-bootstrap@example.invalid",
+            "-c",
+            "core.autocrlf=false",
             "-C",
             str(repo),
             *args,
@@ -73,7 +74,6 @@ def _test_rsa_key(tmp_path: Path) -> tuple[Path, bytes]:
         ],
         check=True,
         capture_output=True,
-        env={},
     )
     public_der = subprocess.run(
         [
@@ -87,7 +87,6 @@ def _test_rsa_key(tmp_path: Path) -> tuple[Path, bytes]:
         ],
         check=True,
         capture_output=True,
-        env={},
     ).stdout
     return private_key, public_der
 
@@ -109,7 +108,6 @@ def _sign(tmp_path: Path, private_key: Path, payload: bytes) -> bytes:
         ],
         check=True,
         capture_output=True,
-        env={},
     )
     return signature_path.read_bytes()
 
@@ -141,6 +139,13 @@ def _fixture_config(
     repo = (tmp_path / "reviewed-repo").resolve()
     (repo / "app").mkdir(parents=True)
     (repo / "scripts").mkdir()
+    unloaded_relative_paths = (
+        "app/reviewed_unloaded.py",
+        *(f"app/reviewed_unloaded_{index:02}.py" for index in range(33)),
+    )
+    unloaded_module_names = tuple(
+        relative_path[:-3].replace("/", ".") for relative_path in unloaded_relative_paths
+    )
     marker_statement = (
         ""
         if import_marker is None
@@ -155,6 +160,53 @@ def _fixture_config(
         "    context.assert_verified_module(\n"
         "        __name__, entry['relative_path'], entry['source_sha256']\n"
         "    )\n"
+        f"    unloaded_modules = {unloaded_module_names!r}\n"
+        "    unloaded_entries = [\n"
+        "        context.verified_ledger_entry(name)\n"
+        "        for name in unloaded_modules\n"
+        "    ]\n"
+        "    unloaded_entry = unloaded_entries[0]\n"
+        "    unloaded_ledger = (\n"
+        "        len(unloaded_entries) == 34\n"
+        "        and all(item['byte_count'] > 0 for item in unloaded_entries)\n"
+        "        and unloaded_entry['relative_path'] == 'app/reviewed_unloaded.py'\n"
+        "        and unloaded_entry['loader_identity']\n"
+        "        == 'factor-v3-verified-source-loader/v1'\n"
+        "    )\n"
+        "    try:\n"
+        "        context.assert_verified_module(\n"
+        "            unloaded_modules[0],\n"
+        "            unloaded_entry['relative_path'],\n"
+        "            unloaded_entry['source_sha256'],\n"
+        "        )\n"
+        "    except BaseException:\n"
+        "        unloaded_assert_rejected = True\n"
+        "    else:\n"
+        "        unloaded_assert_rejected = False\n"
+        "    real_file = globals()['__file__']\n"
+        "    globals()['__file__'] = real_file + '.fake'\n"
+        "    try:\n"
+        "        context.assert_verified_module(\n"
+        "            __name__, entry['relative_path'], entry['source_sha256']\n"
+        "        )\n"
+        "    except BaseException:\n"
+        "        fake_file_rejected = True\n"
+        "    else:\n"
+        "        fake_file_rejected = False\n"
+        "    finally:\n"
+        "        globals()['__file__'] = real_file\n"
+        "    real_loader = globals()['__loader__']\n"
+        "    globals()['__loader__'] = object()\n"
+        "    try:\n"
+        "        context.assert_verified_module(\n"
+        "            __name__, entry['relative_path'], entry['source_sha256']\n"
+        "        )\n"
+        "    except BaseException:\n"
+        "        nonverified_loader_rejected = True\n"
+        "    else:\n"
+        "        nonverified_loader_rejected = False\n"
+        "    finally:\n"
+        "        globals()['__loader__'] = real_loader\n"
         "    try:\n"
         "        __import__('app.not_in_signed_manifest')\n"
         "    except ImportError:\n"
@@ -170,9 +222,14 @@ def _fixture_config(
         "    context.emit_json({\n"
         "        'action': frozen_action_config['action'],\n"
         "        'loader_identity': entry['loader_identity'],\n"
+        "        'fake_file_rejected': fake_file_rejected,\n"
+        "        'nonverified_loader_rejected': nonverified_loader_rejected,\n"
         "        'rejected_unreviewed': rejected_unreviewed,\n"
         "        'replacement_blocked': replacement_blocked,\n"
+        "        'source_registry_entries': 3 + len(unloaded_entries),\n"
         "        'status': 'fixture-verified',\n"
+        "        'unloaded_assert_rejected': unloaded_assert_rejected,\n"
+        "        'unloaded_ledger': unloaded_ledger,\n"
         "    })\n"
         "    return 0\n"
     )
@@ -207,6 +264,11 @@ def _fixture_config(
         '"""Signed fixture package."""\n',
         encoding="utf-8",
     )
+    for relative_path in unloaded_relative_paths:
+        (repo / Path(*relative_path.split("/"))).write_text(
+            "raise RuntimeError('reviewed unloaded fixture must not execute')\n",
+            encoding="utf-8",
+        )
     _git(repo.parent, "init", str(repo))
     _git(repo, "add", "--all")
     _git(repo, "commit", "-m", "fixture")
@@ -219,6 +281,7 @@ def _fixture_config(
             "scripts/build_factor_v3_daily_basic_formal_run_spec.py",
             "scripts/run_factor_v3_daily_basic_formal.py",
             "app/__init__.py",
+            *unloaded_relative_paths,
         )
     ]
     source_root_sha256 = _sha256(_canonical_bytes(source_manifest))
@@ -247,9 +310,9 @@ def _fixture_config(
     receipt_raw = _canonical_bytes(
         {
             "payload": payload,
-            "signature_base64": base64.b64encode(
-                _sign(tmp_path, private_key, payload_raw)
-            ).decode("ascii"),
+            "signature_base64": base64.b64encode(_sign(tmp_path, private_key, payload_raw)).decode(
+                "ascii"
+            ),
         }
     )
     receipt_path, receipt_sha256 = _cas_write(
@@ -297,9 +360,7 @@ def _fixture_config(
         "base_python_executable_sha256": _file_sha256(base_python),
         "bootstrap_claim_path": str(claim_path),
         "bootstrap_claim_sha256": claim_sha256,
-        "builder_relative_path": (
-            "scripts/build_factor_v3_daily_basic_formal_run_spec.py"
-        ),
+        "builder_relative_path": ("scripts/build_factor_v3_daily_basic_formal_run_spec.py"),
         "builder_sha256": builder_sha256,
         "expected_branch": branch,
         "expected_commit": commit,
@@ -314,9 +375,7 @@ def _fixture_config(
         "repo_root": str(repo),
         "review_payload_sha256": review_payload_sha256,
         "review_protocol_sha256": review_protocol_sha256,
-        "review_public_key_spki_der_base64": base64.b64encode(public_der).decode(
-            "ascii"
-        ),
+        "review_public_key_spki_der_base64": base64.b64encode(public_der).decode("ascii"),
         "review_public_key_spki_sha256": public_der_sha256,
         "review_receipt_path": str(receipt_path),
         "review_receipt_sha256": receipt_sha256,
@@ -367,6 +426,7 @@ def test_renderer_is_deterministic_self_contained_and_has_no_placeholder(
     assert not first.endswith(b"\n")
     assert b"{{" not in first
     assert b"}}" not in first
+    assert len(first) <= 30_000
     compile(first, "<factor-v3-formal-bootstrap>", "exec")
 
 
@@ -382,10 +442,15 @@ def test_rendered_bootstrap_executes_only_verified_held_source_bytes(
     assert completed.stderr == ""
     assert json.loads(completed.stdout) == {
         "action": "verify",
+        "fake_file_rejected": True,
         "loader_identity": "factor-v3-verified-source-loader/v1",
+        "nonverified_loader_rejected": True,
         "rejected_unreviewed": True,
         "replacement_blocked": True,
+        "source_registry_entries": 37,
         "status": "fixture-verified",
+        "unloaded_assert_rejected": True,
+        "unloaded_ledger": True,
     }
 
 
@@ -470,13 +535,55 @@ def test_renderer_requires_signed_app_package_initializer(
     tmp_path: Path,
 ) -> None:
     config = _fixture_config(tmp_path)
-    manifest = [
-        item
-        for item in config["source_manifest"]
-        if item["path"] != "app/__init__.py"
-    ]
+    manifest = [item for item in config["source_manifest"] if item["path"] != "app/__init__.py"]
     config["source_manifest"] = manifest
     config["source_root_sha256"] = _sha256(_canonical_bytes(manifest))
 
     with pytest.raises(renderer.FormalBootstrapRenderError, match="app/__init__"):
         renderer.render_factor_v3_formal_bootstrap(config)
+
+
+def test_renderer_rejects_mismatched_executable_identity(tmp_path: Path) -> None:
+    config = _fixture_config(tmp_path)
+    config["python_executable_sha256"] = "0" * 64
+
+    with pytest.raises(renderer.FormalBootstrapRenderError, match="identity"):
+        renderer.render_factor_v3_formal_bootstrap(config)
+
+
+def test_renderer_rejects_noncanonical_public_key_encoding(
+    tmp_path: Path,
+) -> None:
+    config = _fixture_config(tmp_path)
+    config["review_public_key_spki_der_base64"] = "!"
+
+    with pytest.raises(renderer.FormalBootstrapRenderError, match="public key"):
+        renderer.render_factor_v3_formal_bootstrap(config)
+
+
+def test_renderer_rejects_mismatched_public_key_identity(tmp_path: Path) -> None:
+    config = _fixture_config(tmp_path)
+    config["review_public_key_spki_sha256"] = "0" * 64
+
+    with pytest.raises(renderer.FormalBootstrapRenderError, match="public key"):
+        renderer.render_factor_v3_formal_bootstrap(config)
+
+
+def test_renderer_rejects_traversing_trusted_entrypoint(tmp_path: Path) -> None:
+    config = _fixture_config(tmp_path)
+    config["builder_relative_path"] = "scripts/../unreviewed.py"
+
+    with pytest.raises(renderer.FormalBootstrapRenderError, match="builder"):
+        renderer.render_factor_v3_formal_bootstrap(config)
+
+
+def test_rendered_validator_rejects_corrupt_compressed_payload(
+    tmp_path: Path,
+) -> None:
+    config = _fixture_config(tmp_path)
+    rendered = renderer.render_factor_v3_formal_bootstrap(config)
+    payload_offset = len(renderer._WRAPPER_PREFIX)
+    corrupted = rendered[:payload_offset] + b"!" + rendered[payload_offset + 1 :]
+
+    with pytest.raises(renderer.FormalBootstrapRenderError, match="rejected"):
+        renderer.validate_rendered_factor_v3_formal_bootstrap(corrupted)
