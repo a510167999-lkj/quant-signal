@@ -656,6 +656,8 @@ def test_attestation_cannot_authorize_a_different_same_producer_publication(
     )
     attested_run_root = (tmp_path / "attested-run-a").resolve()
     attested_spec_path = (tmp_path / "attested-spec-a.json").resolve()
+    attested_run_root.mkdir()
+    attested_spec_path.write_bytes(b"{}")
     attested_feature = {
         "authority_manifest_relative_path": (
             "feature_history_collection_manifest_candidates/sha256/aa/"
@@ -682,6 +684,10 @@ def test_attestation_cannot_authorize_a_different_same_producer_publication(
     attested_context = {
         "attestation": {"artifact": "A"},
         "attestor_producer": {"root_sha256": "5" * 64},
+        "authority_binding": {
+            "binding_sha256": "9" * 64,
+            "schema": "factor-v3-feature-history-attestation-authority-binding/v1",
+        },
         "feature_history": attested_feature,
         "frozen_source_root": str(tmp_path.resolve()),
         "physical_binding": {"producer_binding_root_sha256": "6" * 64},
@@ -701,6 +707,8 @@ def test_attestation_cannot_authorize_a_different_same_producer_publication(
     )
 
     with pytest.raises(ValueError, match="attest|binding|mismatch"):
+        trade_cal_root = tmp_path / "trade-cal"
+        trade_cal_root.mkdir()
         history_authority._verify_feature_history_with_attested_producer_binding(
             attestation_path=tmp_path / "same-attestation.json",
             expected_attestation_sha256="7" * 64,
@@ -717,7 +725,7 @@ def test_attestation_cannot_authorize_a_different_same_producer_publication(
             temporal_partition_contract=load_temporal_partition_contract(
                 PARTITION_V1_PATH
             ),
-            trade_cal_output_root=Path("synthetic-trade-cal-root"),
+            trade_cal_output_root=trade_cal_root,
             trade_cal_publication=trade_cal_publication,
         )
 

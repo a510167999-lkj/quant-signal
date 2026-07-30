@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+from copy import deepcopy
 from datetime import date, timedelta
 import hashlib
 import inspect
@@ -13,6 +15,68 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import build_factor_v3_daily_basic_formal_run_spec as formal
+
+
+_OPENSSL = Path(r"C:\Program Files\Git\mingw64\bin\openssl.exe")
+
+
+def _test_rsa3072_key(tmp_path: Path, label: str) -> tuple[Path, bytes]:
+    private_key = tmp_path / f"{label}-private.pem"
+    subprocess.run(
+        [
+            str(_OPENSSL),
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:3072",
+            "-out",
+            str(private_key),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    public_der = subprocess.run(
+        [
+            str(_OPENSSL),
+            "pkey",
+            "-in",
+            str(private_key),
+            "-pubout",
+            "-outform",
+            "DER",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+    return private_key, public_der
+
+
+def _test_rsa_signature(
+    tmp_path: Path,
+    *,
+    label: str,
+    private_key: Path,
+    payload: bytes,
+) -> bytes:
+    payload_path = tmp_path / f"{label}-payload.json"
+    signature_path = tmp_path / f"{label}-signature.bin"
+    payload_path.write_bytes(payload)
+    subprocess.run(
+        [
+            str(_OPENSSL),
+            "dgst",
+            "-sha256",
+            "-sign",
+            str(private_key),
+            "-out",
+            str(signature_path),
+            str(payload_path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return signature_path.read_bytes()
 
 
 def _sessions(count: int = 733) -> list[str]:
@@ -133,6 +197,46 @@ def test_formal_paths_and_authority_inputs_are_frozen_exactly() -> None:
             "685c5bb48f043534e94b7acb941d32dc06bb01e8ae92348f585cb063cffa6b0c"
         ),
     }
+
+
+def test_formal_review_manifest_covers_the_complete_runtime_import_closure() -> None:
+    assert formal.FORMAL_REVIEW_SOURCE_RELATIVE_PATHS == (
+        "scripts/build_factor_v3_daily_basic_formal_run_spec.py",
+        "app/audited_pit_factor_v3_feature_history_authority.py",
+        "app/audited_pit_factor_v3_points_contract.py",
+        "app/current_pool.py",
+        "app/current_pool_gate.py",
+        "app/durable_io.py",
+        "app/factor_v3_daily_basic_733_exact_set_authority.py",
+        "app/factor_v3_daily_basic_runner.py",
+        "app/factor_v3_feature_history_frozen_source_attestation.py",
+        "app/factor_v3_feature_history_runner.py",
+        "app/jiaoch_credential_slots.py",
+        "app/jiaoch_daily_basic_collection_set.py",
+        "app/jiaoch_daily_basic_exact_set_authority.py",
+        "app/jiaoch_minute_collection_set.py",
+        "app/jiaoch_minute_raw_authority.py",
+        "app/jiaoch_minute_reconciliation.py",
+        "app/jiaoch_points_collection_set.py",
+        "app/jiaoch_points_raw_authority.py",
+        "app/jiaoch_points_response_normalization.py",
+        "app/jiaoch_trade_cal_authority.py",
+        "app/research_market_data.py",
+        "app/research_membership.py",
+        "app/research_partitions.py",
+        "app/research_pit_collector.py",
+        "app/research_pit_contracts.py",
+        "app/research_pit_sources.py",
+        "app/research_pit_store.py",
+        "app/research_pit_transport.py",
+        "app/research_provider_evidence_partitions.py",
+        "app/research_provider_pit_tail.py",
+        "app/research_provider_pit_tail_v2.py",
+        "app/research_proxy_data.py",
+        "app/research_scope.py",
+        "app/research_security_code_transition.py",
+        "app/research_suspension_evidence.py",
+    )
 
 
 def test_offline_candidate_uses_exact_inputs_builds_twice_and_loads_once() -> None:
@@ -276,20 +380,226 @@ def test_formal_worktree_requires_exact_branch_and_clean_status(
 
 def test_formal_worktree_review_anchor_is_not_caller_supplied() -> None:
     assert inspect.signature(formal.verify_formal_worktree).parameters == {}
-    assert len(formal.FORMAL_REVIEW_RECEIPT_SHA256) == 64
-    assert formal.FORMAL_REVIEW_RECEIPT_PATH == (
+    assert not hasattr(formal, "FORMAL_REVIEW_RECEIPT_SHA256")
+    assert formal.FORMAL_REVIEW_RECEIPT_ROOT == (
         formal.MAIN_REPO_ROOT
         / "data/research_artifacts/factor_v3_daily_basic_formal_review_v1"
         / "review_receipts/sha256"
-        / formal.FORMAL_REVIEW_RECEIPT_SHA256[:2]
-        / f"{formal.FORMAL_REVIEW_RECEIPT_SHA256}.json"
     )
+    assert formal.FORMAL_REVIEW_PUBLIC_KEY_PATH == (
+        formal.MAIN_REPO_ROOT
+        / ".secrets/factor_v3_formal_review_rsa3072_public.pem"
+    )
+    assert formal.FORMAL_REVIEW_PUBLIC_KEY_SPKI_SHA256 == (
+        "552852331cd6c7b0b08483b21c85fcc63b6ea9787c0c5ae8e146b246b46daaee"
+    )
+
+
+def test_rsa3072_pkcs1_v1_5_sha256_verifier_accepts_only_exact_signature(
+    tmp_path: Path,
+) -> None:
+    payload = b'{"review":"test-only-rsa3072-vector"}'
+    private_key, public_der = _test_rsa3072_key(
+        tmp_path,
+        "pure-verifier",
+    )
+    signature = _test_rsa_signature(
+        tmp_path,
+        label="pure-verifier",
+        private_key=private_key,
+        payload=payload,
+    )
+    modulus, exponent = formal._parse_rsa3072_spki_der(public_der)
+
+    assert formal._verify_rsa3072_pkcs1_v1_5_sha256(
+        payload,
+        signature,
+        modulus=modulus,
+        exponent=exponent,
+    )
+    for rejected in (
+        bytes([signature[0] ^ 1]) + signature[1:],
+        signature[:-1],
+        b"\x00" * 384,
+    ):
+        with pytest.raises(formal.FormalRunSpecError, match="signature"):
+            formal._verify_rsa3072_pkcs1_v1_5_sha256(
+                payload,
+                rejected,
+                modulus=modulus,
+                exponent=exponent,
+            )
+    with pytest.raises(formal.FormalRunSpecError, match="signature"):
+        formal._verify_rsa3072_pkcs1_v1_5_sha256(
+            payload + b" ",
+            signature,
+            modulus=modulus,
+            exponent=exponent,
+        )
+
+
+def test_signed_review_receipt_contract_rejects_attacker_controlled_shapes() -> None:
+    source = inspect.getsource(formal._validated_formal_review_receipt)
+
+    assert "signature_base64" in source
+    assert "reviewed_commit" in source
+    assert "reviewed_source_manifest" in source
+    assert "reviewed_source_root_sha256" in source
+    assert "APPROVED_NO_P0_P1_P2" in source
+    assert "reviewer_key_id" in source
+    assert "review_protocol_sha256" in source
+    assert "base64.b64decode" in source
+    assert "validate=True" in source
+    assert "FORMAL_REVIEW_PUBLIC_KEY_PATH" in source
+    assert "FORMAL_REVIEW_PUBLIC_KEY_SPKI_SHA256" in source
+    assert "FORMAL_REVIEW_RECEIPT_SHA256" not in source
+
+
+def test_signed_review_receipt_rejects_replay_mutation_and_attacker_key(
+    tmp_path: Path,
+) -> None:
+    trusted_private, trusted_der = _test_rsa3072_key(
+        tmp_path,
+        "trusted-reviewer",
+    )
+    attacker_private, _attacker_der = _test_rsa3072_key(
+        tmp_path,
+        "attacker",
+    )
+    source_manifest = [
+        {
+            "bytes": 7,
+            "path": "scripts/reviewed.py",
+            "sha256": hashlib.sha256(b"reviewed").hexdigest(),
+        }
+    ]
+    source_root = hashlib.sha256(
+        formal._canonical_bytes(source_manifest)
+    ).hexdigest()
+    commit = "d" * 40
+    input_root = "e" * 64
+    key_id = f"sha256:{hashlib.sha256(trusted_der).hexdigest()}"
+    payload = {
+        "branch": formal.EXPECTED_BRANCH,
+        "decision": "APPROVED_NO_P0_P1_P2",
+        "feature_attestation_sha256": formal.FEATURE_HISTORY_ATTESTATION_SHA256,
+        "formal_input_root_sha256": input_root,
+        "formal_runner_sha256": formal.FACTOR_V3_DAILY_BASIC_RUNNER_SHA256,
+        "issued_at_utc": "2026-07-30T00:00:00+00:00",
+        "project_id": "quant-signal-lkj",
+        "review_nonce_sha256": "f" * 64,
+        "review_protocol_sha256": formal.FORMAL_REVIEW_PROTOCOL_SHA256,
+        "reviewed_commit": commit,
+        "reviewed_source_manifest": source_manifest,
+        "reviewed_source_root_sha256": source_root,
+        "reviewer_key_id": key_id,
+        "schema": "factor-v3-daily-basic-formal-review-signed-payload/v1",
+        "signature_scheme": "RSASSA-PKCS1-v1_5-SHA256",
+    }
+
+    def receipt_raw(
+        value: dict[str, object],
+        *,
+        private_key: Path = trusted_private,
+    ) -> bytes:
+        payload_raw = formal._canonical_bytes(value)
+        signature = _test_rsa_signature(
+            tmp_path,
+            label=hashlib.sha256(payload_raw).hexdigest(),
+            private_key=private_key,
+            payload=payload_raw,
+        )
+        return formal._canonical_bytes(
+            {
+                "payload": value,
+                "signature_base64": base64.b64encode(signature).decode(
+                    "ascii"
+                ),
+            }
+        )
+
+    assert formal._validated_signed_review_receipt(
+        receipt_raw(payload),
+        expected_commit=commit,
+        expected_source_manifest=source_manifest,
+        expected_formal_input_root_sha256=input_root,
+        trusted_public_key_der=trusted_der,
+    ) == payload
+
+    mutations = []
+    for field, replacement in (
+        ("decision", "REJECTED"),
+        ("reviewed_commit", "a" * 40),
+        ("reviewed_source_root_sha256", "b" * 64),
+        ("formal_input_root_sha256", "c" * 64),
+    ):
+        mutated = deepcopy(payload)
+        mutated[field] = replacement
+        mutations.append(receipt_raw(mutated))
+    mutated_manifest = deepcopy(payload)
+    mutated_manifest["reviewed_source_manifest"][0]["path"] = (
+        "scripts/unreviewed.py"
+    )
+    mutations.append(receipt_raw(mutated_manifest))
+    signed_secret = deepcopy(payload)
+    signed_secret["token"] = "forbidden-even-when-signed"
+    mutations.append(receipt_raw(signed_secret))
+    mutations.append(receipt_raw(payload, private_key=attacker_private))
+    valid_raw = receipt_raw(payload)
+    mutations.extend(
+        (
+            valid_raw + b"\n",
+            valid_raw.replace(
+                b'{"payload":',
+                b'{"payload":{},"payload":',
+                1,
+            ),
+            valid_raw.replace(b'"signature_base64":"', b'"signature_base64":" ', 1),
+        )
+    )
+    for rejected in mutations:
+        with pytest.raises(formal.FormalRunSpecError, match="review|signature"):
+            formal._validated_signed_review_receipt(
+                rejected,
+                expected_commit=commit,
+                expected_source_manifest=source_manifest,
+                expected_formal_input_root_sha256=input_root,
+                trusted_public_key_der=trusted_der,
+            )
 
 
 def test_formal_git_executable_sha_is_frozen() -> None:
     assert formal.GIT_EXECUTABLE_SHA256 == (
         "c39b1b4f7a57935bbeadf246dc2466316619453a6a9da77c4a9c6bd6d8fb21d3"
     )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows hardlink executable contract")
+def test_formal_git_executable_allows_a_normal_hardlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = (tmp_path / "git.exe").resolve()
+    raw = b"formal-git-hardlink"
+    executable.write_bytes(raw)
+    os.link(executable, tmp_path / "git-copy.exe")
+    monkeypatch.setattr(formal, "GIT_EXECUTABLE", executable)
+    monkeypatch.setattr(
+        formal,
+        "GIT_EXECUTABLE_SHA256",
+        hashlib.sha256(raw).hexdigest(),
+    )
+    monkeypatch.setattr(
+        formal.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            stdout="ok\n",
+            stderr="",
+            returncode=0,
+        ),
+    )
+
+    assert formal._git_output("rev-parse", "HEAD") == "ok"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows deny-write/delete contract")
@@ -334,6 +644,18 @@ def test_formal_runner_load_binds_physical_source_through_import_and_postverify(
     assert "FACTOR_V3_DAILY_BASIC_RUNNER_SHA256" in source
     assert "_open_pinned_file" in source
     assert "_postverify_pinned_file" in source
+
+
+def test_formal_main_holds_complete_reviewed_sources_through_build_and_publish() -> None:
+    source = inspect.getsource(formal.main)
+
+    assert "_locked_formal_review_sources" in source
+    assert source.index("_locked_formal_review_sources") < source.index(
+        "verify_formal_worktree"
+    )
+    assert source.index("build_and_verify_candidate") < source.index(
+        "publish_candidate"
+    )
 
 
 def test_formal_spec_publication_reuses_safe_cas_primitives() -> None:

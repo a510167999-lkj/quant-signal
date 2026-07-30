@@ -434,6 +434,188 @@ def test_prewindow_loader_binds_attestation_receipt_and_sessions_to_state(
         )
 
 
+def test_prewindow_rejects_real_250_sqlite_state_publication_a_to_b_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions, _development = _sessions()
+    store_root = tmp_path / "pit-store"
+    store_root.mkdir()
+    database = store_root / "metadata.sqlite3"
+    connection = sqlite3.connect(database)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE market_session_generations (
+                trade_date TEXT NOT NULL,
+                generation_id TEXT NOT NULL,
+                terminal_at TEXT NOT NULL,
+                vintage TEXT NOT NULL,
+                manifest_sha256 TEXT NOT NULL,
+                lineage_sha256 TEXT NOT NULL,
+                status TEXT NOT NULL
+            );
+            CREATE TABLE market_session_generation_rows_daily (
+                trade_date TEXT NOT NULL,
+                generation_id TEXT NOT NULL,
+                ts_code TEXT NOT NULL
+            );
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO market_session_generations
+            VALUES (?, ?, ?, ?, ?, ?, 'published')
+            """,
+            [
+                (
+                    session,
+                    f"generation-b-{index}",
+                    f"{session}T15:00:00+00:00",
+                    "historical_backfill",
+                    _sha(f"manifest-b-{index}"),
+                    _sha(f"lineage-b-{index}"),
+                )
+                for index, session in enumerate(sessions)
+            ],
+        )
+        connection.executemany(
+            """
+            INSERT INTO market_session_generation_rows_daily
+            VALUES (?, ?, ?)
+            """,
+            [
+                (session, f"generation-b-{index}", "600001.SH")
+                for index, session in enumerate(sessions)
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    refs_b = [
+        {
+            "trade_date": session,
+            "market_generation_id": f"generation-b-{index}",
+            "market_generation_manifest_sha256": _sha(
+                f"manifest-b-{index}"
+            ),
+            "market_generation_lineage_sha256": _sha(
+                f"lineage-b-{index}"
+            ),
+        }
+        for index, session in enumerate(sessions)
+    ]
+    receipt = {
+        "verified": True,
+        "receipt_sha256": _sha("shared-a-to-b-receipt"),
+        "sessions_sha256": _canonical_sha(sessions),
+        "pit_store_database_sha256": hashlib.sha256(
+            database.read_bytes()
+        ).hexdigest(),
+        "collection_publication_manifest_sha256": _sha("manifest-b"),
+        "snapshot_index_sha256": _sha("snapshot-b"),
+        "source_authority_root_sha256": _sha("source-b"),
+        "session_authority_refs_sha256": _canonical_sha(refs_b),
+    }
+    publication_b = {
+        "authority_manifest_sha256": _sha("manifest-file-b"),
+    }
+    state_b = {
+        "receipt": receipt,
+        "collection_publication": publication_b,
+    }
+    spec = {
+        "run_spec_sha256": _sha("spec"),
+        "collection_plan": {"plan_sha256": _sha("plan")},
+        "development_session_refs": [],
+        "temporal_partition_contract": {
+            "contract_sha256": _sha("temporal")
+        },
+        "trade_cal_output_root": str(tmp_path / "trade-cal"),
+        "trade_cal_publication": {"schema": "bound-trade-cal"},
+    }
+    paths = {
+        "state": tmp_path / "state.json",
+        "publication_root": tmp_path / "publication",
+        "store": store_root,
+    }
+    (tmp_path / "publication").mkdir()
+    (tmp_path / "trade-cal").mkdir()
+    binding_a = {
+        "binding_sha256": _sha("authority-binding-a"),
+        "schema": "factor-v3-feature-history-attestation-authority-binding/v1",
+    }
+    binding_b = {
+        "binding_sha256": _sha("authority-binding-b"),
+        "schema": "factor-v3-feature-history-attestation-authority-binding/v1",
+    }
+    monkeypatch.setattr(
+        frozen,
+        "verify_factor_v3_feature_history_frozen_source_attestation",
+        lambda **_kwargs: {
+            "authority_binding": binding_a,
+            "receipt_sha256": receipt["receipt_sha256"],
+            "session_count": 250,
+            "sessions_sha256": receipt["sessions_sha256"],
+            "verified": True,
+        },
+    )
+    monkeypatch.setattr(
+        frozen,
+        "_validated_attested_replay_context",
+        lambda **_kwargs: {"authority_binding": binding_b},
+    )
+    monkeypatch.setattr(
+        authority.history_runner,
+        "load_factor_v3_feature_history_run_spec",
+        lambda _path: spec,
+    )
+    monkeypatch.setattr(
+        authority.history_runner,
+        "_validated_segments",
+        lambda _plan: [{"sessions": sessions}],
+    )
+    monkeypatch.setattr(
+        authority.history_runner,
+        "_run_paths",
+        lambda _root, *, create: paths,
+    )
+    monkeypatch.setattr(
+        authority.history_runner,
+        "_read_json_file",
+        lambda *_args, **_kwargs: state_b,
+    )
+    monkeypatch.setattr(
+        authority.history_runner,
+        "_validated_state",
+        lambda value, **_kwargs: value,
+    )
+    monkeypatch.setattr(
+        authority.history_runner,
+        "_validated_publication",
+        lambda value: value,
+    )
+    monkeypatch.setattr(
+        authority.history_authority,
+        "_read_collection_manifest",
+        lambda **_kwargs: {"session_authority_refs": refs_b},
+    )
+
+    with pytest.raises(ValueError, match="attestation.*binding|A.*B|drift"):
+        authority._load_feature_history_prewindow_authority(
+            feature_history_run_spec_path=tmp_path / "spec.json",
+            feature_history_run_root=tmp_path / "run",
+            feature_history_frozen_source_attestation_path=(
+                tmp_path / "attestation.json"
+            ),
+            expected_feature_history_frozen_source_attestation_sha256=_sha(
+                "attestation"
+            ),
+            feature_history_frozen_source_root=tmp_path / "frozen",
+            expected_feature_history_frozen_source_commit="b" * 40,
+        )
+
+
 def test_feature_history_database_lock_denies_write_and_replacement(
     tmp_path: Path,
 ) -> None:
