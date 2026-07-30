@@ -876,6 +876,24 @@ SECURITY_STATUS f3_broker_sign_sha256_with_cng_key(
     return ERROR_SUCCESS;
 }
 
+static int parent_directory(
+    const wchar_t *path,
+    wchar_t *output,
+    size_t capacity
+) {
+    wchar_t *separator;
+    if (capacity > UINT_MAX
+        || !canonical_path(path, output, (DWORD)capacity)) {
+        return 0;
+    }
+    separator = wcsrchr(output, L'\\');
+    if (separator == NULL || separator <= output + 2) {
+        return 0;
+    }
+    *separator = L'\0';
+    return 1;
+}
+
 #ifdef F3_BROKER_TESTING
 static int f3_test_handoff_stage = 0;
 static DWORD f3_test_handoff_error = ERROR_SUCCESS;
@@ -1674,24 +1692,6 @@ static wchar_t *sanitized_environment(const wchar_t *protocol) {
     SecureZeroMemory(windows_directory, sizeof(windows_directory));
     block[offset] = L'\0';
     return block;
-}
-
-static int parent_directory(
-    const wchar_t *path,
-    wchar_t *output,
-    size_t capacity
-) {
-    wchar_t *separator;
-    if (capacity > UINT_MAX
-        || !canonical_path(path, output, (DWORD)capacity)) {
-        return 0;
-    }
-    separator = wcsrchr(output, L'\\');
-    if (separator == NULL || separator <= output + 2) {
-        return 0;
-    }
-    *separator = L'\0';
-    return 1;
 }
 
 static int append_command_character(
