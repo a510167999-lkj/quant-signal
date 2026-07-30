@@ -717,6 +717,67 @@ def test_verify_does_not_initialize_an_absent_run(
     }
 
 
+def test_run_lock_rejects_a_symlink_target(tmp_path: Path) -> None:
+    target = tmp_path / "other.lock"
+    target.write_bytes(b"\0")
+    link = tmp_path / "runner.lock"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    with pytest.raises(runner.FactorV3FeatureHistoryRunnerError, match="lock unavailable"):
+        with runner._run_lock(link):
+            pytest.fail("symlink lock must not be acquired")
+
+
+def test_run_lock_rejects_opened_file_identity_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = tmp_path / "runner.lock"
+    expected.write_bytes(b"\0")
+    substitute = tmp_path / "substitute.lock"
+    substitute.write_bytes(b"\0")
+    real_open = runner.os.open
+
+    def open_substitute(path: str, flags: int, mode: int) -> int:
+        assert Path(path) == expected
+        return real_open(str(substitute), flags, mode)
+
+    monkeypatch.setattr(runner.os, "open", open_substitute)
+    with pytest.raises(runner.FactorV3FeatureHistoryRunnerError, match="lock unavailable"):
+        with runner._run_lock(expected):
+            pytest.fail("drifted lock identity must not be acquired")
+
+
+def test_run_lock_rejects_a_hardlink_target(tmp_path: Path) -> None:
+    target = tmp_path / "other.lock"
+    target.write_bytes(b"\0")
+    link = tmp_path / "runner.lock"
+    try:
+        runner.os.link(target, link)
+    except OSError:
+        pytest.skip("hardlink creation is unavailable")
+
+    with pytest.raises(runner.FactorV3FeatureHistoryRunnerError, match="lock unavailable"):
+        with runner._run_lock(link):
+            pytest.fail("hardlink lock must not be acquired")
+
+
+def test_run_lock_rejects_a_reparse_parent(tmp_path: Path) -> None:
+    target = tmp_path / "real-root"
+    target.mkdir()
+    link = tmp_path / "linked-root"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink creation is unavailable")
+
+    with pytest.raises(runner.FactorV3FeatureHistoryRunnerError, match="lock unavailable"):
+        with runner._run_lock(link / "runner.lock"):
+            pytest.fail("lock beneath a reparse parent must not be acquired")
+
+
 def test_cli_has_only_run_and_verify_commands() -> None:
     parser = runner._parser()
     with pytest.raises(SystemExit):
