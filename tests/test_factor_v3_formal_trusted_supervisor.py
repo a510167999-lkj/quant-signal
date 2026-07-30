@@ -873,6 +873,43 @@ def test_worker_credential_in_terminal_output_is_rejected_without_parent_output(
     assert writes == []
 
 
+def test_native_credential_provider_is_not_called_for_invalid_signed_payload(
+    tmp_path: Path,
+) -> None:
+    pins, payload, _authorization_path, environment, writes = _fixture(tmp_path)
+    drifted = dict(payload)
+    drifted["credential_slot_id"] = "unreviewed-slot"
+    authorization_path = _rewrite_authorization(
+        tmp_path,
+        drifted,
+        tmp_path / "execution-key" / "execution-private.pem",
+    )
+    requested: list[bool] = []
+
+    def provide_handle() -> int:
+        requested.append(True)
+        return 1
+
+    with pytest.raises(supervisor.FormalSupervisorError):
+        supervisor._supervise_with_pins(
+            authorization_path=authorization_path,
+            pins=pins,
+            now_utc=datetime(2026, 7, 30, 12, 1, 0, tzinfo=timezone.utc),
+            environment_snapshot=environment,
+            output_writer=_writer(writes),
+            trusted_executed_supervisor_path=payload["executed_supervisor_path"],
+            trusted_executed_supervisor_sha256=payload[
+                "executed_supervisor_sha256"
+            ],
+            trusted_supervisor_loader_path=payload["supervisor_loader_path"],
+            trusted_supervisor_loader_sha256=payload["supervisor_loader_sha256"],
+            native_credential_provider=provide_handle,
+        )
+
+    assert requested == []
+    assert writes == []
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     (

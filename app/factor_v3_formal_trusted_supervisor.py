@@ -849,6 +849,82 @@ class _HeldStdlibFile(_HeldFile):
         self._postverify_identity()
 
 
+class _HeldNativeCredential:
+    def __init__(self, handle: int, *, expected_path: Path, max_bytes: int) -> None:
+        if type(handle) is not int or handle <= 0:
+            raise FormalSupervisorError("native credential handle rejected")
+        kernel32 = _kernel32()
+        get_final_path = kernel32.GetFinalPathNameByHandleW
+        get_final_path.argtypes = (
+            wintypes.HANDLE,
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        )
+        get_final_path.restype = wintypes.DWORD
+        buffer = ctypes.create_unicode_buffer(32768)
+        observed_length = get_final_path(
+            wintypes.HANDLE(handle),
+            buffer,
+            len(buffer),
+            0,
+        )
+        observed = buffer.value
+        if observed.startswith("\\\\?\\"):
+            observed = observed[4:]
+        if (
+            observed_length == 0
+            or observed_length >= len(buffer)
+            or os.path.normcase(observed) != os.path.normcase(str(expected_path))
+        ):
+            kernel32.CloseHandle(wintypes.HANDLE(handle))
+            raise FormalSupervisorError("native credential handle identity rejected")
+        try:
+            descriptor = msvcrt.open_osfhandle(
+                handle,
+                os.O_RDONLY | getattr(os, "O_BINARY", 0),
+            )
+        except BaseException:
+            kernel32.CloseHandle(wintypes.HANDLE(handle))
+            raise
+        self._stream = os.fdopen(descriptor, "rb")
+        try:
+            opened = os.fstat(self._stream.fileno())
+            raw = self._stream.read(max_bytes + 1)
+            self._stream.seek(0)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_size <= 0
+                or opened.st_size > max_bytes
+                or len(raw) != opened.st_size
+            ):
+                raise FormalSupervisorError("native credential handle rejected")
+        except BaseException:
+            self._stream.close()
+            raise
+        self.path = expected_path
+        self.raw = raw
+        self._expected_size = len(raw)
+        self._expected_sha256 = hashlib.sha256(raw).hexdigest()
+        self._max_bytes = max_bytes
+
+    def postverify(self) -> None:
+        opened = os.fstat(self._stream.fileno())
+        self._stream.seek(0)
+        raw = self._stream.read(self._max_bytes + 1)
+        self._stream.seek(0)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_size != self._expected_size
+            or len(raw) != self._expected_size
+            or hashlib.sha256(raw).hexdigest() != self._expected_sha256
+        ):
+            raise FormalSupervisorError("native credential handle drifted")
+
+    def close(self) -> None:
+        self._stream.close()
+
+
 class _HeldLedgerFile:
     def __init__(self, path: Path, raw: bytes, *, replay_label: str) -> None:
         self._chain = _HeldDirectoryChain(path.parent)
@@ -1482,15 +1558,32 @@ def _held_run_credential(
     payload: Mapping[str, Any],
     *,
     stack: ExitStack,
-) -> tuple[str | None, _HeldFile | None]:
+    native_credential_provider: Any = None,
+) -> tuple[str | None, _HeldFile | _HeldNativeCredential | None]:
     if payload["action"] not in {"run", "resume"}:
+        if native_credential_provider is not None:
+            raise FormalSupervisorError("unexpected native credential provider")
         return None, None
-    handle = _HeldFile(
-        Path(str(payload["credential_path"])),
-        expected_sha256=None,
-        label="points-primary credential slot",
-        max_bytes=4096,
-    )
+    credential_path = Path(str(payload["credential_path"]))
+    if native_credential_provider is None:
+        handle: _HeldFile | _HeldNativeCredential = _HeldFile(
+            credential_path,
+            expected_sha256=None,
+            label="points-primary credential slot",
+            max_bytes=4096,
+        )
+    else:
+        if not callable(native_credential_provider):
+            raise FormalSupervisorError("native credential provider rejected")
+        try:
+            native_handle = native_credential_provider()
+        except BaseException:
+            raise FormalSupervisorError("native credential handoff rejected") from None
+        handle = _HeldNativeCredential(
+            native_handle,
+            expected_path=credential_path,
+            max_bytes=4096,
+        )
     stack.callback(handle.close)
     try:
         value = handle.raw.decode("utf-8")
@@ -2246,6 +2339,7 @@ def _supervise_with_pins(
     trusted_executed_supervisor_sha256: str | None = None,
     trusted_supervisor_loader_path: str | None = None,
     trusted_supervisor_loader_sha256: str | None = None,
+    native_credential_provider: Any = None,
 ) -> dict[str, Any]:
     if os.name != "nt":
         raise FormalSupervisorError("trusted supervisor requires Windows")
@@ -2611,6 +2705,7 @@ def _supervise_with_pins(
         credential_value, credential_handle = _held_run_credential(
             payload,
             stack=stack,
+            native_credential_provider=native_credential_provider,
         )
         terminal_guard_request = preflight_terminal_guard_request(
             action=str(payload["worker_action"]),
