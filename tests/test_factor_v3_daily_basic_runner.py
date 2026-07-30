@@ -314,3 +314,81 @@ def test_verify_replays_terminal_exact_set_publication(
             run_spec_path=spec_path,
             run_root=tmp_path / "run",
         )
+
+
+def test_already_verified_run_rejects_rehashed_state_receipt_path_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    spec = _spec(monkeypatch, tmp_path)
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(
+        json.dumps(spec, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    paths = runner._paths(tmp_path / "run", create=True)
+    runner._load_or_initialize(paths, spec, allow_initialize=True)
+    paths["points"].mkdir()
+    paths["authority"].mkdir()
+    generation = str(uuid.uuid4())
+    refs = [
+        {
+            "trade_date": session,
+            "collection_set_relative_path": f"daily_basic_collection_sets/{index}",
+            "collection_set_sha256": f"{index:064x}",
+        }
+        for index, session in enumerate(spec["sessions"])
+    ]
+    publication = {
+        "attestation_relative_path": "attestation.json",
+        "attestation_sha256": "c" * 64,
+        "publication_relative_path": "publication.json",
+        "publication_sha256": "d" * 64,
+        "receipt_relative_path": "receipt.json",
+        "receipt_sha256": "b" * 64,
+        "schema": "factor-v3-daily-basic-733-exact-set-publication/v2",
+    }
+    runner._atomic_json(
+        paths["state"],
+        runner._state_payload(
+            run_spec_sha256=spec["run_spec_sha256"],
+            status="verified",
+            completed_session_count=733,
+            credential_generation_id=generation,
+            collection_set_refs=refs,
+            exact_set_publication=publication,
+            receipt={
+                "authority_root_sha256": "a" * 64,
+                "receipt_relative_path": "tampered-receipt.json",
+                "receipt_sha256": "b" * 64,
+                "verified": True,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_assert_complete_points_output",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_verify_exact_set_coverage",
+        lambda **_kwargs: {
+            "authority_root_sha256": "a" * 64,
+            "receipt_sha256": "b" * 64,
+            "trade_date_count": 733,
+            "trade_dates": spec["sessions"],
+            "verified": True,
+        },
+    )
+
+    with pytest.raises(runner.FactorV3DailyBasicRunnerError, match="terminal receipt"):
+        runner._run_factor_v3_daily_basic_collection_with_route_credential(
+            run_spec_path=spec_path,
+            run_root=tmp_path / "run",
+            credential="test-only-credential",
+            source_generation_id=generation,
+            daily_basic_policy_descriptor=(
+                runner.FACTOR_V3_DAILY_BASIC_COLLECTION_POLICY_DESCRIPTOR
+            ),
+        )
