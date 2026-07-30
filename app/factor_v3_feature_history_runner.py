@@ -728,13 +728,64 @@ def _run_credential_generation_id(
         return generation_id
 
 
+def _validate_open_lock_identity(path: Path, descriptor: int) -> None:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    try:
+        parent_stat = path.parent.lstat()
+        descriptor_stat = os.fstat(descriptor)
+        path_stat = path.lstat()
+        if (
+            path.parent.is_symlink()
+            or not stat.S_ISDIR(parent_stat.st_mode)
+            or getattr(parent_stat, "st_file_attributes", 0) & reparse_flag
+            or path.is_symlink()
+            or not stat.S_ISREG(descriptor_stat.st_mode)
+            or not stat.S_ISREG(path_stat.st_mode)
+            or descriptor_stat.st_nlink != 1
+            or path_stat.st_nlink != 1
+            or getattr(descriptor_stat, "st_file_attributes", 0) & reparse_flag
+            or getattr(path_stat, "st_file_attributes", 0) & reparse_flag
+            or (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            != (path_stat.st_dev, path_stat.st_ino)
+        ):
+            raise OSError
+    except OSError as exc:
+        raise FactorV3FeatureHistoryRunnerError(
+            "factor-v3 feature-history lock unavailable"
+        ) from exc
+
+
 @contextmanager
 def _run_lock(path: Path) -> Iterator[None]:
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        parent_stat = path.parent.lstat()
+        if (
+            path.parent.is_symlink()
+            or not stat.S_ISDIR(parent_stat.st_mode)
+            or getattr(parent_stat, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            or path.is_symlink()
+        ):
+            raise OSError
+    except OSError as exc:
+        raise FactorV3FeatureHistoryRunnerError(
+            "factor-v3 feature-history lock unavailable"
+        ) from exc
     try:
         descriptor = os.open(str(path), flags, 0o600)
     except OSError as exc:
         raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history lock unavailable") from exc
+    try:
+        _validate_open_lock_identity(path, descriptor)
+    except FactorV3FeatureHistoryRunnerError:
+        os.close(descriptor)
+        raise
     try:
         if _fcntl is not None:
             _fcntl.flock(descriptor, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
@@ -748,6 +799,7 @@ def _run_lock(path: Path) -> Iterator[None]:
             raise FactorV3FeatureHistoryRunnerError(
                 "factor-v3 feature-history advisory locking is unavailable"
             )
+        _validate_open_lock_identity(path, descriptor)
     except (OSError, FactorV3FeatureHistoryRunnerError) as exc:
         os.close(descriptor)
         raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history run is already locked") from exc
