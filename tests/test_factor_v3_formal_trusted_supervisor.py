@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -750,6 +751,90 @@ def test_supervisor_executes_exact_worker_and_publishes_one_terminal_frame(
     assert result["launch_authorization_sha256"] == _file_sha256(authorization_path)
     assert Path(result["claim_path"]).is_file()
     assert Path(result["completed_path"]).is_file()
+
+
+def test_native_credential_handle_is_requested_only_after_claim_and_not_reopened(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pins, payload, authorization_path, environment, writes = _fixture(tmp_path)
+    credential_path = Path(str(payload["credential_path"]))
+    authorization_sha256 = _file_sha256(authorization_path)
+    claim_path = supervisor.claim_path_for_authorization(
+        Path(str(payload["execution_ledger_root"])),
+        authorization_sha256,
+    )
+    requested: list[bool] = []
+    real_init = supervisor._HeldFile.__init__
+
+    def observed_init(
+        self: supervisor._HeldFile,
+        path: Path,
+        *,
+        expected_sha256: str | None,
+        label: str,
+        max_bytes: int,
+        allow_empty: bool = False,
+        allow_hardlinks: bool = False,
+        directory_guard: supervisor._HeldFrozenDirectoryTree | None = None,
+    ) -> None:
+        assert label != "points-primary credential slot"
+        real_init(
+            self,
+            path,
+            expected_sha256=expected_sha256,
+            label=label,
+            max_bytes=max_bytes,
+            allow_empty=allow_empty,
+            allow_hardlinks=allow_hardlinks,
+            directory_guard=directory_guard,
+        )
+
+    def provide_handle() -> int:
+        assert claim_path.is_file()
+        requested.append(True)
+        kernel32 = supervisor._kernel32()
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        )
+        create_file.restype = ctypes.c_void_p
+        handle = create_file(
+            str(credential_path),
+            0x80000000,
+            0x00000001,
+            None,
+            3,
+            0x00200000 | 0x08000000,
+            None,
+        )
+        assert handle not in (None, ctypes.c_void_p(-1).value)
+        return int(handle)
+
+    monkeypatch.setattr(supervisor._HeldFile, "__init__", observed_init)
+
+    result = supervisor._supervise_with_pins(
+        authorization_path=authorization_path,
+        pins=pins,
+        now_utc=datetime(2026, 7, 30, 12, 1, 0, tzinfo=timezone.utc),
+        environment_snapshot=environment,
+        output_writer=_writer(writes),
+        trusted_executed_supervisor_path=payload["executed_supervisor_path"],
+        trusted_executed_supervisor_sha256=payload["executed_supervisor_sha256"],
+        trusted_supervisor_loader_path=payload["supervisor_loader_path"],
+        trusted_supervisor_loader_sha256=payload["supervisor_loader_sha256"],
+        native_credential_provider=provide_handle,
+    )
+
+    assert result["status"] == "completed"
+    assert requested == [True]
+    assert json.loads(writes[0])["result"]["secret_present"] is True
     assert len(writes) == 1
     frame = json.loads(writes[0])
     assert frame["launch_authorization_sha256"] == result["launch_authorization_sha256"]
