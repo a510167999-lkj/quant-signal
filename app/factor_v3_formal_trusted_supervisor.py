@@ -585,42 +585,52 @@ def _held_directory_chain(path: Path) -> Iterator[_HeldDirectoryChain]:
 class _HeldFrozenDirectoryTree:
     def __init__(self, paths: tuple[Path, ...]) -> None:
         self._handles: list[tuple[Any, Path, tuple[int, int, int]]] = []
-        seen: set[str] = set()
+        self._paths: dict[str, Path] = {}
         try:
             for root in paths:
-                candidates = [root]
-                if root.is_dir():
-                    for directory, names, _filenames in os.walk(root, topdown=True):
-                        current = Path(directory)
-                        names[:] = sorted(
-                            name
-                            for name in names
-                            if not (
-                                (current / name).is_symlink()
-                                or int(
-                                    getattr(
-                                        (current / name).lstat(),
-                                        "st_file_attributes",
-                                        0,
-                                    )
-                                )
-                                & _REPARSE_ATTRIBUTE
-                            )
-                        )
-                        candidates.append(current)
-                for candidate in candidates:
-                    normalized = os.path.normcase(str(candidate))
-                    if normalized in seen:
-                        continue
-                    handle, identity = _open_directory_handle(
-                        candidate,
-                        share_mode=0x00000001,
-                    )
-                    self._handles.append((handle, candidate, identity))
-                    seen.add(normalized)
+                if not root.is_absolute() or any(part in {".", ".."} for part in root.parts):
+                    raise FormalSupervisorError("frozen stdlib directory rejected")
+                current = Path(root.anchor)
+                self._append_existing(current)
+                for part in root.parts[1:]:
+                    current /= part
+                    self._append_existing(current)
+                if os.path.normcase(str(root)) != os.path.normcase(str(root.resolve(strict=True))):
+                    raise FormalSupervisorError("frozen stdlib directory rejected")
+                for directory, names, _filenames in os.walk(root, topdown=True):
+                    current = Path(directory)
+                    self._append_existing(current)
+                    retained: list[str] = []
+                    for name in sorted(names):
+                        child = current / name
+                        if child.is_symlink() or (
+                            int(getattr(child.lstat(), "st_file_attributes", 0))
+                            & _REPARSE_ATTRIBUTE
+                        ):
+                            continue
+                        self._append_existing(child)
+                        retained.append(name)
+                    names[:] = retained
         except BaseException:
             self.close()
             raise
+
+    def _append_existing(self, path: Path) -> None:
+        normalized = os.path.normcase(str(path))
+        if normalized in self._paths:
+            return
+        handle, identity = _open_directory_handle(
+            path,
+            share_mode=0x00000001,
+        )
+        self._handles.append((handle, path, identity))
+        self._paths[normalized] = path
+
+    def held_directory(self, path: Path) -> Path:
+        candidate = self._paths.get(os.path.normcase(str(path)))
+        if candidate is None:
+            raise FormalSupervisorError("frozen stdlib directory unavailable")
+        return candidate
 
     def postverify(self) -> None:
         kernel32 = _kernel32()
@@ -639,7 +649,18 @@ class _HeldFrozenDirectoryTree:
                 int(information.nFileIndexHigh),
                 int(information.nFileIndexLow),
             )
-            if observed != expected:
+            if (
+                observed != expected
+                or not int(information.dwFileAttributes) & 0x00000010
+                or int(information.dwFileAttributes) & _REPARSE_ATTRIBUTE
+            ):
+                raise FormalSupervisorError("frozen stdlib directory drifted")
+            terminal_handle, terminal_identity = _open_directory_handle(
+                _path,
+                share_mode=0x00000001,
+            )
+            kernel32.CloseHandle(terminal_handle)
+            if terminal_identity != expected:
                 raise FormalSupervisorError("frozen stdlib directory drifted")
 
     def close(self) -> None:
@@ -673,13 +694,19 @@ class _HeldFile:
         max_bytes: int,
         allow_empty: bool = False,
         allow_hardlinks: bool = False,
+        directory_guard: _HeldFrozenDirectoryTree | None = None,
     ) -> None:
-        self._chain = _HeldDirectoryChain(path.parent)
-        candidate = self._chain.path / path.name
+        self._chain = None if directory_guard is not None else _HeldDirectoryChain(path.parent)
+        candidate = (
+            directory_guard.held_directory(path.parent) / path.name
+            if directory_guard is not None
+            else self._chain.path / path.name
+        )
         try:
             before = candidate.lstat()
         except OSError:
-            self._chain.close()
+            if self._chain is not None:
+                self._chain.close()
             raise FormalSupervisorError(f"{label} unavailable") from None
         link_count = int(getattr(before, "st_nlink", 1))
         if (
@@ -690,7 +717,8 @@ class _HeldFile:
             or before.st_size > max_bytes
             or (link_count < 1 if allow_hardlinks else link_count != 1)
         ):
-            self._chain.close()
+            if self._chain is not None:
+                self._chain.close()
             raise FormalSupervisorError(f"{label} rejected")
         kernel32 = _kernel32()
         create_file = kernel32.CreateFileW
@@ -715,7 +743,8 @@ class _HeldFile:
         )
         invalid = ctypes.c_void_p(-1).value
         if handle in (None, invalid):
-            self._chain.close()
+            if self._chain is not None:
+                self._chain.close()
             raise FormalSupervisorError(f"{label} safe open rejected")
         try:
             descriptor = msvcrt.open_osfhandle(
@@ -724,7 +753,8 @@ class _HeldFile:
             )
         except BaseException:
             kernel32.CloseHandle(handle)
-            self._chain.close()
+            if self._chain is not None:
+                self._chain.close()
             raise
         self._stream = os.fdopen(descriptor, "rb")
         try:
@@ -744,7 +774,8 @@ class _HeldFile:
                 raise FormalSupervisorError(f"{label} identity rejected")
         except BaseException:
             self._stream.close()
-            self._chain.close()
+            if self._chain is not None:
+                self._chain.close()
             raise
         self.path = candidate
         self.raw = raw
@@ -754,7 +785,8 @@ class _HeldFile:
         self._allow_hardlinks = allow_hardlinks
 
     def postverify(self) -> None:
-        self._chain.postverify()
+        if self._chain is not None:
+            self._chain.postverify()
         opened = os.fstat(self._stream.fileno())
         try:
             terminal = self.path.lstat()
@@ -775,7 +807,8 @@ class _HeldFile:
 
     def close(self) -> None:
         self._stream.close()
-        self._chain.close()
+        if self._chain is not None:
+            self._chain.close()
 
 
 class _HeldLedgerFile:
@@ -1987,7 +2020,7 @@ def _hold_stdlib_inventory(
     frozen_directories = tuple(Path(str(item["path"])) for item in policy["roots"]) + tuple(
         Path(path).parent for path in policy["absent_paths"]
     )
-    stack.enter_context(_held_frozen_directory_tree(frozen_directories))
+    frozen_tree = stack.enter_context(_held_frozen_directory_tree(frozen_directories))
     try:
         policy = validate_stdlib_policy(
             policy,
@@ -2023,6 +2056,7 @@ def _hold_stdlib_inventory(
             max_bytes=_MAX_EXECUTABLE_BYTES,
             allow_empty=item["kind"] == "source",
             allow_hardlinks=True,
+            directory_guard=frozen_tree,
         )
         stack.callback(held.close)
         if len(held.raw) != byte_count:
@@ -2042,6 +2076,7 @@ def _hold_stdlib_inventory(
     except ValueError as exc:
         raise FormalSupervisorError("stdlib policy rejected") from exc
     return (
+        frozen_tree,
         *handles,
         _StdlibInventoryGuard(
             policy,
