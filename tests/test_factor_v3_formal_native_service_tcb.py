@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -13,7 +14,12 @@ import uuid
 import pytest
 
 from app import factor_v3_formal_trusted_supervisor as formal_supervisor
-from tests.test_factor_v3_formal_trusted_supervisor import _fixture
+from tests.test_factor_v3_formal_trusted_supervisor import (
+    _canonical_bytes,
+    _file_sha256,
+    _fixture,
+    _rewrite_authorization,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -378,7 +384,15 @@ def _build_handoff_fixture(root: Path) -> tuple[Path, Path, Path, Path, bytes, s
     return native, candidate_path, provisional, completed, secret_value, claim_sha256
 
 
-def _build_production_validation_fixture(root: Path) -> tuple[Path, Path]:
+def _build_production_validation_fixture(
+    root: Path,
+) -> tuple[
+    Path,
+    Path,
+    Path,
+    dict[str, object],
+    formal_supervisor._SupervisorPins,
+]:
     from app import factor_v3_formal_native_broker as broker
 
     pins, payload, launch_authorization, _environment, _writes = _fixture(root)
@@ -443,7 +457,13 @@ def _build_production_validation_fixture(root: Path) -> tuple[Path, Path]:
         ],
         libraries=["-lncrypt"],
     )
-    return native, Path(publication["candidate_path"])
+    return (
+        native,
+        Path(publication["candidate_path"]),
+        launch_authorization,
+        payload,
+        pins,
+    )
 
 
 def test_native_manifest_uses_fixed_cng_identity_and_no_private_key_file_slot() -> None:
@@ -546,13 +566,253 @@ def test_production_launch_checks_service_and_fixed_namespace_chains_before_fail
 def test_native_production_candidate_verifies_signed_v2_launch_authorization(
     tmp_path: Path,
 ) -> None:
-    native, candidate = _build_production_validation_fixture(tmp_path)
+    native, candidate, _launch, _payload, _pins = (
+        _build_production_validation_fixture(tmp_path)
+    )
 
     completed = _run(native, "--test-validate-production-candidate", str(candidate))
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout == ""
     assert completed.stderr == ""
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_native_production_candidate_rejects_tampered_launch_signature(
+    tmp_path: Path,
+) -> None:
+    from app import factor_v3_formal_native_broker as broker
+
+    native, candidate, launch, _payload, _pins = (
+        _build_production_validation_fixture(tmp_path)
+    )
+    fields = broker._validated_candidate(candidate.read_bytes())
+    outer = json.loads(launch.read_bytes())
+    signature = bytearray(base64.b64decode(outer["signature_base64"], validate=True))
+    signature[0] ^= 1
+    outer["signature_base64"] = base64.b64encode(signature).decode("ascii")
+    tampered_raw = _canonical_bytes(outer)
+    tampered_digest = hashlib.sha256(tampered_raw).hexdigest()
+    tampered_launch = (
+        tmp_path
+        / "launch_authorizations"
+        / "sha256"
+        / tampered_digest[:2]
+        / f"{tampered_digest}.json"
+    )
+    tampered_launch.parent.mkdir(parents=True)
+    tampered_launch.write_bytes(tampered_raw)
+    raw = broker.build_factor_v3_formal_native_broker_candidate(
+        action="run",
+        authorization_path=fields["authorization_path"],
+        completion_marker_path=fields["completion_marker_path"],
+        publication_receipt_path=fields["publication_receipt_path"],
+        launch_authorization_path=tampered_launch,
+        execution_ledger_root=fields["execution_ledger_root"],
+    )
+    publication = broker.publish_factor_v3_formal_native_broker_candidate(
+        candidate_output_root=tmp_path / "tampered-native-candidates",
+        candidate=raw,
+    )
+
+    completed = _run(
+        native,
+        "--test-validate-production-candidate",
+        publication["candidate_path"],
+    )
+
+    assert completed.returncode != 0
+    assert completed.stdout == ""
+    assert "candidate rejected" in completed.stderr
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_native_production_candidate_rejects_signed_ledger_binding_drift(
+    tmp_path: Path,
+) -> None:
+    from app import factor_v3_formal_native_broker as broker
+
+    native, candidate, _launch, payload, _pins = (
+        _build_production_validation_fixture(tmp_path)
+    )
+    fields = broker._validated_candidate(candidate.read_bytes())
+    drifted = dict(payload)
+    drifted_root = (tmp_path / "signed-drifted-ledger").resolve()
+    drifted_root.mkdir()
+    drifted["execution_ledger_root"] = str(drifted_root)
+    drifted_launch = _rewrite_authorization(
+        tmp_path,
+        drifted,
+        tmp_path / "execution-key" / "execution-private.pem",
+    )
+    raw = broker.build_factor_v3_formal_native_broker_candidate(
+        action="run",
+        authorization_path=fields["authorization_path"],
+        completion_marker_path=fields["completion_marker_path"],
+        publication_receipt_path=fields["publication_receipt_path"],
+        launch_authorization_path=drifted_launch,
+        execution_ledger_root=fields["execution_ledger_root"],
+    )
+    publication = broker.publish_factor_v3_formal_native_broker_candidate(
+        candidate_output_root=tmp_path / "drifted-native-candidates",
+        candidate=raw,
+    )
+
+    completed = _run(
+        native,
+        "--test-validate-production-candidate",
+        publication["candidate_path"],
+    )
+
+    assert completed.returncode != 0
+    assert completed.stdout == ""
+    assert "candidate rejected" in completed.stderr
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_native_production_resume_verifies_original_run_and_claim_lineage(
+    tmp_path: Path,
+) -> None:
+    from app import factor_v3_formal_native_broker as broker
+
+    native, _candidate, original_launch, original, _pins = (
+        _build_production_validation_fixture(tmp_path)
+    )
+    original_sha256 = _file_sha256(original_launch)
+    ledger_root = Path(str(original["execution_ledger_root"]))
+    status_raw = _canonical_bytes(
+        {
+            "action": "run",
+            "authorization_id_sha256": original["authorization_id_sha256"],
+            "authorization_nonce_sha256": original["authorization_nonce_sha256"],
+            "bootstrap_execution_authorization_sha256": original[
+                "bootstrap_execution_authorization_sha256"
+            ],
+            "launch_authorization_sha256": original_sha256,
+            "replay_scope": original["replay_scope"],
+            "schema": formal_supervisor.CLAIM_SCHEMA,
+            "status": "claimed",
+        }
+    )
+    status_path = formal_supervisor.claim_path_for_authorization(
+        ledger_root,
+        original_sha256,
+    )
+    status_path.parent.mkdir(parents=True)
+    status_path.write_bytes(status_raw)
+    resume = dict(original)
+    resume.update(
+        {
+            "action": "resume",
+            "resume_of_authorization_id_sha256": original[
+                "authorization_id_sha256"
+            ],
+            "resume_of_authorization_nonce_sha256": original[
+                "authorization_nonce_sha256"
+            ],
+            "resume_of_authorization_sha256": original_sha256,
+            "resume_of_bootstrap_execution_authorization_sha256": original[
+                "bootstrap_execution_authorization_sha256"
+            ],
+            "resume_of_replay_scope": original["replay_scope"],
+            "resume_status_path": str(status_path),
+            "resume_status_sha256": hashlib.sha256(status_raw).hexdigest(),
+        }
+    )
+    resume_launch = _rewrite_authorization(
+        tmp_path,
+        resume,
+        tmp_path / "execution-key" / "execution-private.pem",
+    )
+    raw = broker.build_factor_v3_formal_native_broker_candidate(
+        action="resume",
+        authorization_path=resume["bootstrap_execution_authorization_path"],
+        completion_marker_path=resume["publication_completion_marker_path"],
+        publication_receipt_path=resume["supervisor_publication_receipt_path"],
+        launch_authorization_path=resume_launch,
+        execution_ledger_root=resume["execution_ledger_root"],
+        resume_authorization_path=original_launch,
+        resume_status_path=status_path,
+    )
+    publication = broker.publish_factor_v3_formal_native_broker_candidate(
+        candidate_output_root=tmp_path / "resume-native-candidates",
+        candidate=raw,
+    )
+
+    completed = _run(
+        native,
+        "--test-validate-production-candidate",
+        publication["candidate_path"],
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == ""
+    assert completed.stderr == ""
+
+    first_resume_sha256 = _file_sha256(resume_launch)
+    second_status_raw = _canonical_bytes(
+        {
+            "action": "resume",
+            "authorization_id_sha256": resume["authorization_id_sha256"],
+            "authorization_nonce_sha256": resume["authorization_nonce_sha256"],
+            "bootstrap_execution_authorization_sha256": resume[
+                "bootstrap_execution_authorization_sha256"
+            ],
+            "launch_authorization_sha256": first_resume_sha256,
+            "replay_scope": resume["replay_scope"],
+            "schema": formal_supervisor.CLAIM_SCHEMA,
+            "status": "claimed",
+        }
+    )
+    second_status_path = formal_supervisor.claim_path_for_authorization(
+        ledger_root,
+        first_resume_sha256,
+    )
+    second_status_path.parent.mkdir(parents=True, exist_ok=True)
+    second_status_path.write_bytes(second_status_raw)
+    resume_of_resume = dict(resume)
+    resume_of_resume.update(
+        {
+            "resume_of_authorization_sha256": first_resume_sha256,
+            "resume_status_path": str(second_status_path),
+            "resume_status_sha256": hashlib.sha256(second_status_raw).hexdigest(),
+        }
+    )
+    resume_of_resume_launch = _rewrite_authorization(
+        tmp_path,
+        resume_of_resume,
+        tmp_path / "execution-key" / "execution-private.pem",
+    )
+    invalid_raw = broker.build_factor_v3_formal_native_broker_candidate(
+        action="resume",
+        authorization_path=resume_of_resume[
+            "bootstrap_execution_authorization_path"
+        ],
+        completion_marker_path=resume_of_resume[
+            "publication_completion_marker_path"
+        ],
+        publication_receipt_path=resume_of_resume[
+            "supervisor_publication_receipt_path"
+        ],
+        launch_authorization_path=resume_of_resume_launch,
+        execution_ledger_root=resume_of_resume["execution_ledger_root"],
+        resume_authorization_path=resume_launch,
+        resume_status_path=second_status_path,
+    )
+    invalid_publication = broker.publish_factor_v3_formal_native_broker_candidate(
+        candidate_output_root=tmp_path / "resume-of-resume-native-candidates",
+        candidate=invalid_raw,
+    )
+
+    rejected = _run(
+        native,
+        "--test-validate-production-candidate",
+        invalid_publication["candidate_path"],
+    )
+
+    assert rejected.returncode != 0
+    assert rejected.stdout == ""
+    assert "candidate rejected" in rejected.stderr
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
