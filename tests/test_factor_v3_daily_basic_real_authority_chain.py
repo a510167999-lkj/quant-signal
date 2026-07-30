@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from datetime import date, datetime, timedelta, timezone
 import hashlib
+import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -540,6 +541,17 @@ def test_real_250_plus_483_authority_chain_runs_and_cli_reverifies(
         )
         == 2
     )
+
+
+def test_real_chain_fixture_inherits_the_verified_receipt_identity_triple() -> None:
+    source = inspect.getsource(
+        test_real_250_plus_483_authority_chain_runs_and_cli_reverifies
+    )
+
+    assert '"sessions_sha256": "f" * 64' not in source
+    assert 'feature_receipt["receipt_sha256"]' in source
+    assert 'feature_receipt["session_count"]' in source
+    assert 'feature_receipt["sessions_sha256"]' in source
 
 
 def test_real_chain_fixture_uses_trusted_dispatch_and_buffers_binding(
