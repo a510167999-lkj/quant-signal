@@ -953,25 +953,108 @@ static int parent_directory(
     return 1;
 }
 
+static int append_command_character(
+    wchar_t *output,
+    size_t capacity,
+    size_t *offset,
+    wchar_t value
+) {
+    if (*offset + 1 >= capacity) {
+        return 0;
+    }
+    output[(*offset)++] = value;
+    return 1;
+}
+
+static int append_quoted_argument(
+    const wchar_t *argument,
+    wchar_t *output,
+    size_t capacity,
+    size_t *offset
+) {
+    const wchar_t *cursor = argument;
+    if (argument == NULL
+        || !append_command_character(
+            output,
+            capacity,
+            offset,
+            L'"'
+        )) {
+        return 0;
+    }
+    while (*cursor != L'\0') {
+        size_t backslashes = 0;
+        size_t index;
+        while (*cursor == L'\\') {
+            ++backslashes;
+            ++cursor;
+        }
+        if (*cursor == L'\0') {
+            backslashes *= 2;
+        } else if (*cursor == L'"') {
+            backslashes = backslashes * 2 + 1;
+        }
+        for (index = 0; index < backslashes; ++index) {
+            if (!append_command_character(
+                    output,
+                    capacity,
+                    offset,
+                    L'\\'
+                )) {
+                return 0;
+            }
+        }
+        if (*cursor == L'\0') {
+            break;
+        }
+        if (!append_command_character(
+                output,
+                capacity,
+                offset,
+                *cursor
+            )) {
+            return 0;
+        }
+        ++cursor;
+    }
+    return append_command_character(
+        output,
+        capacity,
+        offset,
+        L'"'
+    );
+}
+
 static int quoted_command_line(
     const wchar_t *executable,
     const wchar_t *argument,
     wchar_t *output,
     size_t capacity
 ) {
-    int result;
-    if (wcschr(executable, L'"') != NULL || wcschr(argument, L'"') != NULL) {
+    size_t offset = 0;
+    if (!append_quoted_argument(
+            executable,
+            output,
+            capacity,
+            &offset
+        )
+        || !append_command_character(
+            output,
+            capacity,
+            &offset,
+            L' '
+        )
+        || !append_quoted_argument(
+            argument,
+            output,
+            capacity,
+            &offset
+        )
+        || offset >= capacity) {
         return 0;
     }
-    result = _snwprintf_s(
-        output,
-        capacity,
-        _TRUNCATE,
-        L"\"%ls\" \"%ls\"",
-        executable,
-        argument
-    );
-    return result > 0;
+    output[offset] = L'\0';
+    return 1;
 }
 
 static int launch_test_child(
@@ -1234,6 +1317,23 @@ int wmain(int argc, wchar_t **argv) {
         return 0;
     }
 #ifdef F3_BROKER_TESTING
+    if (argc == 4 && wcscmp(argv[1], L"--test-quote-command") == 0) {
+        wchar_t command_line[32768];
+        if (!quoted_command_line(
+                argv[2],
+                argv[3],
+                command_line,
+                sizeof(command_line) / sizeof(command_line[0])
+            )
+            || fputws(command_line, stdout) < 0
+            || fflush(stdout) != 0) {
+            SecureZeroMemory(command_line, sizeof(command_line));
+            fwprintf(stderr, L"native broker command quoting rejected\n");
+            return 27;
+        }
+        SecureZeroMemory(command_line, sizeof(command_line));
+        return 0;
+    }
     if (
         argc == 3
         && wcscmp(argv[1], L"--test-current-token-readonly-root") == 0
