@@ -1,0 +1,144 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import uuid
+
+import pytest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BROKER_ROOT = REPO_ROOT / "native" / "factor_v3_formal_native_broker"
+BROKER_SOURCE = BROKER_ROOT / "factor_v3_formal_native_broker.c"
+BROKER_MANIFEST = BROKER_ROOT / "factor_v3_formal_native_broker_manifest.h"
+SERVICE_INSTALLER = (
+    REPO_ROOT / "scripts" / "install_factor_v3_formal_native_broker_service.ps1"
+)
+
+
+def _compile_test_broker(tmp_path: Path) -> Path:
+    gcc = shutil.which("gcc")
+    if gcc is None:
+        pytest.skip("Win32 GCC is unavailable")
+    output = tmp_path / "factor_v3_formal_native_broker-service-tcb-test.exe"
+    completed = subprocess.run(
+        [
+            gcc,
+            "-std=c11",
+            "-DUNICODE",
+            "-D_UNICODE",
+            "-municode",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-DF3_BROKER_TESTING=1",
+            "-DF3_BROKER_DISPOSABLE_TEST_MANIFEST=1",
+            f"-I{BROKER_ROOT}",
+            str(BROKER_SOURCE),
+            "-o",
+            str(output),
+            "-ladvapi32",
+            "-lbcrypt",
+            "-lncrypt",
+        ],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return output
+
+
+def _run(binary: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(binary), *arguments],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_native_manifest_uses_fixed_cng_identity_and_no_private_key_file_slot() -> None:
+    source = BROKER_SOURCE.read_text(encoding="utf-8")
+    manifest = BROKER_MANIFEST.read_text(encoding="utf-8")
+
+    assert "F3_BROKER_SIGNING_KEY_SLOT_PATH" not in source
+    assert "F3_BROKER_SIGNING_KEY_SLOT_PATH" not in manifest
+    assert '#define F3_BROKER_CNG_PROVIDER L"Microsoft Software Key Storage Provider"' in (
+        manifest
+    )
+    assert '#define F3_BROKER_CNG_KEY_NAME L"quant-signal-lkj-factor-v3-formal"' in (
+        manifest
+    )
+    assert '#define F3_BROKER_CNG_ALGORITHM NCRYPT_RSA_ALGORITHM' in manifest
+    assert "NCryptSignHash" in source
+    assert "NCRYPT_ALLOW_EXPORT_FLAG" not in source
+    assert "NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG" not in source
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_interactive_process_is_rejected_as_formal_service_identity(
+    tmp_path: Path,
+) -> None:
+    native = _compile_test_broker(tmp_path)
+    completed = _run(native, "--test-require-service-identity")
+
+    assert completed.returncode != 0
+    assert completed.stdout == ""
+    assert "service identity rejected" in completed.stderr.lower()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_protected_namespace_requires_trusted_owner_and_no_effective_caller_write(
+    tmp_path: Path,
+) -> None:
+    native = _compile_test_broker(tmp_path)
+
+    mutable = _run(native, "--test-protected-namespace", str(tmp_path))
+    assert mutable.returncode != 0
+    assert "namespace rejected" in mutable.stderr.lower()
+
+    protected_root = Path(os.environ["SystemRoot"]) / "System32"
+    protected = _run(native, "--test-protected-namespace", str(protected_root))
+    assert protected.returncode == 0, protected.stderr
+    assert protected.stdout == ""
+    assert protected.stderr == ""
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_disposable_cng_key_is_nonexportable_signs_and_is_deleted(
+    tmp_path: Path,
+) -> None:
+    native = _compile_test_broker(tmp_path)
+    key_name = f"quant-signal-lkj-disposable-test-{uuid.uuid4()}"
+
+    first = _run(native, "--test-cng-disposable", key_name)
+    assert first.returncode == 0, first.stderr
+    assert first.stdout == "CNG_DISPOSABLE_SIGN_OK\n"
+    assert first.stderr == ""
+
+    absent = _run(native, "--test-cng-key-absent", key_name)
+    assert absent.returncode == 0, absent.stderr
+    assert absent.stdout == ""
+    assert absent.stderr == ""
+
+    second = _run(native, "--test-cng-disposable", key_name)
+    assert second.returncode == 0, second.stderr
+
+
+def test_service_installer_is_explicit_dry_run_and_documents_external_tcb() -> None:
+    script = SERVICE_INSTALLER.read_text(encoding="utf-8")
+
+    assert "SupportsShouldProcess" in script
+    assert "DRY-RUN" in script
+    assert "Windows administrator" in script
+    assert "SCM" in script
+    assert "service SID" in script
+    assert "ACL" in script
+    assert "CNG" in script
+    assert "exit 1" in script
