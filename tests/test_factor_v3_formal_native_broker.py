@@ -532,6 +532,33 @@ def test_native_broker_job_kills_child_when_last_job_handle_closes(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_native_broker_assigns_job_atomically_before_child_resume(
+    tmp_path: Path,
+) -> None:
+    native, _helper = _compile_fixture_broker(tmp_path)
+    raw, _paths = _candidate(tmp_path)
+    candidate_path = _publish_candidate(tmp_path, raw)
+    output = tmp_path / "pre-resume-child-must-not-run.txt"
+    completed = subprocess.run(
+        [
+            str(native),
+            "--test-job-pre-resume-kill",
+            str(candidate_path),
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert not output.exists()
+    source = BROKER_SOURCE.read_text(encoding="utf-8")
+    assert "PROC_THREAD_ATTRIBUTE_JOB_LIST" in source
+    assert "AssignProcessToJobObject" not in source
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
 def test_native_broker_holds_candidate_ancestor_identity_through_child_lifetime(
     tmp_path: Path,
 ) -> None:
