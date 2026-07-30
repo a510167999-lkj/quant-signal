@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <ncrypt.h>
 #include <sddl.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,6 +68,7 @@
 #define F3_MAX_SECRET_SLOT_BYTES (64u * 1024u)
 #define F3_RSA_BITS 2048u
 #define F3_DISPOSABLE_KEY_PREFIX L"quant-signal-lkj-disposable-test-"
+#define F3_MAX_HELD_DIRECTORIES 128u
 
 typedef struct HeldFile {
     HANDLE handle;
@@ -74,6 +76,25 @@ typedef struct HeldFile {
     DWORD size_high;
     wchar_t final_path[32768];
 } HeldFile;
+
+typedef struct HeldDirectory {
+    HANDLE handle;
+    DWORD volume_serial;
+    DWORD file_index_high;
+    DWORD file_index_low;
+} HeldDirectory;
+
+typedef struct HeldDirectoryChain {
+    HeldDirectory entries[F3_MAX_HELD_DIRECTORIES];
+    size_t count;
+} HeldDirectoryChain;
+
+static int strict_windows_candidate_path(const wchar_t *path);
+static int parent_directory(
+    const wchar_t *path,
+    wchar_t *output,
+    size_t capacity
+);
 
 typedef enum CandidateAction {
     ACTION_INVALID = 0,
@@ -324,6 +345,409 @@ cleanup:
     }
     SecureZeroMemory(privilege_buffer, sizeof(privilege_buffer));
     return immutable;
+}
+
+static int unsafe_ordinary_writer_sid(PSID sid) {
+    return sid != NULL
+        && IsValidSid(sid)
+        && (
+            sid_matches_well_known(sid, WinWorldSid)
+            || sid_matches_well_known(sid, WinAuthenticatedUserSid)
+            || sid_matches_well_known(sid, WinBuiltinUsersSid)
+            || sid_matches_well_known(sid, WinInteractiveSid)
+        );
+}
+
+static PSID allowed_ace_sid(void *raw_ace, BYTE ace_type) {
+    if (ace_type == ACCESS_ALLOWED_ACE_TYPE) {
+        ACCESS_ALLOWED_ACE *ace = (ACCESS_ALLOWED_ACE *)raw_ace;
+        return (PSID)&ace->SidStart;
+    }
+    if (ace_type == ACCESS_ALLOWED_CALLBACK_ACE_TYPE) {
+        ACCESS_ALLOWED_CALLBACK_ACE *ace =
+            (ACCESS_ALLOWED_CALLBACK_ACE *)raw_ace;
+        return (PSID)&ace->SidStart;
+    }
+    if (ace_type == ACCESS_ALLOWED_OBJECT_ACE_TYPE
+        || ace_type == ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE) {
+        ACCESS_ALLOWED_OBJECT_ACE *ace =
+            (ACCESS_ALLOWED_OBJECT_ACE *)raw_ace;
+        size_t offset = offsetof(ACCESS_ALLOWED_OBJECT_ACE, ObjectType);
+        if ((ace->Flags & ACE_OBJECT_TYPE_PRESENT) != 0) {
+            offset += sizeof(GUID);
+        }
+        if ((ace->Flags & ACE_INHERITED_OBJECT_TYPE_PRESENT) != 0) {
+            offset += sizeof(GUID);
+        }
+        return (PSID)((BYTE *)raw_ace + offset);
+    }
+    return NULL;
+}
+
+static DWORD allowed_ace_mask(void *raw_ace, BYTE ace_type) {
+    if (ace_type == ACCESS_ALLOWED_ACE_TYPE) {
+        return ((ACCESS_ALLOWED_ACE *)raw_ace)->Mask;
+    }
+    if (ace_type == ACCESS_ALLOWED_CALLBACK_ACE_TYPE) {
+        return ((ACCESS_ALLOWED_CALLBACK_ACE *)raw_ace)->Mask;
+    }
+    if (ace_type == ACCESS_ALLOWED_OBJECT_ACE_TYPE
+        || ace_type == ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE) {
+        return ((ACCESS_ALLOWED_OBJECT_ACE *)raw_ace)->Mask;
+    }
+    return 0;
+}
+
+static int dacl_has_no_unsafe_writer(
+    PACL dacl,
+    DWORD mutation_rights,
+    GENERIC_MAPPING *mapping
+) {
+    ACL_SIZE_INFORMATION information;
+    DWORD index;
+    if (dacl == NULL
+        || mapping == NULL
+        || !GetAclInformation(
+            dacl,
+            &information,
+            sizeof(information),
+            AclSizeInformation
+        )) {
+        return 0;
+    }
+    for (index = 0; index < information.AceCount; ++index) {
+        void *raw_ace = NULL;
+        ACE_HEADER *header;
+        PSID sid;
+        DWORD mask;
+        if (!GetAce(dacl, index, &raw_ace) || raw_ace == NULL) {
+            return 0;
+        }
+        header = (ACE_HEADER *)raw_ace;
+        if ((header->AceFlags & INHERIT_ONLY_ACE) != 0) {
+            continue;
+        }
+        sid = allowed_ace_sid(raw_ace, header->AceType);
+        if (sid == NULL || !unsafe_ordinary_writer_sid(sid)) {
+            continue;
+        }
+        mask = allowed_ace_mask(raw_ace, header->AceType);
+        MapGenericMask(&mask, mapping);
+        if ((mask & mutation_rights) != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int held_directory_security_is_immutable(
+    HANDLE directory,
+    DWORD mutation_rights,
+    int reject_unsafe_writer
+) {
+    GENERIC_MAPPING mapping = {
+        FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE,
+        FILE_GENERIC_EXECUTE,
+        FILE_ALL_ACCESS
+    };
+    BYTE privilege_buffer[4096];
+    PRIVILEGE_SET *privileges = (PRIVILEGE_SET *)privilege_buffer;
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    PACL dacl = NULL;
+    PSID owner = NULL;
+    HANDLE primary_token = NULL;
+    HANDLE impersonation_token = NULL;
+    DWORD privilege_size = sizeof(privilege_buffer);
+    DWORD granted = 0;
+    DWORD desired = MAXIMUM_ALLOWED;
+    BOOL access_status = FALSE;
+    int immutable = 0;
+    if (directory == INVALID_HANDLE_VALUE
+        || GetSecurityInfo(
+            directory,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | GROUP_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION,
+            &owner,
+            NULL,
+            &dacl,
+            NULL,
+            &descriptor
+        ) != ERROR_SUCCESS
+        || dacl == NULL
+        || !trusted_namespace_owner(owner)
+        || (reject_unsafe_writer
+            && !dacl_has_no_unsafe_writer(
+                dacl,
+                mutation_rights,
+                &mapping
+            ))
+        || !OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_DUPLICATE,
+            &primary_token
+        )
+        || !DuplicateToken(
+            primary_token,
+            SecurityImpersonation,
+            &impersonation_token
+        )) {
+        goto cleanup;
+    }
+    MapGenericMask(&desired, &mapping);
+    if (!AccessCheck(
+            descriptor,
+            impersonation_token,
+            desired,
+            &mapping,
+            privileges,
+            &privilege_size,
+            &granted,
+            &access_status
+        )
+        || !access_status) {
+        goto cleanup;
+    }
+    immutable = (granted & mutation_rights) == 0;
+
+cleanup:
+    if (impersonation_token != NULL) {
+        CloseHandle(impersonation_token);
+    }
+    if (primary_token != NULL) {
+        CloseHandle(primary_token);
+    }
+    if (descriptor != NULL) {
+        LocalFree(descriptor);
+    }
+    SecureZeroMemory(privilege_buffer, sizeof(privilege_buffer));
+    return immutable;
+}
+
+static void close_held_directory_chain(HeldDirectoryChain *chain) {
+    size_t index;
+    if (chain == NULL) {
+        return;
+    }
+    for (index = 0; index < chain->count; ++index) {
+        if (chain->entries[index].handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(chain->entries[index].handle);
+            chain->entries[index].handle = INVALID_HANDLE_VALUE;
+        }
+    }
+    chain->count = 0;
+}
+
+static void initialize_held_directory_chain(HeldDirectoryChain *chain) {
+    size_t index;
+    if (chain == NULL) {
+        return;
+    }
+    memset(chain, 0, sizeof(*chain));
+    for (index = 0; index < F3_MAX_HELD_DIRECTORIES; ++index) {
+        chain->entries[index].handle = INVALID_HANDLE_VALUE;
+    }
+}
+
+static int append_held_directory(
+    const wchar_t *path,
+    int final_namespace,
+    HeldDirectoryChain *chain
+) {
+    static const DWORD full_mutation_rights =
+        FILE_ADD_FILE
+        | FILE_ADD_SUBDIRECTORY
+        | FILE_DELETE_CHILD
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | DELETE
+        | WRITE_DAC
+        | WRITE_OWNER;
+    static const DWORD ancestor_mutation_rights =
+        FILE_DELETE_CHILD
+        | DELETE
+        | WRITE_DAC
+        | WRITE_OWNER;
+    BY_HANDLE_FILE_INFORMATION information;
+    FILE_ATTRIBUTE_TAG_INFO tag;
+    HeldDirectory *held;
+    if (chain == NULL || chain->count >= F3_MAX_HELD_DIRECTORIES) {
+        return 0;
+    }
+    held = &chain->entries[chain->count];
+    memset(held, 0, sizeof(*held));
+    held->handle = CreateFileW(
+        path,
+        READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        NULL
+    );
+    if (held->handle == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    if (!GetFileInformationByHandle(held->handle, &information)
+        || !GetFileInformationByHandleEx(
+            held->handle,
+            FileAttributeTagInfo,
+            &tag,
+            sizeof(tag)
+        )
+        || (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+        || (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        SetLastError(2001);
+        CloseHandle(held->handle);
+        held->handle = INVALID_HANDLE_VALUE;
+        return 0;
+    }
+    if (!held_directory_security_is_immutable(
+            held->handle,
+            final_namespace
+                ? full_mutation_rights
+                : ancestor_mutation_rights,
+            final_namespace
+        )) {
+        SetLastError(final_namespace ? 2003 : 2002);
+        CloseHandle(held->handle);
+        held->handle = INVALID_HANDLE_VALUE;
+        return 0;
+    }
+    held->volume_serial = information.dwVolumeSerialNumber;
+    held->file_index_high = information.nFileIndexHigh;
+    held->file_index_low = information.nFileIndexLow;
+    chain->count += 1;
+    return 1;
+}
+
+static int held_directory_chain_unchanged(
+    const HeldDirectoryChain *chain
+) {
+    size_t index;
+    if (chain == NULL || chain->count == 0) {
+        return 0;
+    }
+    for (index = 0; index < chain->count; ++index) {
+        BY_HANDLE_FILE_INFORMATION information;
+        FILE_ATTRIBUTE_TAG_INFO tag;
+        const HeldDirectory *held = &chain->entries[index];
+        if (held->handle == INVALID_HANDLE_VALUE
+            || !GetFileInformationByHandle(
+                held->handle,
+                &information
+            )
+            || !GetFileInformationByHandleEx(
+                held->handle,
+                FileAttributeTagInfo,
+                &tag,
+                sizeof(tag)
+            )
+            || information.dwVolumeSerialNumber != held->volume_serial
+            || information.nFileIndexHigh != held->file_index_high
+            || information.nFileIndexLow != held->file_index_low
+            || (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+            || (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int hold_protected_file_chain(
+    const wchar_t *file_path,
+    HeldDirectoryChain *chain
+) {
+    wchar_t parent[32768];
+    wchar_t prefix[32768];
+    size_t length;
+    size_t index;
+    if (chain == NULL
+        || !strict_windows_candidate_path(file_path)
+        || !reject_reparse_chain(file_path)
+        || !parent_directory(
+            file_path,
+            parent,
+            sizeof(parent) / sizeof(parent[0])
+        )) {
+        return 0;
+    }
+    initialize_held_directory_chain(chain);
+    length = wcslen(parent);
+    if (length < 3) {
+        return 0;
+    }
+    prefix[0] = parent[0];
+    prefix[1] = L':';
+    prefix[2] = L'\\';
+    prefix[3] = L'\0';
+    if (!append_held_directory(prefix, length == 3, chain)) {
+        goto rejected;
+    }
+    for (index = 3; index <= length; ++index) {
+        if (index != length && parent[index] != L'\\') {
+            continue;
+        }
+        if (index == 3) {
+            continue;
+        }
+        if (index + 1 > sizeof(prefix) / sizeof(prefix[0])) {
+            goto rejected;
+        }
+        memcpy(prefix, parent, index * sizeof(wchar_t));
+        prefix[index] = L'\0';
+        if (!append_held_directory(
+                prefix,
+                index == length,
+                chain
+            )) {
+            goto rejected;
+        }
+    }
+    SecureZeroMemory(parent, sizeof(parent));
+    SecureZeroMemory(prefix, sizeof(prefix));
+    return held_directory_chain_unchanged(chain);
+
+rejected:
+    close_held_directory_chain(chain);
+    SecureZeroMemory(parent, sizeof(parent));
+    SecureZeroMemory(prefix, sizeof(prefix));
+    return 0;
+}
+
+int hold_production_namespace_chains(
+    HeldDirectoryChain *runtime_chain,
+    HeldDirectoryChain *source_chain,
+    HeldDirectoryChain *credential_chain
+) {
+    initialize_held_directory_chain(runtime_chain);
+    initialize_held_directory_chain(source_chain);
+    initialize_held_directory_chain(credential_chain);
+    if (runtime_chain == NULL
+        || source_chain == NULL
+        || credential_chain == NULL
+        || !hold_protected_file_chain(
+            F3_BROKER_RUNTIME_PATH,
+            runtime_chain
+        )
+        || !hold_protected_file_chain(
+            F3_BROKER_SOURCE_PATH,
+            source_chain
+        )
+        || !hold_protected_file_chain(
+            F3_BROKER_CREDENTIAL_SLOT_PATH,
+            credential_chain
+        )) {
+        close_held_directory_chain(credential_chain);
+        close_held_directory_chain(source_chain);
+        close_held_directory_chain(runtime_chain);
+        return 0;
+    }
+    return held_directory_chain_unchanged(runtime_chain)
+        && held_directory_chain_unchanged(source_chain)
+        && held_directory_chain_unchanged(credential_chain);
 }
 
 int f3_broker_current_process_is_expected_service(void) {
@@ -1603,6 +2027,36 @@ static int validate_candidate_only(const wchar_t *candidate_path) {
 }
 
 #ifdef F3_BROKER_TESTING
+static int test_protected_file_chain(const wchar_t *path) {
+    HeldDirectoryChain chain;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    FILE_ATTRIBUTE_TAG_INFO tag;
+    int ok = hold_protected_file_chain(path, &chain)
+        && (file = CreateFileW(
+            path,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ,
+            NULL,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            NULL
+        )) != INVALID_HANDLE_VALUE
+        && GetFileInformationByHandleEx(
+            file,
+            FileAttributeTagInfo,
+            &tag,
+            sizeof(tag)
+        )
+        && (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+        && (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+        && held_directory_chain_unchanged(&chain);
+    if (file != INVALID_HANDLE_VALUE) {
+        CloseHandle(file);
+    }
+    close_held_directory_chain(&chain);
+    return ok;
+}
+
 static int hash_memory(
     const unsigned char *data,
     DWORD size,
@@ -2643,6 +3097,17 @@ int wmain(int argc, wchar_t **argv) {
         }
         return 0;
     }
+    if (argc == 3 && wcscmp(argv[1], L"--test-protected-file-chain") == 0) {
+        if (!test_protected_file_chain(argv[2])) {
+            fwprintf(
+                stderr,
+                L"native broker namespace chain rejected error=%lu\n",
+                GetLastError()
+            );
+            return 35;
+        }
+        return 0;
+    }
     if (argc == 3 && wcscmp(argv[1], L"--test-cng-key-absent") == 0) {
         if (!cng_key_absent(argv[2])) {
             fwprintf(stderr, L"native broker disposable CNG key still present\n");
@@ -2712,10 +3177,24 @@ int wmain(int argc, wchar_t **argv) {
 #endif
     if (argc == 3 && wcscmp(argv[1], L"--launch") == 0) {
 #if F3_BROKER_PRODUCTION_HANDOFF_READY
+        HeldDirectoryChain runtime_chain;
+        HeldDirectoryChain source_chain;
+        HeldDirectoryChain credential_chain;
         if (!f3_broker_current_process_is_expected_service()) {
             fwprintf(stderr, L"native broker service identity rejected\n");
             return 28;
         }
+        if (!hold_production_namespace_chains(
+                &runtime_chain,
+                &source_chain,
+                &credential_chain
+            )) {
+            fwprintf(stderr, L"native broker production namespace rejected\n");
+            return 36;
+        }
+        close_held_directory_chain(&credential_chain);
+        close_held_directory_chain(&source_chain);
+        close_held_directory_chain(&runtime_chain);
         fwprintf(stderr, L"native broker credential handoff is unimplemented\n");
 #else
         fwprintf(stderr, L"native broker production boundary is unprovisioned\n");
