@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import ast
-import base64
 from contextlib import ExitStack
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import inspect
 import json
 import os
 from pathlib import Path
 import py_compile
+import shutil
 import subprocess
 import sys
 
@@ -17,6 +17,7 @@ import pytest
 from app import factor_v3_formal_bootstrap_renderer as renderer
 from app import factor_v3_formal_bootstrap_runtime as runtime
 from app import factor_v3_formal_control_contract as contract
+from app import factor_v3_formal_supervisor_control as supervisor_control
 from app import factor_v3_formal_trusted_supervisor as supervisor
 
 
@@ -707,22 +708,37 @@ def test_resume_replay_tuple_rejects_a_completed_original_authorization(
 
 def test_actual_completion_supervisor_runtime_and_be3_dispatch_chain(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from tests.test_factor_v3_formal_bootstrap_authorization import (
         _be3_crossline_authorized_fixture,
-        _canonical_bytes,
         _execution_test_key,
-        _sign,
         _write_completion_authorization,
     )
 
     now = datetime.now(timezone.utc).replace(microsecond=0)
-    config, execution_payload, execution_authorization_path, public_der = (
+    config, _execution_payload, execution_authorization_path, public_der = (
         _be3_crossline_authorized_fixture(
             tmp_path,
             authorization_now=now,
         )
     )
+    source_app = Path(__file__).resolve().parents[1] / "app"
+    reviewed_app = Path(str(config["repo_root"])) / "app"
+    for name in (
+        "factor_v3_formal_control_contract.py",
+        "factor_v3_formal_supervisor_loader_runtime.py",
+        "factor_v3_formal_trusted_supervisor.py",
+    ):
+        shutil.copyfile(source_app / name, reviewed_app / name)
+    exclude_path = Path(str(config["repo_root"])) / ".git" / "info" / "exclude"
+    with exclude_path.open("a", encoding="utf-8", newline="\n") as stream:
+        for name in (
+            "factor_v3_formal_control_contract.py",
+            "factor_v3_formal_supervisor_loader_runtime.py",
+            "factor_v3_formal_trusted_supervisor.py",
+        ):
+            stream.write(f"/app/{name}\n")
     completion_payload = renderer._plan_factor_v3_formal_bootstrap_publication_with_test_trust(
         authorization_path=execution_authorization_path,
         trusted_public_key_spki_der=public_der,
@@ -736,146 +752,62 @@ def test_actual_completion_supervisor_runtime_and_be3_dispatch_chain(
         completion_authorization_path=completion_authorization_path,
         trusted_public_key_spki_der=public_der,
     )
-
-    integration_root = Path(supervisor.__file__).resolve().parents[1]
-    supervisor_source = Path(supervisor.__file__).resolve()
-    git_path = Path(str(execution_payload["git_executable_path"]))
-    supervisor_commit = subprocess.run(
-        [str(git_path), "-C", str(integration_root), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    ).stdout.strip()
     completion_path = Path(str(publication["completion_marker_path"]))
-    pins = supervisor._SupervisorPins(
-        base_python_executable_path=str(execution_payload["base_python_executable_path"]),
-        base_python_executable_sha256=str(execution_payload["base_python_executable_sha256"]),
-        bootstrap_completion_marker_path=str(completion_path),
-        bootstrap_completion_marker_sha256=contract.sha256_bytes(completion_path.read_bytes()),
-        bootstrap_completion_schema=contract.PUBLICATION_COMPLETION_SCHEMA,
-        control_contract_source_sha256=supervisor._CONTROL_CONTRACT_SOURCE_SHA256,
-        execution_public_key_spki_der_base64=base64.b64encode(public_der).decode("ascii"),
-        execution_public_key_spki_sha256=contract.sha256_bytes(public_der),
-        git_executable_path=str(git_path),
-        git_executable_sha256=str(execution_payload["git_executable_sha256"]),
-        python_executable_path=str(execution_payload["python_executable_path"]),
-        python_executable_sha256=str(execution_payload["python_executable_sha256"]),
-        repo_root=str(integration_root),
-        supervisor_expected_commit=supervisor_commit,
-        supervisor_source_relative_path=("app/factor_v3_formal_trusted_supervisor.py"),
-        supervisor_source_sha256=contract.sha256_bytes(supervisor_source.read_bytes()),
-        worker_protocol=contract.WORKER_PROTOCOL,
-        worker_terminal_schema=contract.WORKER_TERMINAL_SCHEMA,
+    supervisor_publication = supervisor_control._publish_with_trust(
+        authorization_path=execution_authorization_path,
+        completion_marker_path=completion_path,
+        trusted_public_key_spki_der=public_der,
     )
     ledger_root = (tmp_path / "actual-combined-ledger").resolve()
     ledger_root.mkdir()
-    launch_payload = {
-        "action": "verify",
-        "authorization_id_sha256": execution_payload["authorization_id_sha256"],
-        "authorization_nonce_sha256": execution_payload["authorization_nonce_sha256"],
-        "base_python_executable_path": pins.base_python_executable_path,
-        "base_python_executable_sha256": pins.base_python_executable_sha256,
-        "bootstrap_execution_authorization_path": str(execution_authorization_path),
-        "bootstrap_execution_authorization_sha256": contract.sha256_bytes(
-            execution_authorization_path.read_bytes()
-        ),
-        "bootstrap_output_root": publication["bootstrap_output_root"],
-        "bootstrap_worker_path": publication["bootstrap_path"],
-        "bootstrap_worker_sha256": publication["bootstrap_sha256"],
-        "control_contract_descriptor_sha256": (contract.control_contract_descriptor_sha256()),
-        "control_contract_source_sha256": pins.control_contract_source_sha256,
-        "environment_policy": contract.worker_environment_policy(),
-        "execution_key_id": f"sha256:{pins.execution_public_key_spki_sha256}",
-        "execution_ledger_root": str(ledger_root),
-        "expires_at_utc": (now + timedelta(minutes=30)).isoformat(timespec="seconds"),
-        "formal_input_root_path": execution_payload["formal_input_root_path"],
-        "formal_input_root_sha256": execution_payload["formal_input_root_sha256"],
-        "formal_output_root": execution_payload["formal_output_root"],
-        "git_executable_path": pins.git_executable_path,
-        "git_executable_sha256": pins.git_executable_sha256,
-        "issued_at_utc": now.isoformat(timespec="seconds"),
-        "project_id": "quant-signal-lkj",
-        "publication_completion_marker_path": str(completion_path),
-        "publication_completion_marker_sha256": pins.bootstrap_completion_marker_sha256,
-        "publication_completion_schema": pins.bootstrap_completion_schema,
-        "python_executable_path": pins.python_executable_path,
-        "python_executable_sha256": pins.python_executable_sha256,
-        "repo_root": execution_payload["repo_root"],
-        "replay_scope": contract.EXECUTION_REPLAY_SCOPE,
-        "resume_of_authorization_id_sha256": None,
-        "resume_of_authorization_nonce_sha256": None,
-        "resume_of_authorization_sha256": None,
-        "resume_of_bootstrap_execution_authorization_sha256": None,
-        "resume_of_replay_scope": None,
-        "resume_status_path": None,
-        "resume_status_sha256": None,
-        "review_public_key_spki_sha256": execution_payload["review_public_key_spki_sha256"],
-        "reviewed_commit": execution_payload["expected_commit"],
-        "run_root": execution_payload["run_root"],
-        "run_spec_path": execution_payload["run_spec_path"],
-        "run_spec_sha256": execution_payload["run_spec_sha256"],
-        "schema": supervisor.LAUNCH_AUTHORIZATION_SCHEMA,
-        "source_root_sha256": execution_payload["source_root_sha256"],
-        "stdlib_inventory_root_sha256": execution_payload["stdlib_policy_root_sha256"],
-        "stdlib_policy_path": publication["stdlib_policy_path"],
-        "stdlib_policy_sha256": publication["stdlib_policy_sha256"],
-        "supervisor_expected_commit": pins.supervisor_expected_commit,
-        "supervisor_source_sha256": pins.supervisor_source_sha256,
-        "worker_action": "verify",
-        "worker_argv": contract.exact_worker_argv(
-            python_executable_path=pins.python_executable_path,
-            bootstrap_worker_path=str(publication["bootstrap_path"]),
-            pycache_prefix=str(execution_payload["stdlib_policy"]["pycache_prefix"]),
-        ),
-        "worker_protocol": contract.WORKER_PROTOCOL,
-        "worker_pycache_prefix": execution_payload["stdlib_policy"]["pycache_prefix"],
-        "worker_terminal_schema": contract.WORKER_TERMINAL_SCHEMA,
-        "worker_timeout_seconds": 120,
-    }
-    private_key, _execution_public_der = _execution_test_key(tmp_path)
-    launch_raw = _canonical_bytes(
-        {
-            "payload": launch_payload,
-            "signature_base64": base64.b64encode(
-                _sign(
-                    tmp_path,
-                    private_key,
-                    _canonical_bytes(launch_payload),
-                )
-            ).decode("ascii"),
-        }
+    private_key_path, _execution_public_der = _execution_test_key(tmp_path)
+    launch_authorization = (
+        supervisor_control._build_factor_v3_formal_supervisor_launch_authorization_with_trust(
+            authorization_path=execution_authorization_path,
+            completion_marker_path=completion_path,
+            publication_receipt_path=supervisor_publication[
+                "supervisor_publication_receipt_path"
+            ],
+            private_key_path=private_key_path,
+            trusted_public_key_spki_der=public_der,
+            verify_reviewed_sources=False,
+            action="verify",
+            execution_ledger_root=ledger_root,
+            now_utc=now,
+        )
     )
-    launch_sha256 = contract.sha256_bytes(launch_raw)
-    launch_directory = tmp_path / "launch_authorizations" / "sha256" / launch_sha256[:2]
-    launch_directory.mkdir(parents=True)
-    launch_path = (launch_directory / f"{launch_sha256}.json").resolve()
-    launch_path.write_bytes(launch_raw)
-    environment = {
-        name: os.environ[name] for name in contract.PUBLIC_ENVIRONMENT if name in os.environ
-    }
-    rendered_supervisor_path = (tmp_path / "rendered-formal-supervisor.py").resolve()
-    rendered_supervisor_path.write_bytes(supervisor._render_supervisor_with_test_pins(pins))
-    completed = subprocess.run(
-        [
-            pins.python_executable_path,
-            "-B",
-            str(rendered_supervisor_path),
-            str(launch_path),
-        ],
-        check=False,
-        capture_output=True,
-        env=environment,
-        timeout=180,
-    )
+    real_run = subprocess.run
+    observed: list[subprocess.CompletedProcess[bytes]] = []
 
-    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
-    assert completed.stderr == b""
-    frame = json.loads(completed.stdout)
-    assert frame["schema"] == contract.WORKER_TERMINAL_SCHEMA
-    assert frame["result"] == {
-        "run_root": execution_payload["run_root"],
-        "run_spec_path": execution_payload["run_spec_path"],
-        "source": "be3-crossline-lightweight-runner",
-        "status": "verified",
-    }
+    def capture(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        completed = real_run(*args, **kwargs)
+        observed.append(completed)
+        return completed
+
+    monkeypatch.setattr(supervisor_control.subprocess, "run", capture)
+    try:
+        result = supervisor_control._launch_factor_v3_formal_supervisor_with_trust(
+            authorization_path=execution_authorization_path,
+            completion_marker_path=completion_path,
+            publication_receipt_path=supervisor_publication[
+                "supervisor_publication_receipt_path"
+            ],
+            launch_authorization_path=launch_authorization["launch_authorization_path"],
+            trusted_public_key_spki_der=public_der,
+            environment_snapshot={
+                name: os.environ[name]
+                for name in contract.PUBLIC_ENVIRONMENT
+                if name in os.environ
+            },
+        )
+    except supervisor_control.FormalSupervisorControlError as exc:
+        stderr = observed[-1].stderr.decode("utf-8", errors="replace")
+        raise AssertionError(stderr) from exc
+
+    launch_sha256 = str(launch_authorization["launch_authorization_sha256"])
+    completed_path = supervisor.completed_path_for_authorization(ledger_root, launch_sha256)
+    completed = json.loads(completed_path.read_bytes())
+    assert result["status"] == "completed"
+    assert result["launch_authorization_sha256"] == launch_sha256
+    assert completed["status"] == "completed"
+    assert completed["worker_terminal_sha256"] == result["worker_terminal_sha256"]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import shutil
@@ -20,13 +21,15 @@ from tests.test_factor_v3_formal_bootstrap_authorization import (
 
 def _bootstrap_publication(
     tmp_path: Path,
+    *,
+    action: str = "verify",
 ) -> tuple[Path, Path, bytes]:
     (
         config,
         _payload,
         authorization_path,
         trusted_public_der,
-    ) = _authorized_fixture(tmp_path)
+    ) = _authorized_fixture(tmp_path, action=action)
     source_app = Path(__file__).resolve().parents[1] / "app"
     reviewed_app = Path(str(config["repo_root"])) / "app"
     for name in (
@@ -195,3 +198,125 @@ def test_signed_verify_runs_only_through_external_exact_loader(
         raise AssertionError(stderr) from exc
 
     assert result["status"] == "completed"
+
+
+def test_external_loader_run_claims_before_credential_and_resumes_without_leak(
+    tmp_path: Path,
+) -> None:
+    authorization_path, completion_path, trusted_public_der = _bootstrap_publication(
+        tmp_path,
+        action="run",
+    )
+    publication = control._publish_with_trust(
+        authorization_path=authorization_path,
+        completion_marker_path=completion_path,
+        trusted_public_key_spki_der=trusted_public_der,
+    )
+    ledger_root = (tmp_path / "supervisor-ledger").resolve()
+    ledger_root.mkdir()
+    credential_path = (tmp_path / "points-primary.token").resolve()
+    private_key_path, _public_der = _execution_test_key(tmp_path)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    launch_authorization = (
+        control._build_factor_v3_formal_supervisor_launch_authorization_with_trust(
+            authorization_path=authorization_path,
+            completion_marker_path=completion_path,
+            publication_receipt_path=publication[
+                "supervisor_publication_receipt_path"
+            ],
+            private_key_path=private_key_path,
+            trusted_public_key_spki_der=trusted_public_der,
+            verify_reviewed_sources=False,
+            action="run",
+            credential_path=credential_path,
+            execution_ledger_root=ledger_root,
+            now_utc=now,
+        )
+    )
+    launch_path = Path(str(launch_authorization["launch_authorization_path"]))
+    launch_sha256 = str(launch_authorization["launch_authorization_sha256"])
+
+    with pytest.raises(
+        control.FormalSupervisorControlError,
+        match="trusted supervisor execution rejected",
+    ):
+        control._launch_factor_v3_formal_supervisor_with_trust(
+            authorization_path=authorization_path,
+            completion_marker_path=completion_path,
+            publication_receipt_path=publication[
+                "supervisor_publication_receipt_path"
+            ],
+            launch_authorization_path=launch_path,
+            trusted_public_key_spki_der=trusted_public_der,
+            environment_snapshot={
+                name: os.environ[name]
+                for name in contract.PUBLIC_ENVIRONMENT
+                if name in os.environ
+            },
+        )
+
+    claim_path = supervisor.claim_path_for_authorization(ledger_root, launch_sha256)
+    launch_payload = json.loads(launch_path.read_bytes())["payload"]
+    nonce_replay_sha256 = contract.sha256_bytes(
+        contract.canonical_bytes(
+            {
+                "authorization_nonce_sha256": launch_payload[
+                    "authorization_nonce_sha256"
+                ],
+                "replay_scope": launch_payload["replay_scope"],
+            }
+        )
+    )
+    for category, identity in (
+        ("bootstrap_authorizations", launch_payload["bootstrap_execution_authorization_sha256"]),
+        ("authorization_ids", launch_payload["authorization_id_sha256"]),
+        ("authorization_nonces", nonce_replay_sha256),
+    ):
+        assert (
+            ledger_root
+            / category
+            / "sha256"
+            / str(identity)[:2]
+            / f"{identity}.json"
+        ).is_file()
+    assert claim_path.is_file()
+    assert not supervisor.completed_path_for_authorization(ledger_root, launch_sha256).exists()
+
+    credential_value = "test-only-points-primary-never-log"
+    credential_path.write_text(credential_value, encoding="utf-8", newline="\n")
+    resume_now = datetime.now(timezone.utc).replace(microsecond=0)
+    resume_authorization = (
+        control._build_factor_v3_formal_supervisor_launch_authorization_with_trust(
+            authorization_path=authorization_path,
+            completion_marker_path=completion_path,
+            publication_receipt_path=publication[
+                "supervisor_publication_receipt_path"
+            ],
+            private_key_path=private_key_path,
+            trusted_public_key_spki_der=trusted_public_der,
+            verify_reviewed_sources=False,
+            action="resume",
+            credential_path=credential_path,
+            execution_ledger_root=ledger_root,
+            resume_authorization_path=launch_path,
+            resume_status_path=claim_path,
+            now_utc=resume_now,
+        )
+    )
+    result = control._launch_factor_v3_formal_supervisor_with_trust(
+        authorization_path=authorization_path,
+        completion_marker_path=completion_path,
+        publication_receipt_path=publication["supervisor_publication_receipt_path"],
+        launch_authorization_path=resume_authorization["launch_authorization_path"],
+        trusted_public_key_spki_der=trusted_public_der,
+        environment_snapshot={
+            name: os.environ[name]
+            for name in contract.PUBLIC_ENVIRONMENT
+            if name in os.environ
+        },
+    )
+
+    assert result["status"] == "completed"
+    assert credential_value not in json.dumps(result, sort_keys=True)
+    for ledger_path in ledger_root.rglob("*.json"):
+        assert credential_value.encode("utf-8") not in ledger_path.read_bytes()
