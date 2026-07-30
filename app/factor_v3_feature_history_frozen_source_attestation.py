@@ -767,6 +767,15 @@ def _locked_physical_frozen_source_binding(source_root: str | Path):
                 max_bytes=_MAX_SOURCE_BYTES,
             )
             digest = _sha256(raw)
+            commit_raw = _git_blob_bytes(
+                root,
+                FROZEN_SOURCE_COMMIT,
+                relative_path,
+            )
+            if not hmac.compare_digest(raw, commit_raw):
+                raise ValueError(
+                    "factor-v3 frozen-source commit source binding rejected"
+                )
             entries.append(
                 {
                     "physical_bytes": len(raw),
