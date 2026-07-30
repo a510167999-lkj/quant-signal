@@ -532,7 +532,10 @@ def _fixture(
         "resume_of_authorization_id_sha256": None,
         "resume_of_authorization_sha256": None,
         "resume_of_authorization_nonce_sha256": None,
+        "resume_of_action": None,
         "resume_of_bootstrap_execution_authorization_sha256": None,
+        "resume_of_launch_authorization_schema": None,
+        "resume_of_launch_authorization_signature_sha256": None,
         "resume_of_replay_scope": None,
         "resume_status_path": None,
         "resume_status_sha256": None,
@@ -919,6 +922,10 @@ def test_failed_claim_requires_independently_signed_resume_action(
         fail=True,
     )
     original_sha256 = _file_sha256(authorization_path)
+    original_outer = json.loads(authorization_path.read_bytes())
+    original_signature_sha256 = _sha256(
+        supervisor._decoded_signature(original_outer["signature_base64"])
+    )
 
     with pytest.raises(supervisor.FormalSupervisorError):
         _run_fixture(pins, authorization_path, environment, writes)
@@ -940,8 +947,13 @@ def test_failed_claim_requires_independently_signed_resume_action(
             "resume_of_authorization_id_sha256": original_authorization_id_sha256,
             "resume_of_authorization_sha256": original_sha256,
             "resume_of_authorization_nonce_sha256": original_authorization_nonce_sha256,
+            "resume_of_action": "run",
             "resume_of_bootstrap_execution_authorization_sha256": (
                 original_bootstrap_execution_authorization_sha256
+            ),
+            "resume_of_launch_authorization_schema": supervisor.LAUNCH_AUTHORIZATION_SCHEMA,
+            "resume_of_launch_authorization_signature_sha256": (
+                original_signature_sha256
             ),
             "resume_of_replay_scope": original_replay_scope,
             "resume_status_path": str(claim_path),
@@ -1179,6 +1191,10 @@ def test_original_and_resume_share_one_atomic_worker_and_terminal_lease(
 ) -> None:
     pins, payload, authorization_path, environment, original_writes = _fixture(tmp_path)
     original_sha256 = _file_sha256(authorization_path)
+    original_outer = json.loads(authorization_path.read_bytes())
+    original_signature_sha256 = _sha256(
+        supervisor._decoded_signature(original_outer["signature_base64"])
+    )
     entered_original = threading.Event()
     entered_resume = threading.Event()
     release_original = threading.Event()
@@ -1236,9 +1252,14 @@ def test_original_and_resume_share_one_atomic_worker_and_terminal_lease(
             "resume_of_authorization_id_sha256": payload["authorization_id_sha256"],
             "resume_of_authorization_sha256": original_sha256,
             "resume_of_authorization_nonce_sha256": payload["authorization_nonce_sha256"],
+            "resume_of_action": "run",
             "resume_of_bootstrap_execution_authorization_sha256": payload[
                 "bootstrap_execution_authorization_sha256"
             ],
+            "resume_of_launch_authorization_schema": supervisor.LAUNCH_AUTHORIZATION_SCHEMA,
+            "resume_of_launch_authorization_signature_sha256": (
+                original_signature_sha256
+            ),
             "resume_of_replay_scope": payload["replay_scope"],
             "resume_status_path": str(claim_path),
             "resume_status_sha256": _file_sha256(claim_path),

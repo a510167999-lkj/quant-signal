@@ -651,6 +651,175 @@ def _openssl(
     return completed.stdout
 
 
+def _validated_resume_original(
+    *,
+    publication: Mapping[str, Any],
+    original_path: Path,
+    status_path: Path,
+    ledger_root: Path,
+) -> tuple[dict[str, Any], str, str, str]:
+    handles: list[supervisor._HeldFile] = []
+    try:
+        authorization_sha256 = original_path.stem
+        if _SHA256_RE.fullmatch(authorization_sha256) is None:
+            raise FormalSupervisorControlError("resume launch rejected")
+        supervisor._validate_cas_path(
+            original_path,
+            authorization_sha256,
+            category="launch_authorizations",
+            suffix=".json",
+            label="resume authorization",
+        )
+        bootstrap_root = _absolute(
+            str(publication["config"]["bootstrap_output_root"]),
+            label="bootstrap output root",
+        )
+        expected_original_path = (
+            bootstrap_root
+            / "launch_authorizations"
+            / "sha256"
+            / authorization_sha256[:2]
+            / f"{authorization_sha256}.json"
+        )
+        if os.path.normcase(str(original_path)) != os.path.normcase(
+            str(expected_original_path)
+        ):
+            raise FormalSupervisorControlError("resume launch rejected")
+        original_handle = supervisor._HeldFile(
+            original_path,
+            expected_sha256=authorization_sha256,
+            label="resume authorization",
+            max_bytes=_MAX_AUTHORIZATION_BYTES,
+        )
+        handles.append(original_handle)
+        outer = _strict_json(original_handle.raw, label="resume authorization")
+        if set(outer) != {"payload", "signature_base64"}:
+            raise FormalSupervisorControlError("resume launch rejected")
+        original_value = outer.get("payload")
+        if type(original_value) is not dict:
+            raise FormalSupervisorControlError("resume launch rejected")
+        original_validation_time = supervisor._parse_utc(
+            original_value.get("not_before_utc"),
+            label="resume original not-before time",
+        )
+        original_payload = supervisor._validate_launch_payload(
+            original_value,
+            pins=publication["pins"],
+            now_utc=original_validation_time,
+            trusted_executed_supervisor_path=publication["executed_supervisor_path"],
+            trusted_executed_supervisor_sha256=publication["executed_supervisor_sha256"],
+            trusted_supervisor_loader_path=publication["supervisor_loader_path"],
+            trusted_supervisor_loader_sha256=publication["supervisor_loader_sha256"],
+        )
+        signature = supervisor._decoded_signature(outer.get("signature_base64"))
+        public_der = base64.b64decode(
+            publication["pins"].execution_public_key_spki_der_base64.encode("ascii"),
+            validate=True,
+        )
+        supervisor._verify_signature(
+            _canonical_bytes(original_payload),
+            signature,
+            public_der=public_der,
+        )
+        if (
+            original_payload["schema"] != supervisor.LAUNCH_AUTHORIZATION_SCHEMA
+            or original_payload["action"] != "run"
+            or original_payload["worker_action"] != "run"
+            or original_payload["bootstrap_execution_authorization_sha256"]
+            != publication["config"]["execution_authorization_sha256"]
+        ):
+            raise FormalSupervisorControlError("resume launch rejected")
+        expected_status_path = supervisor.claim_path_for_authorization(
+            ledger_root,
+            authorization_sha256,
+        )
+        if os.path.normcase(str(status_path)) != os.path.normcase(
+            str(expected_status_path)
+        ):
+            raise FormalSupervisorControlError("resume launch rejected")
+        status_handle = supervisor._HeldFile(
+            status_path,
+            expected_sha256=None,
+            label="resume status",
+            max_bytes=_MAX_AUTHORIZATION_BYTES,
+        )
+        handles.append(status_handle)
+        status = _strict_json(status_handle.raw, label="resume status")
+        signature_sha256 = _sha256(signature)
+        if (
+            set(status) != supervisor._CLAIM_FIELDS
+            or status.get("schema") != supervisor.CLAIM_SCHEMA
+            or status.get("status") != "claimed"
+            or status.get("action") != "run"
+            or status.get("launch_authorization_sha256") != authorization_sha256
+            or status.get("launch_authorization_schema")
+            != supervisor.LAUNCH_AUTHORIZATION_SCHEMA
+            or status.get("launch_authorization_signature_sha256") != signature_sha256
+            or status.get("authorization_id_sha256")
+            != original_payload["authorization_id_sha256"]
+            or status.get("authorization_nonce_sha256")
+            != original_payload["authorization_nonce_sha256"]
+            or status.get("bootstrap_execution_authorization_sha256")
+            != original_payload["bootstrap_execution_authorization_sha256"]
+            or status.get("replay_scope") != original_payload["replay_scope"]
+        ):
+            raise FormalSupervisorControlError("resume launch rejected")
+        status_sha256 = _sha256(status_handle.raw)
+        nonce_replay_sha256 = _sha256(
+            _canonical_bytes(
+                {
+                    "authorization_nonce_sha256": original_payload[
+                        "authorization_nonce_sha256"
+                    ],
+                    "replay_scope": original_payload["replay_scope"],
+                }
+            )
+        )
+        for category, identity in (
+            (
+                "bootstrap_authorizations",
+                original_payload["bootstrap_execution_authorization_sha256"],
+            ),
+            ("authorization_ids", original_payload["authorization_id_sha256"]),
+            ("authorization_nonces", nonce_replay_sha256),
+        ):
+            tuple_path = (
+                ledger_root
+                / category
+                / "sha256"
+                / str(identity)[:2]
+                / f"{identity}.json"
+            )
+            tuple_handle = supervisor._HeldFile(
+                tuple_path,
+                expected_sha256=status_sha256,
+                label="resume replay tuple",
+                max_bytes=_MAX_AUTHORIZATION_BYTES,
+            )
+            handles.append(tuple_handle)
+            if tuple_handle.raw != status_handle.raw:
+                raise FormalSupervisorControlError("resume launch rejected")
+        for handle in handles:
+            handle.postverify()
+        return (
+            original_payload,
+            authorization_sha256,
+            signature_sha256,
+            status_sha256,
+        )
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        supervisor.FormalSupervisorError,
+    ):
+        raise FormalSupervisorControlError("resume launch rejected") from None
+    finally:
+        for handle in reversed(handles):
+            handle.close()
+
+
 def _launch_payload(
     *,
     publication: Mapping[str, Any],
@@ -708,7 +877,10 @@ def _launch_payload(
         "resume_of_authorization_id_sha256": None,
         "resume_of_authorization_nonce_sha256": None,
         "resume_of_authorization_sha256": None,
+        "resume_of_action": None,
         "resume_of_bootstrap_execution_authorization_sha256": None,
+        "resume_of_launch_authorization_schema": None,
+        "resume_of_launch_authorization_signature_sha256": None,
         "resume_of_replay_scope": None,
         "resume_status_path": None,
         "resume_status_sha256": None,
@@ -721,23 +893,32 @@ def _launch_payload(
             label="resume authorization",
         )
         status_path = _absolute(str(resume_status_path), label="resume status")
-        original = _strict_json(
-            original_path.read_bytes(),
-            label="resume authorization",
+        (
+            original_payload,
+            original_authorization_sha256,
+            original_signature_sha256,
+            status_sha256,
+        ) = _validated_resume_original(
+            publication=publication,
+            original_path=original_path,
+            status_path=status_path,
+            ledger_root=ledger_root,
         )
-        original_payload = original.get("payload")
-        if type(original_payload) is not dict:
-            raise FormalSupervisorControlError("resume launch rejected")
         resume_values = {
             "resume_of_authorization_id_sha256": original_payload["authorization_id_sha256"],
             "resume_of_authorization_nonce_sha256": original_payload["authorization_nonce_sha256"],
-            "resume_of_authorization_sha256": _sha256(original_path.read_bytes()),
+            "resume_of_authorization_sha256": original_authorization_sha256,
+            "resume_of_action": original_payload["action"],
             "resume_of_bootstrap_execution_authorization_sha256": config[
                 "execution_authorization_sha256"
             ],
+            "resume_of_launch_authorization_schema": original_payload["schema"],
+            "resume_of_launch_authorization_signature_sha256": (
+                original_signature_sha256
+            ),
             "resume_of_replay_scope": contract.EXECUTION_REPLAY_SCOPE,
             "resume_status_path": str(status_path),
-            "resume_status_sha256": _sha256(status_path.read_bytes()),
+            "resume_status_sha256": status_sha256,
         }
         launch_id = str(resume_values["resume_of_authorization_id_sha256"])
         launch_nonce = str(resume_values["resume_of_authorization_nonce_sha256"])
@@ -841,6 +1022,16 @@ def _build_factor_v3_formal_supervisor_launch_authorization_with_trust(
     )
     if verify_reviewed_sources:
         _verify_reviewed_sources(publication)
+    current = datetime.now(timezone.utc).replace(microsecond=0) if now_utc is None else now_utc
+    payload = _launch_payload(
+        publication=publication,
+        action=action,
+        credential_path=credential_path,
+        execution_ledger_root=execution_ledger_root,
+        now_utc=current,
+        resume_authorization_path=resume_authorization_path,
+        resume_status_path=resume_status_path,
+    )
     private_path = _absolute(str(private_key_path), label="execution private key")
     private_handle = supervisor._HeldFile(
         private_path,
@@ -855,16 +1046,6 @@ def _build_factor_v3_formal_supervisor_launch_authorization_with_trust(
         )
         if _sha256(derived_der) != _sha256(trusted_public_key_spki_der):
             raise FormalSupervisorControlError("execution private key role rejected")
-        current = datetime.now(timezone.utc).replace(microsecond=0) if now_utc is None else now_utc
-        payload = _launch_payload(
-            publication=publication,
-            action=action,
-            credential_path=credential_path,
-            execution_ledger_root=execution_ledger_root,
-            now_utc=current,
-            resume_authorization_path=resume_authorization_path,
-            resume_status_path=resume_status_path,
-        )
         signature = _openssl(
             ["dgst", "-sha256", "-sign", str(private_path)],
             input_raw=_canonical_bytes(payload),

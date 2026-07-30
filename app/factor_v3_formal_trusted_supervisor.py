@@ -108,8 +108,9 @@ BOOTSTRAP_EXECUTION_AUTHORIZATION_KEY_ROLE = "factor-v3-bootstrap-execution-auth
 PUBLICATION_RECEIPT_SCHEMA = "factor-v3-formal-bootstrap-publication-receipt/v1"
 SUPERVISOR_PUBLICATION_RECEIPT_SCHEMA = "factor-v3-formal-supervisor-publication-receipt/v1"
 STDLIB_INVENTORY_SCHEMA = STDLIB_POLICY_SCHEMA
-CLAIM_SCHEMA = "factor-v3-formal-supervisor-execution-claim/v1"
-COMPLETED_SCHEMA = "factor-v3-formal-supervisor-execution-completed/v1"
+CLAIM_SCHEMA = "factor-v3-formal-supervisor-execution-claim/v2"
+COMPLETED_SCHEMA = "factor-v3-formal-supervisor-execution-completed/v2"
+RESUME_TRANSITION_SCHEMA = "factor-v3-formal-supervisor-resume-transition/v1"
 WORKER_ENVIRONMENT_POLICY = worker_environment_policy()
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -167,7 +168,10 @@ _LAUNCH_FIELDS = {
     "resume_of_authorization_id_sha256",
     "resume_of_authorization_sha256",
     "resume_of_authorization_nonce_sha256",
+    "resume_of_action",
     "resume_of_bootstrap_execution_authorization_sha256",
+    "resume_of_launch_authorization_schema",
+    "resume_of_launch_authorization_signature_sha256",
     "resume_of_replay_scope",
     "resume_status_path",
     "resume_status_sha256",
@@ -194,6 +198,18 @@ _LAUNCH_FIELDS = {
     "worker_pycache_prefix",
     "worker_terminal_schema",
     "worker_timeout_seconds",
+}
+_CLAIM_FIELDS = {
+    "action",
+    "authorization_id_sha256",
+    "authorization_nonce_sha256",
+    "bootstrap_execution_authorization_sha256",
+    "launch_authorization_schema",
+    "launch_authorization_sha256",
+    "launch_authorization_signature_sha256",
+    "replay_scope",
+    "schema",
+    "status",
 }
 _TERMINAL_FIELDS = set(WORKER_TERMINAL_FIELDS)
 _BOOTSTRAP_EXECUTION_AUTHORIZATION_FIELDS = {
@@ -1319,8 +1335,12 @@ def _validate_launch_payload(
                     "resume_of_authorization_nonce_sha256",
                     "resume_of_authorization_sha256",
                     "resume_of_bootstrap_execution_authorization_sha256",
+                    "resume_of_launch_authorization_signature_sha256",
                 )
             )
+            or payload.get("resume_of_action") != "run"
+            or payload.get("resume_of_launch_authorization_schema")
+            != LAUNCH_AUTHORIZATION_SCHEMA
             or payload.get("resume_of_replay_scope") != EXECUTION_REPLAY_SCOPE
             or payload["authorization_id_sha256"] != payload["resume_of_authorization_id_sha256"]
             or payload["authorization_nonce_sha256"]
@@ -1339,7 +1359,10 @@ def _validate_launch_payload(
             "resume_of_authorization_id_sha256",
             "resume_of_authorization_nonce_sha256",
             "resume_of_authorization_sha256",
+            "resume_of_action",
             "resume_of_bootstrap_execution_authorization_sha256",
+            "resume_of_launch_authorization_schema",
+            "resume_of_launch_authorization_signature_sha256",
             "resume_of_replay_scope",
             "resume_status_path",
             "resume_status_sha256",
@@ -2121,9 +2144,15 @@ def _validate_resume_status(
     stack.callback(held.close)
     status = _strict_canonical_json(held.raw, label="resume status")
     if (
-        status.get("schema") != CLAIM_SCHEMA
+        set(status) != _CLAIM_FIELDS
+        or status.get("schema") != CLAIM_SCHEMA
         or status.get("status") != "claimed"
+        or status.get("action") != payload["resume_of_action"]
         or status.get("launch_authorization_sha256") != payload["resume_of_authorization_sha256"]
+        or status.get("launch_authorization_schema")
+        != payload["resume_of_launch_authorization_schema"]
+        or status.get("launch_authorization_signature_sha256")
+        != payload["resume_of_launch_authorization_signature_sha256"]
         or status.get("authorization_id_sha256") != payload["resume_of_authorization_id_sha256"]
         or status.get("authorization_nonce_sha256")
         != payload["resume_of_authorization_nonce_sha256"]
@@ -2245,11 +2274,13 @@ def _supervise_with_pins(
             trusted_supervisor_loader_path=trusted_supervisor_loader_path,
             trusted_supervisor_loader_sha256=trusted_supervisor_loader_sha256,
         )
+        authorization_signature = _decoded_signature(outer.get("signature_base64"))
         _verify_signature(
             _canonical_bytes(payload),
-            _decoded_signature(outer.get("signature_base64")),
+            authorization_signature,
             public_der=public_der,
         )
+        authorization_signature_sha256 = hashlib.sha256(authorization_signature).hexdigest()
         self_source_path = Path(pins.repo_root) / Path(
             *pins.supervisor_source_relative_path.split("/")
         )
@@ -2451,7 +2482,9 @@ def _supervise_with_pins(
                 "bootstrap_execution_authorization_sha256": payload[
                     "bootstrap_execution_authorization_sha256"
                 ],
+                "launch_authorization_schema": payload["schema"],
                 "launch_authorization_sha256": authorization_sha256,
+                "launch_authorization_signature_sha256": authorization_signature_sha256,
                 "replay_scope": payload["replay_scope"],
                 "schema": CLAIM_SCHEMA,
                 "status": "claimed",
@@ -2467,13 +2500,56 @@ def _supervise_with_pins(
             replay_label="execution authorization",
         )
         ledger_handles.append(claim_handle)
+        resume_transition_sha256: str | None = None
         if payload["action"] == "resume":
-            resumed_handle, _resumed_path, _resumed_sha256 = _ledger_write_once(
+            resume_transition_raw = _canonical_bytes(
+                {
+                    "original_action": payload["resume_of_action"],
+                    "original_authorization_id_sha256": payload[
+                        "resume_of_authorization_id_sha256"
+                    ],
+                    "original_authorization_nonce_sha256": payload[
+                        "resume_of_authorization_nonce_sha256"
+                    ],
+                    "original_bootstrap_execution_authorization_sha256": payload[
+                        "resume_of_bootstrap_execution_authorization_sha256"
+                    ],
+                    "original_claim_sha256": payload["resume_status_sha256"],
+                    "original_launch_authorization_schema": payload[
+                        "resume_of_launch_authorization_schema"
+                    ],
+                    "original_launch_authorization_sha256": payload[
+                        "resume_of_authorization_sha256"
+                    ],
+                    "original_launch_authorization_signature_sha256": payload[
+                        "resume_of_launch_authorization_signature_sha256"
+                    ],
+                    "original_replay_scope": payload["resume_of_replay_scope"],
+                    "resume_action": payload["action"],
+                    "resume_authorization_id_sha256": payload["authorization_id_sha256"],
+                    "resume_authorization_nonce_sha256": payload[
+                        "authorization_nonce_sha256"
+                    ],
+                    "resume_bootstrap_execution_authorization_sha256": payload[
+                        "bootstrap_execution_authorization_sha256"
+                    ],
+                    "resume_claim_sha256": claim_sha256,
+                    "resume_launch_authorization_schema": payload["schema"],
+                    "resume_launch_authorization_sha256": authorization_sha256,
+                    "resume_launch_authorization_signature_sha256": (
+                        authorization_signature_sha256
+                    ),
+                    "resume_replay_scope": payload["replay_scope"],
+                    "schema": RESUME_TRANSITION_SCHEMA,
+                    "status": "resumed",
+                }
+            )
+            resumed_handle, _resumed_path, resume_transition_sha256 = _ledger_write_once(
                 ledger_chain,
                 stack=stack,
                 category="resumed_authorizations",
                 authorization_sha256=str(payload["resume_of_authorization_sha256"]),
-                raw=claim_raw,
+                raw=resume_transition_raw,
                 replay_label="resume authorization",
             )
             ledger_handles.append(resumed_handle)
@@ -2579,6 +2655,10 @@ def _supervise_with_pins(
                 "artifact_manifest_sha256": artifact_manifest_sha256,
                 "claim_sha256": claim_sha256,
                 "launch_authorization_sha256": authorization_sha256,
+                "resume_of_authorization_sha256": payload[
+                    "resume_of_authorization_sha256"
+                ],
+                "resume_transition_sha256": resume_transition_sha256,
                 "schema": COMPLETED_SCHEMA,
                 "status": "completed",
                 "worker_terminal_sha256": hashlib.sha256(stdout).hexdigest(),

@@ -71,6 +71,10 @@ def _bootstrap_publication(
         ).stdout.strip()
         == config["expected_commit"]
     )
+    exclude_raw = (repo_root / ".git" / "info" / "exclude").read_text(
+        encoding="utf-8"
+    )
+    assert all(relative_path not in exclude_raw for relative_path in reviewed_sources)
     completion_payload = (
         bootstrap_renderer._plan_factor_v3_formal_bootstrap_publication_with_test_trust(
             authorization_path=authorization_path,
@@ -422,6 +426,18 @@ def test_external_loader_run_claims_before_credential_and_resumes_without_leak(
     assert completed["launch_authorization_sha256"] == resume_sha256
     assert completed["resume_of_authorization_sha256"] == launch_sha256
     assert completed["resume_transition_sha256"] == contract.sha256_bytes(transition_raw)
+    assert set(completed) == {
+        "artifact_manifest_sha256",
+        "claim_sha256",
+        "launch_authorization_sha256",
+        "resume_of_authorization_sha256",
+        "resume_transition_sha256",
+        "schema",
+        "status",
+        "worker_terminal_sha256",
+    }
+    assert completed["schema"] == "factor-v3-formal-supervisor-execution-completed/v2"
+    assert completed["status"] == "completed"
     assert credential_value not in json.dumps(result, sort_keys=True)
     for ledger_path in ledger_root.rglob("*.json"):
         assert credential_value.encode("utf-8") not in ledger_path.read_bytes()

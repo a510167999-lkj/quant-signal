@@ -760,6 +760,10 @@ def test_actual_completion_supervisor_runtime_and_be3_dispatch_chain(
         ).stdout.strip()
         == config["expected_commit"]
     )
+    exclude_raw = (repo_root / ".git" / "info" / "exclude").read_text(
+        encoding="utf-8"
+    )
+    assert all(relative_path not in exclude_raw for relative_path in reviewed_sources)
     completion_payload = renderer._plan_factor_v3_formal_bootstrap_publication_with_test_trust(
         authorization_path=execution_authorization_path,
         trusted_public_key_spki_der=public_der,
