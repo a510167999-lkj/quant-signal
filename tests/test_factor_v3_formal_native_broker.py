@@ -723,7 +723,7 @@ def test_native_candidate_parser_rejects_windows_path_aliases(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
-def test_native_broker_rejects_hardlinked_fixed_source_and_credential_slots(
+def test_native_broker_rejects_hardlinked_source_without_preopening_credential(
     tmp_path: Path,
 ) -> None:
     native, _helper = _compile_fixture_broker(tmp_path)
@@ -743,7 +743,7 @@ def test_native_broker_rejects_hardlinked_fixed_source_and_credential_slots(
 
     credential_hardlink = tmp_path / "credential-hardlink.slot"
     os.link(tmp_path / "dummy-credential.slot", credential_hardlink)
-    rejected_credential = subprocess.run(
+    credential_not_touched = subprocess.run(
         [
             str(native),
             "--test-launch",
@@ -755,8 +755,8 @@ def test_native_broker_rejects_hardlinked_fixed_source_and_credential_slots(
         text=True,
         timeout=30,
     )
-    assert rejected_credential.returncode != 0
-    assert not (tmp_path / "credential-out").exists()
+    assert credential_not_touched.returncode == 0
+    assert (tmp_path / "credential-out").exists()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")

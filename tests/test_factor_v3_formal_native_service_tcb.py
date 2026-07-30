@@ -468,6 +468,23 @@ def test_restricted_child_gets_credential_only_after_bound_ready_and_broker_comp
         native, candidate, provisional, completed, secret, claim_sha256 = (
             _build_handoff_fixture(root)
         )
+        credential = root / "broker-secret" / "points-primary.slot"
+        hardlink = root / "broker-secret" / "points-primary-hardlink.slot"
+        os.link(credential, hardlink)
+        rejected_key = f"quant-signal-lkj-disposable-test-{uuid.uuid4()}"
+        rejected = _run(
+            native,
+            "--test-credential-handoff",
+            str(candidate),
+            str(provisional),
+            str(completed),
+            rejected_key,
+        )
+        assert rejected.returncode != 0
+        assert not provisional.exists()
+        assert not completed.exists()
+        hardlink.unlink()
+
         key_name = f"quant-signal-lkj-disposable-test-{uuid.uuid4()}"
         launched = _run(
             native,
