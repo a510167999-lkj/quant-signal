@@ -1,3 +1,7 @@
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+
 #include <windows.h>
 #include <aclapi.h>
 #include <bcrypt.h>
@@ -972,21 +976,25 @@ static int quoted_command_line(
 
 static int launch_test_child(
     const wchar_t *output_path,
-    int close_job_after_child_ready
+    int close_job_after_child_ready,
+    int close_job_before_child_resume
 ) {
-    STARTUPINFOW startup;
+    STARTUPINFOEXW startup;
     PROCESS_INFORMATION process;
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+    PPROC_THREAD_ATTRIBUTE_LIST attributes = NULL;
+    SIZE_T attributes_size = 0;
     HANDLE job = NULL;
     wchar_t command_line[32768];
     wchar_t runtime_directory[32768];
     wchar_t *environment = NULL;
     DWORD exit_code = 1;
+    BOOL process_in_job = FALSE;
     int ok = 0;
     memset(&startup, 0, sizeof(startup));
     memset(&process, 0, sizeof(process));
     memset(&limits, 0, sizeof(limits));
-    startup.cb = sizeof(startup);
+    startup.StartupInfo.cb = sizeof(startup);
     if (!quoted_command_line(
             F3_BROKER_RUNTIME_PATH,
             output_path,
@@ -1014,24 +1022,74 @@ static int launch_test_child(
             JobObjectExtendedLimitInformation,
             &limits,
             sizeof(limits)
+        )) {
+        goto cleanup;
+    }
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attributes_size);
+    if (attributes_size == 0) {
+        goto cleanup;
+    }
+    attributes = (PPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        attributes_size
+    );
+    if (attributes == NULL
+        || !InitializeProcThreadAttributeList(
+            attributes,
+            1,
+            0,
+            &attributes_size
         )
-        || !CreateProcessW(
+        || !UpdateProcThreadAttribute(
+            attributes,
+            0,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST,
+            &job,
+            sizeof(job),
+            NULL,
+            NULL
+        )) {
+        goto cleanup;
+    }
+    startup.lpAttributeList = attributes;
+    if (!CreateProcessW(
             F3_BROKER_RUNTIME_PATH,
             command_line,
             NULL,
             NULL,
             FALSE,
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            CREATE_SUSPENDED
+                | CREATE_UNICODE_ENVIRONMENT
+                | CREATE_NO_WINDOW
+                | EXTENDED_STARTUPINFO_PRESENT,
             environment,
             runtime_directory,
-            &startup,
+            &startup.StartupInfo,
             &process
         )
-        || !AssignProcessToJobObject(job, process.hProcess)
-        || ResumeThread(process.hThread) == (DWORD)-1) {
+        || !IsProcessInJob(process.hProcess, job, &process_in_job)
+        || !process_in_job) {
         if (process.hProcess != NULL) {
             TerminateProcess(process.hProcess, 90);
         }
+        goto cleanup;
+    }
+    if (close_job_before_child_resume) {
+        CloseHandle(job);
+        job = NULL;
+        if (WaitForSingleObject(process.hProcess, 5000) != WAIT_OBJECT_0
+            || !GetExitCodeProcess(process.hProcess, &exit_code)
+            || exit_code == STILL_ACTIVE
+            || GetFileAttributesW(output_path) != INVALID_FILE_ATTRIBUTES) {
+            TerminateProcess(process.hProcess, 94);
+            goto cleanup;
+        }
+        ok = 1;
+        goto cleanup;
+    }
+    if (ResumeThread(process.hThread) == (DWORD)-1) {
+        TerminateProcess(process.hProcess, 90);
         goto cleanup;
     }
     if (close_job_after_child_ready) {
@@ -1071,6 +1129,10 @@ cleanup:
     if (job != NULL) {
         CloseHandle(job);
     }
+    if (attributes != NULL) {
+        DeleteProcThreadAttributeList(attributes);
+        HeapFree(GetProcessHeap(), 0, attributes);
+    }
     if (environment != NULL) {
         SecureZeroMemory(environment, 32768 * sizeof(wchar_t));
         HeapFree(GetProcessHeap(), 0, environment);
@@ -1108,7 +1170,8 @@ static int validate_candidate_only(const wchar_t *candidate_path) {
 static int test_launch(
     const wchar_t *candidate_path,
     const wchar_t *output_path,
-    int close_job_after_child_ready
+    int close_job_after_child_ready,
+    int close_job_before_child_resume
 ) {
     HeldFile runtime = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile source = {INVALID_HANDLE_VALUE, 0, 0, {0}};
@@ -1138,7 +1201,11 @@ static int test_launch(
         ok = 0;
         goto cleanup;
     }
-    ok = launch_test_child(output_path, close_job_after_child_ready);
+    ok = launch_test_child(
+        output_path,
+        close_job_after_child_ready,
+        close_job_before_child_resume
+    );
     if (ok) {
         ok = held_unchanged(&candidate, NULL)
             && held_unchanged(&source, F3_BROKER_SOURCE_SHA256)
@@ -1178,16 +1245,26 @@ int wmain(int argc, wchar_t **argv) {
         return 0;
     }
     if (argc == 4 && wcscmp(argv[1], L"--test-launch") == 0) {
-        if (!test_launch(argv[2], argv[3], 0)) {
+        if (!test_launch(argv[2], argv[3], 0, 0)) {
             fwprintf(stderr, L"native broker test boundary rejected\n");
             return 21;
         }
         return 0;
     }
     if (argc == 4 && wcscmp(argv[1], L"--test-job-kill") == 0) {
-        if (!test_launch(argv[2], argv[3], 1)) {
+        if (!test_launch(argv[2], argv[3], 1, 0)) {
             fwprintf(stderr, L"native broker job boundary rejected\n");
             return 24;
+        }
+        return 0;
+    }
+    if (
+        argc == 4
+        && wcscmp(argv[1], L"--test-job-pre-resume-kill") == 0
+    ) {
+        if (!test_launch(argv[2], argv[3], 0, 1)) {
+            fwprintf(stderr, L"native broker atomic job boundary rejected\n");
+            return 26;
         }
         return 0;
     }
