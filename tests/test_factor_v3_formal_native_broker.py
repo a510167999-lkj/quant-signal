@@ -349,6 +349,32 @@ def test_candidate_builder_rejects_invalid_action_paths_and_resume_shape(
         )
 
 
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        r"\\server\share\authorization.json",
+        r"\\?\C:\frozen\authorization.json",
+        r"C:\frozen\authorization.json:stream",
+        "C:\\frozen\\control\x01authorization.json",
+        r"C:\frozen\trailing.\authorization.json",
+        "C:\\frozen\\trailing \\authorization.json",
+        r"C:\frozen\..\authorization.json",
+        r"C:\PROGRA~1\authorization.json",
+        r"C:\frozen\NUL.txt",
+    ],
+)
+def test_candidate_builder_rejects_windows_path_aliases(
+    tmp_path: Path,
+    unsafe_path: str,
+) -> None:
+    paths = _public_paths(tmp_path)
+    with pytest.raises(Exception, match="path"):
+        _broker_module().build_factor_v3_formal_native_broker_candidate(
+            action="verify",
+            **{**paths, "authorization_path": unsafe_path},
+        )
+
+
 def test_resume_candidate_binds_only_public_resume_paths(tmp_path: Path) -> None:
     broker = _broker_module()
     paths = _public_paths(tmp_path)
@@ -560,6 +586,38 @@ def test_native_broker_rejects_relative_public_path_in_untrusted_candidate(
     drifted = raw.replace(
         f"authorization_path={paths['authorization_path']}\n".encode("utf-8"),
         b"authorization_path=relative.json\n",
+    )
+    assert drifted != raw
+    candidate_path = _write_raw_candidate(tmp_path / "untrusted", drifted)
+    completed = subprocess.run(
+        [str(native), "--validate-candidate", str(candidate_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode != 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        r"C:\frozen\authorization.json:stream",
+        r"C:\frozen\..\authorization.json",
+        r"C:\PROGRA~1\authorization.json",
+        r"C:\frozen\NUL.txt",
+    ],
+)
+def test_native_candidate_parser_rejects_windows_path_aliases(
+    tmp_path: Path,
+    unsafe_path: str,
+) -> None:
+    native, _helper = _compile_fixture_broker(tmp_path)
+    raw, paths = _candidate(tmp_path, action="verify")
+    drifted = raw.replace(
+        f"authorization_path={paths['authorization_path']}\n".encode("utf-8"),
+        f"authorization_path={unsafe_path}\n".encode("utf-8"),
     )
     assert drifted != raw
     candidate_path = _write_raw_candidate(tmp_path / "untrusted", drifted)
