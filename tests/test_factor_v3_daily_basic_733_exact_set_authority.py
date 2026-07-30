@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from app import factor_v3_daily_basic_733_exact_set_authority as authority
+from app import factor_v3_daily_basic_runner as runner
 from app import jiaoch_daily_basic_exact_set_authority as legacy
 from app.jiaoch_points_response_normalization import NormalizedDailyBasicRow
 
@@ -287,3 +288,91 @@ def test_capability_free_verifier_rejects_deleted_or_tampered_terminal_artifacts
         authority.verify_factor_v3_daily_basic_733_exact_set_coverage(
             **_verify_kwargs(kwargs, publication)
         )
+
+
+def test_runner_verify_cli_replays_real_v2_terminal_verifier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, _prewindow, _development = _kwargs(tmp_path, monkeypatch)
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    points_root = run_root / "points-output"
+    authority_root = run_root / "exact-set-authority"
+    points_root.mkdir()
+    authority_root.mkdir()
+    kwargs["points_output_root"] = points_root
+    kwargs["output_root"] = authority_root
+    kwargs["expected_development_temporal_role"] = "development_4"
+    exact_inputs = {
+        key: (
+            str(kwargs[key])
+            if isinstance(kwargs[key], Path)
+            else kwargs[key]
+        )
+        for key in (
+            "feature_history_run_spec_path",
+            "feature_history_run_root",
+            "audited_development_universe_sqlite_path",
+            "expected_development_coverage_audit_sha256",
+            "expected_development_artifact_root_sha256",
+            "expected_development_temporal_contract_sha256",
+            "expected_development_temporal_role",
+            "security_code_transition_evidence_root",
+            "expected_security_code_transition_contract_sha256",
+        )
+    }
+    spec = runner.build_factor_v3_daily_basic_run_spec(
+        exact_set_authority_inputs=exact_inputs,
+        timeout_seconds=30,
+        max_attempts=3,
+    )
+    spec_path = tmp_path / "run-spec.json"
+    spec_path.write_bytes(authority._canonical_bytes(spec))
+    publication = authority.publish_factor_v3_daily_basic_733_exact_set_coverage(
+        **kwargs
+    )
+    verified = authority.verify_factor_v3_daily_basic_733_exact_set_coverage(
+        **_verify_kwargs(kwargs, publication)
+    )
+    paths = runner._paths(run_root, create=False)
+    runner._load_or_initialize(paths, spec, allow_initialize=True)
+    runner._atomic_json(
+        paths["state"],
+        runner._state_payload(
+            run_spec_sha256=spec["run_spec_sha256"],
+            status="verified",
+            completed_session_count=733,
+            credential_generation_id="d8d8b232-8b60-4e76-bdd4-f511e2492b96",
+            collection_set_refs=kwargs["collection_set_refs"],
+            exact_set_publication=publication,
+            receipt={
+                "authority_root_sha256": verified["authority_root_sha256"],
+                "receipt_relative_path": publication["receipt_relative_path"],
+                "receipt_sha256": verified["receipt_sha256"],
+                "verified": True,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_assert_complete_points_output",
+        lambda *_args, **_kwargs: None,
+    )
+    attestation = authority_root / Path(
+        *publication["attestation_relative_path"].split("/")
+    )
+    attestation.unlink()
+
+    assert (
+        runner.main(
+            [
+                "verify",
+                "--run-spec",
+                str(spec_path),
+                "--run-root",
+                str(run_root),
+            ]
+        )
+        == 2
+    )

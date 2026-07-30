@@ -21,7 +21,6 @@ import sys
 from typing import Any
 import uuid
 
-from app import audited_pit_factor_v3_feature_history_authority as history_authority
 from app.durable_io import fsync_directory, fsync_file
 
 try:
@@ -46,8 +45,8 @@ __all__ = (
 )
 
 
-_RUN_SPEC_SCHEMA = "factor-v3-daily-basic-run-spec/v1"
-_RUN_STATE_SCHEMA = "factor-v3-daily-basic-run-state/v1"
+_RUN_SPEC_SCHEMA = "factor-v3-daily-basic-run-spec/v2"
+_RUN_STATE_SCHEMA = "factor-v3-daily-basic-run-state/v2"
 _POLICY_SCHEMA = "jiaoch-credential-factor-v3-daily-basic-policy-descriptor/v1"
 _POLICY_DOCUMENT_SCHEMA = "jiaoch-credential-factor-v3-daily-basic-routing-policy/v1"
 _MAX_RUN_SPEC_BYTES = 4 * 1024 * 1024
@@ -59,13 +58,12 @@ _RUN_SPEC_FIELDS = frozenset(
         "collection_policy_descriptor",
         "collector",
         "exact_set_authority_inputs",
-        "feature_history_authority_receipt_sha256",
-        "feature_history_collection_plan_sha256",
         "run_spec_sha256",
         "schema",
         "session_count",
         "sessions",
         "sessions_sha256",
+        "source_authority_root_sha256",
     }
 )
 _STATE_FIELDS = frozenset(
@@ -83,12 +81,14 @@ _STATE_FIELDS = frozenset(
 )
 _EXACT_INPUT_FIELDS = frozenset(
     {
-        "audited_universe_sqlite_path",
-        "expected_artifact_root_sha256",
-        "expected_coverage_audit_sha256",
+        "audited_development_universe_sqlite_path",
+        "expected_development_artifact_root_sha256",
+        "expected_development_coverage_audit_sha256",
+        "expected_development_temporal_contract_sha256",
+        "expected_development_temporal_role",
         "expected_security_code_transition_contract_sha256",
-        "expected_temporal_contract_sha256",
-        "expected_temporal_role",
+        "feature_history_run_root",
+        "feature_history_run_spec_path",
         "security_code_transition_evidence_root",
     }
 )
@@ -285,49 +285,67 @@ def _validated_exact_inputs(value: Any) -> dict[str, Any]:
     if type(value) is not dict or set(value) != _EXACT_INPUT_FIELDS:
         raise FactorV3DailyBasicRunnerError("factor-v3 daily-basic exact-set inputs rejected")
     output = json.loads(_canonical_bytes(value))
-    for field in ("audited_universe_sqlite_path", "security_code_transition_evidence_root"):
+    for field in (
+        "audited_development_universe_sqlite_path",
+        "feature_history_run_root",
+        "feature_history_run_spec_path",
+        "security_code_transition_evidence_root",
+    ):
         if type(output[field]) is not str or not Path(output[field]).is_absolute():
             raise FactorV3DailyBasicRunnerError("factor-v3 daily-basic exact-set inputs rejected")
     for field in (
-        "expected_artifact_root_sha256",
-        "expected_coverage_audit_sha256",
+        "expected_development_artifact_root_sha256",
+        "expected_development_coverage_audit_sha256",
+        "expected_development_temporal_contract_sha256",
         "expected_security_code_transition_contract_sha256",
-        "expected_temporal_contract_sha256",
     ):
         _require_sha256(output[field], label=field)
-    if output["expected_temporal_role"] != "development_4":
+    if output["expected_development_temporal_role"] != "development_4":
         raise FactorV3DailyBasicRunnerError("factor-v3 daily-basic temporal role rejected")
     return output
 
 
-def _verified_history_sources(
-    *,
-    feature_history_collection_plan: Mapping[str, Any],
-    feature_history_authority_receipt: Mapping[str, Any],
-    development_session_refs: Sequence[Mapping[str, Any]],
-) -> tuple[list[str], list[str], str, str]:
-    """Rebuild the two frozen sources instead of accepting caller date labels."""
+def _verified_733_sources(
+    exact_set_authority_inputs: Mapping[str, Any],
+) -> tuple[list[str], str]:
+    """Rebuild the ordered 250+483 union from both durable authorities."""
 
+    from app import factor_v3_daily_basic_733_exact_set_authority as authority
+
+    inputs = _validated_exact_inputs(exact_set_authority_inputs)
     try:
-        prewindow = history_authority._verify_plan_self_integrity(feature_history_collection_plan)
-        development = history_authority._validated_development_sessions(development_session_refs)
-    except (AttributeError, ValueError) as exc:
-        raise FactorV3DailyBasicRunnerError("factor-v3 daily-basic history sources rejected") from exc
-    receipt = feature_history_authority_receipt
-    if (
-        type(receipt) is not dict
-        or receipt.get("verified") is not True
-        or receipt.get("authority_status") != "VERIFIED_FEATURE_HISTORY_ONLY"
-        or receipt.get("feature_history_only") is not True
-        or receipt.get("collection_plan_sha256") != feature_history_collection_plan.get("plan_sha256")
-        or receipt.get("session_count") != len(prewindow)
-        or receipt.get("sessions_sha256") != _sha256(prewindow)
-    ):
-        raise FactorV3DailyBasicRunnerError("factor-v3 daily-basic prewindow authority rejected")
-    receipt_sha256 = receipt.get("receipt_sha256")
-    if receipt_sha256 != _sha256({key: item for key, item in receipt.items() if key != "receipt_sha256"}):
-        raise FactorV3DailyBasicRunnerError("factor-v3 daily-basic prewindow authority rejected")
-    return list(prewindow), list(development), str(feature_history_collection_plan["plan_sha256"]), receipt_sha256
+        source, identity = authority._load_733_authority(
+            feature_history_run_spec_path=inputs["feature_history_run_spec_path"],
+            feature_history_run_root=inputs["feature_history_run_root"],
+            audited_development_universe_sqlite_path=inputs[
+                "audited_development_universe_sqlite_path"
+            ],
+            expected_development_coverage_audit_sha256=inputs[
+                "expected_development_coverage_audit_sha256"
+            ],
+            expected_development_artifact_root_sha256=inputs[
+                "expected_development_artifact_root_sha256"
+            ],
+            expected_development_temporal_contract_sha256=inputs[
+                "expected_development_temporal_contract_sha256"
+            ],
+            expected_development_temporal_role=inputs[
+                "expected_development_temporal_role"
+            ],
+        )
+    except (AttributeError, KeyError, OSError, ValueError) as exc:
+        raise FactorV3DailyBasicRunnerError(
+            "factor-v3 daily-basic 733 source authorities rejected"
+        ) from exc
+    sessions = [partition.trade_date for partition in source.partitions]
+    _validate_sessions(sessions, expected_count=733)
+    root_sha256 = identity.get("root_sha256")
+    _require_sha256(root_sha256, label="source authority root")
+    if identity.get("sessions_sha256") != _sha256(sessions):
+        raise FactorV3DailyBasicRunnerError(
+            "factor-v3 daily-basic 733 source authorities rejected"
+        )
+    return sessions, root_sha256
 
 
 def _validated_run_spec(value: Any) -> dict[str, Any]:
@@ -344,16 +362,12 @@ def _validated_run_spec(value: Any) -> dict[str, Any]:
     _validated_policy(value.get("collection_policy_descriptor"))
     _validated_collector(value.get("collector"))
     _validated_exact_inputs(value.get("exact_set_authority_inputs"))
-    _require_sha256(value.get("feature_history_collection_plan_sha256"), label="history plan hash")
-    _require_sha256(value.get("feature_history_authority_receipt_sha256"), label="history receipt hash")
+    _require_sha256(value.get("source_authority_root_sha256"), label="source authority root")
     return json.loads(_canonical_bytes(value))
 
 
 def build_factor_v3_daily_basic_run_spec(
     *,
-    feature_history_collection_plan: Mapping[str, Any],
-    feature_history_authority_receipt: Mapping[str, Any],
-    development_session_refs: Sequence[Mapping[str, Any]],
     exact_set_authority_inputs: Mapping[str, Any],
     timeout_seconds: float,
     max_attempts: int,
@@ -365,19 +379,14 @@ def build_factor_v3_daily_basic_run_spec(
     later consumes a smaller shifted source-date label union.
     """
 
-    prewindow, development, plan_sha256, receipt_sha256 = _verified_history_sources(
-        feature_history_collection_plan=feature_history_collection_plan,
-        feature_history_authority_receipt=feature_history_authority_receipt,
-        development_session_refs=development_session_refs,
-    )
-    sessions = [*prewindow, *development]
+    validated_inputs = _validated_exact_inputs(exact_set_authority_inputs)
+    sessions, source_authority_root_sha256 = _verified_733_sources(validated_inputs)
     _validate_sessions(sessions, expected_count=733)
     if sessions != sorted(sessions) or len(set(sessions)) != 733:
         raise FactorV3DailyBasicRunnerError("factor-v3 daily-basic requires exact 733 sessions")
     unsigned = {
         "schema": _RUN_SPEC_SCHEMA,
-        "feature_history_collection_plan_sha256": plan_sha256,
-        "feature_history_authority_receipt_sha256": receipt_sha256,
+        "source_authority_root_sha256": source_authority_root_sha256,
         "sessions": sessions,
         "session_count": len(sessions),
         "sessions_sha256": _sha256(sessions),
@@ -385,7 +394,7 @@ def build_factor_v3_daily_basic_run_spec(
         "collector": _validated_collector(
             {"timeout_seconds": timeout_seconds, "max_attempts": max_attempts, "workers": 1}
         ),
-        "exact_set_authority_inputs": _validated_exact_inputs(exact_set_authority_inputs),
+        "exact_set_authority_inputs": validated_inputs,
     }
     return _validated_run_spec({**unsigned, "run_spec_sha256": _sha256(unsigned)})
 
@@ -553,26 +562,119 @@ def _assert_complete_points_output(points_root: Path, refs: Sequence[Mapping[str
             raise FactorV3DailyBasicRunnerError("factor-v3 daily-basic points output has partial artifacts")
 
 
-def _publish_exact_set_coverage(*, authority_root: Path, points_root: Path, refs: Sequence[Mapping[str, Any],], inputs: Mapping[str, Any]) -> dict[str, Any]:
-    from app import jiaoch_daily_basic_exact_set_authority as authority
+def _exact_set_kwargs(
+    *,
+    authority_root: Path,
+    points_root: Path,
+    refs: Sequence[Mapping[str, Any]],
+    inputs: Mapping[str, Any],
+) -> dict[str, Any]:
+    validated = _validated_exact_inputs(inputs)
+    return {
+        "feature_history_run_spec_path": validated["feature_history_run_spec_path"],
+        "feature_history_run_root": validated["feature_history_run_root"],
+        "audited_development_universe_sqlite_path": validated[
+            "audited_development_universe_sqlite_path"
+        ],
+        "expected_development_coverage_audit_sha256": validated[
+            "expected_development_coverage_audit_sha256"
+        ],
+        "expected_development_artifact_root_sha256": validated[
+            "expected_development_artifact_root_sha256"
+        ],
+        "expected_development_temporal_contract_sha256": validated[
+            "expected_development_temporal_contract_sha256"
+        ],
+        "expected_development_temporal_role": validated[
+            "expected_development_temporal_role"
+        ],
+        "points_output_root": points_root,
+        "collection_set_refs": refs,
+        "security_code_transition_evidence_root": validated[
+            "security_code_transition_evidence_root"
+        ],
+        "expected_security_code_transition_contract_sha256": validated[
+            "expected_security_code_transition_contract_sha256"
+        ],
+        "output_root": authority_root,
+    }
 
-    publication = authority.publish_daily_basic_exact_set_coverage(
-        audited_universe_sqlite_path=inputs["audited_universe_sqlite_path"],
-        expected_coverage_audit_sha256=inputs["expected_coverage_audit_sha256"],
-        expected_artifact_root_sha256=inputs["expected_artifact_root_sha256"],
-        expected_temporal_contract_sha256=inputs["expected_temporal_contract_sha256"],
-        expected_temporal_role=inputs["expected_temporal_role"],
-        points_output_root=points_root,
-        collection_set_refs=refs,
-        security_code_transition_evidence_root=inputs["security_code_transition_evidence_root"],
-        expected_security_code_transition_contract_sha256=inputs["expected_security_code_transition_contract_sha256"],
-        output_root=authority_root,
+
+def _publish_exact_set_coverage(
+    *,
+    authority_root: Path,
+    points_root: Path,
+    refs: Sequence[Mapping[str, Any]],
+    inputs: Mapping[str, Any],
+) -> dict[str, Any]:
+    from app import factor_v3_daily_basic_733_exact_set_authority as authority
+
+    publication = authority.publish_factor_v3_daily_basic_733_exact_set_coverage(
+        **_exact_set_kwargs(
+            authority_root=authority_root,
+            points_root=points_root,
+            refs=refs,
+            inputs=inputs,
+        )
     )
-    required = {"authority_root_sha256", "publication_capability", "publication_status", "receipt_created", "receipt_relative_path", "receipt_sha256", "schema"}
-    if type(publication) is not dict or set(publication) != required or publication["publication_status"] != "DURABLE_POSTVERIFIED_AND_RETURNED":
+    required = {
+        "attestation_relative_path",
+        "attestation_sha256",
+        "publication_relative_path",
+        "publication_sha256",
+        "receipt_relative_path",
+        "receipt_sha256",
+        "schema",
+    }
+    if (
+        type(publication) is not dict
+        or set(publication) != required
+        or publication["schema"]
+        != "factor-v3-daily-basic-733-exact-set-publication/v2"
+    ):
         raise FactorV3DailyBasicRunnerError("factor-v3 daily-basic exact-set publication rejected")
-    # The capability is deliberately kept out of durable runner state and results.
-    return {key: value for key, value in publication.items() if key != "publication_capability"}
+    return dict(publication)
+
+
+def _verify_exact_set_coverage(
+    *,
+    authority_root: Path,
+    points_root: Path,
+    refs: Sequence[Mapping[str, Any]],
+    inputs: Mapping[str, Any],
+    publication: Mapping[str, Any],
+) -> dict[str, Any]:
+    from app import factor_v3_daily_basic_733_exact_set_authority as authority
+
+    try:
+        verified = authority.verify_factor_v3_daily_basic_733_exact_set_coverage(
+            **_exact_set_kwargs(
+                authority_root=authority_root,
+                points_root=points_root,
+                refs=refs,
+                inputs=inputs,
+            ),
+            publication=publication,
+        )
+    except (KeyError, OSError, ValueError) as exc:
+        raise FactorV3DailyBasicRunnerError(
+            "factor-v3 daily-basic terminal exact-set verification rejected"
+        ) from exc
+    if type(verified) is not dict or verified.get("verified") is not True:
+        raise FactorV3DailyBasicRunnerError(
+            "factor-v3 daily-basic terminal exact-set verification rejected"
+        )
+    sessions = _validate_sessions(verified.get("trade_dates"), expected_count=733)
+    if (
+        verified.get("trade_date_count") != 733
+        or [item.get("trade_date") for item in refs] != sessions
+    ):
+        raise FactorV3DailyBasicRunnerError(
+            "factor-v3 daily-basic terminal exact-set verification rejected"
+        )
+    _require_sha256(verified.get("authority_root_sha256"), label="authority root")
+    _require_sha256(verified.get("receipt_sha256"), label="receipt")
+    return dict(verified)
 
 
 def _result(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -601,7 +703,30 @@ def _run_factor_v3_daily_basic_collection_with_route_credential(
     with _run_lock(paths["lock"]):
         state = _load_or_initialize(paths, spec, allow_initialize=True)
         if state["status"] == "verified":
-            _assert_complete_points_output(_safe_directory(paths["points"], label="points root", create=False), state["collection_set_refs"], sessions)
+            points_root = _safe_directory(
+                paths["points"], label="points root", create=False
+            )
+            _assert_complete_points_output(
+                points_root, state["collection_set_refs"], sessions
+            )
+            exact_verified = _verify_exact_set_coverage(
+                authority_root=_safe_directory(
+                    paths["authority"], label="authority root", create=False
+                ),
+                points_root=points_root,
+                refs=state["collection_set_refs"],
+                inputs=spec["exact_set_authority_inputs"],
+                publication=state["exact_set_publication"],
+            )
+            if (
+                state["receipt"].get("authority_root_sha256")
+                != exact_verified["authority_root_sha256"]
+                or state["receipt"].get("receipt_sha256")
+                != exact_verified["receipt_sha256"]
+            ):
+                raise FactorV3DailyBasicRunnerError(
+                    "factor-v3 daily-basic terminal receipt rejected"
+                )
             return _result(state)
         persisted = state["credential_generation_id"]
         if persisted is not None and persisted != source_generation_id:
@@ -641,7 +766,19 @@ def _run_factor_v3_daily_basic_collection_with_route_credential(
                 authority_root=_safe_directory(paths["authority"], label="authority root", create=True),
                 points_root=points_root, refs=refs, inputs=spec["exact_set_authority_inputs"],
             )
-            receipt = {"authority_root_sha256": publication["authority_root_sha256"], "receipt_relative_path": publication["receipt_relative_path"], "receipt_sha256": publication["receipt_sha256"], "verified": True}
+            exact_verified = _verify_exact_set_coverage(
+                authority_root=paths["authority"],
+                points_root=points_root,
+                refs=refs,
+                inputs=spec["exact_set_authority_inputs"],
+                publication=publication,
+            )
+            receipt = {
+                "authority_root_sha256": exact_verified["authority_root_sha256"],
+                "receipt_relative_path": publication["receipt_relative_path"],
+                "receipt_sha256": exact_verified["receipt_sha256"],
+                "verified": True,
+            }
             verified = _state_payload(
                 run_spec_sha256=spec["run_spec_sha256"], status="verified", completed_session_count=733,
                 credential_generation_id=active_generation, collection_set_refs=refs,
@@ -676,7 +813,32 @@ def verify_factor_v3_daily_basic_run(*, run_spec_path: str | Path, run_root: str
         state = _load_or_initialize(paths, spec, allow_initialize=False)
         if state["status"] != "verified" or state["receipt"] is None:
             raise FactorV3DailyBasicRunnerError("factor-v3 daily-basic run is not verified")
-        _assert_complete_points_output(_safe_directory(paths["points"], label="points root", create=False), state["collection_set_refs"], sessions)
+        points_root = _safe_directory(
+            paths["points"], label="points root", create=False
+        )
+        _assert_complete_points_output(
+            points_root, state["collection_set_refs"], sessions
+        )
+        exact_verified = _verify_exact_set_coverage(
+            authority_root=_safe_directory(
+                paths["authority"], label="authority root", create=False
+            ),
+            points_root=points_root,
+            refs=state["collection_set_refs"],
+            inputs=spec["exact_set_authority_inputs"],
+            publication=state["exact_set_publication"],
+        )
+        if (
+            state["receipt"].get("authority_root_sha256")
+            != exact_verified["authority_root_sha256"]
+            or state["receipt"].get("receipt_sha256")
+            != exact_verified["receipt_sha256"]
+            or state["receipt"].get("receipt_relative_path")
+            != state["exact_set_publication"].get("receipt_relative_path")
+        ):
+            raise FactorV3DailyBasicRunnerError(
+                "factor-v3 daily-basic terminal receipt rejected"
+            )
         return _result(state)
 
 
