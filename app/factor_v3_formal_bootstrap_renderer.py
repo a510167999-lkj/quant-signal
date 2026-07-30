@@ -28,7 +28,7 @@ class FormalBootstrapRenderError(RuntimeError):
 
 
 CONFIG_SCHEMA = "factor-v3-formal-bootstrap-render-config/v1"
-RUNTIME_TEMPLATE_SHA256 = "bf206a2cb5e17ef96527985445391d3d7ef67bc8563fa3fe64d4edb49c8a110a"
+RUNTIME_TEMPLATE_SHA256 = "3d88ad2dd921db20a87d1d6bfa0f3eac72dac47d7aae7f5ecb49f85b97d410e9"
 AUTHORIZATION_SCHEMA = "factor-v3-formal-bootstrap-execution-authorization/v2"
 PUBLICATION_RECEIPT_SCHEMA = "factor-v3-formal-bootstrap-publication-receipt/v1"
 COMPLETION_SCHEMA = "factor-v3-formal-bootstrap-publication-completion/v1"
@@ -53,6 +53,7 @@ _MAX_SOURCE_BYTES = 4 * 1024 * 1024
 _MAX_EXECUTABLE_BYTES = 64 * 1024 * 1024
 _MAX_RUNTIME_BYTES = 8 * 1024 * 1024
 _MAX_WINDOWS_C_COMMAND_BYTES = 30_000
+_MAX_EXECUTION_AUTHORIZATION_LIFETIME_SECONDS = 24 * 60 * 60
 _REPARSE_ATTRIBUTE = 0x00000400
 _WRAPPER_PREFIX = b"import base64,zlib;exec(compile(zlib.decompress(base64.b64decode(b'"
 _WRAPPER_SUFFIX = b"')),'<factor-v3-formal-bootstrap>','exec'))"
@@ -288,7 +289,11 @@ def _validated_replay_claim(
         if now_utc is not None
         else datetime.now(timezone.utc).replace(microsecond=0)
     )
-    if not issued <= not_before < expires or not not_before <= now <= expires:
+    if (
+        not issued <= not_before < expires
+        or not not_before <= now <= expires
+        or (expires - issued).total_seconds() > _MAX_EXECUTION_AUTHORIZATION_LIFETIME_SECONDS
+    ):
         raise FormalBootstrapRenderError("authorization replay window rejected")
     return output
 
@@ -407,12 +412,36 @@ def _read_safe_file(
         os.close(descriptor)
 
 
-def _stdlib_inventory_sha256(path: Path, *, kind: str) -> str:
+def _stdlib_entry_kind_and_module(relative_path: str) -> tuple[str, str]:
+    filename = relative_path.rsplit("/", 1)[-1]
+    for entry_kind, suffixes in (
+        ("source", importlib.machinery.SOURCE_SUFFIXES),
+        ("bytecode", importlib.machinery.BYTECODE_SUFFIXES),
+        ("extension", importlib.machinery.EXTENSION_SUFFIXES),
+        ("dll", (".dll",)),
+    ):
+        for suffix in sorted(suffixes, key=len, reverse=True):
+            if filename.endswith(suffix):
+                stem_path = relative_path[: -len(suffix)]
+                parts = stem_path.split("/")
+                if parts[-1] == "__init__":
+                    parts = parts[:-1]
+                module = ".".join(parts) or "__stdlib_root__"
+                return entry_kind, module
+    raise FormalBootstrapRenderError("stdlib inventory module rejected")
+
+
+def _stdlib_inventory(
+    path: Path,
+    *,
+    kind: str,
+) -> tuple[list[dict[str, Any]], str]:
     if kind == "stdlib_zip":
         if not path.exists():
-            return hashlib.sha256(
+            return [], hashlib.sha256(
                 _canonical_bytes(
                     {
+                        "entries": [],
                         "kind": kind,
                         "path": str(path),
                         "state": "absent",
@@ -425,13 +454,21 @@ def _stdlib_inventory_sha256(path: Path, *, kind: str) -> str:
             max_bytes=_MAX_EXECUTABLE_BYTES,
             allow_hardlinks=True,
         )
-        return hashlib.sha256(
+        entries = [
+            {
+                "bytes": len(raw),
+                "kind": "stdlib_zip",
+                "module": "__stdlib_zip__",
+                "path": path.name,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        ]
+        return entries, hashlib.sha256(
             _canonical_bytes(
                 {
-                    "bytes": len(raw),
+                    "entries": entries,
                     "kind": kind,
                     "path": str(path),
-                    "sha256": hashlib.sha256(raw).hexdigest(),
                 }
             )
         ).hexdigest()
@@ -470,14 +507,18 @@ def _stdlib_inventory_sha256(path: Path, *, kind: str) -> str:
                     max_bytes=_MAX_EXECUTABLE_BYTES,
                     allow_hardlinks=True,
                 )
+            relative_path = candidate.relative_to(root).as_posix()
+            entry_kind, module = _stdlib_entry_kind_and_module(relative_path)
             entries.append(
                 {
                     "bytes": len(raw),
-                    "path": candidate.relative_to(root).as_posix(),
+                    "kind": entry_kind,
+                    "module": module,
+                    "path": relative_path,
                     "sha256": hashlib.sha256(raw).hexdigest(),
                 }
             )
-    return hashlib.sha256(
+    return entries, hashlib.sha256(
         _canonical_bytes(
             {
                 "entries": entries,
@@ -486,6 +527,10 @@ def _stdlib_inventory_sha256(path: Path, *, kind: str) -> str:
             }
         )
     ).hexdigest()
+
+
+def _stdlib_inventory_sha256(path: Path, *, kind: str) -> str:
+    return _stdlib_inventory(path, kind=kind)[1]
 
 
 @lru_cache(maxsize=4)
@@ -500,24 +545,24 @@ def _trusted_stdlib_policy_for_base_python(
         executable.parent,
         label="base Python root",
     )
-    roots = [
-        {
-            "kind": kind,
-            "path": str(path),
-            "inventory_sha256": _stdlib_inventory_sha256(
-                path,
-                kind=kind,
-            ),
-        }
-        for kind, path in (
-            ("stdlib", base_root / "Lib"),
-            ("platstdlib", base_root / "DLLs"),
-            (
-                "stdlib_zip",
-                base_root / f"python{sys.version_info.major}{sys.version_info.minor}.zip",
-            ),
+    roots = []
+    for kind, path in (
+        ("stdlib", base_root / "Lib"),
+        ("platstdlib", base_root / "DLLs"),
+        (
+            "stdlib_zip",
+            base_root / f"python{sys.version_info.major}{sys.version_info.minor}.zip",
+        ),
+    ):
+        entries, inventory_sha256 = _stdlib_inventory(path, kind=kind)
+        roots.append(
+            {
+                "entries": entries,
+                "inventory_sha256": inventory_sha256,
+                "kind": kind,
+                "path": str(path),
+            }
         )
-    ]
     importer_policy = {
         "bytecode_suffixes": list(importlib.machinery.BYTECODE_SUFFIXES),
         "extension_suffixes": list(importlib.machinery.EXTENSION_SUFFIXES),
@@ -530,6 +575,25 @@ def _trusted_stdlib_policy_for_base_python(
         "inventory_root_sha256": hashlib.sha256(_canonical_bytes(roots)).hexdigest(),
         "roots": roots,
         "schema": "factor-v3-bootstrap-stdlib-policy/v1",
+        "supervisor_prelocked": True,
+    }
+
+
+def _compact_stdlib_policy_binding(policy: Mapping[str, Any]) -> dict[str, Any]:
+    roots = [
+        {
+            "inventory_sha256": root["inventory_sha256"],
+            "kind": root["kind"],
+            "path": root["path"],
+        }
+        for root in policy["roots"]
+    ]
+    return {
+        "importer_policy_sha256": policy["importer_policy_sha256"],
+        "inventory_root_sha256": policy["inventory_root_sha256"],
+        "roots": roots,
+        "schema": "factor-v3-bootstrap-stdlib-binding/v1",
+        "supervisor_prelocked": True,
     }
 
 
@@ -545,6 +609,7 @@ def _supervisor_protocol_descriptor() -> dict[str, Any]:
             "FACTOR_V3_FORMAL_LAUNCH_ACTION",
             "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256",
             "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL",
+            "FACTOR_V3_FORMAL_STDLIB_PRELOCKED_ROOT_SHA256",
         ],
         "protocol": _SUPERVISOR_PROTOCOL,
         "public_environment": ["SYSTEMROOT", "TEMP", "TMP", "WINDIR"],
@@ -557,6 +622,7 @@ def _supervisor_protocol_descriptor() -> dict[str, Any]:
             "result",
             "schema",
             "status",
+            "stdlib_inventory_root_sha256",
             "worker_action",
         ],
         "terminal_schema": _WORKER_TERMINAL_SCHEMA,
@@ -1204,7 +1270,7 @@ def _authorized_config(
             "replay_scope": payload["replay_scope"],
             "run_spec_sha256": payload["run_spec_sha256"],
             "runtime_template_sha256": payload["runtime_template_sha256"],
-            "stdlib_policy": payload["stdlib_policy"],
+            "stdlib_policy": _compact_stdlib_policy_binding(payload["stdlib_policy"]),
             "supervisor_protocol": payload["supervisor_protocol"],
         }
     )
@@ -1405,21 +1471,52 @@ def _held_win32_directory_chain(
             "volume_serial": int(value.volume_serial),
         }
 
+    def reopen_identity(path: Path) -> dict[str, Any]:
+        handle = create_file(
+            str(path),
+            0x00000080,
+            0x00000001 | 0x00000002 | 0x00000004,
+            None,
+            3,
+            0x00200000 | 0x02000000,
+            None,
+        )
+        if handle in (None, invalid_handle):
+            raise FormalBootstrapRenderError("Win32 directory current path rejected")
+        try:
+            return information(path, handle)
+        finally:
+            close_handle(handle)
+
+    requested_paths: list[Path] = []
+    root_normalized = os.path.normcase(str(trusted_root))
+    for requested in directories:
+        path = _safe_existing_directory(
+            requested,
+            label="held directory",
+        )
+        normalized = os.path.normcase(str(path))
+        try:
+            within_root = os.path.commonpath((normalized, root_normalized)) == root_normalized
+        except ValueError:
+            within_root = False
+        if not within_root:
+            raise FormalBootstrapRenderError("Win32 directory handle chain rejected")
+        current = Path(path.anchor)
+        requested_paths.append(current)
+        for part in path.parts[1:]:
+            current /= part
+            requested_paths.append(current)
+
     try:
-        for requested in directories:
-            path = _safe_existing_directory(
-                requested,
-                label="held directory",
-            )
+        for path in requested_paths:
             normalized = os.path.normcase(str(path))
-            if normalized in seen or os.path.commonpath(
-                (normalized, os.path.normcase(str(trusted_root)))
-            ) != os.path.normcase(str(trusted_root)):
-                raise FormalBootstrapRenderError("Win32 directory handle chain rejected")
+            if normalized in seen:
+                continue
             seen.add(normalized)
             handle = create_file(
                 str(path),
-                0x00010000 | 0x00000080,
+                0x80000000,
                 0x00000001 | 0x00000002,
                 None,
                 3,
@@ -1434,15 +1531,29 @@ def _held_win32_directory_chain(
                 close_handle(handle)
                 raise
             handles.append((path, handle, identity))
-        yield tuple(identity for _path, _handle, identity in handles)
+
+        class HeldDirectoryChain:
+            def __len__(self) -> int:
+                return len(handles)
+
+            def __iter__(self) -> Any:
+                return iter(identity for _path, _handle, identity in handles)
+
+            def __getitem__(self, index: int) -> dict[str, Any]:
+                return handles[index][2]
+
+            def handle_for(self, path: Path) -> wintypes.HANDLE:
+                normalized = os.path.normcase(str(path))
+                for held_path, handle, _identity in reversed(handles):
+                    if os.path.normcase(str(held_path)) == normalized:
+                        return handle
+                raise FormalBootstrapRenderError("Win32 publication directory handle unavailable")
+
+        yield HeldDirectoryChain()
         for path, handle, identity in handles:
             if information(path, handle) != identity:
                 raise FormalBootstrapRenderError("Win32 directory handle chain drifted")
-            terminal = _safe_existing_directory(
-                path,
-                label="held directory",
-            )
-            if terminal != path:
+            if reopen_identity(path) != identity:
                 raise FormalBootstrapRenderError("Win32 directory handle chain drifted")
     finally:
         for _path, handle, _identity in reversed(handles):
@@ -1459,13 +1570,50 @@ def _held_publication_directory_tree(
         root,
         label="bootstrap output root",
     )
-    with ExitStack() as stack:
-        stack.enter_context(
-            _held_win32_directory_chain(
-                root=trusted_root,
-                directories=(trusted_root,),
-            )
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    invalid_handle = ctypes.c_void_p(-1).value
+    flush_handles: dict[str, wintypes.HANDLE] = {}
+
+    def hold_flush_handle(path: Path) -> None:
+        normalized = os.path.normcase(str(path))
+        if normalized in flush_handles:
+            return
+        handle = create_file(
+            str(path),
+            0x00000002,
+            0x00000001 | 0x00000002,
+            None,
+            3,
+            0x00200000 | 0x02000000,
+            None,
         )
+        if handle in (None, invalid_handle):
+            raise FormalBootstrapRenderError("Win32 publication directory flush handle rejected")
+        flush_handles[normalized] = handle
+
+    with ExitStack() as stack:
+        chains = [
+            stack.enter_context(
+                _held_win32_directory_chain(
+                    root=trusted_root,
+                    directories=(trusted_root,),
+                )
+            )
+        ]
         held = {os.path.normcase(str(trusted_root))}
         for category, digest in targets:
             current = trusted_root
@@ -1485,15 +1633,191 @@ def _held_publication_directory_tree(
                 )
                 normalized = os.path.normcase(str(candidate))
                 if normalized not in held:
-                    stack.enter_context(
-                        _held_win32_directory_chain(
-                            root=trusted_root,
-                            directories=(candidate,),
+                    chains.append(
+                        stack.enter_context(
+                            _held_win32_directory_chain(
+                                root=trusted_root,
+                                directories=(candidate,),
+                            )
                         )
                     )
                     held.add(normalized)
+                    hold_flush_handle(candidate)
                 current = candidate
-        yield
+
+        class HeldPublicationDirectoryTree:
+            def handle_for(self, path: Path) -> wintypes.HANDLE:
+                flush_handle = flush_handles.get(os.path.normcase(str(path)))
+                if flush_handle is not None:
+                    return flush_handle
+                for chain in reversed(chains):
+                    try:
+                        return chain.handle_for(path)
+                    except FormalBootstrapRenderError:
+                        continue
+                raise FormalBootstrapRenderError("Win32 publication directory handle unavailable")
+
+        try:
+            yield HeldPublicationDirectoryTree()
+        finally:
+            for handle in reversed(tuple(flush_handles.values())):
+                close_handle(handle)
+
+
+class _HeldWin32PublishedFile:
+    def __init__(self, *, path: Path, descriptor: int) -> None:
+        self.path = path
+        self.descriptor = descriptor
+        self.identity = self._validated_metadata()
+
+    def _validated_metadata(self) -> os.stat_result:
+        try:
+            metadata = os.fstat(self.descriptor)
+        except OSError as exc:
+            raise FormalBootstrapRenderError("content-addressed file handle rejected") from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or int(getattr(metadata, "st_nlink", 1)) != 1
+            or bool(int(getattr(metadata, "st_file_attributes", 0)) & _REPARSE_ATTRIBUTE)
+        ):
+            raise FormalBootstrapRenderError("content-addressed file handle rejected")
+        return metadata
+
+    def write(self, raw: bytes) -> None:
+        _write_all(self.descriptor, raw)
+        os.fsync(self.descriptor)
+
+    def read(self, *, expected_bytes: int) -> bytes:
+        try:
+            os.lseek(self.descriptor, 0, os.SEEK_SET)
+        except OSError as exc:
+            raise FormalBootstrapRenderError("content-addressed file handle rejected") from exc
+        remaining = expected_bytes
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(self.descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                raise FormalBootstrapRenderError("content-addressed file handle rejected")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(self.descriptor, 1):
+            raise FormalBootstrapRenderError("content-addressed file handle rejected")
+        return b"".join(chunks)
+
+    def terminal_verify(self, expected_raw: bytes) -> None:
+        terminal = self._validated_metadata()
+        try:
+            current = self.path.lstat()
+        except OSError as exc:
+            raise FormalBootstrapRenderError(
+                "content-addressed terminal identity rejected"
+            ) from exc
+        if (
+            not os.path.samestat(self.identity, terminal)
+            or not os.path.samestat(terminal, current)
+            or terminal.st_size != len(expected_raw)
+            or _is_reparse(self.path)
+            or not hmac.compare_digest(
+                self.read(expected_bytes=len(expected_raw)),
+                expected_raw,
+            )
+        ):
+            raise FormalBootstrapRenderError("content-addressed terminal identity rejected")
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            descriptor = self.descriptor
+            self.descriptor = -1
+            os.close(descriptor)
+
+
+def _open_held_win32_published_file(
+    *,
+    path: Path,
+    create_if_missing: bool = True,
+) -> tuple[_HeldWin32PublishedFile, bool]:
+    if os.name != "nt":
+        raise FormalBootstrapRenderError("Win32 content-addressed file rejected")
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    invalid_handle = ctypes.c_void_p(-1).value
+    common_flags = 0x00200000 | 0x02000000 | 0x80000000
+    handle = None
+    created = False
+    if create_if_missing:
+        handle = create_file(
+            str(path),
+            0x80000000 | 0x40000000,
+            0x00000001,
+            None,
+            1,
+            common_flags,
+            None,
+        )
+        created = handle not in (None, invalid_handle)
+    if not created:
+        error = ctypes.get_last_error()
+        if create_if_missing and error not in {80, 183}:
+            raise FormalBootstrapRenderError("content-addressed output rejected")
+        handle = create_file(
+            str(path),
+            0x80000000,
+            0x00000001,
+            None,
+            3,
+            common_flags,
+            None,
+        )
+        created = False
+    if handle in (None, invalid_handle):
+        raise FormalBootstrapRenderError("content-addressed output rejected")
+    descriptor: int | None = None
+    try:
+        descriptor = msvcrt.open_osfhandle(
+            int(handle),
+            ((os.O_RDWR if created else os.O_RDONLY) | getattr(os, "O_BINARY", 0)),
+        )
+        return (
+            _HeldWin32PublishedFile(
+                path=path,
+                descriptor=descriptor,
+            ),
+            created,
+        )
+    except BaseException:
+        if descriptor is None:
+            close_handle(handle)
+        else:
+            os.close(descriptor)
+        raise
+
+
+def _flush_held_win32_directory(
+    *,
+    path: Path,
+    handle: wintypes.HANDLE,
+) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    flush = kernel32.FlushFileBuffers
+    flush.argtypes = (wintypes.HANDLE,)
+    flush.restype = wintypes.BOOL
+    if not flush(handle):
+        raise FormalBootstrapRenderError(f"Win32 publication directory flush rejected: {path}")
 
 
 def _safe_cas_publish(
@@ -1503,6 +1827,7 @@ def _safe_cas_publish(
     digest: str,
     suffix: str,
     raw: bytes,
+    held_files: list[tuple[_HeldWin32PublishedFile, bytes]] | None = None,
 ) -> tuple[Path, str]:
     if hashlib.sha256(raw).hexdigest() != digest:
         raise FormalBootstrapRenderError("content-addressed payload rejected")
@@ -1511,44 +1836,24 @@ def _safe_cas_publish(
         (category, "sha256", digest[:2]),
     )
     path = directory / f"{digest}{suffix}"
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_BINARY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    descriptor: int | None = None
+    held: _HeldWin32PublishedFile | None = None
+    retained = False
     try:
-        descriptor = os.open(path, flags, 0o600)
-    except FileExistsError:
-        existing = _read_safe_file(
-            path,
-            label="content-addressed output",
-            max_bytes=_MAX_RUNTIME_BYTES,
-        )
-        if not hmac.compare_digest(existing, raw):
+        held, created = _open_held_win32_published_file(path=path)
+        if created:
+            held.write(raw)
+        terminal = held.read(expected_bytes=len(raw))
+        if not hmac.compare_digest(terminal, raw):
             raise FormalBootstrapRenderError("content-addressed output collision")
-    except OSError as exc:
-        raise FormalBootstrapRenderError("content-addressed output rejected") from exc
-    else:
-        try:
-            opened = os.fstat(descriptor)
-            if not stat.S_ISREG(opened.st_mode) or int(getattr(opened, "st_nlink", 1)) != 1:
-                raise FormalBootstrapRenderError("content-addressed output rejected")
-            _write_all(descriptor, raw)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    terminal = _read_safe_file(
-        path,
-        label="content-addressed output",
-        max_bytes=_MAX_RUNTIME_BYTES,
-    )
-    if not hmac.compare_digest(terminal, raw):
-        raise FormalBootstrapRenderError("content-addressed terminal hash rejected")
-    relative = path.relative_to(root).as_posix()
-    return path, relative
+        held.terminal_verify(raw)
+        if held_files is not None:
+            held_files.append((held, raw))
+            retained = True
+        relative = path.relative_to(root).as_posix()
+        return path, relative
+    finally:
+        if held is not None and not retained:
+            held.close()
 
 
 def _publication_materials(
@@ -1663,6 +1968,7 @@ def _publish_prevalidated_completion_for_test(
     bootstrap_sha256 = hashlib.sha256(bootstrap_raw).hexdigest()
     receipt_sha256 = hashlib.sha256(receipt_raw).hexdigest()
     completion_sha256 = hashlib.sha256(completion_raw).hexdigest()
+    held_files: list[tuple[_HeldWin32PublishedFile, bytes]] = []
     with _held_publication_directory_tree(
         root=root,
         targets=(
@@ -1670,28 +1976,49 @@ def _publish_prevalidated_completion_for_test(
             ("publication_receipts", receipt_sha256),
             ("completion_markers", completion_sha256),
         ),
-    ):
-        bootstrap = _safe_cas_publish(
-            root=root,
-            category="bootstraps",
-            digest=bootstrap_sha256,
-            suffix=".py",
-            raw=bootstrap_raw,
-        )
-        receipt = _safe_cas_publish(
-            root=root,
-            category="publication_receipts",
-            digest=receipt_sha256,
-            suffix=".json",
-            raw=receipt_raw,
-        )
-        completion = _safe_cas_publish(
-            root=root,
-            category="completion_markers",
-            digest=completion_sha256,
-            suffix=".json",
-            raw=completion_raw,
-        )
+    ) as directories:
+        try:
+            bootstrap = _safe_cas_publish(
+                root=root,
+                category="bootstraps",
+                digest=bootstrap_sha256,
+                suffix=".py",
+                raw=bootstrap_raw,
+                held_files=held_files,
+            )
+            receipt = _safe_cas_publish(
+                root=root,
+                category="publication_receipts",
+                digest=receipt_sha256,
+                suffix=".json",
+                raw=receipt_raw,
+                held_files=held_files,
+            )
+            completion = _safe_cas_publish(
+                root=root,
+                category="completion_markers",
+                digest=completion_sha256,
+                suffix=".json",
+                raw=completion_raw,
+                held_files=held_files,
+            )
+            if held_files:
+                flushed: set[str] = set()
+                for held, _expected_raw in held_files:
+                    parent = held.path.parent
+                    normalized = os.path.normcase(str(parent))
+                    if normalized in flushed:
+                        continue
+                    _flush_held_win32_directory(
+                        path=parent,
+                        handle=directories.handle_for(parent),
+                    )
+                    flushed.add(normalized)
+                for held, expected_raw in held_files:
+                    held.terminal_verify(expected_raw)
+        finally:
+            for held, _expected_raw in reversed(held_files):
+                held.close()
     return {
         "bootstrap": bootstrap,
         "completion": completion,
@@ -1750,6 +2077,210 @@ def publish_factor_v3_formal_bootstrap(
     return _publish_factor_v3_formal_bootstrap_with_test_trust(
         authorization_path=authorization_path,
         completion_authorization_path=completion_authorization_path,
+        trusted_public_key_spki_der=(_production_execution_authorization_public_key_der()),
+    )
+
+
+def _validated_completion_marker_payload(value: Any) -> dict[str, Any]:
+    fields = {
+        "action",
+        "authorization_id_sha256",
+        "authorization_nonce_sha256",
+        "bootstrap_bytes",
+        "bootstrap_output_root",
+        "bootstrap_relative_path",
+        "bootstrap_sha256",
+        "execution_authorization_sha256",
+        "receipt_bytes",
+        "receipt_relative_path",
+        "receipt_sha256",
+        "runtime_template_sha256",
+        "schema",
+        "status",
+    }
+    if (
+        type(value) is not dict
+        or set(value) != fields
+        or value.get("schema") != COMPLETION_SCHEMA
+        or value.get("status") != "completed"
+        or value.get("action") not in {"build-spec", "run", "verify"}
+        or value.get("runtime_template_sha256") != RUNTIME_TEMPLATE_SHA256
+    ):
+        raise FormalBootstrapRenderError("completion marker payload rejected")
+    payload = json.loads(_canonical_bytes(value))
+    _reject_credential_shape(payload)
+    for field in (
+        "authorization_id_sha256",
+        "authorization_nonce_sha256",
+        "bootstrap_sha256",
+        "execution_authorization_sha256",
+        "receipt_sha256",
+        "runtime_template_sha256",
+    ):
+        _require_sha256(payload.get(field), label=f"completion marker {field}")
+    for field in ("bootstrap_bytes", "receipt_bytes"):
+        size = payload.get(field)
+        if type(size) is not int or isinstance(size, bool) or not 0 < size <= _MAX_RUNTIME_BYTES:
+            raise FormalBootstrapRenderError("completion marker payload rejected")
+    root = _absolute_path(
+        payload.get("bootstrap_output_root"),
+        label="completion marker bootstrap output root",
+    )
+    expected_bootstrap = (
+        f"bootstraps/sha256/{payload['bootstrap_sha256'][:2]}/{payload['bootstrap_sha256']}.py"
+    )
+    expected_receipt = (
+        f"publication_receipts/sha256/{payload['receipt_sha256'][:2]}/"
+        f"{payload['receipt_sha256']}.json"
+    )
+    if (
+        payload.get("bootstrap_relative_path") != expected_bootstrap
+        or payload.get("receipt_relative_path") != expected_receipt
+    ):
+        raise FormalBootstrapRenderError("completion marker payload rejected")
+    payload["bootstrap_output_root"] = str(root)
+    return payload
+
+
+def _opened_completion_file(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int,
+) -> tuple[_HeldWin32PublishedFile, bytes]:
+    held, created = _open_held_win32_published_file(
+        path=path,
+        create_if_missing=False,
+    )
+    if created:
+        held.close()
+        raise FormalBootstrapRenderError(f"{label} rejected")
+    try:
+        byte_count = int(held.identity.st_size)
+        if not 0 < byte_count <= max_bytes:
+            raise FormalBootstrapRenderError(f"{label} rejected")
+        raw = held.read(expected_bytes=byte_count)
+        held.terminal_verify(raw)
+        return held, raw
+    except BaseException:
+        held.close()
+        raise
+
+
+def _validate_factor_v3_formal_bootstrap_completion_marker_with_test_trust(
+    *,
+    completion_marker_path: Path | str,
+    trusted_public_key_spki_der: bytes,
+) -> dict[str, Any]:
+    marker_path = _absolute_path(
+        str(completion_marker_path),
+        label="completion marker path",
+    )
+    if (
+        marker_path.suffix != ".json"
+        or _SHA256_RE.fullmatch(marker_path.stem) is None
+        or marker_path.parent.parent.parent.name != "completion_markers"
+    ):
+        raise FormalBootstrapRenderError("completion marker CAS rejected")
+    marker_digest = marker_path.stem
+    _validate_cas_path(
+        marker_path,
+        marker_digest,
+        label="completion marker",
+    )
+    marker, marker_raw = _opened_completion_file(
+        marker_path,
+        label="completion marker",
+        max_bytes=_MAX_CONFIG_BYTES,
+    )
+    held_files: list[tuple[_HeldWin32PublishedFile, bytes]] = [(marker, marker_raw)]
+    try:
+        if hashlib.sha256(marker_raw).hexdigest() != marker_digest:
+            raise FormalBootstrapRenderError("completion marker CAS rejected")
+        outer = _strict_canonical_json(marker_raw)
+        if set(outer) != {"payload", "signature_base64"}:
+            raise FormalBootstrapRenderError("completion marker rejected")
+        payload = _validated_completion_marker_payload(outer.get("payload"))
+        _verify_rsa3072_signature(
+            _canonical_bytes(payload),
+            _decoded_signature(
+                outer.get("signature_base64"),
+                label="completion marker",
+            ),
+            public_der=trusted_public_key_spki_der,
+            label="completion marker",
+        )
+        root = _safe_existing_directory(
+            Path(payload["bootstrap_output_root"]),
+            label="completion marker bootstrap output root",
+        )
+        expected_marker = (
+            root / "completion_markers" / "sha256" / marker_digest[:2] / f"{marker_digest}.json"
+        )
+        if os.path.normcase(str(marker_path)) != os.path.normcase(str(expected_marker)):
+            raise FormalBootstrapRenderError("completion marker root rejected")
+        bootstrap_path = root / Path(*payload["bootstrap_relative_path"].split("/"))
+        receipt_path = root / Path(*payload["receipt_relative_path"].split("/"))
+        with _held_win32_directory_chain(
+            root=root,
+            directories=(
+                marker_path.parent,
+                bootstrap_path.parent,
+                receipt_path.parent,
+            ),
+        ):
+            bootstrap, bootstrap_raw = _opened_completion_file(
+                bootstrap_path,
+                label="completion bootstrap",
+                max_bytes=_MAX_RUNTIME_BYTES,
+            )
+            held_files.append((bootstrap, bootstrap_raw))
+            receipt, receipt_raw = _opened_completion_file(
+                receipt_path,
+                label="completion receipt",
+                max_bytes=_MAX_CONFIG_BYTES,
+            )
+            held_files.append((receipt, receipt_raw))
+            if (
+                len(bootstrap_raw) != payload["bootstrap_bytes"]
+                or hashlib.sha256(bootstrap_raw).hexdigest() != payload["bootstrap_sha256"]
+                or len(receipt_raw) != payload["receipt_bytes"]
+                or hashlib.sha256(receipt_raw).hexdigest() != payload["receipt_sha256"]
+            ):
+                raise FormalBootstrapRenderError("completion content rejected")
+            validate_rendered_factor_v3_formal_bootstrap(bootstrap_raw)
+            receipt_payload = _strict_canonical_json(receipt_raw)
+            expected_receipt = {
+                "action": payload["action"],
+                "bootstrap_bytes": payload["bootstrap_bytes"],
+                "bootstrap_relative_path": payload["bootstrap_relative_path"],
+                "bootstrap_sha256": payload["bootstrap_sha256"],
+                "execution_authorization_sha256": payload["execution_authorization_sha256"],
+                "runtime_template_sha256": payload["runtime_template_sha256"],
+                "schema": PUBLICATION_RECEIPT_SCHEMA,
+            }
+            if receipt_payload != expected_receipt:
+                raise FormalBootstrapRenderError("completion receipt rejected")
+            for held, expected_raw in held_files:
+                held.terminal_verify(expected_raw)
+            return {
+                **payload,
+                "bootstrap_path": str(bootstrap_path),
+                "completion_marker_path": str(marker_path),
+                "completion_marker_sha256": marker_digest,
+                "receipt_path": str(receipt_path),
+            }
+    finally:
+        for held, _expected_raw in reversed(held_files):
+            held.close()
+
+
+def validate_factor_v3_formal_bootstrap_completion_marker(
+    *,
+    completion_marker_path: Path | str,
+) -> dict[str, Any]:
+    return _validate_factor_v3_formal_bootstrap_completion_marker_with_test_trust(
+        completion_marker_path=completion_marker_path,
         trusted_public_key_spki_der=(_production_execution_authorization_public_key_der()),
     )
 

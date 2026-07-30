@@ -41,10 +41,11 @@ _MAX_SOURCE_BYTES = 4 * 1024 * 1024
 _MAX_EXECUTABLE_BYTES = 64 * 1024 * 1024
 _MAX_CAPTURE_CHARS = 1024 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024
+_MAX_EXECUTION_AUTHORIZATION_LIFETIME_SECONDS = 24 * 60 * 60
 _REPARSE_ATTRIBUTE = 0x00000400
 _EXECUTION_AUTHORIZATION_KEY_ROLE = "factor-v3-bootstrap-execution-authorization"
 _EXECUTION_REPLAY_SCOPE = "factor-v3-formal-bootstrap-execution/v1"
-_STDLIB_POLICY_SCHEMA = "factor-v3-bootstrap-stdlib-policy/v1"
+_STDLIB_POLICY_SCHEMA = "factor-v3-bootstrap-stdlib-binding/v1"
 _SUPERVISOR_PROTOCOL = "factor-v3-formal-supervisor-worker/v1"
 _WORKER_TERMINAL_SCHEMA = "factor-v3-formal-bootstrap-worker-terminal/v1"
 _SUPERVISOR_PUBLIC_ENVIRONMENT = frozenset({"SYSTEMROOT", "WINDIR", "TEMP", "TMP"})
@@ -53,6 +54,7 @@ _SUPERVISOR_FIXED_ENVIRONMENT = frozenset(
         "FACTOR_V3_FORMAL_LAUNCH_ACTION",
         "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256",
         "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL",
+        "FACTOR_V3_FORMAL_STDLIB_PRELOCKED_ROOT_SHA256",
     }
 )
 _SUPERVISOR_ACTION_SECRET_ENVIRONMENT = {
@@ -71,6 +73,7 @@ _WORKER_TERMINAL_FIELDS = frozenset(
         "result",
         "schema",
         "status",
+        "stdlib_inventory_root_sha256",
         "worker_action",
     }
 )
@@ -206,6 +209,7 @@ def _validated_replay_claim(
         or expires <= not_before
         or current < not_before
         or current > expires
+        or (expires - issued).total_seconds() > _MAX_EXECUTION_AUTHORIZATION_LIFETIME_SECONDS
     ):
         raise _BootstrapError("execution authorization replay rejected")
     return dict(value)
@@ -266,6 +270,8 @@ def _validated_supervisor_environment(
         or names - allowed
         or names & {"JIAOCH_TOKEN"} != expected_secrets
         or canonical.get("FACTOR_V3_FORMAL_LAUNCH_PROTOCOL") != _SUPERVISOR_PROTOCOL
+        or _SHA256_RE.fullmatch(str(canonical.get("FACTOR_V3_FORMAL_STDLIB_PRELOCKED_ROOT_SHA256")))
+        is None
         or _SHA256_RE.fullmatch(str(canonical.get("FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256")))
         is None
     ):
@@ -366,6 +372,7 @@ def _canonical_worker_terminal_frame(
         "result": result,
         "schema": _WORKER_TERMINAL_SCHEMA,
         "status": "completed",
+        "stdlib_inventory_root_sha256": config["stdlib_policy"]["inventory_root_sha256"],
         "worker_action": config["action"],
     }
     if set(frame) != _WORKER_TERMINAL_FIELDS:
@@ -1090,12 +1097,35 @@ def _read_inventory_file(path: Path, *, label: str) -> bytes:
         os.close(descriptor)
 
 
-def _stdlib_inventory_sha256(path: Path, *, kind: str) -> str:
+def _stdlib_entry_kind_and_module(relative_path: str) -> tuple[str, str]:
+    filename = relative_path.rsplit("/", 1)[-1]
+    for entry_kind, suffixes in (
+        ("source", importlib.machinery.SOURCE_SUFFIXES),
+        ("bytecode", importlib.machinery.BYTECODE_SUFFIXES),
+        ("extension", importlib.machinery.EXTENSION_SUFFIXES),
+        ("dll", (".dll",)),
+    ):
+        for suffix in sorted(suffixes, key=len, reverse=True):
+            if filename.endswith(suffix):
+                stem_path = relative_path[: -len(suffix)]
+                parts = stem_path.split("/")
+                if parts[-1] == "__init__":
+                    parts = parts[:-1]
+                return entry_kind, ".".join(parts) or "__stdlib_root__"
+    raise _BootstrapError("stdlib inventory module rejected")
+
+
+def _stdlib_inventory(
+    path: Path,
+    *,
+    kind: str,
+) -> tuple[list[dict[str, Any]], str]:
     if kind == "stdlib_zip":
         if not path.exists():
-            return hashlib.sha256(
+            return [], hashlib.sha256(
                 _canonical_bytes(
                     {
+                        "entries": [],
                         "kind": kind,
                         "path": str(path),
                         "state": "absent",
@@ -1103,13 +1133,21 @@ def _stdlib_inventory_sha256(path: Path, *, kind: str) -> str:
                 )
             ).hexdigest()
         raw = _read_inventory_file(path, label="stdlib zip")
-        return hashlib.sha256(
+        entries = [
+            {
+                "bytes": len(raw),
+                "kind": "stdlib_zip",
+                "module": "__stdlib_zip__",
+                "path": path.name,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        ]
+        return entries, hashlib.sha256(
             _canonical_bytes(
                 {
-                    "bytes": len(raw),
+                    "entries": entries,
                     "kind": kind,
                     "path": str(path),
-                    "sha256": hashlib.sha256(raw).hexdigest(),
                 }
             )
         ).hexdigest()
@@ -1140,14 +1178,18 @@ def _stdlib_inventory_sha256(path: Path, *, kind: str) -> str:
                 candidate,
                 label=f"{kind} inventory file",
             )
+            relative_path = candidate.relative_to(root).as_posix()
+            entry_kind, module = _stdlib_entry_kind_and_module(relative_path)
             entries.append(
                 {
                     "bytes": len(raw),
-                    "path": candidate.relative_to(root).as_posix(),
+                    "kind": entry_kind,
+                    "module": module,
+                    "path": relative_path,
                     "sha256": hashlib.sha256(raw).hexdigest(),
                 }
             )
-    return hashlib.sha256(
+    return entries, hashlib.sha256(
         _canonical_bytes(
             {
                 "entries": entries,
@@ -1156,6 +1198,10 @@ def _stdlib_inventory_sha256(path: Path, *, kind: str) -> str:
             }
         )
     ).hexdigest()
+
+
+def _stdlib_inventory_sha256(path: Path, *, kind: str) -> str:
+    return _stdlib_inventory(path, kind=kind)[1]
 
 
 def _validated_stdlib_policy(
@@ -1182,23 +1228,41 @@ def _validated_stdlib_policy(
         "source_suffixes": list(importlib.machinery.SOURCE_SUFFIXES),
         "zip_finder": "zipimporter",
     }
-    roots = [
-        {
-            "inventory_sha256": _stdlib_inventory_sha256(path, kind=kind),
-            "kind": kind,
-            "path": str(path),
-        }
-        for kind, path in expected_paths
-    ]
-    expected = {
+    roots = []
+    for kind, path in expected_paths:
+        entries, inventory_sha256 = _stdlib_inventory(path, kind=kind)
+        roots.append(
+            {
+                "entries": entries,
+                "inventory_sha256": inventory_sha256,
+                "kind": kind,
+                "path": str(path),
+            }
+        )
+    authorization_policy = {
         "importer_policy_sha256": hashlib.sha256(_canonical_bytes(importer_policy)).hexdigest(),
         "inventory_root_sha256": hashlib.sha256(_canonical_bytes(roots)).hexdigest(),
         "roots": roots,
+        "schema": "factor-v3-bootstrap-stdlib-policy/v1",
+        "supervisor_prelocked": True,
+    }
+    expected = {
+        "importer_policy_sha256": hashlib.sha256(_canonical_bytes(importer_policy)).hexdigest(),
+        "inventory_root_sha256": authorization_policy["inventory_root_sha256"],
+        "roots": [
+            {
+                "inventory_sha256": root["inventory_sha256"],
+                "kind": root["kind"],
+                "path": root["path"],
+            }
+            for root in roots
+        ],
         "schema": _STDLIB_POLICY_SCHEMA,
+        "supervisor_prelocked": True,
     }
     if value != expected:
         raise _BootstrapError("stdlib policy rejected")
-    return expected
+    return authorization_policy
 
 
 def _validated_config() -> dict[str, Any]:
@@ -1363,7 +1427,7 @@ def _validated_config() -> dict[str, Any]:
         or config.get("supervisor_protocol") != _supervisor_protocol_descriptor()
     ):
         raise _BootstrapError("embedded authorization policy rejected")
-    _validated_stdlib_policy(
+    config["_authorization_stdlib_policy"] = _validated_stdlib_policy(
         config.get("stdlib_policy"),
         base_python_executable=Path(str(config["base_python_executable_path"])),
     )
@@ -1607,7 +1671,7 @@ def _validate_execution_authorization(
         "shim_sha256": config["shim_sha256"],
         "source_manifest": config["source_manifest"],
         "source_root_sha256": config["source_root_sha256"],
-        "stdlib_policy": config["stdlib_policy"],
+        "stdlib_policy": config["_authorization_stdlib_policy"],
         "supervisor_protocol": config["supervisor_protocol"],
     }
     if outer.get("payload") != expected_payload:
@@ -1895,6 +1959,11 @@ def _trusted_run() -> bytes:
         dict(os.environ),
         worker_action=str(config["action"]),
     )
+    if (
+        supervisor_environment["FACTOR_V3_FORMAL_STDLIB_PRELOCKED_ROOT_SHA256"]
+        != config["stdlib_policy"]["inventory_root_sha256"]
+    ):
+        raise _BootstrapError("stdlib supervisor prelock rejected")
     python_path = Path(str(config["python_executable_path"]))
     base_python_path = Path(str(config["base_python_executable_path"]))
     if (
