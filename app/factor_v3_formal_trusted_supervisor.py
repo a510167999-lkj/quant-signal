@@ -783,8 +783,9 @@ class _HeldFile:
         self._label = label
         self._max_bytes = max_bytes
         self._allow_hardlinks = allow_hardlinks
+        self._expected_size = len(raw)
 
-    def postverify(self) -> None:
+    def _postverify_identity(self) -> os.stat_result:
         if self._chain is not None:
             self._chain.postverify()
         opened = os.fstat(self._stream.fileno())
@@ -792,23 +793,34 @@ class _HeldFile:
             terminal = self.path.lstat()
         except OSError:
             raise FormalSupervisorError(f"{self._label} drifted") from None
+        link_count = int(getattr(terminal, "st_nlink", 1))
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not os.path.samestat(opened, terminal)
+            or int(getattr(terminal, "st_file_attributes", 0)) & _REPARSE_ATTRIBUTE
+            or (link_count < 1 if self._allow_hardlinks else link_count != 1)
+            or opened.st_size != self._expected_size
+        ):
+            raise FormalSupervisorError(f"{self._label} drifted")
+        return opened
+
+    def postverify(self) -> None:
+        opened = self._postverify_identity()
         self._stream.seek(0)
         raw = self._stream.read(self._max_bytes + 1)
         self._stream.seek(0)
-        link_count = int(getattr(terminal, "st_nlink", 1))
-        if (
-            not os.path.samestat(opened, terminal)
-            or int(getattr(terminal, "st_file_attributes", 0)) & _REPARSE_ATTRIBUTE
-            or (link_count < 1 if self._allow_hardlinks else link_count != 1)
-            or len(raw) != opened.st_size
-            or hashlib.sha256(raw).hexdigest() != self._expected_sha256
-        ):
+        if len(raw) != opened.st_size or hashlib.sha256(raw).hexdigest() != self._expected_sha256:
             raise FormalSupervisorError(f"{self._label} drifted")
 
     def close(self) -> None:
         self._stream.close()
         if self._chain is not None:
             self._chain.close()
+
+
+class _HeldStdlibFile(_HeldFile):
+    def postverify(self) -> None:
+        self._postverify_identity()
 
 
 class _HeldLedgerFile:
@@ -2049,7 +2061,7 @@ def _hold_stdlib_inventory(
         digest = _require_sha256(item.get("sha256"), label="stdlib inventory SHA")
         if type(byte_count) is not int or not 0 <= byte_count <= _MAX_EXECUTABLE_BYTES:
             raise FormalSupervisorError("stdlib inventory rejected")
-        held = _HeldFile(
+        held = _HeldStdlibFile(
             path,
             expected_sha256=digest,
             label="stdlib inventory file",
