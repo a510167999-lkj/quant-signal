@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import date, datetime
 import hashlib
@@ -15,6 +16,8 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
+import tempfile
 import types
 from typing import Any
 import uuid
@@ -23,6 +26,7 @@ from app.audited_pit_factor_v3_points_contract import (
     FACTOR_V3_POINTS_CONTRACT_SHA256,
     canonical_sha256,
 )
+from app.durable_io import fsync_directory
 from app.research_partitions import (
     PartitionContractError,
     assert_range_allowed,
@@ -51,6 +55,10 @@ _COLLECTION_ISSUANCE_PATH_RE = re.compile(
     r"^feature_history_collection_publication_receipts/sha256/"
     r"([0-9a-f]{2})/([0-9a-f]{64})\.json$"
 )
+_COLLECTION_SNAPSHOT_INDEX_PATH_RE = re.compile(
+    r"^feature_history_collection_snapshots/sha256/"
+    r"([0-9a-f]{2})/([0-9a-f]{64})/snapshot-index\.json$"
+)
 _LOOPBACK_PROXY_RE = re.compile(
     r"^http://(?P<host>localhost|\[[0-9A-Fa-f:]+\]|[0-9.]+):"
     r"(?P<port>[1-9][0-9]{0,4})$"
@@ -59,6 +67,7 @@ _WIRE_DATE_RE = re.compile(r"^[0-9]{8}$")
 _MAX_TRADE_CAL_MANIFEST_BYTES = 256 * 1024
 _MAX_COLLECTION_MANIFEST_BYTES = 2 * 1024 * 1024
 _MAX_COLLECTION_ISSUANCE_BYTES = 16 * 1024
+_MAX_COLLECTION_SNAPSHOT_INDEX_BYTES = 2 * 1024 * 1024
 _FROZEN_PARTITION_V1_SHA256 = "cf70083e66f8706bf21e48b655c5b4342886e230c6a88dcfff04698d12b2e227"
 _FROZEN_DEVELOPMENT_SESSIONS_SHA256 = (
     "d4dd11e90438a407ba470398a218696a3abe4151881dd41956248dace37c27b6"
@@ -140,12 +149,32 @@ _COLLECTION_MANIFEST_FIELDS = frozenset(
         "session_authority_refs_sha256",
         "session_count",
         "sessions_sha256",
+        "snapshot_index_relative_path",
+        "snapshot_index_sha256",
         "source_authority_root_sha256",
         "suspend_d_authority_session_count",
         "upstream_beijing_preserved_session_count",
         "upstream_scope_root_sha256",
         "upstream_star_preserved_session_count",
     }
+)
+_COLLECTION_SNAPSHOT_INDEX_FIELDS = frozenset(
+    {
+        "database",
+        "raw_artifact_count",
+        "raw_artifact_set_sha256",
+        "raw_artifacts",
+        "receipt_manifest_sha256",
+        "schema",
+        "session_count",
+        "sessions_sha256",
+    }
+)
+_COLLECTION_SNAPSHOT_DATABASE_FIELDS = frozenset(
+    {"bytes", "path", "sha256"}
+)
+_COLLECTION_SNAPSHOT_RAW_FIELDS = frozenset(
+    {"dataset", "raw_bytes", "raw_path", "raw_sha256"}
 )
 _SESSION_AUTHORITY_REF_FIELDS = frozenset(
     {
@@ -164,6 +193,7 @@ _SESSION_AUTHORITY_REF_FIELDS = frozenset(
 _PRODUCER_FILES = (
     "audited_pit_factor_v3_feature_history_authority.py",
     "audited_pit_factor_v3_points_contract.py",
+    "durable_io.py",
     "jiaoch_credential_slots.py",
     "jiaoch_trade_cal_authority.py",
     "research_partitions.py",
@@ -182,7 +212,7 @@ _SAFETY = {
 }
 
 FACTOR_V3_FEATURE_HISTORY_AUTHORITY_CONTRACT = {
-    "schema_version": "audited-pit-factor-v3-feature-history-authority-contract/v1",
+    "schema_version": "audited-pit-factor-v3-feature-history-authority-contract/v2",
     "purpose": "feature_history_only",
     "factor_v3_points_contract_sha256": FACTOR_V3_POINTS_CONTRACT_SHA256,
     "development_sessions": {
@@ -228,6 +258,9 @@ FACTOR_V3_FEATURE_HISTORY_AUTHORITY_CONTRACT = {
         "raw_and_normalized_receipts_replayed": True,
         "raw_artifact_identity_postverified": True,
         "closed_store_scope_verified": True,
+        "content_addressed_snapshot_required": True,
+        "live_pit_store_accepted_by_public_verifier": False,
+        "snapshot_database_and_raw_replayed": True,
         "terminal_database_and_raw_snapshot_postverified": True,
         "collection_publication_capability_required": True,
         "collection_publication_issuance_required": True,
@@ -247,7 +280,7 @@ FACTOR_V3_FEATURE_HISTORY_AUTHORITY_CONTRACT = {
     "safety": deepcopy(_SAFETY),
 }
 FACTOR_V3_FEATURE_HISTORY_AUTHORITY_CONTRACT_SHA256 = (
-    "85eb33174415b3ab0fd841bb7a0c2a9089fa8784b2e1fbbab8f8ebe5b89ad96a"
+    "ba6e4f6e67871cb5e6341ac7cb9a84c7fa5f9c2055ac1fbbbdf9e1af35ab2cee"
 )
 if (
     canonical_sha256(FACTOR_V3_FEATURE_HISTORY_AUTHORITY_CONTRACT)
@@ -485,10 +518,391 @@ def _validated_collection_publication(value: Any) -> dict[str, Any]:
     }
 
 
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        value = os.lstat(path)
+    except OSError:
+        return False
+    return bool(
+        stat.S_ISLNK(value.st_mode)
+        or getattr(value, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+@contextmanager
+def _snapshot_directory_chain_guard(
+    root: Path,
+    directory: Path,
+):
+    resolved_root = root.resolve(strict=True)
+    resolved_directory = directory.resolve(strict=True)
+    try:
+        relative = resolved_directory.relative_to(resolved_root)
+    except ValueError:
+        raise ValueError(
+            "factor-v3 feature history snapshot path rejected"
+        ) from None
+    paths = [resolved_root]
+    current = resolved_root
+    for part in relative.parts:
+        current = current / part
+        paths.append(current)
+    identities = []
+    for path in paths:
+        value = os.lstat(path)
+        if (
+            _is_reparse_point(path)
+            or not stat.S_ISDIR(value.st_mode)
+        ):
+            raise ValueError(
+                "factor-v3 feature history snapshot path rejected"
+            )
+        identities.append(
+            (
+                path,
+                value.st_dev,
+                value.st_ino,
+                getattr(value, "st_file_attributes", 0),
+            )
+        )
+    handles: list[tuple[int, Any]] = []
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class _FileAttributeTagInfo(ctypes.Structure):
+            _fields_ = [
+                ("file_attributes", wintypes.DWORD),
+                ("reparse_tag", wintypes.DWORD),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        get_information = kernel32.GetFileInformationByHandleEx
+        get_information.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        get_information.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        invalid_handle = ctypes.c_void_p(-1).value
+        try:
+            for position, path in enumerate(paths):
+                handle = create_file(
+                    str(path),
+                    (
+                        (
+                            0x40000000
+                            | 0x00000020
+                            | 0x00000080
+                            | 0x00100000
+                        )
+                        if position == len(paths) - 1
+                        else 0x00000080
+                    ),
+                    (
+                        0x00000001 | 0x00000002
+                        if position == len(paths) - 1
+                        else 0x00000001
+                    ),
+                    None,
+                    3,
+                    0x00200000 | 0x02000000,
+                    None,
+                )
+                if handle in (None, invalid_handle):
+                    raise OSError
+                info = _FileAttributeTagInfo()
+                if not get_information(
+                    handle,
+                    9,
+                    ctypes.byref(info),
+                    ctypes.sizeof(info),
+                ) or info.file_attributes & 0x00000400:
+                    close_handle(handle)
+                    raise OSError
+                handles.append((handle, close_handle))
+        except OSError:
+            for handle, closer in reversed(handles):
+                closer(handle)
+            raise ValueError(
+                "factor-v3 feature history snapshot path rejected"
+            ) from None
+    else:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            for path in paths:
+                descriptor = os.open(path, flags)
+                value = os.fstat(descriptor)
+                if not stat.S_ISDIR(value.st_mode):
+                    os.close(descriptor)
+                    raise OSError
+                handles.append((descriptor, os.close))
+        except OSError:
+            for descriptor, closer in reversed(handles):
+                closer(descriptor)
+            raise ValueError(
+                "factor-v3 feature history snapshot path rejected"
+            ) from None
+    try:
+        yield handles[-1][0]
+        for (
+            path,
+            expected_device,
+            expected_inode,
+            expected_attributes,
+        ) in identities:
+            value = os.lstat(path)
+            if (
+                _is_reparse_point(path)
+                or not stat.S_ISDIR(value.st_mode)
+                or value.st_dev != expected_device
+                or value.st_ino != expected_inode
+                or getattr(value, "st_file_attributes", 0)
+                != expected_attributes
+                or not path.resolve(strict=True).is_relative_to(
+                    resolved_root
+                )
+            ):
+                raise ValueError(
+                    "factor-v3 feature history snapshot path drifted"
+                )
+    finally:
+        for handle, closer in reversed(handles):
+            closer(handle)
+
+
+def _flush_snapshot_parent(final_parent_anchor: int) -> None:
+    if os.name != "nt":
+        try:
+            os.fsync(final_parent_anchor)
+        except OSError:
+            raise ValueError(
+                "factor-v3 feature history snapshot promotion rejected"
+            ) from None
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    flush_file_buffers = kernel32.FlushFileBuffers
+    flush_file_buffers.argtypes = (wintypes.HANDLE,)
+    flush_file_buffers.restype = wintypes.BOOL
+    if not flush_file_buffers(final_parent_anchor):
+        raise ValueError(
+            "factor-v3 feature history snapshot promotion rejected"
+        )
+
+
+def _promote_snapshot_directory(
+    *,
+    staging: Path,
+    final_root: Path,
+    final_parent_anchor: int,
+) -> None:
+    if final_root.name in {"", ".", ".."} or final_root.parent == final_root:
+        raise ValueError(
+            "factor-v3 feature history snapshot path rejected"
+        )
+    if os.name != "nt":
+        import ctypes
+        import errno
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        rename_noreplace = getattr(libc, "renameat2", None)
+        if rename_noreplace is None:
+            raise ValueError(
+                "factor-v3 feature history snapshot promotion rejected"
+            )
+        rename_noreplace.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename_noreplace.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        try:
+            result = rename_noreplace(
+                -100,
+                os.fsencode(staging),
+                final_parent_anchor,
+                os.fsencode(final_root.name),
+                1,
+            )
+        except (OSError, ValueError, TypeError):
+            raise ValueError(
+                "factor-v3 feature history snapshot promotion rejected"
+            ) from None
+        if result != 0:
+            error_code = ctypes.get_errno()
+            if error_code in {errno.EEXIST, errno.ENOTEMPTY}:
+                raise FileExistsError(
+                    error_code,
+                    "snapshot CAS already exists",
+                    str(final_root),
+                )
+            raise ValueError(
+                "factor-v3 feature history snapshot promotion rejected"
+            )
+        _flush_snapshot_parent(final_parent_anchor)
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("reparse_tag", wintypes.DWORD),
+        ]
+
+    class _FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("replace_if_exists", wintypes.BYTE),
+            ("root_directory", wintypes.HANDLE),
+            ("file_name_length", wintypes.DWORD),
+            ("file_name", wintypes.WCHAR * 1),
+        ]
+
+    class _IoStatusValue(ctypes.Union):
+        _fields_ = [
+            ("status", wintypes.LONG),
+            ("pointer", wintypes.LPVOID),
+        ]
+
+    class _IoStatusBlock(ctypes.Structure):
+        _anonymous_ = ("value",)
+        _fields_ = [
+            ("value", _IoStatusValue),
+            ("information", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    get_information = kernel32.GetFileInformationByHandleEx
+    get_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    get_information.restype = wintypes.BOOL
+    nt_set_information = ntdll.NtSetInformationFile
+    nt_set_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(_IoStatusBlock),
+        wintypes.LPVOID,
+        wintypes.ULONG,
+        ctypes.c_int,
+    )
+    nt_set_information.restype = wintypes.LONG
+    nt_status_to_error = ntdll.RtlNtStatusToDosError
+    nt_status_to_error.argtypes = (wintypes.LONG,)
+    nt_status_to_error.restype = wintypes.ULONG
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    invalid_handle = ctypes.c_void_p(-1).value
+    source_handle = create_file(
+        str(staging),
+        0x00010000 | 0x00000080 | 0x00100000,
+        0x00000001,
+        None,
+        3,
+        0x00200000 | 0x02000000,
+        None,
+    )
+    if source_handle in (None, invalid_handle):
+        raise ValueError(
+            "factor-v3 feature history snapshot promotion rejected"
+        )
+    try:
+        attributes = _FileAttributeTagInfo()
+        if not get_information(
+            source_handle,
+            9,
+            ctypes.byref(attributes),
+            ctypes.sizeof(attributes),
+        ) or attributes.file_attributes & 0x00000400:
+            raise ValueError(
+                "factor-v3 feature history snapshot promotion rejected"
+            )
+        encoded_name = final_root.name.encode("utf-16-le")
+        offset = _FileRenameInfo.file_name.offset
+        buffer = ctypes.create_string_buffer(
+            ctypes.sizeof(_FileRenameInfo) + len(encoded_name)
+        )
+        information = _FileRenameInfo.from_buffer(buffer)
+        information.replace_if_exists = 0
+        information.root_directory = final_parent_anchor
+        information.file_name_length = len(encoded_name)
+        ctypes.memmove(
+            ctypes.addressof(buffer) + offset,
+            encoded_name,
+            len(encoded_name),
+        )
+        io_status = _IoStatusBlock()
+        status = nt_set_information(
+            source_handle,
+            ctypes.byref(io_status),
+            buffer,
+            len(buffer),
+            10,
+        )
+        if status < 0:
+            error_code = int(nt_status_to_error(status))
+            if error_code in {80, 183}:
+                raise FileExistsError(
+                    error_code,
+                    "snapshot CAS already exists",
+                    str(final_root),
+                )
+            raise ValueError(
+                "factor-v3 feature history snapshot promotion rejected"
+            )
+        _flush_snapshot_parent(final_parent_anchor)
+    finally:
+        close_handle(source_handle)
+
+
 def _safe_collection_output_root(value: str | Path) -> Path:
     root = Path(value)
     try:
-        if root.is_symlink() or not root.is_dir():
+        if _is_reparse_point(root) or not root.is_dir():
             raise OSError
         resolved = root.resolve(strict=True)
     except OSError:
@@ -509,7 +923,7 @@ def _collection_manifest_path(
     path = root.joinpath(*relative_path.split("/"))
     try:
         if (
-            path.is_symlink()
+            _is_reparse_point(path)
             or not path.is_file()
             or path.resolve(strict=True).parent != path.parent.resolve(strict=True)
             or not path.resolve(strict=True).is_relative_to(root)
@@ -573,7 +987,7 @@ def _write_collection_content_addressed_candidate(
             parent.mkdir(exist_ok=True)
             resolved = parent.resolve(strict=True)
             if (
-                parent.is_symlink()
+                _is_reparse_point(parent)
                 or not parent.is_dir()
                 or not resolved.is_relative_to(root)
             ):
@@ -676,7 +1090,7 @@ def _validated_collection_publication_issuance(
     path = root.joinpath(*relative_path.split("/"))
     try:
         if (
-            path.is_symlink()
+            _is_reparse_point(path)
             or not path.is_file()
             or path.resolve(strict=True).parent != path.parent.resolve(strict=True)
             or not path.resolve(strict=True).is_relative_to(root)
@@ -698,6 +1112,798 @@ def _validated_collection_publication_issuance(
     stored = _strict_json_loads(raw, label="collection issuance")
     if not hmac.compare_digest(raw, _canonical_bytes(stored)) or stored != issuance:
         raise ValueError("factor-v3 feature history collection issuance rejected")
+
+
+@contextmanager
+def _snapshot_source_reader(path: Path):
+    try:
+        if _is_reparse_point(path) or not path.is_file():
+            raise OSError
+        resolved = path.resolve(strict=True)
+    except OSError:
+        raise ValueError(
+            "factor-v3 feature history snapshot source rejected"
+        ) from None
+    descriptor = -1
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+
+        class _FileAttributeTagInfo(ctypes.Structure):
+            _fields_ = [
+                ("file_attributes", wintypes.DWORD),
+                ("reparse_tag", wintypes.DWORD),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        get_information = kernel32.GetFileInformationByHandleEx
+        get_information.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        get_information.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        handle = create_file(
+            str(resolved),
+            0x80000000,
+            0x00000001,
+            None,
+            3,
+            0x00200000 | 0x08000000,
+            None,
+        )
+        invalid_handle = ctypes.c_void_p(-1).value
+        if handle == invalid_handle:
+            raise ValueError(
+                "factor-v3 feature history snapshot source rejected"
+            )
+        info = _FileAttributeTagInfo()
+        try:
+            if not get_information(
+                handle,
+                9,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            ) or info.file_attributes & 0x00000400:
+                raise OSError
+            descriptor = msvcrt.open_osfhandle(
+                int(handle),
+                os.O_RDONLY | getattr(os, "O_BINARY", 0),
+            )
+            handle = invalid_handle
+        except (OSError, ValueError):
+            if handle != invalid_handle:
+                close_handle(handle)
+            raise ValueError(
+                "factor-v3 feature history snapshot source rejected"
+            ) from None
+    else:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(resolved, flags)
+        except OSError:
+            raise ValueError(
+                "factor-v3 feature history snapshot source rejected"
+            ) from None
+    try:
+        source_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise ValueError(
+                "factor-v3 feature history snapshot source rejected"
+            )
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            yield handle, source_stat
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _snapshot_raw_descriptors_from_database(
+    database_path: Path,
+) -> list[dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    connection = sqlite3.connect(
+        database_path.resolve(strict=True).as_uri()
+        + "?mode=ro&immutable=1",
+        uri=True,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        rows = connection.execute(
+            """
+            SELECT dataset, raw_path, raw_sha256, raw_bytes
+            FROM receipts
+            WHERE raw_path IS NOT NULL AND raw_path != ''
+            UNION ALL
+            SELECT dataset, raw_path, raw_sha256, raw_bytes
+            FROM fetch_attempts
+            WHERE raw_path IS NOT NULL AND raw_path != ''
+            ORDER BY raw_path COLLATE BINARY
+            """
+        )
+        for stored in rows:
+            dataset = str(stored["dataset"])
+            raw_path = str(stored["raw_path"])
+            raw_sha256 = _strict_sha256(
+                stored["raw_sha256"],
+                label="snapshot raw sha256",
+            )
+            raw_bytes = stored["raw_bytes"]
+            relative = Path(*raw_path.split("/"))
+            if (
+                dataset not in _REQUIRED_FEATURE_HISTORY_APIS
+                or type(raw_bytes) is not int
+                or raw_bytes <= 0
+                or relative.is_absolute()
+                or ".." in relative.parts
+                or relative.as_posix() != raw_path
+                or len(relative.parts) != 4
+                or relative.parts[0] != "raw"
+                or relative.parts[1] != dataset
+                or relative.parts[2] != raw_sha256[:2]
+                or relative.stem != raw_sha256
+                or relative.suffix != ".json"
+            ):
+                raise ValueError(
+                    "factor-v3 feature history snapshot raw descriptor rejected"
+                )
+            descriptor = {
+                "dataset": dataset,
+                "raw_bytes": raw_bytes,
+                "raw_path": raw_path,
+                "raw_sha256": raw_sha256,
+            }
+            previous = records.setdefault(raw_path, descriptor)
+            if previous != descriptor:
+                raise ValueError(
+                    "factor-v3 feature history snapshot raw descriptor rejected"
+                )
+    except sqlite3.DatabaseError:
+        raise ValueError(
+            "factor-v3 feature history snapshot database rejected"
+        ) from None
+    finally:
+        connection.close()
+    if not records:
+        raise ValueError(
+            "factor-v3 feature history snapshot raw descriptor rejected"
+        )
+    return [records[key] for key in sorted(records)]
+
+
+def _copy_snapshot_member(
+    *,
+    source_root: Path,
+    source_relative_path: str,
+    destination_root: Path,
+    expected_bytes: int | None,
+    expected_sha256: str | None,
+) -> dict[str, Any]:
+    relative = Path(*source_relative_path.split("/"))
+    if (
+        relative.is_absolute()
+        or ".." in relative.parts
+        or relative.as_posix() != source_relative_path
+    ):
+        raise ValueError(
+            "factor-v3 feature history snapshot member rejected"
+        )
+    source = source_root.joinpath(*relative.parts)
+    current = source_root
+    try:
+        for part in relative.parts:
+            current = current / part
+            if _is_reparse_point(current):
+                raise OSError
+        if not source.resolve(strict=True).is_relative_to(
+            source_root.resolve(strict=True)
+        ):
+            raise OSError
+    except OSError:
+        raise ValueError(
+            "factor-v3 feature history snapshot member rejected"
+        ) from None
+    destination = destination_root.joinpath(*relative.parts)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    current = destination_root
+    for part in relative.parts[:-1]:
+        current = current / part
+        if _is_reparse_point(current) or not current.is_dir():
+            raise ValueError(
+                "factor-v3 feature history snapshot member rejected"
+            )
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    output_descriptor = -1
+    digest = hashlib.sha256()
+    copied = 0
+    try:
+        with _snapshot_source_reader(source) as (
+            source_handle,
+            source_stat,
+        ):
+            if (
+                expected_bytes is not None
+                and source_stat.st_size != expected_bytes
+            ):
+                raise ValueError(
+                    "factor-v3 feature history snapshot member rejected"
+                )
+            output_descriptor = os.open(destination, flags, 0o600)
+            with os.fdopen(output_descriptor, "wb") as output_handle:
+                output_descriptor = -1
+                while True:
+                    chunk = source_handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    copied += len(chunk)
+                    output_handle.write(chunk)
+                output_handle.flush()
+                os.fsync(output_handle.fileno())
+    except (OSError, ValueError):
+        try:
+            if destination.exists() and not _is_reparse_point(
+                destination
+            ):
+                destination.unlink()
+        except OSError:
+            pass
+        raise ValueError(
+            "factor-v3 feature history snapshot member rejected"
+        ) from None
+    finally:
+        if output_descriptor >= 0:
+            os.close(output_descriptor)
+    observed_sha256 = digest.hexdigest()
+    if (
+        copied <= 0
+        or (
+            expected_bytes is not None
+            and copied != expected_bytes
+        )
+        or (
+            expected_sha256 is not None
+            and not hmac.compare_digest(
+                observed_sha256,
+                expected_sha256,
+            )
+        )
+        or destination.stat().st_size != copied
+        or not hmac.compare_digest(
+            _file_sha256(destination),
+            observed_sha256,
+        )
+    ):
+        destination.unlink(missing_ok=True)
+        raise ValueError(
+            "factor-v3 feature history snapshot member rejected"
+        )
+    fsync_directory(destination.parent)
+    return {
+        "bytes": copied,
+        "path": source_relative_path,
+        "sha256": observed_sha256,
+    }
+
+
+def _snapshot_index_relative_path(digest: str) -> str:
+    validated = _strict_sha256(
+        digest,
+        label="snapshot index sha256",
+    )
+    return (
+        "feature_history_collection_snapshots/sha256/"
+        f"{validated[:2]}/{validated}/snapshot-index.json"
+    )
+
+
+def _snapshot_raw_artifact_set_sha256(
+    descriptors: Sequence[Mapping[str, Any]],
+) -> str:
+    return canonical_sha256(
+        [
+            {
+                "raw_bytes": descriptor["raw_bytes"],
+                "raw_path": descriptor["raw_path"],
+                "raw_sha256": descriptor["raw_sha256"],
+            }
+            for descriptor in descriptors
+        ]
+    )
+
+
+def _validated_snapshot_index(
+    value: Any,
+    *,
+    sessions: Sequence[str],
+) -> dict[str, Any]:
+    index = _strict_mapping(
+        value,
+        fields=_COLLECTION_SNAPSHOT_INDEX_FIELDS,
+        label="snapshot index",
+    )
+    database = _strict_mapping(
+        index.get("database"),
+        fields=_COLLECTION_SNAPSHOT_DATABASE_FIELDS,
+        label="snapshot database",
+    )
+    if (
+        index.get("schema")
+        != "audited-pit-factor-v3-feature-history-snapshot-index/v1"
+        or index.get("session_count") != len(sessions)
+        or index.get("sessions_sha256") != canonical_sha256(sessions)
+        or database.get("path") != "metadata.sqlite3"
+        or type(database.get("bytes")) is not int
+        or database["bytes"] <= 0
+    ):
+        raise ValueError(
+            "factor-v3 feature history snapshot index rejected"
+        )
+    _strict_sha256(
+        database.get("sha256"),
+        label="snapshot database sha256",
+    )
+    _strict_sha256(
+        index.get("receipt_manifest_sha256"),
+        label="snapshot receipt manifest sha256",
+    )
+    raw = index.get("raw_artifacts")
+    if type(raw) is not list or not raw:
+        raise ValueError(
+            "factor-v3 feature history snapshot index rejected"
+        )
+    normalized = []
+    for item in raw:
+        descriptor = _strict_mapping(
+            item,
+            fields=_COLLECTION_SNAPSHOT_RAW_FIELDS,
+            label="snapshot raw descriptor",
+        )
+        dataset = descriptor.get("dataset")
+        raw_path = descriptor.get("raw_path")
+        raw_sha256 = _strict_sha256(
+            descriptor.get("raw_sha256"),
+            label="snapshot raw sha256",
+        )
+        raw_bytes = descriptor.get("raw_bytes")
+        if type(raw_path) is not str:
+            raise ValueError(
+                "factor-v3 feature history snapshot index rejected"
+            )
+        relative = Path(*raw_path.split("/"))
+        if (
+            dataset not in _REQUIRED_FEATURE_HISTORY_APIS
+            or type(raw_bytes) is not int
+            or raw_bytes <= 0
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or relative.as_posix() != raw_path
+            or len(relative.parts) != 4
+            or relative.parts[0] != "raw"
+            or relative.parts[1] != dataset
+            or relative.parts[2] != raw_sha256[:2]
+            or relative.stem != raw_sha256
+            or relative.suffix != ".json"
+        ):
+            raise ValueError(
+                "factor-v3 feature history snapshot index rejected"
+            )
+        normalized.append(
+            {
+                "dataset": dataset,
+                "raw_bytes": raw_bytes,
+                "raw_path": raw_path,
+                "raw_sha256": raw_sha256,
+            }
+        )
+    if (
+        normalized
+        != sorted(normalized, key=lambda item: item["raw_path"])
+        or len({item["raw_path"] for item in normalized})
+        != len(normalized)
+        or index.get("raw_artifact_count") != len(normalized)
+        or index.get("raw_artifact_set_sha256")
+        != _snapshot_raw_artifact_set_sha256(normalized)
+    ):
+        raise ValueError(
+            "factor-v3 feature history snapshot index rejected"
+        )
+    return {
+        **deepcopy(index),
+        "database": deepcopy(database),
+        "raw_artifacts": normalized,
+    }
+
+
+def _read_and_replay_collection_snapshot(
+    *,
+    output_root: str | Path,
+    relative_path: str,
+    expected_sha256: str,
+    sessions: Sequence[str],
+    temporal_partition_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    digest = _strict_sha256(
+        expected_sha256,
+        label="snapshot index sha256",
+    )
+    match = _COLLECTION_SNAPSHOT_INDEX_PATH_RE.fullmatch(relative_path)
+    if (
+        match is None
+        or match.group(1) != digest[:2]
+        or match.group(2) != digest
+    ):
+        raise ValueError(
+            "factor-v3 feature history snapshot index path rejected"
+        )
+    root = _safe_collection_output_root(output_root)
+    path = root.joinpath(*relative_path.split("/"))
+    snapshot_root = path.parent
+    try:
+        descendant = root
+        for part in relative_path.split("/"):
+            descendant = descendant / part
+            if descendant.exists() and _is_reparse_point(descendant):
+                raise OSError
+        if (
+            _is_reparse_point(path)
+            or not path.is_file()
+            or path.resolve(strict=True).parent
+            != snapshot_root.resolve(strict=True)
+            or not path.resolve(strict=True).is_relative_to(root)
+        ):
+            raise OSError
+        stat_before = path.stat()
+        if (
+            stat_before.st_size <= 0
+            or stat_before.st_size
+            > _MAX_COLLECTION_SNAPSHOT_INDEX_BYTES
+        ):
+            raise OSError
+        raw = path.read_bytes()
+        stat_after = path.stat()
+    except OSError:
+        raise ValueError(
+            "factor-v3 feature history snapshot index rejected"
+        ) from None
+    if (
+        len(raw) != stat_before.st_size
+        or stat_after.st_size != stat_before.st_size
+        or stat_after.st_mtime_ns != stat_before.st_mtime_ns
+        or not hmac.compare_digest(
+            hashlib.sha256(raw).hexdigest(),
+            digest,
+        )
+    ):
+        raise ValueError(
+            "factor-v3 feature history snapshot index rejected"
+        )
+    index = _validated_snapshot_index(
+        _strict_json_loads(raw, label="snapshot index"),
+        sessions=sessions,
+    )
+    if not hmac.compare_digest(raw, _canonical_bytes(index)):
+        raise ValueError(
+            "factor-v3 feature history snapshot index rejected"
+        )
+    database_path = snapshot_root / index["database"]["path"]
+    if (
+        _is_reparse_point(database_path)
+        or not database_path.is_file()
+        or database_path.stat().st_size != index["database"]["bytes"]
+        or not hmac.compare_digest(
+            _file_sha256(database_path),
+            index["database"]["sha256"],
+        )
+    ):
+        raise ValueError(
+            "factor-v3 feature history snapshot database rejected"
+        )
+    actual_paths = set()
+    raw_root = snapshot_root / "raw"
+    try:
+        if _is_reparse_point(raw_root) or not raw_root.is_dir():
+            raise OSError
+        for candidate in raw_root.rglob("*"):
+            if _is_reparse_point(candidate):
+                raise OSError
+            if candidate.is_file():
+                actual_paths.add(
+                    candidate.relative_to(snapshot_root).as_posix()
+                )
+    except (OSError, ValueError):
+        raise ValueError(
+            "factor-v3 feature history snapshot raw artifact rejected"
+        ) from None
+    expected_paths = {
+        descriptor["raw_path"]
+        for descriptor in index["raw_artifacts"]
+    }
+    if actual_paths != expected_paths:
+        raise ValueError(
+            "factor-v3 feature history snapshot raw artifact rejected"
+        )
+    for descriptor in index["raw_artifacts"]:
+        member = snapshot_root.joinpath(
+            *descriptor["raw_path"].split("/")
+        )
+        if (
+            _is_reparse_point(member)
+            or not member.is_file()
+            or member.stat().st_size != descriptor["raw_bytes"]
+            or not hmac.compare_digest(
+                _file_sha256(member),
+                descriptor["raw_sha256"],
+            )
+        ):
+            raise ValueError(
+                "factor-v3 feature history snapshot raw artifact rejected"
+            )
+    replay = _replay_pit_store(
+        pit_store_root=snapshot_root,
+        expected_database_sha256=index["database"]["sha256"],
+        sessions=sessions,
+        temporal_partition_contract=temporal_partition_contract,
+    )
+    terminal_stat = path.stat()
+    if (
+        replay["database_bytes"] != index["database"]["bytes"]
+        or replay["receipt_manifest_sha256"]
+        != index["receipt_manifest_sha256"]
+        or replay["raw_artifact_count"]
+        != index["raw_artifact_count"]
+        or replay["raw_artifact_set_sha256"]
+        != index["raw_artifact_set_sha256"]
+        or terminal_stat.st_size != stat_before.st_size
+        or terminal_stat.st_mtime_ns != stat_before.st_mtime_ns
+        or not hmac.compare_digest(_file_sha256(path), digest)
+    ):
+        raise ValueError(
+            "factor-v3 feature history snapshot replay rejected"
+        )
+    return {
+        "index": index,
+        "relative_path": relative_path,
+        "replay": replay,
+        "sha256": digest,
+        "snapshot_root": snapshot_root,
+    }
+
+
+def _capture_feature_history_snapshot(
+    *,
+    pit_store_root: str | Path,
+    output_root: str | Path,
+    sessions: Sequence[str],
+    temporal_partition_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    source_root = Path(pit_store_root)
+    root = _safe_collection_output_root(output_root)
+    try:
+        if (
+            _is_reparse_point(source_root)
+            or not source_root.is_dir()
+            or source_root.resolve(strict=True) == root
+            or source_root.resolve(strict=True).is_relative_to(root)
+            or root.is_relative_to(source_root.resolve(strict=True))
+        ):
+            raise OSError
+        source_root = source_root.resolve(strict=True)
+    except OSError:
+        raise ValueError(
+            "factor-v3 feature history snapshot source root rejected"
+        ) from None
+    source_database = source_root / "metadata.sqlite3"
+    if any(
+        Path(f"{source_database}{suffix}").exists()
+        for suffix in ("-wal", "-shm")
+    ):
+        raise ValueError(
+            "factor-v3 feature history PIT store must be finalized without WAL or SHM"
+        )
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=".feature-history-snapshot-",
+            suffix=".partial",
+            dir=str(root),
+        )
+    )
+    try:
+        database = _copy_snapshot_member(
+            source_root=source_root,
+            source_relative_path="metadata.sqlite3",
+            destination_root=staging,
+            expected_bytes=None,
+            expected_sha256=None,
+        )
+        descriptors = _snapshot_raw_descriptors_from_database(
+            staging / "metadata.sqlite3"
+        )
+        source_raw_root = source_root / "raw"
+        actual_source_paths = set()
+        try:
+            if (
+                _is_reparse_point(source_raw_root)
+                or not source_raw_root.is_dir()
+            ):
+                raise OSError
+            for candidate in source_raw_root.rglob("*"):
+                if _is_reparse_point(candidate):
+                    raise OSError
+                if candidate.is_file():
+                    actual_source_paths.add(
+                        candidate.relative_to(source_root).as_posix()
+                    )
+        except (OSError, ValueError):
+            raise ValueError(
+                "factor-v3 feature history snapshot source raw tree rejected"
+            ) from None
+        if actual_source_paths != {
+            descriptor["raw_path"] for descriptor in descriptors
+        }:
+            raise ValueError(
+                "factor-v3 feature history snapshot source raw tree rejected"
+            )
+        for descriptor in descriptors:
+            copied = _copy_snapshot_member(
+                source_root=source_root,
+                source_relative_path=descriptor["raw_path"],
+                destination_root=staging,
+                expected_bytes=descriptor["raw_bytes"],
+                expected_sha256=descriptor["raw_sha256"],
+            )
+            if copied != {
+                "bytes": descriptor["raw_bytes"],
+                "path": descriptor["raw_path"],
+                "sha256": descriptor["raw_sha256"],
+            }:
+                raise ValueError(
+                    "factor-v3 feature history snapshot raw copy rejected"
+                )
+        replay = _replay_pit_store(
+            pit_store_root=staging,
+            expected_database_sha256=database["sha256"],
+            sessions=sessions,
+            temporal_partition_contract=temporal_partition_contract,
+        )
+        if (
+            replay["raw_artifact_count"] != len(descriptors)
+            or replay["raw_artifact_set_sha256"]
+            != _snapshot_raw_artifact_set_sha256(descriptors)
+        ):
+            raise ValueError(
+                "factor-v3 feature history snapshot replay rejected"
+            )
+        index = {
+            "database": database,
+            "raw_artifact_count": len(descriptors),
+            "raw_artifact_set_sha256": (
+                _snapshot_raw_artifact_set_sha256(descriptors)
+            ),
+            "raw_artifacts": descriptors,
+            "receipt_manifest_sha256": replay[
+                "receipt_manifest_sha256"
+            ],
+            "schema": (
+                "audited-pit-factor-v3-feature-history-snapshot-index/v1"
+            ),
+            "session_count": len(sessions),
+            "sessions_sha256": canonical_sha256(sessions),
+        }
+        raw_index = _canonical_bytes(
+            _validated_snapshot_index(index, sessions=sessions)
+        )
+        if len(raw_index) > _MAX_COLLECTION_SNAPSHOT_INDEX_BYTES:
+            raise ValueError(
+                "factor-v3 feature history snapshot index rejected"
+            )
+        digest = hashlib.sha256(raw_index).hexdigest()
+        index_path = staging / "snapshot-index.json"
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(index_path, flags, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(raw_index)
+            handle.flush()
+            os.fsync(handle.fileno())
+        fsync_directory(staging)
+        relative_path = _snapshot_index_relative_path(digest)
+        directory_parts = relative_path.split("/")[:-1]
+        final_parent = root
+        for part in directory_parts[:-1]:
+            child = final_parent / part
+            if not child.exists():
+                child.mkdir()
+                fsync_directory(final_parent)
+            if (
+                _is_reparse_point(child)
+                or not child.is_dir()
+                or not child.resolve(strict=True).is_relative_to(root)
+            ):
+                raise ValueError(
+                    "factor-v3 feature history snapshot path rejected"
+                )
+            final_parent = child
+        final_root = final_parent / directory_parts[-1]
+        with _snapshot_directory_chain_guard(
+            root,
+            final_parent,
+        ) as final_parent_anchor:
+            if final_root.exists():
+                _flush_snapshot_parent(final_parent_anchor)
+                existing = _read_and_replay_collection_snapshot(
+                    output_root=root,
+                    relative_path=relative_path,
+                    expected_sha256=digest,
+                    sessions=sessions,
+                    temporal_partition_contract=(
+                        temporal_partition_contract
+                    ),
+                )
+                return existing
+            try:
+                _promote_snapshot_directory(
+                    staging=staging,
+                    final_root=final_root,
+                    final_parent_anchor=final_parent_anchor,
+                )
+            except FileExistsError:
+                _flush_snapshot_parent(final_parent_anchor)
+                existing = _read_and_replay_collection_snapshot(
+                    output_root=root,
+                    relative_path=relative_path,
+                    expected_sha256=digest,
+                    sessions=sessions,
+                    temporal_partition_contract=(
+                        temporal_partition_contract
+                    ),
+                )
+                return existing
+            return _read_and_replay_collection_snapshot(
+                output_root=root,
+                relative_path=relative_path,
+                expected_sha256=digest,
+                sessions=sessions,
+                temporal_partition_contract=temporal_partition_contract,
+            )
+    except (OSError, sqlite3.DatabaseError, ValueError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith(
+            "factor-v3 feature history"
+        ):
+            raise
+        raise ValueError(
+            "factor-v3 feature history snapshot capture rejected"
+        ) from None
 
 
 def _validated_trade_cal_publication(value: Any) -> dict[str, Any]:
@@ -2307,27 +3513,6 @@ def _replay_pit_store(
     }
 
 
-def _derived_pit_store_database_anchor(pit_store_root: str | Path) -> tuple[Path, str]:
-    root = Path(pit_store_root)
-    database_path = root / "metadata.sqlite3"
-    try:
-        if (
-            root.is_symlink()
-            or not root.is_dir()
-            or database_path.is_symlink()
-            or not database_path.is_file()
-            or database_path.resolve(strict=True).parent != root.resolve(strict=True)
-        ):
-            raise OSError
-    except OSError:
-        raise ValueError("factor-v3 feature history PIT store rejected") from None
-    if any(Path(f"{database_path}{suffix}").exists() for suffix in ("-wal", "-shm")):
-        raise ValueError(
-            "factor-v3 feature history PIT store must be finalized without WAL or SHM"
-        )
-    return database_path.resolve(strict=True), _file_sha256(database_path)
-
-
 def _validated_collection_manifest(
     value: Any,
     *,
@@ -2341,7 +3526,7 @@ def _validated_collection_manifest(
     )
     if (
         manifest.get("schema")
-        != "audited-pit-factor-v3-feature-history-collection-manifest/v1"
+        != "audited-pit-factor-v3-feature-history-collection-manifest/v2"
         or manifest.get("authority_status") != "UNGRANTED_FEATURE_HISTORY_ONLY"
         or manifest.get("feature_history_only") is not True
         or manifest.get("factor_v3_points_contract_sha256")
@@ -2371,6 +3556,7 @@ def _validated_collection_manifest(
         "pit_store_raw_artifact_set_sha256",
         "pit_store_receipt_manifest_sha256",
         "session_authority_refs_sha256",
+        "snapshot_index_sha256",
         "source_authority_root_sha256",
         "upstream_scope_root_sha256",
     ):
@@ -2388,6 +3574,22 @@ def _validated_collection_manifest(
         <= 0
     ):
         raise ValueError("factor-v3 feature history collection manifest rejected")
+    snapshot_relative_path = manifest.get(
+        "snapshot_index_relative_path"
+    )
+    snapshot_sha256 = manifest.get("snapshot_index_sha256")
+    if (
+        type(snapshot_relative_path) is not str
+        or _COLLECTION_SNAPSHOT_INDEX_PATH_RE.fullmatch(
+            snapshot_relative_path
+        )
+        is None
+        or _snapshot_index_relative_path(snapshot_sha256)
+        != snapshot_relative_path
+    ):
+        raise ValueError(
+            "factor-v3 feature history collection snapshot rejected"
+        )
     expected_capability_sha256 = hashlib.sha256(
         publication["publication_capability"].encode("utf-8")
     ).hexdigest()
@@ -2422,6 +3624,8 @@ def _manifest_from_replay(
     feature_history_route_policy_descriptor: Mapping[str, Any],
     publication_capability: str,
     replay: Mapping[str, Any],
+    snapshot_index_relative_path: str,
+    snapshot_index_sha256: str,
     sessions: Sequence[str],
 ) -> dict[str, Any]:
     return {
@@ -2454,7 +3658,7 @@ def _manifest_from_replay(
         "publication_capability_sha256": hashlib.sha256(
             publication_capability.encode("utf-8")
         ).hexdigest(),
-        "schema": "audited-pit-factor-v3-feature-history-collection-manifest/v1",
+        "schema": "audited-pit-factor-v3-feature-history-collection-manifest/v2",
         "security_code_transition_contract_sha256": (
             SECURITY_CODE_TRANSITION_CONTRACT_SHA256
         ),
@@ -2462,6 +3666,8 @@ def _manifest_from_replay(
         "session_authority_refs_sha256": canonical_sha256(replay["session_refs"]),
         "session_count": len(sessions),
         "sessions_sha256": canonical_sha256(sessions),
+        "snapshot_index_relative_path": snapshot_index_relative_path,
+        "snapshot_index_sha256": snapshot_index_sha256,
         "source_authority_root_sha256": replay["source_authority_root_sha256"],
         "suspend_d_authority_session_count": len(sessions),
         "upstream_beijing_preserved_session_count": len(sessions),
@@ -2495,14 +3701,14 @@ def _publish_factor_v3_feature_history_collection_candidate(
         feature_history_route_policy_descriptor
     )
     contract = _validated_partition_contract(temporal_partition_contract)
-    _database_path, database_sha256 = _derived_pit_store_database_anchor(pit_store_root)
     producer_before = _producer_binding()
-    replay = _replay_pit_store(
+    snapshot = _capture_feature_history_snapshot(
         pit_store_root=pit_store_root,
-        expected_database_sha256=database_sha256,
+        output_root=publication_output_root,
         sessions=sessions,
         temporal_partition_contract=contract,
     )
+    replay = snapshot["replay"]
     if _producer_binding() != producer_before:
         raise ValueError("factor-v3 feature history collection producer drift rejected")
     publication_capability = str(uuid.uuid4())
@@ -2512,6 +3718,8 @@ def _publish_factor_v3_feature_history_collection_candidate(
         feature_history_route_policy_descriptor=route_policy,
         publication_capability=publication_capability,
         replay=replay,
+        snapshot_index_relative_path=snapshot["relative_path"],
+        snapshot_index_sha256=snapshot["sha256"],
         sessions=sessions,
     )
     publication = {
@@ -2551,7 +3759,6 @@ def _publish_factor_v3_feature_history_collection_candidate(
         collection_publication_output_root=output_root,
         collection_plan=collection_plan,
         development_session_refs=development_session_refs,
-        pit_store_root=pit_store_root,
         temporal_partition_contract=temporal_partition_contract,
         trade_cal_output_root=trade_cal_output_root,
         trade_cal_publication=trade_cal_publication,
@@ -2565,7 +3772,6 @@ def verify_factor_v3_feature_history_collection_authority(
     collection_publication_output_root: str | Path,
     collection_plan: Mapping[str, Any],
     development_session_refs: Sequence[Mapping[str, Any]],
-    pit_store_root: str | Path,
     temporal_partition_contract: Mapping[str, Any],
     trade_cal_output_root: str | Path,
     trade_cal_publication: Mapping[str, Any],
@@ -2603,12 +3809,14 @@ def verify_factor_v3_feature_history_collection_authority(
         raise ValueError("factor-v3 feature history collection manifest rejected")
     contract = _validated_partition_contract(temporal_partition_contract)
     producer_before = _producer_binding()
-    replay = _replay_pit_store(
-        pit_store_root=pit_store_root,
-        expected_database_sha256=manifest["pit_store_database_sha256"],
+    snapshot = _read_and_replay_collection_snapshot(
+        output_root=collection_publication_output_root,
+        relative_path=manifest["snapshot_index_relative_path"],
+        expected_sha256=manifest["snapshot_index_sha256"],
         sessions=sessions,
         temporal_partition_contract=contract,
     )
+    replay = snapshot["replay"]
     if _producer_binding() != producer_before:
         raise ValueError("factor-v3 feature history collection producer drift rejected")
     if (
@@ -2632,7 +3840,7 @@ def verify_factor_v3_feature_history_collection_authority(
     if terminal_manifest != manifest:
         raise ValueError("factor-v3 feature history collection manifest drifted")
     unsigned = {
-        "schema_version": "audited-pit-factor-v3-feature-history-authority-receipt/v2",
+        "schema_version": "audited-pit-factor-v3-feature-history-authority-receipt/v3",
         "verified": True,
         "authority_status": "VERIFIED_FEATURE_HISTORY_ONLY",
         "feature_history_only": True,
@@ -2647,6 +3855,7 @@ def verify_factor_v3_feature_history_collection_authority(
         "session_count": len(sessions),
         "sessions_sha256": canonical_sha256(sessions),
         "session_authority_refs_sha256": manifest["session_authority_refs_sha256"],
+        "snapshot_index_sha256": snapshot["sha256"],
         "pit_store_database_sha256": replay["database_sha256"],
         "pit_store_database_bytes": replay["database_bytes"],
         "pit_store_receipt_manifest_sha256": replay[

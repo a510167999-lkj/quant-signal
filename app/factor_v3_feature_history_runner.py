@@ -1047,7 +1047,6 @@ def _verify_collection_authority(
     *,
     publication_root: Path,
     publication: Mapping[str, Any],
-    store_root: Path,
     spec: Mapping[str, Any],
 ) -> dict[str, Any]:
     receipt = history_authority.verify_factor_v3_feature_history_collection_authority(
@@ -1056,7 +1055,6 @@ def _verify_collection_authority(
         trade_cal_publication=spec["trade_cal_publication"],
         development_session_refs=spec["development_session_refs"],
         temporal_partition_contract=spec["temporal_partition_contract"],
-        pit_store_root=store_root,
         collection_publication_output_root=publication_root,
         collection_publication=publication,
     )
@@ -1083,14 +1081,11 @@ def _verify_existing_publication(
     state: Mapping[str, Any],
 ) -> dict[str, Any]:
     publication = _validated_publication(state["collection_publication"])
-    store_root = _safe_directory(paths["store"], label="PIT store", create=False)
-    _assert_no_partial_store_artifacts(store_root, sessions)
     receipt = _verify_collection_authority(
         publication_root=_safe_directory(
             paths["publication_root"], label="publication root", create=False
         ),
         publication=publication,
-        store_root=store_root,
         spec=spec,
     )
     verified = _state_payload(
@@ -1233,7 +1228,6 @@ def _run_factor_v3_feature_history_collection_with_route_credential(
             receipt = _verify_collection_authority(
                 publication_root=publication_root,
                 publication=publication,
-                store_root=store_root,
                 spec=spec,
             )
             verified = _state_payload(
