@@ -29,6 +29,14 @@ from tests import test_research_security_code_transition as transition_fixture
 PARTITION_PATH = Path("data/research_partitions/frozen-v1.json")
 
 
+def _daily_authority_code(session: str) -> str:
+    if session == "2025-02-14":
+        return "300114.SZ"
+    if session == "2025-02-17":
+        return "302132.SZ"
+    return "600001.SH"
+
+
 def _real_feature_history_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -203,6 +211,14 @@ def _publish_market_session(
             "temporal_contract_sha256": temporal_contract_sha256,
             "temporal_role": "development",
         }
+        rows = pit_fixture._market_default_rows(
+            dataset,
+            session,
+        )
+        code = _daily_authority_code(session)
+        if code != "600001.SH":
+            for row in rows:
+                row[1 if dataset == "stk_limit" else 0] = code
         raw = json.dumps(
             {
                 "request_id": f"factor-v3-daily-basic-{dataset}-{session}",
@@ -210,10 +226,7 @@ def _publish_market_session(
                 "msg": "",
                 "data": {
                     "fields": fields,
-                    "items": pit_fixture._market_default_rows(
-                        dataset,
-                        session,
-                    ),
+                    "items": rows,
                 },
             },
             separators=(",", ":"),
@@ -309,7 +322,7 @@ def _real_development_artifact(
             params={"trade_date": session.replace("-", "")},
             raw_bytes=pit_fixture._daily_response(
                 session.replace("-", ""),
-                [["600001.SH", "Fixture", "Industry"]],
+                [[_daily_authority_code(session), "Fixture", "Industry"]],
             ),
             http_status=200,
             retrieved_at=f"{session}T08:00:00+00:00",
@@ -361,6 +374,7 @@ class _DailyBasicTransport:
     def post(self, *, body: bytes, **_kwargs: object) -> SimpleNamespace:
         request = json.loads(body)
         trade_date = request["params"]["trade_date"]
+        session = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}"
         response = {
             "code": 0,
             "msg": "success",
@@ -368,7 +382,7 @@ class _DailyBasicTransport:
                 "fields": request["fields"].split(","),
                 "items": [
                     [
-                        "600001.SH",
+                        _daily_authority_code(session),
                         trade_date,
                         1.0,
                         2.0,
@@ -391,6 +405,10 @@ def test_real_250_plus_483_authority_chain_runs_and_cli_reverifies(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    evidence_root, transition_sha256 = _real_transition_evidence(
+        tmp_path,
+        monkeypatch,
+    )
     feature_spec_path, feature_run_root, prewindow = _real_feature_history_run(
         tmp_path,
         monkeypatch,
@@ -402,10 +420,6 @@ def test_real_250_plus_483_authority_chain_runs_and_cli_reverifies(
         tmp_path,
         development,
         temporal_contract_sha256=contract["contract_sha256"],
-    )
-    evidence_root, transition_sha256 = _real_transition_evidence(
-        tmp_path,
-        monkeypatch,
     )
     loaded = authority._load_development_authority(
         audited_development_universe_sqlite_path=artifact["path"],

@@ -32,6 +32,8 @@ PRODUCER_VERSION = "app.factor_v3_daily_basic_733_exact_set_authority/1"
 _AUTHORITY_STATUS = "VERIFIED_FACTOR_V3_733_DAILY_BASIC_EXACT_SET"
 _AUTHORITY_SCOPE = "FACTOR_V3_250_PREWINDOW_PLUS_483_DEVELOPMENT_INPUT_ONLY"
 _ROW_AUTHORITY_STATUS = "GRANTED_FOR_BOUND_FACTOR_V3_733_COVERAGE_ONLY"
+_FROZEN_DEVELOPMENT_SLICE_ROLE = "development_4"
+_AUDITED_DEVELOPMENT_TEMPORAL_ROLE = "development"
 _MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 _MAX_SOURCE_BYTES = 4 * 1024 * 1024
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -166,6 +168,11 @@ def _combine_authorities(
         "schema": "factor-v3-daily-basic-733-source-authorities/v1",
         "session_count": 733,
         "sessions_sha256": _canonical_sha256(dates),
+        "temporal_role_binding": {
+            "audited_artifact_role": _AUDITED_DEVELOPMENT_TEMPORAL_ROLE,
+            "frozen_development_slice_role": _FROZEN_DEVELOPMENT_SLICE_ROLE,
+            "partition_vintage_binding": "published_terminal_at",
+        },
     }
     refs = _partition_refs(partitions)
     rows = [
@@ -273,13 +280,15 @@ def _load_feature_history_prewindow_authority(
         generations = {
             str(row[0]): {
                 "generation_id": str(row[1]),
-                "vintage": str(row[2]),
-                "manifest_sha256": str(row[3]),
-                "lineage_sha256": str(row[4]),
+                "published_at": str(row[2]),
+                "source_vintage": str(row[3]),
+                "manifest_sha256": str(row[4]),
+                "lineage_sha256": str(row[5]),
             }
             for row in connection.execute(
                 """
-                SELECT trade_date, generation_id, vintage, manifest_sha256, lineage_sha256
+                SELECT trade_date, generation_id, terminal_at, vintage,
+                       manifest_sha256, lineage_sha256
                 FROM market_session_generations
                 WHERE status = 'published'
                 ORDER BY trade_date
@@ -313,6 +322,8 @@ def _load_feature_history_prewindow_authority(
             or ref is None
             or not codes
             or codes != sorted(set(codes))
+            or generation["source_vintage"]
+            not in {"live_forward", "historical_backfill"}
             or generation["generation_id"] != ref.get("market_generation_id")
             or generation["manifest_sha256"]
             != ref.get("market_generation_manifest_sha256")
@@ -326,7 +337,7 @@ def _load_feature_history_prewindow_authority(
                 generation_id=generation["generation_id"],
                 generation_manifest_sha256=generation["manifest_sha256"],
                 generation_lineage_sha256=generation["lineage_sha256"],
-                vintage=generation["vintage"],
+                vintage=generation["published_at"],
                 ts_codes=tuple(codes),
             )
         )
@@ -362,14 +373,129 @@ def _load_development_authority(
     expected_development_temporal_contract_sha256: str,
     expected_development_temporal_role: str,
 ) -> legacy.AuditedDailyAuthority:
-    authority = legacy._load_audited_daily_authority(
-        audited_universe_sqlite_path=audited_development_universe_sqlite_path,
+    if expected_development_temporal_role != _FROZEN_DEVELOPMENT_SLICE_ROLE:
+        raise ValueError(
+            "factor-v3 daily-basic development slice temporal role rejected"
+        )
+    database_path = Path(audited_development_universe_sqlite_path)
+    with legacy.AuditedPointInTimeUniverse.from_file(
+        str(database_path),
         expected_coverage_audit_sha256=expected_development_coverage_audit_sha256,
         expected_artifact_root_sha256=expected_development_artifact_root_sha256,
         expected_temporal_contract_sha256=expected_development_temporal_contract_sha256,
-        expected_temporal_role=expected_development_temporal_role,
-    )
-    if len(authority.partitions) != 483:
+        expected_temporal_role=_AUDITED_DEVELOPMENT_TEMPORAL_ROLE,
+    ) as universe:
+        database_path = universe.database_path
+        manifest = universe.manifest
+        refs = manifest["market_generations"]["refs"]
+        ref_by_date = {str(ref["trade_date"]): ref for ref in refs}
+        if len(ref_by_date) != len(refs):
+            raise ValueError("factor-v3 daily-basic development refs rejected")
+        connection = universe._require_open()
+        generations = {
+            str(row["trade_date"]): {
+                "generation_id": str(row["generation_id"]),
+                "published_at": str(row["terminal_at"]),
+                "source_vintage": str(row["vintage"]),
+                "manifest_sha256": str(row["manifest_sha256"]),
+                "lineage_sha256": str(row["lineage_sha256"]),
+            }
+            for row in connection.execute(
+                """
+                SELECT trade_date, generation_id, terminal_at, vintage,
+                       manifest_sha256, lineage_sha256
+                FROM market_session_generations
+                WHERE status = 'published'
+                ORDER BY trade_date
+                """
+            )
+        }
+        codes_by_date: dict[str, list[str]] = {
+            str(ref["trade_date"]): [] for ref in refs
+        }
+        for row in connection.execute(
+            """
+            SELECT trade_date, generation_id, ts_code
+            FROM market_session_generation_rows_daily
+            ORDER BY trade_date, ts_code
+            """
+        ):
+            session = str(row["trade_date"])
+            generation_id = str(row["generation_id"])
+            code = str(row["ts_code"])
+            if (
+                session not in codes_by_date
+                or generations.get(session, {}).get("generation_id") != generation_id
+            ):
+                raise ValueError("factor-v3 daily-basic development rows rejected")
+            codes_by_date[session].append(code)
+        partitions = []
+        for ref in refs:
+            session = str(ref["trade_date"])
+            generation = generations.get(session)
+            codes = codes_by_date.get(session)
+            if (
+                generation is None
+                or not codes
+                or codes != sorted(set(codes))
+                or generation["source_vintage"]
+                not in {"live_forward", "historical_backfill"}
+                or generation["generation_id"] != str(ref["generation_id"])
+                or generation["manifest_sha256"] != str(ref["manifest_sha256"])
+                or generation["lineage_sha256"] != str(ref["lineage_sha256"])
+                or generation["source_vintage"] != str(ref["vintage"])
+            ):
+                raise ValueError(
+                    "factor-v3 daily-basic development partition rejected"
+                )
+            partitions.append(
+                legacy.AuthoritativeDailyPartition(
+                    trade_date=session,
+                    generation_id=generation["generation_id"],
+                    generation_manifest_sha256=generation["manifest_sha256"],
+                    generation_lineage_sha256=generation["lineage_sha256"],
+                    vintage=generation["published_at"],
+                    ts_codes=tuple(codes),
+                )
+            )
+        partition_tuple = tuple(partitions)
+        manifest_raw = raw_authority._read_safe_file(
+            database_path.parent / "manifest.json",
+            label="factor-v3 daily-basic development manifest",
+            max_bytes=legacy._MAX_MANIFEST_BYTES,
+        )
+        authority = legacy.AuditedDailyAuthority(
+            manifest_file_sha256=_sha256(manifest_raw),
+            manifest_sha256=str(manifest["manifest_sha256"]),
+            bundle_sha256=str(manifest["bundle_sha256"]),
+            artifact_root_sha256=str(manifest["artifact_root_sha256"]),
+            sqlite_sha256=str(manifest["sqlite"]["sha256"]),
+            coverage_audit_sha256=str(manifest["coverage_audit_sha256"]),
+            temporal_contract_sha256=str(
+                manifest["temporal_binding"]["contract_sha256"]
+            ),
+            temporal_role=str(manifest["temporal_binding"]["role"]),
+            daily_table_rows=int(
+                manifest["tables"]["market_session_generation_rows_daily"][
+                    "rows"
+                ]
+            ),
+            daily_table_sha256=str(
+                manifest["tables"]["market_session_generation_rows_daily"][
+                    "sha256"
+                ]
+            ),
+            market_generation_count=int(manifest["market_generations"]["count"]),
+            market_generation_root_sha256=_canonical_sha256(
+                _partition_refs(partition_tuple)
+            ),
+            partitions=partition_tuple,
+        )
+    legacy._validate_audited_daily_authority(authority)
+    if (
+        authority.temporal_role != _AUDITED_DEVELOPMENT_TEMPORAL_ROLE
+        or len(authority.partitions) != 483
+    ):
         raise ValueError("factor-v3 daily-basic development authority requires exact 483 sessions")
     return authority
 
@@ -409,7 +535,16 @@ def _load_733_authority(**kwargs: Any) -> tuple[legacy.AuditedDailyAuthority, di
             "expected_development_temporal_role"
         ],
     )
-    return _combine_authorities(prewindow, development)
+    combined, identity = _combine_authorities(prewindow, development)
+    expected_root = kwargs.get("expected_source_authority_root_sha256")
+    if expected_root is not None:
+        expected = _sha256_text(
+            expected_root,
+            label="expected source authority root",
+        )
+        if not hmac.compare_digest(identity["root_sha256"], expected):
+            raise ValueError("factor-v3 daily-basic source authority root rejected")
+    return combined, identity
 
 
 def _validated_refs(
@@ -812,6 +947,7 @@ def _source_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
             "expected_development_artifact_root_sha256",
             "expected_development_temporal_contract_sha256",
             "expected_development_temporal_role",
+            "expected_source_authority_root_sha256",
         )
     }
 
@@ -825,6 +961,7 @@ def publish_factor_v3_daily_basic_733_exact_set_coverage(
     expected_development_artifact_root_sha256: str,
     expected_development_temporal_contract_sha256: str,
     expected_development_temporal_role: str,
+    expected_source_authority_root_sha256: str,
     points_output_root: str | Path,
     collection_set_refs: Sequence[Mapping[str, Any]],
     security_code_transition_evidence_root: str | Path,
@@ -933,6 +1070,7 @@ def verify_factor_v3_daily_basic_733_exact_set_coverage(
     expected_development_artifact_root_sha256: str,
     expected_development_temporal_contract_sha256: str,
     expected_development_temporal_role: str,
+    expected_source_authority_root_sha256: str,
     points_output_root: str | Path,
     collection_set_refs: Sequence[Mapping[str, Any]],
     security_code_transition_evidence_root: str | Path,

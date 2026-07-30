@@ -10,7 +10,6 @@ from typing import Any
 import pytest
 
 from app import factor_v3_daily_basic_733_exact_set_authority as authority
-from app import factor_v3_daily_basic_runner as runner
 from app import jiaoch_daily_basic_exact_set_authority as legacy
 from app.jiaoch_points_response_normalization import NormalizedDailyBasicRow
 
@@ -308,7 +307,6 @@ def test_v2_rejects_same_dates_from_replaced_source_authority_root(
             **_verify_kwargs(kwargs, publication)
         )
 
-
 @pytest.mark.parametrize("artifact", ["receipt", "attestation", "publication"])
 def test_capability_free_verifier_rejects_deleted_or_tampered_terminal_artifacts(
     artifact: str,
@@ -328,4 +326,3 @@ def test_capability_free_verifier_rejects_deleted_or_tampered_terminal_artifacts
         authority.verify_factor_v3_daily_basic_733_exact_set_coverage(
             **_verify_kwargs(kwargs, publication)
         )
-

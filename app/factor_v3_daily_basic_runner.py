@@ -93,6 +93,34 @@ _EXACT_INPUT_FIELDS = frozenset(
     }
 )
 _COLLECTOR_FIELDS = frozenset({"max_attempts", "timeout_seconds", "workers"})
+_TERMINAL_PUBLICATION_FIELDS = frozenset(
+    {
+        "attestation_relative_path",
+        "attestation_sha256",
+        "publication_relative_path",
+        "publication_sha256",
+        "receipt_relative_path",
+        "receipt_sha256",
+        "schema",
+    }
+)
+_TERMINAL_RECEIPT_FIELDS = frozenset(
+    {
+        "authority_root_sha256",
+        "receipt_relative_path",
+        "receipt_sha256",
+        "verified",
+    }
+)
+_TERMINAL_VERIFICATION_FIELDS = frozenset(
+    {
+        "authority_root_sha256",
+        "receipt_sha256",
+        "trade_date_count",
+        "trade_dates",
+        "verified",
+    }
+)
 
 _DAILY_BASIC_POLICY_DOCUMENT = {
     "schema": _POLICY_DOCUMENT_SCHEMA,
@@ -568,8 +596,13 @@ def _exact_set_kwargs(
     points_root: Path,
     refs: Sequence[Mapping[str, Any]],
     inputs: Mapping[str, Any],
+    expected_source_authority_root_sha256: str,
 ) -> dict[str, Any]:
     validated = _validated_exact_inputs(inputs)
+    source_root = _require_sha256(
+        expected_source_authority_root_sha256,
+        label="source authority root",
+    )
     return {
         "feature_history_run_spec_path": validated["feature_history_run_spec_path"],
         "feature_history_run_root": validated["feature_history_run_root"],
@@ -588,6 +621,7 @@ def _exact_set_kwargs(
         "expected_development_temporal_role": validated[
             "expected_development_temporal_role"
         ],
+        "expected_source_authority_root_sha256": source_root,
         "points_output_root": points_root,
         "collection_set_refs": refs,
         "security_code_transition_evidence_root": validated[
@@ -606,6 +640,7 @@ def _publish_exact_set_coverage(
     points_root: Path,
     refs: Sequence[Mapping[str, Any]],
     inputs: Mapping[str, Any],
+    expected_source_authority_root_sha256: str,
 ) -> dict[str, Any]:
     from app import factor_v3_daily_basic_733_exact_set_authority as authority
 
@@ -615,20 +650,14 @@ def _publish_exact_set_coverage(
             points_root=points_root,
             refs=refs,
             inputs=inputs,
+            expected_source_authority_root_sha256=(
+                expected_source_authority_root_sha256
+            ),
         )
     )
-    required = {
-        "attestation_relative_path",
-        "attestation_sha256",
-        "publication_relative_path",
-        "publication_sha256",
-        "receipt_relative_path",
-        "receipt_sha256",
-        "schema",
-    }
     if (
         type(publication) is not dict
-        or set(publication) != required
+        or set(publication) != _TERMINAL_PUBLICATION_FIELDS
         or publication["schema"]
         != "factor-v3-daily-basic-733-exact-set-publication/v2"
     ):
@@ -643,6 +672,7 @@ def _verify_exact_set_coverage(
     refs: Sequence[Mapping[str, Any]],
     inputs: Mapping[str, Any],
     publication: Mapping[str, Any],
+    expected_source_authority_root_sha256: str,
 ) -> dict[str, Any]:
     from app import factor_v3_daily_basic_733_exact_set_authority as authority
 
@@ -653,6 +683,9 @@ def _verify_exact_set_coverage(
                 points_root=points_root,
                 refs=refs,
                 inputs=inputs,
+                expected_source_authority_root_sha256=(
+                    expected_source_authority_root_sha256
+                ),
             ),
             publication=publication,
         )
@@ -660,7 +693,11 @@ def _verify_exact_set_coverage(
         raise FactorV3DailyBasicRunnerError(
             "factor-v3 daily-basic terminal exact-set verification rejected"
         ) from exc
-    if type(verified) is not dict or verified.get("verified") is not True:
+    if (
+        type(verified) is not dict
+        or set(verified) != _TERMINAL_VERIFICATION_FIELDS
+        or verified.get("verified") is not True
+    ):
         raise FactorV3DailyBasicRunnerError(
             "factor-v3 daily-basic terminal exact-set verification rejected"
         )
@@ -675,6 +712,47 @@ def _verify_exact_set_coverage(
     _require_sha256(verified.get("authority_root_sha256"), label="authority root")
     _require_sha256(verified.get("receipt_sha256"), label="receipt")
     return dict(verified)
+
+
+def _assert_terminal_verification(
+    *,
+    publication: Any,
+    receipt: Any,
+    verified: Any,
+) -> None:
+    if (
+        type(publication) is not dict
+        or set(publication) != _TERMINAL_PUBLICATION_FIELDS
+        or publication.get("schema")
+        != "factor-v3-daily-basic-733-exact-set-publication/v2"
+        or type(receipt) is not dict
+        or set(receipt) != _TERMINAL_RECEIPT_FIELDS
+        or receipt.get("verified") is not True
+        or type(verified) is not dict
+        or set(verified) != _TERMINAL_VERIFICATION_FIELDS
+        or verified.get("verified") is not True
+    ):
+        raise FactorV3DailyBasicRunnerError(
+            "factor-v3 daily-basic terminal receipt rejected"
+        )
+    for field in (
+        "attestation_sha256",
+        "publication_sha256",
+        "receipt_sha256",
+    ):
+        _require_sha256(publication.get(field), label=field)
+    _require_sha256(receipt.get("authority_root_sha256"), label="authority root")
+    _require_sha256(receipt.get("receipt_sha256"), label="receipt")
+    if (
+        receipt["authority_root_sha256"] != verified.get("authority_root_sha256")
+        or receipt["receipt_sha256"] != verified.get("receipt_sha256")
+        or receipt["receipt_sha256"] != publication.get("receipt_sha256")
+        or receipt["receipt_relative_path"]
+        != publication.get("receipt_relative_path")
+    ):
+        raise FactorV3DailyBasicRunnerError(
+            "factor-v3 daily-basic terminal receipt rejected"
+        )
 
 
 def _result(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -717,16 +795,15 @@ def _run_factor_v3_daily_basic_collection_with_route_credential(
                 refs=state["collection_set_refs"],
                 inputs=spec["exact_set_authority_inputs"],
                 publication=state["exact_set_publication"],
+                expected_source_authority_root_sha256=spec[
+                    "source_authority_root_sha256"
+                ],
             )
-            if (
-                state["receipt"].get("authority_root_sha256")
-                != exact_verified["authority_root_sha256"]
-                or state["receipt"].get("receipt_sha256")
-                != exact_verified["receipt_sha256"]
-            ):
-                raise FactorV3DailyBasicRunnerError(
-                    "factor-v3 daily-basic terminal receipt rejected"
-                )
+            _assert_terminal_verification(
+                publication=state["exact_set_publication"],
+                receipt=state["receipt"],
+                verified=exact_verified,
+            )
             return _result(state)
         persisted = state["credential_generation_id"]
         if persisted is not None and persisted != source_generation_id:
@@ -765,6 +842,9 @@ def _run_factor_v3_daily_basic_collection_with_route_credential(
             publication = _publish_exact_set_coverage(
                 authority_root=_safe_directory(paths["authority"], label="authority root", create=True),
                 points_root=points_root, refs=refs, inputs=spec["exact_set_authority_inputs"],
+                expected_source_authority_root_sha256=spec[
+                    "source_authority_root_sha256"
+                ],
             )
             exact_verified = _verify_exact_set_coverage(
                 authority_root=paths["authority"],
@@ -772,6 +852,9 @@ def _run_factor_v3_daily_basic_collection_with_route_credential(
                 refs=refs,
                 inputs=spec["exact_set_authority_inputs"],
                 publication=publication,
+                expected_source_authority_root_sha256=spec[
+                    "source_authority_root_sha256"
+                ],
             )
             receipt = {
                 "authority_root_sha256": exact_verified["authority_root_sha256"],
@@ -779,6 +862,11 @@ def _run_factor_v3_daily_basic_collection_with_route_credential(
                 "receipt_sha256": exact_verified["receipt_sha256"],
                 "verified": True,
             }
+            _assert_terminal_verification(
+                publication=publication,
+                receipt=receipt,
+                verified=exact_verified,
+            )
             verified = _state_payload(
                 run_spec_sha256=spec["run_spec_sha256"], status="verified", completed_session_count=733,
                 credential_generation_id=active_generation, collection_set_refs=refs,
@@ -827,18 +915,15 @@ def verify_factor_v3_daily_basic_run(*, run_spec_path: str | Path, run_root: str
             refs=state["collection_set_refs"],
             inputs=spec["exact_set_authority_inputs"],
             publication=state["exact_set_publication"],
+            expected_source_authority_root_sha256=spec[
+                "source_authority_root_sha256"
+            ],
         )
-        if (
-            state["receipt"].get("authority_root_sha256")
-            != exact_verified["authority_root_sha256"]
-            or state["receipt"].get("receipt_sha256")
-            != exact_verified["receipt_sha256"]
-            or state["receipt"].get("receipt_relative_path")
-            != state["exact_set_publication"].get("receipt_relative_path")
-        ):
-            raise FactorV3DailyBasicRunnerError(
-                "factor-v3 daily-basic terminal receipt rejected"
-            )
+        _assert_terminal_verification(
+            publication=state["exact_set_publication"],
+            receipt=state["receipt"],
+            verified=exact_verified,
+        )
         return _result(state)
 
 
