@@ -44,3 +44,22 @@ def test_external_loader_establishes_the_boundary_before_supervisor_imports() ->
     assert "import pathlib" not in source[:boundary]
     assert "import json" not in source[:boundary]
     assert "import base64" not in source[:boundary]
+
+
+def test_external_loader_exposes_a_pipe_only_native_credential_provider() -> None:
+    control = import_module("app.factor_v3_formal_supervisor_control")
+
+    source = control.SUPERVISOR_EXTERNAL_LOADER_TEMPLATE
+    signature_check = source.index(
+        '_verify_signature(_canonical_bytes(_payload), _authorization["signature_base64"])'
+    )
+    provider = source.index("_TRUSTED_NATIVE_BROKER_CREDENTIAL_PROVIDER")
+    supervisor_exec = source.index("# EXECUTED_SUPERVISOR_BYTES_EXECUTED")
+
+    assert '"--native-broker-v1"' in source
+    assert provider > signature_check
+    assert provider < supervisor_exec
+    assert "sys.stdin.buffer.readline(" in source
+    assert "sys.stdout.buffer.write(" in source
+    assert '"HANDLE="' in source
+    assert "NATIVE_BROKER_CREDENTIAL_HANDLE" not in source
