@@ -21,6 +21,24 @@
 #ifndef F3_BROKER_PRODUCTION_HANDOFF_READY
 #define F3_BROKER_PRODUCTION_HANDOFF_READY 0
 #endif
+#ifndef F3_BROKER_RESTRICTING_SID
+#define F3_BROKER_RESTRICTING_SID L""
+#endif
+#ifndef F3_BROKER_HANDOFF_ORIGINAL_SCHEMA
+#define F3_BROKER_HANDOFF_ORIGINAL_SCHEMA ""
+#endif
+#ifndef F3_BROKER_HANDOFF_ORIGINAL_ACTION
+#define F3_BROKER_HANDOFF_ORIGINAL_ACTION ""
+#endif
+#ifndef F3_BROKER_HANDOFF_ORIGINAL_ENVELOPE_SHA256
+#define F3_BROKER_HANDOFF_ORIGINAL_ENVELOPE_SHA256 ""
+#endif
+#ifndef F3_BROKER_HANDOFF_ORIGINAL_SIGNATURE_SHA256
+#define F3_BROKER_HANDOFF_ORIGINAL_SIGNATURE_SHA256 ""
+#endif
+#ifndef F3_BROKER_HANDOFF_ORIGINAL_CAS_SHA256
+#define F3_BROKER_HANDOFF_ORIGINAL_CAS_SHA256 ""
+#endif
 
 #ifdef F3_BROKER_TESTING
 #ifndef F3_BROKER_DISPOSABLE_TEST_MANIFEST
@@ -40,6 +58,10 @@
 #define F3_SIGNING_KEY_SLOT_ID "factor-v3-execution-authorization"
 #define F3_CREDENTIAL_SLOT_ID "points-primary"
 #define F3_CHILD_PROTOCOL L"factor-v3-formal-native-broker-child/v1"
+#define F3_HANDOFF_CHILD_PROTOCOL "factor-v3-formal-native-broker-child/v2"
+#define F3_HANDOFF_CHILD_PROTOCOL_W L"factor-v3-formal-native-broker-child/v2"
+#define F3_PROVISIONAL_SCHEMA "factor-v3-formal-native-broker-provisional/v1"
+#define F3_COMPLETED_SCHEMA "factor-v3-formal-native-broker-completed/v1"
 #define F3_MAX_CANDIDATE_BYTES (64u * 1024u)
 #define F3_MAX_MANIFEST_FILE_BYTES (64u * 1024u * 1024u)
 #define F3_MAX_SECRET_SLOT_BYTES (64u * 1024u)
@@ -431,6 +453,9 @@ SECURITY_STATUS f3_broker_sign_sha256_with_cng_key(
 }
 
 #ifdef F3_BROKER_TESTING
+static int f3_test_handoff_stage = 0;
+static DWORD f3_test_handoff_error = ERROR_SUCCESS;
+
 static int cng_key_absent(const wchar_t *key_name) {
     NCRYPT_PROV_HANDLE provider = 0;
     NCRYPT_KEY_HANDLE key = 0;
@@ -1163,7 +1188,7 @@ static int append_environment_entry(
     return 1;
 }
 
-static wchar_t *sanitized_environment(void) {
+static wchar_t *sanitized_environment(const wchar_t *protocol) {
     const size_t capacity = 32768;
     wchar_t *block = (wchar_t *)HeapAlloc(
         GetProcessHeap(),
@@ -1173,7 +1198,7 @@ static wchar_t *sanitized_environment(void) {
     size_t offset = 0;
     wchar_t windows_directory[32768];
     UINT windows_directory_length;
-    if (block == NULL) {
+    if (block == NULL || protocol == NULL || protocol[0] == L'\0') {
         return NULL;
     }
     if (!append_environment_entry(
@@ -1181,7 +1206,7 @@ static wchar_t *sanitized_environment(void) {
             capacity,
             &offset,
             L"FACTOR_V3_FORMAL_NATIVE_BROKER_PROTOCOL",
-            F3_CHILD_PROTOCOL
+            protocol
         )) {
         HeapFree(GetProcessHeap(), 0, block);
         return NULL;
@@ -1373,7 +1398,7 @@ static int launch_test_child(
         )) {
         goto cleanup;
     }
-    environment = sanitized_environment();
+    environment = sanitized_environment(F3_CHILD_PROTOCOL);
     if (environment == NULL) {
         goto cleanup;
     }
@@ -1532,6 +1557,950 @@ static int validate_candidate_only(const wchar_t *candidate_path) {
 }
 
 #ifdef F3_BROKER_TESTING
+static int hash_memory(
+    const unsigned char *data,
+    DWORD size,
+    unsigned char digest[32]
+) {
+    BCRYPT_ALG_HANDLE algorithm = NULL;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    NTSTATUS status;
+    int ok = 0;
+    status = BCryptOpenAlgorithmProvider(
+        &algorithm,
+        BCRYPT_SHA256_ALGORITHM,
+        NULL,
+        0
+    );
+    if (status < 0) {
+        goto cleanup;
+    }
+    status = BCryptCreateHash(
+        algorithm,
+        &hash,
+        NULL,
+        0,
+        NULL,
+        0,
+        0
+    );
+    if (status < 0
+        || BCryptHashData(hash, (PUCHAR)data, size, 0) < 0
+        || BCryptFinishHash(hash, digest, 32, 0) < 0) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (hash != NULL) {
+        BCryptDestroyHash(hash);
+    }
+    if (algorithm != NULL) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+    }
+    return ok;
+}
+
+static void digest_to_ascii(
+    const unsigned char digest[32],
+    char output[65]
+) {
+    static const char digits[] = "0123456789abcdef";
+    size_t index;
+    for (index = 0; index < 32; ++index) {
+        output[index * 2] = digits[digest[index] >> 4];
+        output[index * 2 + 1] = digits[digest[index] & 15];
+    }
+    output[64] = '\0';
+}
+
+static int exact_sha256_ascii(const char *value) {
+    size_t index;
+    if (value == NULL || strlen(value) != 64) {
+        return 0;
+    }
+    for (index = 0; index < 64; ++index) {
+        if (!((value[index] >= '0' && value[index] <= '9')
+                || (value[index] >= 'a' && value[index] <= 'f'))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int validate_bound_ready(
+    const unsigned char *ready,
+    DWORD ready_size,
+    const char candidate_sha256[65],
+    char claim_sha256[65]
+) {
+    unsigned char claim_digest[32];
+    char claim_fields[1024];
+    char expected[1400];
+    int claim_length;
+    int expected_length;
+    if (strcmp(
+            F3_BROKER_HANDOFF_ORIGINAL_SCHEMA,
+            "factor-v3-formal-supervisor-launch-authorization/v2"
+        ) != 0
+        || strcmp(F3_BROKER_HANDOFF_ORIGINAL_ACTION, "run") != 0
+        || !exact_sha256_ascii(
+            F3_BROKER_HANDOFF_ORIGINAL_ENVELOPE_SHA256
+        )
+        || !exact_sha256_ascii(
+            F3_BROKER_HANDOFF_ORIGINAL_SIGNATURE_SHA256
+        )
+        || !exact_sha256_ascii(F3_BROKER_HANDOFF_ORIGINAL_CAS_SHA256)
+        || !exact_sha256_ascii(candidate_sha256)) {
+        return 0;
+    }
+    claim_length = snprintf(
+        claim_fields,
+        sizeof(claim_fields),
+        "original_schema=%s\n"
+        "original_action=%s\n"
+        "original_envelope_sha256=%s\n"
+        "original_signature_sha256=%s\n"
+        "original_cas_sha256=%s\n"
+        "candidate_sha256=%s\n",
+        F3_BROKER_HANDOFF_ORIGINAL_SCHEMA,
+        F3_BROKER_HANDOFF_ORIGINAL_ACTION,
+        F3_BROKER_HANDOFF_ORIGINAL_ENVELOPE_SHA256,
+        F3_BROKER_HANDOFF_ORIGINAL_SIGNATURE_SHA256,
+        F3_BROKER_HANDOFF_ORIGINAL_CAS_SHA256,
+        candidate_sha256
+    );
+    if (claim_length <= 0
+        || (size_t)claim_length >= sizeof(claim_fields)
+        || !hash_memory(
+            (const unsigned char *)claim_fields,
+            (DWORD)claim_length,
+            claim_digest
+        )) {
+        SecureZeroMemory(claim_fields, sizeof(claim_fields));
+        return 0;
+    }
+    digest_to_ascii(claim_digest, claim_sha256);
+    expected_length = snprintf(
+        expected,
+        sizeof(expected),
+        "READY " F3_HANDOFF_CHILD_PROTOCOL "\n"
+        "%s"
+        "claim_sha256=%s\n",
+        claim_fields,
+        claim_sha256
+    );
+    SecureZeroMemory(claim_digest, sizeof(claim_digest));
+    SecureZeroMemory(claim_fields, sizeof(claim_fields));
+    if (expected_length <= 0
+        || (size_t)expected_length >= sizeof(expected)
+        || ready_size != (DWORD)expected_length
+        || memcmp(ready, expected, ready_size) != 0) {
+        SecureZeroMemory(expected, sizeof(expected));
+        SecureZeroMemory(claim_sha256, 65);
+        return 0;
+    }
+    SecureZeroMemory(expected, sizeof(expected));
+    return 1;
+}
+
+static int read_bound_ready(
+    HANDLE pipe,
+    const char candidate_sha256[65],
+    char claim_sha256[65]
+) {
+    unsigned char buffer[1400];
+    DWORD total = 0;
+    DWORD available = 0;
+    DWORD count = 0;
+    DWORD elapsed = 0;
+    int ok = 0;
+    while (elapsed < 10000 && total < sizeof(buffer)) {
+        if (!PeekNamedPipe(pipe, NULL, 0, NULL, &available, NULL)) {
+            goto cleanup;
+        }
+        if (available == 0) {
+            Sleep(10);
+            elapsed += 10;
+            continue;
+        }
+        if (available > sizeof(buffer) - total
+            || !ReadFile(
+                pipe,
+                buffer + total,
+                available,
+                &count,
+                NULL
+            )
+            || count == 0) {
+            goto cleanup;
+        }
+        total += count;
+        if (total > 0 && buffer[total - 1] == '\n') {
+            char marker[] = "claim_sha256=";
+            size_t minimum = strlen(marker) + 65;
+            if (total >= minimum
+                && memcmp(
+                    buffer + total - minimum,
+                    marker,
+                    strlen(marker)
+                ) == 0) {
+                break;
+            }
+        }
+    }
+    ok = validate_bound_ready(
+        buffer,
+        total,
+        candidate_sha256,
+        claim_sha256
+    );
+
+cleanup:
+    SecureZeroMemory(buffer, sizeof(buffer));
+    return ok;
+}
+
+static int create_restricted_primary_token(HANDLE *restricted_token) {
+    HANDLE primary = NULL;
+    PSID disabled_sid = NULL;
+    SID_AND_ATTRIBUTES disabled;
+    int ok = 0;
+    memset(&disabled, 0, sizeof(disabled));
+    if (restricted_token == NULL
+        || F3_BROKER_RESTRICTING_SID[0] == L'\0') {
+        return 0;
+    }
+    *restricted_token = NULL;
+    if (!OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
+            &primary
+        )
+        || !ConvertStringSidToSidW(
+            F3_BROKER_RESTRICTING_SID,
+            &disabled_sid
+        )) {
+        goto cleanup;
+    }
+    disabled.Sid = disabled_sid;
+    disabled.Attributes = 0;
+    if (!CreateRestrictedToken(
+            primary,
+            DISABLE_MAX_PRIVILEGE,
+            1,
+            &disabled,
+            0,
+            NULL,
+            0,
+            NULL,
+            restricted_token
+        )) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (!ok && restricted_token != NULL && *restricted_token != NULL) {
+        CloseHandle(*restricted_token);
+        *restricted_token = NULL;
+    }
+    if (primary != NULL) {
+        CloseHandle(primary);
+    }
+    if (disabled_sid != NULL) {
+        LocalFree(disabled_sid);
+    }
+    return ok;
+}
+
+static int read_exact_provisional(
+    const wchar_t *path,
+    unsigned char digest[32]
+) {
+    static const unsigned char expected[] =
+        "schema=" F3_PROVISIONAL_SCHEMA "\n"
+        "restricted_token=1\n"
+        "pre_claim_secret_open_denied=1\n"
+        "credential_handle_read_ok=1\n"
+        "post_claim_secret_reopen_denied=1\n"
+        "runtime_namespace_write_denied=1\n"
+        "completed_path_write_denied=1\n"
+        "status=provisional\n";
+    HeldFile provisional = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    unsigned char *raw = NULL;
+    DWORD raw_size = 0;
+    int ok = open_held_file(
+            path,
+            sizeof(expected) - 1,
+            &provisional
+        )
+        && read_candidate(&provisional, &raw, &raw_size)
+        && raw_size == sizeof(expected) - 1
+        && memcmp(raw, expected, raw_size) == 0
+        && hash_memory(raw, raw_size, digest)
+        && held_unchanged(&provisional, NULL);
+    if (raw != NULL) {
+        SecureZeroMemory(raw, (SIZE_T)raw_size + 1);
+        HeapFree(GetProcessHeap(), 0, raw);
+    }
+    close_held(&provisional);
+    return ok;
+}
+
+static int atomic_write_new(
+    const wchar_t *path,
+    const unsigned char *data,
+    DWORD size
+) {
+    wchar_t temporary[32768];
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    DWORD written = 0;
+    DWORD total = 0;
+    int length;
+    int ok = 0;
+    if (!strict_windows_candidate_path(path)
+        || !reject_reparse_chain(path)
+        || GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+        return 0;
+    }
+    length = swprintf(
+        temporary,
+        sizeof(temporary) / sizeof(temporary[0]),
+        L"%ls.tmp-%lu-%llu",
+        path,
+        GetCurrentProcessId(),
+        (unsigned long long)GetTickCount64()
+    );
+    if (length <= 0
+        || (size_t)length >= sizeof(temporary) / sizeof(temporary[0])) {
+        return 0;
+    }
+    handle = CreateFileW(
+        temporary,
+        GENERIC_WRITE,
+        0,
+        NULL,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+        NULL
+    );
+    if (handle == INVALID_HANDLE_VALUE) {
+        goto cleanup;
+    }
+    while (total < size) {
+        if (!WriteFile(
+                handle,
+                data + total,
+                size - total,
+                &written,
+                NULL
+            )
+            || written == 0) {
+            goto cleanup;
+        }
+        total += written;
+    }
+    if (!FlushFileBuffers(handle)) {
+        goto cleanup;
+    }
+    CloseHandle(handle);
+    handle = INVALID_HANDLE_VALUE;
+    if (!MoveFileExW(temporary, path, MOVEFILE_WRITE_THROUGH)) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(handle);
+    }
+    if (!ok) {
+        DeleteFileW(temporary);
+    }
+    SecureZeroMemory(temporary, sizeof(temporary));
+    return ok;
+}
+
+static int create_disposable_cng_key(
+    const wchar_t *key_name,
+    NCRYPT_PROV_HANDLE *provider,
+    NCRYPT_KEY_HANDLE *key
+) {
+    DWORD bits = F3_RSA_BITS;
+    DWORD export_policy = 0;
+    if (key_name == NULL
+        || provider == NULL
+        || key == NULL
+        || wcsncmp(
+            key_name,
+            F3_DISPOSABLE_KEY_PREFIX,
+            wcslen(F3_DISPOSABLE_KEY_PREFIX)
+        ) != 0
+        || !cng_key_absent(key_name)
+        || f3_broker_open_cng_provider(provider) != ERROR_SUCCESS
+        || NCryptCreatePersistedKey(
+            *provider,
+            key,
+            F3_BROKER_CNG_ALGORITHM,
+            key_name,
+            0,
+            0
+        ) != ERROR_SUCCESS
+        || NCryptSetProperty(
+            *key,
+            NCRYPT_LENGTH_PROPERTY,
+            (PBYTE)&bits,
+            sizeof(bits),
+            0
+        ) != ERROR_SUCCESS
+        || NCryptSetProperty(
+            *key,
+            NCRYPT_EXPORT_POLICY_PROPERTY,
+            (PBYTE)&export_policy,
+            sizeof(export_policy),
+            0
+        ) != ERROR_SUCCESS
+        || NCryptFinalizeKey(*key, 0) != ERROR_SUCCESS) {
+        return 0;
+    }
+    return 1;
+}
+
+static int write_signed_completed(
+    const wchar_t *completed_path,
+    const wchar_t *key_name,
+    const char claim_sha256[65],
+    const char candidate_sha256[65],
+    const unsigned char provisional_digest[32]
+) {
+    BCRYPT_PKCS1_PADDING_INFO padding = {BCRYPT_SHA256_ALGORITHM};
+    NCRYPT_PROV_HANDLE provider = 0;
+    NCRYPT_KEY_HANDLE key = 0;
+    unsigned char unsigned_digest[32];
+    unsigned char *signature = NULL;
+    DWORD signature_size = 0;
+    DWORD private_size = 0;
+    char provisional_sha256[65];
+    char unsigned_ledger[1024];
+    unsigned char *ledger = NULL;
+    size_t ledger_capacity;
+    int unsigned_length;
+    int signature_verified = 0;
+    int key_deleted = 0;
+    int ok = 0;
+    size_t index;
+    size_t offset;
+    digest_to_ascii(provisional_digest, provisional_sha256);
+    unsigned_length = snprintf(
+        unsigned_ledger,
+        sizeof(unsigned_ledger),
+        "schema=" F3_COMPLETED_SCHEMA "\n"
+        "status=completed\n"
+        "claim_sha256=%s\n"
+        "candidate_sha256=%s\n"
+        "provisional_sha256=%s\n"
+        "signature_algorithm=RSA-PKCS1-SHA256\n"
+        "signature_verified_before_key_delete=1\n",
+        claim_sha256,
+        candidate_sha256,
+        provisional_sha256
+    );
+    if (unsigned_length <= 0
+        || (size_t)unsigned_length >= sizeof(unsigned_ledger)
+        || !hash_memory(
+            (const unsigned char *)unsigned_ledger,
+            (DWORD)unsigned_length,
+            unsigned_digest
+        )
+        || !create_disposable_cng_key(key_name, &provider, &key)
+        || f3_broker_sign_sha256_with_cng_key(
+            key,
+            unsigned_digest,
+            &signature,
+            &signature_size
+        ) != ERROR_SUCCESS
+        || NCryptVerifySignature(
+            key,
+            &padding,
+            unsigned_digest,
+            sizeof(unsigned_digest),
+            signature,
+            signature_size,
+            NCRYPT_PAD_PKCS1_FLAG
+        ) != ERROR_SUCCESS
+        || NCryptExportKey(
+            key,
+            0,
+            BCRYPT_RSAFULLPRIVATE_BLOB,
+            NULL,
+            NULL,
+            0,
+            &private_size,
+            0
+        ) == ERROR_SUCCESS) {
+        goto cleanup;
+    }
+    signature_verified = 1;
+    ledger_capacity = (size_t)unsigned_length
+        + strlen("signature_hex=\n")
+        + (size_t)signature_size * 2
+        + 1;
+    ledger = (unsigned char *)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        ledger_capacity
+    );
+    if (ledger == NULL) {
+        goto cleanup;
+    }
+    memcpy(ledger, unsigned_ledger, (size_t)unsigned_length);
+    offset = (size_t)unsigned_length;
+    memcpy(ledger + offset, "signature_hex=", strlen("signature_hex="));
+    offset += strlen("signature_hex=");
+    for (index = 0; index < signature_size; ++index) {
+        static const char digits[] = "0123456789abcdef";
+        ledger[offset++] = (unsigned char)digits[signature[index] >> 4];
+        ledger[offset++] = (unsigned char)digits[signature[index] & 15];
+    }
+    ledger[offset++] = '\n';
+    if (offset + 1 > ledger_capacity) {
+        goto cleanup;
+    }
+    key_deleted = NCryptDeleteKey(key, 0) == ERROR_SUCCESS;
+    key = 0;
+    if (!key_deleted
+        || !cng_key_absent(key_name)
+        || !atomic_write_new(
+            completed_path,
+            ledger,
+            (DWORD)offset
+        )) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (signature != NULL) {
+        SecureZeroMemory(signature, signature_size);
+        HeapFree(GetProcessHeap(), 0, signature);
+    }
+    if (key != 0) {
+        key_deleted = NCryptDeleteKey(key, 0) == ERROR_SUCCESS;
+        key = 0;
+    }
+    if (provider != 0) {
+        NCryptFreeObject(provider);
+    }
+    if (ledger != NULL) {
+        SecureZeroMemory(ledger, ledger_capacity);
+        HeapFree(GetProcessHeap(), 0, ledger);
+    }
+    SecureZeroMemory(unsigned_digest, sizeof(unsigned_digest));
+    SecureZeroMemory(unsigned_ledger, sizeof(unsigned_ledger));
+    SecureZeroMemory(provisional_sha256, sizeof(provisional_sha256));
+    return ok
+        && signature_verified
+        && key_deleted
+        && cng_key_absent(key_name);
+}
+
+static int launch_restricted_handoff_child(
+    const wchar_t *provisional_path,
+    const char candidate_sha256[65],
+    const wchar_t *completed_path,
+    const wchar_t *key_name,
+    HeldFile *runtime,
+    HeldFile *source,
+    HeldFile *candidate
+) {
+    STARTUPINFOEXW startup;
+    PROCESS_INFORMATION process;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+    SECURITY_ATTRIBUTES pipe_security;
+    PPROC_THREAD_ATTRIBUTE_LIST attributes = NULL;
+    SIZE_T attributes_size = 0;
+    HANDLE inherited_handles[3];
+    HANDLE job = NULL;
+    HANDLE restricted_token = NULL;
+    HANDLE child_input = INVALID_HANDLE_VALUE;
+    HANDLE parent_input = INVALID_HANDLE_VALUE;
+    HANDLE parent_output = INVALID_HANDLE_VALUE;
+    HANDLE child_output = INVALID_HANDLE_VALUE;
+    HANDLE null_error = INVALID_HANDLE_VALUE;
+    HANDLE remote_credential = NULL;
+    HeldFile credential = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    wchar_t command_line[32768];
+    wchar_t runtime_directory[32768];
+    wchar_t *environment = NULL;
+    char claim_sha256[65];
+    char response[128];
+    char candidate_hash[65];
+    unsigned char candidate_digest[32];
+    unsigned char provisional_digest[32];
+    DWORD response_size;
+    DWORD written = 0;
+    DWORD child_exit = 1;
+    BOOL process_in_job = FALSE;
+    int attributes_initialized = 0;
+    int child_created = 0;
+    int ok = 0;
+    memset(&startup, 0, sizeof(startup));
+    memset(&process, 0, sizeof(process));
+    memset(&limits, 0, sizeof(limits));
+    memset(&pipe_security, 0, sizeof(pipe_security));
+    memset(claim_sha256, 0, sizeof(claim_sha256));
+    memset(candidate_hash, 0, sizeof(candidate_hash));
+    pipe_security.nLength = sizeof(pipe_security);
+    pipe_security.bInheritHandle = TRUE;
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    f3_test_handoff_stage = 10;
+    if (!hash_held_file(candidate, candidate_digest)) {
+        goto cleanup;
+    }
+    digest_to_ascii(candidate_digest, candidate_hash);
+    if (strcmp(candidate_hash, candidate_sha256) != 0
+        || !quoted_command_line(
+            F3_BROKER_RUNTIME_PATH,
+            provisional_path,
+            command_line,
+            sizeof(command_line) / sizeof(command_line[0])
+        )
+        || !parent_directory(
+            F3_BROKER_RUNTIME_PATH,
+            runtime_directory,
+            sizeof(runtime_directory) / sizeof(runtime_directory[0])
+        )) {
+        goto cleanup;
+    }
+    f3_test_handoff_stage = 121;
+    environment = sanitized_environment(F3_HANDOFF_CHILD_PROTOCOL_W);
+    if (environment == NULL) {
+        goto cleanup;
+    }
+    f3_test_handoff_stage = 122;
+    if (!create_restricted_primary_token(&restricted_token)) {
+        goto cleanup;
+    }
+    f3_test_handoff_stage = 123;
+    if (!CreatePipe(
+            &child_input,
+            &parent_input,
+            &pipe_security,
+            0
+        )) {
+        goto cleanup;
+    }
+    f3_test_handoff_stage = 124;
+    if (!CreatePipe(
+            &parent_output,
+            &child_output,
+            &pipe_security,
+            0
+        )) {
+        goto cleanup;
+    }
+    f3_test_handoff_stage = 125;
+    if (!SetHandleInformation(
+            parent_input,
+            HANDLE_FLAG_INHERIT,
+            0
+        )
+        || !SetHandleInformation(
+            parent_output,
+            HANDLE_FLAG_INHERIT,
+            0
+        )) {
+        goto cleanup;
+    }
+    f3_test_handoff_stage = 13;
+    null_error = CreateFileW(
+        L"NUL",
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        &pipe_security,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (null_error == INVALID_HANDLE_VALUE) {
+        goto cleanup;
+    }
+    startup.StartupInfo.hStdInput = child_input;
+    startup.StartupInfo.hStdOutput = child_output;
+    startup.StartupInfo.hStdError = null_error;
+    inherited_handles[0] = child_input;
+    inherited_handles[1] = child_output;
+    inherited_handles[2] = null_error;
+    f3_test_handoff_stage = 14;
+    job = CreateJobObjectW(NULL, NULL);
+    if (job == NULL) {
+        goto cleanup;
+    }
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &limits,
+            sizeof(limits)
+        )) {
+        goto cleanup;
+    }
+    f3_test_handoff_stage = 15;
+    InitializeProcThreadAttributeList(NULL, 2, 0, &attributes_size);
+    if (attributes_size == 0) {
+        goto cleanup;
+    }
+    attributes = (PPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        attributes_size
+    );
+    if (attributes == NULL
+        || !InitializeProcThreadAttributeList(
+            attributes,
+            2,
+            0,
+            &attributes_size
+        )) {
+        goto cleanup;
+    }
+    attributes_initialized = 1;
+    if (!UpdateProcThreadAttribute(
+            attributes,
+            0,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST,
+            &job,
+            sizeof(job),
+            NULL,
+            NULL
+        )
+        || !UpdateProcThreadAttribute(
+            attributes,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            inherited_handles,
+            sizeof(inherited_handles),
+            NULL,
+            NULL
+        )) {
+        goto cleanup;
+    }
+    startup.lpAttributeList = attributes;
+    f3_test_handoff_stage = 16;
+    if (!CreateProcessAsUserW(
+            restricted_token,
+            F3_BROKER_RUNTIME_PATH,
+            command_line,
+            NULL,
+            NULL,
+            TRUE,
+            CREATE_SUSPENDED
+                | CREATE_UNICODE_ENVIRONMENT
+                | CREATE_NO_WINDOW
+                | EXTENDED_STARTUPINFO_PRESENT,
+            environment,
+            runtime_directory,
+            &startup.StartupInfo,
+            &process
+        )
+        || !IsProcessInJob(process.hProcess, job, &process_in_job)
+        || !process_in_job) {
+        if (process.hProcess != NULL) {
+            TerminateProcess(process.hProcess, 90);
+        }
+        goto cleanup;
+    }
+    child_created = 1;
+    CloseHandle(child_input);
+    child_input = INVALID_HANDLE_VALUE;
+    CloseHandle(child_output);
+    child_output = INVALID_HANDLE_VALUE;
+    CloseHandle(null_error);
+    null_error = INVALID_HANDLE_VALUE;
+    f3_test_handoff_stage = 17;
+    if (ResumeThread(process.hThread) == (DWORD)-1) {
+        goto cleanup;
+    }
+    if (!read_bound_ready(
+            parent_output,
+            candidate_hash,
+            claim_sha256
+        )) {
+        DWORD diagnostic_exit = STILL_ACTIVE;
+        WaitForSingleObject(process.hProcess, 1000);
+        if (GetExitCodeProcess(process.hProcess, &diagnostic_exit)
+            && diagnostic_exit != STILL_ACTIVE) {
+            f3_test_handoff_error = diagnostic_exit;
+        }
+        goto cleanup;
+    }
+    f3_test_handoff_stage = 18;
+    if (!open_held_file(
+            F3_BROKER_CREDENTIAL_SLOT_PATH,
+            F3_MAX_SECRET_SLOT_BYTES,
+            &credential
+        )
+        || !DuplicateHandle(
+            GetCurrentProcess(),
+            credential.handle,
+            process.hProcess,
+            &remote_credential,
+            GENERIC_READ,
+            FALSE,
+            0
+        )) {
+        goto cleanup;
+    }
+    f3_test_handoff_stage = 19;
+    response_size = (DWORD)snprintf(
+        response,
+        sizeof(response),
+        "HANDLE=%llx\n",
+        (unsigned long long)(uintptr_t)remote_credential
+    );
+    if (response_size == 0
+        || response_size >= sizeof(response)
+        || !WriteFile(
+            parent_input,
+            response,
+            response_size,
+            &written,
+            NULL
+        )
+        || written != response_size
+        || !FlushFileBuffers(parent_input)) {
+        goto cleanup;
+    }
+    CloseHandle(parent_input);
+    parent_input = INVALID_HANDLE_VALUE;
+    f3_test_handoff_stage = 20;
+    if (WaitForSingleObject(process.hProcess, 30000) != WAIT_OBJECT_0
+        || !GetExitCodeProcess(process.hProcess, &child_exit)
+        || child_exit != 0
+        || !held_unchanged(candidate, NULL)
+        || !held_unchanged(source, F3_BROKER_SOURCE_SHA256)
+        || !held_unchanged(runtime, F3_BROKER_RUNTIME_SHA256)
+        || !held_unchanged(&credential, NULL)
+        || !read_exact_provisional(
+            provisional_path,
+            provisional_digest
+        )
+        || !write_signed_completed(
+            completed_path,
+            key_name,
+            claim_sha256,
+            candidate_hash,
+            provisional_digest
+        )) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (!ok && f3_test_handoff_error == ERROR_SUCCESS) {
+        f3_test_handoff_error = GetLastError();
+    }
+    if (!ok && child_created && process.hProcess != NULL) {
+        TerminateProcess(process.hProcess, 97);
+        WaitForSingleObject(process.hProcess, 5000);
+    }
+    if (process.hThread != NULL) {
+        CloseHandle(process.hThread);
+    }
+    if (process.hProcess != NULL) {
+        CloseHandle(process.hProcess);
+    }
+    close_held(&credential);
+    if (child_input != INVALID_HANDLE_VALUE) {
+        CloseHandle(child_input);
+    }
+    if (parent_input != INVALID_HANDLE_VALUE) {
+        CloseHandle(parent_input);
+    }
+    if (parent_output != INVALID_HANDLE_VALUE) {
+        CloseHandle(parent_output);
+    }
+    if (child_output != INVALID_HANDLE_VALUE) {
+        CloseHandle(child_output);
+    }
+    if (null_error != INVALID_HANDLE_VALUE) {
+        CloseHandle(null_error);
+    }
+    if (restricted_token != NULL) {
+        CloseHandle(restricted_token);
+    }
+    if (job != NULL) {
+        CloseHandle(job);
+    }
+    if (attributes_initialized) {
+        DeleteProcThreadAttributeList(attributes);
+    }
+    if (attributes != NULL) {
+        HeapFree(GetProcessHeap(), 0, attributes);
+    }
+    if (environment != NULL) {
+        SecureZeroMemory(environment, 32768 * sizeof(wchar_t));
+        HeapFree(GetProcessHeap(), 0, environment);
+    }
+    SecureZeroMemory(command_line, sizeof(command_line));
+    SecureZeroMemory(runtime_directory, sizeof(runtime_directory));
+    SecureZeroMemory(claim_sha256, sizeof(claim_sha256));
+    SecureZeroMemory(candidate_hash, sizeof(candidate_hash));
+    SecureZeroMemory(candidate_digest, sizeof(candidate_digest));
+    SecureZeroMemory(provisional_digest, sizeof(provisional_digest));
+    SecureZeroMemory(response, sizeof(response));
+    return ok;
+}
+
+static int test_credential_handoff(
+    const wchar_t *candidate_path,
+    const wchar_t *provisional_path,
+    const wchar_t *completed_path,
+    const wchar_t *key_name
+) {
+    HeldFile runtime = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile source = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile candidate = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    CandidateAction action = ACTION_INVALID;
+    unsigned char digest[32];
+    char candidate_sha256[65];
+    int ok = open_and_validate_public_boundary(
+        candidate_path,
+        &runtime,
+        &source,
+        &candidate,
+        &action
+    );
+    f3_test_handoff_stage = 1;
+    if (!ok
+        || action != ACTION_RUN
+        || !hash_held_file(&candidate, digest)) {
+        ok = 0;
+        goto cleanup;
+    }
+    f3_test_handoff_stage = 2;
+    digest_to_ascii(digest, candidate_sha256);
+    ok = launch_restricted_handoff_child(
+        provisional_path,
+        candidate_sha256,
+        completed_path,
+        key_name,
+        &runtime,
+        &source,
+        &candidate
+    );
+
+cleanup:
+    SecureZeroMemory(digest, sizeof(digest));
+    SecureZeroMemory(candidate_sha256, sizeof(candidate_sha256));
+    close_held(&candidate);
+    close_held(&source);
+    close_held(&runtime);
+    return ok;
+}
+
 static int test_launch(
     const wchar_t *candidate_path,
     const wchar_t *output_path,
@@ -1541,7 +2510,6 @@ static int test_launch(
     HeldFile runtime = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile source = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile candidate = {INVALID_HANDLE_VALUE, 0, 0, {0}};
-    HeldFile credential = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     CandidateAction action = ACTION_INVALID;
     int ok = open_and_validate_public_boundary(
         candidate_path,
@@ -1550,13 +2518,7 @@ static int test_launch(
         &candidate,
         &action
     );
-    if (!ok
-        || ((action == ACTION_RUN || action == ACTION_RESUME)
-            && !open_held_file(
-                F3_BROKER_CREDENTIAL_SLOT_PATH,
-                F3_MAX_SECRET_SLOT_BYTES,
-                &credential
-            ))) {
+    if (!ok) {
         ok = 0;
         goto cleanup;
     }
@@ -1568,13 +2530,10 @@ static int test_launch(
     if (ok) {
         ok = held_unchanged(&candidate, NULL)
             && held_unchanged(&source, F3_BROKER_SOURCE_SHA256)
-            && held_unchanged(&runtime, F3_BROKER_RUNTIME_SHA256)
-            && (credential.handle == INVALID_HANDLE_VALUE
-                || held_unchanged(&credential, NULL));
+            && held_unchanged(&runtime, F3_BROKER_RUNTIME_SHA256);
     }
 
 cleanup:
-    close_held(&credential);
     close_held(&candidate);
     close_held(&source);
     close_held(&runtime);
@@ -1591,6 +2550,26 @@ int wmain(int argc, wchar_t **argv) {
         return 0;
     }
 #ifdef F3_BROKER_TESTING
+    if (
+        argc == 6
+        && wcscmp(argv[1], L"--test-credential-handoff") == 0
+    ) {
+        if (!test_credential_handoff(
+                argv[2],
+                argv[3],
+                argv[4],
+                argv[5]
+            )) {
+            fwprintf(
+                stderr,
+                L"native broker credential handoff rejected stage=%d error=%lu\n",
+                f3_test_handoff_stage,
+                f3_test_handoff_error
+            );
+            return 33;
+        }
+        return 0;
+    }
     if (argc == 2 && wcscmp(argv[1], L"--test-require-service-identity") == 0) {
         if (!f3_broker_current_process_is_expected_service()) {
             fwprintf(stderr, L"native broker service identity rejected\n");
