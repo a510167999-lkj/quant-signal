@@ -496,6 +496,27 @@ def test_public_entrypoint_has_no_key_or_argv_parameter() -> None:
     assert tuple(parameters) == ("authorization_path",)
 
 
+def test_unrendered_template_has_no_production_entrypoint() -> None:
+    with pytest.raises(supervisor.FormalSupervisorError, match="fixed production"):
+        supervisor.supervise_factor_v3_formal_execution(Path("unused.json"))
+
+
+def test_terminal_writer_retries_interruption_and_partial_writes() -> None:
+    observed: list[bytes] = []
+
+    def writer(_descriptor: int, raw: bytes | memoryview) -> int:
+        value = bytes(raw)
+        if not observed:
+            observed.append(b"")
+            raise InterruptedError
+        observed.append(value)
+        return min(2, len(value))
+
+    supervisor._write_all(1, b"abcdef", writer=writer)
+
+    assert observed == [b"", b"abcdef", b"cdef", b"ef"]
+
+
 def test_supervisor_executes_exact_worker_and_publishes_one_terminal_frame(
     tmp_path: Path,
 ) -> None:
@@ -731,10 +752,14 @@ def test_artifact_claim_and_completed_files_remain_held_through_success_output(
         ledger_root,
         authorization_sha256,
     )
+    stdlib_manifest = json.loads(
+        Path(str(payload["stdlib_inventory_manifest_path"])).read_text(encoding="utf-8")
+    )
+    stdlib_path = Path(str(stdlib_manifest["entries"][0]["path"]))
     blocked: list[bool] = []
 
     def writer(_descriptor: int, raw: bytes | memoryview) -> int:
-        for path in (artifact_path, claim_path, completed_path):
+        for path in (artifact_path, claim_path, completed_path, stdlib_path):
             replacement = path.with_name(path.name + ".moved")
             try:
                 path.rename(replacement)
@@ -755,7 +780,7 @@ def test_artifact_claim_and_completed_files_remain_held_through_success_output(
         output_writer=writer,
     )
 
-    assert blocked == [True, True, True]
+    assert blocked == [True, True, True, True]
 
 
 @pytest.mark.parametrize(
