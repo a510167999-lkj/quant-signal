@@ -17,6 +17,7 @@ def _entry(root: Path, relative_path: str, module: str) -> dict[str, object]:
     raw = path.read_bytes()
     return {
         "bytes": len(raw),
+        "is_package": False,
         "kind": "source",
         "module": module,
         "path": str(path),
@@ -30,6 +31,9 @@ def test_shared_contract_is_the_only_v2_protocol_definition() -> None:
     assert contract.WORKER_PROTOCOL == "factor-v3-formal-supervisor-worker/v2"
     assert contract.WORKER_TERMINAL_SCHEMA == (
         "factor-v3-formal-bootstrap-worker-terminal/v2"
+    )
+    assert contract.PUBLICATION_COMPLETION_SCHEMA == (
+        "factor-v3-formal-bootstrap-publication-completion/v2"
     )
     assert contract.STDLIB_POLICY_SCHEMA == "factor-v3-formal-stdlib-policy/v2"
     assert contract.STDLIB_ROOT_ENVIRONMENT == (
@@ -79,22 +83,39 @@ def test_flat_stdlib_policy_root_is_canonical_and_binds_absence_and_empty_pycach
     ]
 
     policy = contract.canonical_stdlib_policy(
-        roots=[str(platstdlib), str(stdlib)],
+        roots=[
+            {"path": str(platstdlib), "role": "platstdlib"},
+            {"path": str(stdlib), "role": "stdlib"},
+        ],
         entries=entries,
         absent_paths=[str(absent_zip)],
         pycache_prefix=str(pycache),
     )
     reordered = contract.canonical_stdlib_policy(
-        roots=[str(stdlib), str(platstdlib)],
+        roots=[
+            {"path": str(stdlib), "role": "stdlib"},
+            {"path": str(platstdlib), "role": "platstdlib"},
+        ],
         entries=list(reversed(entries)),
         absent_paths=[str(absent_zip)],
         pycache_prefix=str(pycache),
     )
 
     assert policy == reordered
-    assert policy["roots"] == sorted([str(stdlib), str(platstdlib)])
+    assert set(policy) == {
+        "absent_paths",
+        "entries",
+        "pycache_prefix",
+        "roots",
+        "schema",
+    }
+    assert policy["roots"] == [
+        {"path": str(platstdlib), "role": "platstdlib"},
+        {"path": str(stdlib), "role": "stdlib"},
+    ]
     assert list(policy["entries"][0]) == [
         "bytes",
+        "is_package",
         "kind",
         "module",
         "path",
@@ -104,11 +125,12 @@ def test_flat_stdlib_policy_root_is_canonical_and_binds_absence_and_empty_pycach
     ]
     assert policy["absent_paths"] == [str(absent_zip)]
     assert policy["pycache_prefix"] == str(pycache)
-    assert policy["pycache_state"] == "exact-empty-directory"
-    assert policy["preloaded_stdlib_tcb"] == (
-        "all-filesystem-backed-startup-modules-must-match-an-exact-entry"
-    )
-    assert contract.validate_stdlib_policy(policy) == policy
+    root_sha256 = contract.stdlib_policy_root_sha256(policy)
+    assert contract.validate_stdlib_policy(
+        policy,
+        expected_root_sha256=root_sha256,
+        require_filesystem=True,
+    ) == policy
 
     for mutation in (
         {**policy, "absent_paths": []},
@@ -126,9 +148,11 @@ def test_flat_stdlib_policy_root_is_canonical_and_binds_absence_and_empty_pycach
             ],
         },
     ):
-        assert mutation["root_sha256"] == policy["root_sha256"]
         with pytest.raises(contract.FormalControlContractError):
-            contract.validate_stdlib_policy(mutation)
+            contract.validate_stdlib_policy(
+                mutation,
+                expected_root_sha256=root_sha256,
+            )
 
 
 def test_exact_worker_argv_signs_empty_pycache_prefix(tmp_path: Path) -> None:
