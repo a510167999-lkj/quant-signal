@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 from types import SimpleNamespace
 
 import pytest
@@ -122,17 +123,31 @@ class _FakeRunner:
     def __init__(self, candidate: dict[str, object]) -> None:
         self.candidate = candidate
         self.build_calls: list[dict[str, object]] = []
-        self.load_calls: list[Path] = []
+        self.validate_calls: list[bytes] = []
 
     def build_factor_v3_daily_basic_run_spec(self, **kwargs: object) -> dict[str, object]:
         self.build_calls.append(kwargs)
         return json.loads(json.dumps(self.candidate))
 
-    def load_factor_v3_daily_basic_run_spec(self, path: str | Path) -> dict[str, object]:
-        candidate_path = Path(path)
-        self.load_calls.append(candidate_path)
-        assert not candidate_path.read_bytes().endswith(b"\n")
-        return json.loads(candidate_path.read_text(encoding="utf-8"))
+    def validate_factor_v3_daily_basic_run_spec_bytes(
+        self,
+        raw: bytes,
+    ) -> dict[str, object]:
+        self.validate_calls.append(raw)
+        assert not raw.endswith(b"\n")
+        return json.loads(raw)
+
+    def load_factor_v3_daily_basic_run_spec(
+        self,
+        _path: str | Path,
+    ) -> dict[str, object]:
+        raise AssertionError("preflight must not create a temporary run spec")
+
+    def run_factor_v3_daily_basic_collection(self, **_kwargs: object) -> object:
+        raise AssertionError("preflight must not run collection")
+
+    def verify_factor_v3_daily_basic_run(self, **_kwargs: object) -> object:
+        raise AssertionError("preflight must not verify a persisted run")
 
 
 class _FrozenActionConfig(Mapping[str, object]):
@@ -469,9 +484,18 @@ def test_external_bootstrap_claim_binds_every_runtime_trust_anchor() -> None:
         )
 
 
-def test_offline_candidate_uses_exact_inputs_builds_twice_and_loads_once() -> None:
+def test_offline_candidate_uses_exact_inputs_builds_twice_and_validates_in_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     fake = _FakeRunner(_candidate())
 
+    monkeypatch.setattr(
+        tempfile,
+        "TemporaryDirectory",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preflight must not create temporary files")
+        ),
+    )
     candidate, content = formal.build_and_verify_candidate(fake)
 
     assert candidate["session_count"] == 733
@@ -490,7 +514,7 @@ def test_offline_candidate_uses_exact_inputs_builds_twice_and_loads_once() -> No
             "max_attempts": 3,
         },
     ]
-    assert len(fake.load_calls) == 1
+    assert fake.validate_calls == [content]
     assert content == json.dumps(
         candidate,
         ensure_ascii=False,
@@ -1072,6 +1096,45 @@ def test_success_output_is_buffered_until_external_terminal_postverify(
     assert len(context.buffered) == 1
     assert context.postverify_calls == 0
     assert capsys.readouterr() == ("", "")
+
+
+def test_preflight_dispatch_never_publishes_runs_or_verifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _frozen_action_config("preflight")
+    context = _TrustedBootstrapContext(config)
+    runner = _FakeRunner(_candidate())
+    events: list[str] = []
+    monkeypatch.setattr(formal, "_load_runner", lambda _context: runner)
+    monkeypatch.setattr(
+        formal,
+        "verify_planned_run_root",
+        lambda: events.append("run-root-readonly-verified"),
+    )
+    monkeypatch.setattr(
+        formal,
+        "publish_candidate",
+        lambda _content: (_ for _ in ()).throw(
+            AssertionError("preflight must not publish")
+        ),
+    )
+    monkeypatch.setattr(
+        formal,
+        "_postverify_verified_module_ledger",
+        lambda _context, _manifest: events.append("ledger"),
+    )
+
+    assert formal.trusted_dispatch(context, config) == 0
+
+    assert events == ["run-root-readonly-verified", "ledger"]
+    assert runner.validate_calls
+    assert context.buffered == [
+        formal.safe_summary(
+            _candidate(),
+            runner.validate_calls[0],
+            published=False,
+        )
+    ]
 
 
 def test_failed_terminal_ledger_proof_emits_no_success(

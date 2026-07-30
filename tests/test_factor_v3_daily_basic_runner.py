@@ -102,6 +102,45 @@ def test_run_spec_derives_exact_ordered_733_session_union(
     )
 
 
+def test_run_spec_bytes_validator_is_canonical_and_shared_by_path_loader(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    spec = _spec(monkeypatch, tmp_path)
+    raw = json.dumps(
+        spec,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+    assert runner.validate_factor_v3_daily_basic_run_spec_bytes(raw) == spec
+
+    path = tmp_path / "run-spec.json"
+    path.write_bytes(raw)
+    calls: list[bytes] = []
+    original = runner.validate_factor_v3_daily_basic_run_spec_bytes
+
+    def capture(candidate: bytes) -> dict[str, object]:
+        calls.append(candidate)
+        return original(candidate)
+
+    monkeypatch.setattr(
+        runner,
+        "validate_factor_v3_daily_basic_run_spec_bytes",
+        capture,
+    )
+    assert runner.load_factor_v3_daily_basic_run_spec(path) == spec
+    assert calls == [raw]
+
+    with pytest.raises(
+        runner.FactorV3DailyBasicRunnerError,
+        match="run spec",
+    ):
+        runner.validate_factor_v3_daily_basic_run_spec_bytes(raw + b"\n")
+
+
 def test_run_spec_rejects_overlapping_or_handwritten_source_sessions(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

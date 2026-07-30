@@ -667,6 +667,31 @@ def test_launch_reviewed_commit_must_equal_the_rendered_supervisor_pin(
         )
 
 
+def test_preflight_launch_payload_is_first_class_and_has_no_credential(
+    tmp_path: Path,
+) -> None:
+    pins, payload, _authorization_path, _environment, _writes = _fixture(
+        tmp_path,
+        action="preflight",
+        worker_action="preflight",
+    )
+
+    validated = supervisor._validate_launch_payload(
+        payload,
+        pins=pins,
+        now_utc=datetime(2026, 7, 30, 12, 1, 0, tzinfo=timezone.utc),
+        trusted_executed_supervisor_path=payload["executed_supervisor_path"],
+        trusted_executed_supervisor_sha256=payload["executed_supervisor_sha256"],
+        trusted_supervisor_loader_path=payload["supervisor_loader_path"],
+        trusted_supervisor_loader_sha256=payload["supervisor_loader_sha256"],
+    )
+
+    assert validated["action"] == "preflight"
+    assert validated["worker_action"] == "preflight"
+    assert validated["credential_path"] is None
+    assert validated["credential_slot_id"] is None
+
+
 def test_unrendered_template_has_no_production_entrypoint() -> None:
     with pytest.raises(supervisor.FormalSupervisorError, match="fixed production"):
         supervisor.supervise_factor_v3_formal_execution(Path("unused.json"))

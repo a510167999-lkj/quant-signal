@@ -45,10 +45,12 @@ def test_shared_contract_is_the_only_v2_protocol_definition() -> None:
     assert contract.STDLIB_ROOT_ENVIRONMENT == ("FACTOR_V3_FORMAL_STDLIB_INVENTORY_ROOT_SHA256")
     assert contract.WORKER_ACTION_BY_LAUNCH_ACTION == {
         "build-spec": "build-spec",
+        "preflight": "preflight",
         "resume": "run",
         "run": "run",
         "verify": "verify",
     }
+    assert contract.ACTION_SECRET_ENVIRONMENT["preflight"] == []
     expected = contract.worker_protocol_descriptor()
     assert renderer._supervisor_protocol_descriptor() == expected
     assert runtime._supervisor_protocol_descriptor() == expected

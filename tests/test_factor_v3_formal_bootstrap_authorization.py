@@ -630,7 +630,7 @@ def test_each_action_requires_an_independent_authorization(
 ) -> None:
     authorization_hashes = set()
     rendered_hashes = set()
-    for action in ("build-spec", "run", "verify"):
+    for action in ("build-spec", "preflight", "run", "verify"):
         action_root = tmp_path / action
         action_root.mkdir()
         (
@@ -642,8 +642,8 @@ def test_each_action_requires_an_independent_authorization(
         authorization_hashes.add(_sha256(authorization_path.read_bytes()))
         rendered_hashes.add(_sha256(_render_authorized(authorization_path, trusted_public_der)))
 
-    assert len(authorization_hashes) == 3
-    assert len(rendered_hashes) == 3
+    assert len(authorization_hashes) == 4
+    assert len(rendered_hashes) == 4
 
 
 @pytest.mark.parametrize(

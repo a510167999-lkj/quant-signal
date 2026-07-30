@@ -658,6 +658,24 @@ def test_supervisor_environment_policy_is_action_exact(
         )
 
 
+def test_preflight_supervisor_environment_is_nonsecret_and_action_exact() -> None:
+    environment = {
+        "FACTOR_V3_FORMAL_LAUNCH_ACTION": "preflight",
+        "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256": "1" * 64,
+        "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL": SUPERVISOR_PROTOCOL,
+        "FACTOR_V3_FORMAL_STDLIB_INVENTORY_ROOT_SHA256": "2" * 64,
+        "SYSTEMROOT": r"C:\Windows",
+    }
+
+    validated = runtime._validated_supervisor_environment(
+        environment,
+        worker_action="preflight",
+    )
+
+    assert validated["FACTOR_V3_FORMAL_LAUNCH_ACTION"] == "preflight"
+    assert "JIAOCH_TOKEN" not in validated
+
+
 def test_worker_rejects_missing_stdlib_prelock_proof(
     tmp_path: Path,
 ) -> None:

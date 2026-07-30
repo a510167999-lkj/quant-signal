@@ -127,10 +127,15 @@ def test_supervisor_publication_is_deterministic_and_revalidated_from_sources(
     assert Path(validated["supervisor_publication_receipt_path"]).read_bytes()
 
 
+@pytest.mark.parametrize("action", ("verify", "preflight"))
 def test_launch_v2_binds_actual_artifact_receipt_and_external_loader(
     tmp_path: Path,
+    action: str,
 ) -> None:
-    authorization_path, completion_path, trusted_public_der = _bootstrap_publication(tmp_path)
+    authorization_path, completion_path, trusted_public_der = _bootstrap_publication(
+        tmp_path,
+        action=action,
+    )
     publication_result = control._publish_with_trust(
         authorization_path=authorization_path,
         completion_marker_path=completion_path,
@@ -148,7 +153,7 @@ def test_launch_v2_binds_actual_artifact_receipt_and_external_loader(
 
     payload = control._launch_payload(
         publication=publication,
-        action="verify",
+        action=action,
         credential_path=None,
         execution_ledger_root=ledger_root,
         now_utc=now,
@@ -172,6 +177,7 @@ def test_launch_v2_binds_actual_artifact_receipt_and_external_loader(
     )
     assert validated["credential_path"] is None
     assert validated["credential_slot_id"] is None
+    assert validated["worker_action"] == action
 
 
 def test_signed_verify_runs_only_through_external_exact_loader(
