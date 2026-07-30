@@ -24,7 +24,7 @@ PRODUCTION_EXECUTION_PUBLIC_KEY_PATH = Path(
     r"\factor_v3_execution_authorization_rsa3072_public.pem"
 )
 PRODUCTION_EXECUTION_PUBLIC_KEY_SPKI_SHA256 = (
-    "3776d27e0553f315fbfbe24e70975efeafe9e84ed4bedd2cc54ea67f597339c2"
+    "70c8ad8f74cddfe363175d76c433cb145aadcd7cbd8af669768e697d99cccce8"
 )
 SUPERVISOR_PROTOCOL = "factor-v3-formal-supervisor-worker/v1"
 WORKER_TERMINAL_SCHEMA = "factor-v3-formal-bootstrap-worker-terminal/v1"
@@ -180,6 +180,37 @@ def test_stdlib_policy_uses_exact_roots_and_content_inventory() -> None:
         for item in policy["roots"]
     )
     assert all(len(item["inventory_sha256"]) == 64 for item in policy["roots"])
+
+
+def test_runtime_template_identity_is_canonical_lf_and_rejects_mixed_eol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_lf = Path(renderer.__file__).resolve().with_name(
+        "factor_v3_formal_bootstrap_runtime.py"
+    ).read_bytes().replace(b"\r\n", b"\n")
+    runtime_crlf = runtime_lf.replace(b"\n", b"\r\n")
+    expected_sha256 = hashlib.sha256(runtime_lf).hexdigest()
+    monkeypatch.setattr(renderer, "RUNTIME_TEMPLATE_SHA256", expected_sha256)
+
+    assert renderer._canonical_runtime_template_bytes(runtime_lf) == runtime_lf
+    assert renderer._canonical_runtime_template_bytes(runtime_crlf) == runtime_lf
+    for invalid in (
+        b"first\rsecond\r",
+        b"first\r\nsecond\n",
+        b"first\nsecond\r\n",
+    ):
+        with pytest.raises(
+            renderer.FormalBootstrapRenderError,
+            match="line endings",
+        ):
+            renderer._canonical_runtime_template_bytes(invalid)
+
+    monkeypatch.setattr(
+        renderer,
+        "_read_safe_file",
+        lambda *_args, **_kwargs: runtime_crlf,
+    )
+    assert renderer._runtime_template_bytes() == runtime_lf
 
 
 def test_win32_directory_handle_chain_blocks_parent_replacement(
