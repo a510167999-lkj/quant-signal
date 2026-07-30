@@ -772,6 +772,32 @@ def test_fixed_supervisor_renderer_embeds_all_production_pins(
     compile(rendered, "<rendered-factor-v3-supervisor>", "exec")
 
 
+def test_supervisor_renderer_rejects_an_unpinned_template_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pins, _payload, _authorization_path, _environment, _writes = _fixture(tmp_path)
+    source_path = Path(supervisor.__file__).resolve()
+    tampered_path = (tmp_path / "tampered-supervisor-template.py").resolve()
+    tampered_path.write_bytes(
+        source_path.read_bytes().replace(
+            b"class FormalSupervisorError(RuntimeError):",
+            b"class FormalSupervisorError(BaseException):",
+            1,
+        )
+    )
+    contract_path = source_path.with_name("factor_v3_formal_control_contract.py")
+    monkeypatch.setattr(
+        supervisor,
+        "_EMBEDDED_CONTROL_CONTRACT_SOURCE",
+        contract_path.read_bytes(),
+    )
+    monkeypatch.setattr(supervisor, "__file__", str(tampered_path))
+
+    with pytest.raises(supervisor.FormalSupervisorError, match="source"):
+        supervisor._render_supervisor_with_test_pins(pins)
+
+
 def test_failed_claim_requires_independently_signed_resume_action(
     tmp_path: Path,
 ) -> None:
