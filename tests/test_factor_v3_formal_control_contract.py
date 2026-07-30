@@ -522,6 +522,114 @@ def test_shared_stdlib_directory_guard_terminally_reopens_every_held_path(
         assert len(reopened_paths) == len(expected_paths)
 
 
+def test_stdlib_terminal_round_hashes_policy_without_rereading_held_entry_stream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdlib = (tmp_path / "fake-python" / "Lib").resolve()
+    platstdlib = (tmp_path / "fake-python" / "DLLs").resolve()
+    pycache = (tmp_path / "pycache-blocker").resolve()
+    stdlib.mkdir(parents=True)
+    platstdlib.mkdir(parents=True)
+    pycache.write_bytes(b"factor-v3-pycache-blocker/v1\n")
+    source = stdlib / "fixture.py"
+    source.write_bytes(b"VALUE = 1\n")
+    policy = contract.canonical_stdlib_policy(
+        roots=[
+            {"path": str(platstdlib), "role": "platstdlib"},
+            {"path": str(stdlib), "role": "stdlib"},
+        ],
+        entries=[_entry(stdlib, "fixture.py", "fixture")],
+        absent_paths=[str(stdlib.parent / "python311.zip")],
+        pycache_prefix=str(pycache),
+    )
+    root_sha256 = contract.stdlib_policy_root_sha256(policy)
+
+    with ExitStack() as stack:
+        handles = supervisor._hold_stdlib_inventory(
+            contract.canonical_bytes(policy),
+            payload={"stdlib_inventory_root_sha256": root_sha256},
+            authorization={"stdlib_policy": policy},
+            stack=stack,
+        )
+        entry_handle = next(
+            handle
+            for handle in handles
+            if isinstance(handle, supervisor._HeldFile) and handle.path == source
+        )
+        real_stream = entry_handle._stream
+
+        class ObservedStream:
+            def __init__(self) -> None:
+                self.read_calls = 0
+
+            def read(self, *args: object, **kwargs: object) -> bytes:
+                self.read_calls += 1
+                return real_stream.read(*args, **kwargs)
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(real_stream, name)
+
+        observed_stream = ObservedStream()
+        entry_handle._stream = observed_stream
+        original_validate = supervisor.validate_stdlib_policy
+        filesystem_validations = 0
+
+        def observed_validate(*args: object, **kwargs: object) -> dict[str, object]:
+            nonlocal filesystem_validations
+            result = original_validate(*args, **kwargs)
+            if kwargs.get("require_filesystem"):
+                filesystem_validations += 1
+            return result
+
+        monkeypatch.setattr(supervisor, "validate_stdlib_policy", observed_validate)
+
+        for handle in handles:
+            handle.postverify()
+
+        assert filesystem_validations == 1
+        assert observed_stream.read_calls == 0
+
+
+def test_shared_stdlib_guard_retains_each_entry_identity_check(tmp_path: Path) -> None:
+    stdlib = (tmp_path / "fake-python" / "Lib").resolve()
+    platstdlib = (tmp_path / "fake-python" / "DLLs").resolve()
+    pycache = (tmp_path / "pycache-blocker").resolve()
+    stdlib.mkdir(parents=True)
+    platstdlib.mkdir(parents=True)
+    pycache.write_bytes(b"factor-v3-pycache-blocker/v1\n")
+    source = stdlib / "fixture.py"
+    source.write_bytes(b"VALUE = 1\n")
+    policy = contract.canonical_stdlib_policy(
+        roots=[
+            {"path": str(platstdlib), "role": "platstdlib"},
+            {"path": str(stdlib), "role": "stdlib"},
+        ],
+        entries=[_entry(stdlib, "fixture.py", "fixture")],
+        absent_paths=[str(stdlib.parent / "python311.zip")],
+        pycache_prefix=str(pycache),
+    )
+    root_sha256 = contract.stdlib_policy_root_sha256(policy)
+
+    with ExitStack() as stack:
+        handles = supervisor._hold_stdlib_inventory(
+            contract.canonical_bytes(policy),
+            payload={"stdlib_inventory_root_sha256": root_sha256},
+            authorization={"stdlib_policy": policy},
+            stack=stack,
+        )
+        entry_handle = next(
+            handle
+            for handle in handles
+            if isinstance(handle, supervisor._HeldFile) and handle.path == source
+        )
+        entry_handle.path = platstdlib / "missing.py"
+
+        with pytest.raises(supervisor.FormalSupervisorError, match="stdlib inventory file"):
+            for handle in handles:
+                handle.postverify()
+
+
 def test_runtime_installs_early_exact_loader_before_filesystem_imports() -> None:
     source = Path(runtime.__file__).read_text(encoding="utf-8")
     marker = "# EARLY_EXACT_IMPORT_BOUNDARY_COMPLETE"
