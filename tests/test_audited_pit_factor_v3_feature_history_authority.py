@@ -633,7 +633,6 @@ def _verify_source_bound(
             plan["development_sessions"]["sessions"]
         ),
         temporal_partition_contract=load_temporal_partition_contract(PARTITION_V1_PATH),
-        pit_store_root=Path(store.root),
         collection_publication_output_root=publication_output_root,
         collection_publication=collection_publication,
     )
@@ -664,7 +663,6 @@ def test_public_surface_is_offline_and_caller_cannot_select_history_window() -> 
         "collection_publication_output_root",
         "collection_plan",
         "development_session_refs",
-        "pit_store_root",
         "temporal_partition_contract",
         "trade_cal_output_root",
         "trade_cal_publication",
@@ -1394,6 +1392,54 @@ def test_formal_authority_rejects_database_drift_after_publication(
             trade_cal_output_root=Path("synthetic-trade-cal-root"),
             trade_cal_publication=publication,
         )
+
+
+def test_public_verifier_replays_snapshot_after_live_store_is_detached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, publication, _sessions, store, _refs, _database_sha256 = (
+        _real_store_fixture(tmp_path, monkeypatch)
+    )
+    publication_output_root, collection_publication = _publish_source_bound(
+        plan=plan,
+        publication=publication,
+        store=store,
+    )
+    manifest = history_authority._read_collection_manifest(
+        output_root=publication_output_root,
+        publication=collection_publication,
+    )
+    assert manifest["schema"] == (
+        "audited-pit-factor-v3-feature-history-collection-manifest/v2"
+    )
+    assert manifest["snapshot_index_relative_path"].startswith(
+        "feature_history_collection_snapshots/sha256/"
+    )
+    assert len(manifest["snapshot_index_sha256"]) == 64
+
+    live_root = Path(store.root)
+    live_root.rename(tmp_path / "detached-live-pit-store")
+    receipt = (
+        history_authority.verify_factor_v3_feature_history_collection_authority(
+            collection_publication=collection_publication,
+            collection_publication_output_root=publication_output_root,
+            collection_plan=plan,
+            development_session_refs=_development_refs(
+                plan["development_sessions"]["sessions"]
+            ),
+            temporal_partition_contract=load_temporal_partition_contract(
+                PARTITION_V1_PATH
+            ),
+            trade_cal_output_root=Path("synthetic-trade-cal-root"),
+            trade_cal_publication=publication,
+        )
+    )
+
+    assert receipt["verified"] is True
+    assert receipt["snapshot_index_sha256"] == (
+        manifest["snapshot_index_sha256"]
+    )
 
 
 def test_formal_authority_rejects_raw_receipt_tamper_even_with_refreshed_database_anchor(
