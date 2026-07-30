@@ -40,6 +40,7 @@ __all__ = (
     "build_factor_v3_daily_basic_run_spec",
     "load_factor_v3_daily_basic_run_spec",
     "run_factor_v3_daily_basic_collection",
+    "validate_factor_v3_daily_basic_run_spec_bytes",
     "verify_factor_v3_daily_basic_run",
     "main",
 )
@@ -252,7 +253,7 @@ def _strict_json(raw: bytes, *, label: str) -> dict[str, Any]:
     return value
 
 
-def _read_json(path: Path, *, label: str, max_bytes: int) -> dict[str, Any]:
+def _read_bytes(path: Path, *, label: str, max_bytes: int) -> bytes:
     try:
         before = path.stat()
         if path.is_symlink() or not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
@@ -263,7 +264,14 @@ def _read_json(path: Path, *, label: str, max_bytes: int) -> dict[str, Any]:
         raise FactorV3DailyBasicRunnerError(f"factor-v3 daily-basic {label} unavailable") from exc
     if before.st_size != len(raw) or after.st_size != before.st_size or after.st_mtime_ns != before.st_mtime_ns:
         raise FactorV3DailyBasicRunnerError(f"factor-v3 daily-basic {label} drifted")
-    return _strict_json(raw, label=label)
+    return raw
+
+
+def _read_json(path: Path, *, label: str, max_bytes: int) -> dict[str, Any]:
+    return _strict_json(
+        _read_bytes(path, label=label, max_bytes=max_bytes),
+        label=label,
+    )
 
 
 def _safe_directory(path: Path, *, label: str, create: bool) -> Path:
@@ -586,8 +594,27 @@ def build_factor_v3_daily_basic_run_spec(
     return _validated_run_spec({**unsigned, "run_spec_sha256": _sha256(unsigned)})
 
 
+def validate_factor_v3_daily_basic_run_spec_bytes(raw: bytes) -> dict[str, Any]:
+    if type(raw) is not bytes:
+        raise FactorV3DailyBasicRunnerError(
+            "factor-v3 daily-basic run spec rejected"
+        )
+    value = _strict_json(raw, label="run spec")
+    if _canonical_bytes(value) != raw:
+        raise FactorV3DailyBasicRunnerError(
+            "factor-v3 daily-basic run spec rejected"
+        )
+    return _validated_run_spec(value)
+
+
 def load_factor_v3_daily_basic_run_spec(path: str | Path) -> dict[str, Any]:
-    return _validated_run_spec(_read_json(Path(path), label="run spec", max_bytes=_MAX_RUN_SPEC_BYTES))
+    return validate_factor_v3_daily_basic_run_spec_bytes(
+        _read_bytes(
+            Path(path),
+            label="run spec",
+            max_bytes=_MAX_RUN_SPEC_BYTES,
+        )
+    )
 
 
 def _paths(run_root: str | Path, *, create: bool) -> dict[str, Path]:

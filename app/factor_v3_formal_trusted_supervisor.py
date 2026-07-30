@@ -29,7 +29,7 @@ class FormalSupervisorError(RuntimeError):
 
 _EMBEDDED_CONTROL_CONTRACT_SOURCE: bytes | None = None
 _CONTROL_CONTRACT_SOURCE_NAME = "factor_v3_formal_control_contract.py"
-_CONTROL_CONTRACT_SOURCE_SHA256 = "a821ff1b3d338528ca9b63918a5d5f7453513b6f54ee1b8a3c06e811ef9cfad6"
+_CONTROL_CONTRACT_SOURCE_SHA256 = "eed9dc9fe938d476b2ff054cf586feff46e14d7325a96cf421cd668de1b86cff"
 
 
 def _fixed_control_contract_source() -> bytes:

@@ -40,7 +40,7 @@ class FormalBootstrapRenderError(RuntimeError):
 
 
 CONFIG_SCHEMA = "factor-v3-formal-bootstrap-render-config/v1"
-RUNTIME_TEMPLATE_SHA256 = "078881dc426951b9ddd212bca74ef13d1371e73696c03413b6ab82f69aaa151a"
+RUNTIME_TEMPLATE_SHA256 = "f29cab288d895b62866ec74fd3a869db0ba3f10c16868fcbc139235d1244ce7c"
 AUTHORIZATION_SCHEMA = "factor-v3-formal-bootstrap-execution-authorization/v2"
 PUBLICATION_RECEIPT_SCHEMA = "factor-v3-formal-bootstrap-publication-receipt/v1"
 COMPLETION_SCHEMA = PUBLICATION_COMPLETION_SCHEMA
@@ -835,7 +835,7 @@ def _validated_config(value: Mapping[str, Any]) -> dict[str, Any]:
         set(config) != _CONFIG_FIELDS
         or config.get("schema") != CONFIG_SCHEMA
         or config.get("project_id") != "quant-signal-lkj"
-        or config.get("action") not in {"build-spec", "run", "verify"}
+        or config.get("action") not in {"build-spec", "preflight", "run", "verify"}
         or type(config.get("expected_branch")) is not str
         or not config["expected_branch"]
         or _COMMIT_RE.fullmatch(str(config.get("expected_commit"))) is None
@@ -1101,7 +1101,7 @@ def _validated_execution_authorization(
         or set(payload) != _AUTHORIZATION_FIELDS
         or payload.get("schema") != AUTHORIZATION_SCHEMA
         or payload.get("project_id") != "quant-signal-lkj"
-        or payload.get("action") not in {"build-spec", "run", "verify"}
+        or payload.get("action") not in {"build-spec", "preflight", "run", "verify"}
         or type(payload.get("expected_branch")) is not str
         or not payload["expected_branch"]
         or _COMMIT_RE.fullmatch(str(payload.get("expected_commit"))) is None
@@ -2190,7 +2190,7 @@ def _validated_completion_marker_payload(value: Any) -> dict[str, Any]:
         or set(value) != fields
         or value.get("schema") != COMPLETION_SCHEMA
         or value.get("status") != "completed"
-        or value.get("action") not in {"build-spec", "run", "verify"}
+        or value.get("action") not in {"build-spec", "preflight", "run", "verify"}
         or value.get("runtime_template_sha256") != RUNTIME_TEMPLATE_SHA256
     ):
         raise FormalBootstrapRenderError("completion marker payload rejected")

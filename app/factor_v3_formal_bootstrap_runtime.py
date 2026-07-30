@@ -458,6 +458,7 @@ def _validated_supervisor_environment(
 ) -> dict[str, str]:
     if type(environment) is not dict or worker_action not in {
         "build-spec",
+        "preflight",
         "run",
         "verify",
     }:
@@ -1591,7 +1592,7 @@ def _validated_config() -> dict[str, Any]:
         set(config) != fields
         or config.get("schema") != _CONFIG_SCHEMA
         or config.get("project_id") != "quant-signal-lkj"
-        or config.get("action") not in {"build-spec", "run", "verify"}
+        or config.get("action") not in {"build-spec", "preflight", "run", "verify"}
         or type(config.get("expected_branch")) is not str
         or not config["expected_branch"]
         or _COMMIT_RE.fullmatch(str(config.get("expected_commit"))) is None

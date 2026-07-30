@@ -14,7 +14,6 @@ import re
 import stat
 import subprocess
 import sys
-import tempfile
 from types import ModuleType
 from typing import Any
 
@@ -137,7 +136,7 @@ FORMAL_REVIEW_PUBLIC_KEY_SPKI_SHA256 = (
     "552852331cd6c7b0b08483b21c85fcc63b6ea9787c0c5ae8e146b246b46daaee"
 )
 FACTOR_V3_DAILY_BASIC_RUNNER_SHA256 = (
-    "454e0f4437cdfe5283b59d1b1cf0383151fe017fa5d0a0918f1d1108a0901ce9"
+    "41d2da09e983e90ca4edd474c60777194c6fd99afc0a268f4b0836b6b1019477"
 )
 SPEC_OUTPUT_ROOT = (
     MAIN_REPO_ROOT
@@ -1343,10 +1342,9 @@ def build_and_verify_candidate(
     candidate = _assert_formal_candidate(first)
     if first_bytes.endswith(b"\n"):
         raise FormalRunSpecError("formal run spec has a trailing newline")
-    with tempfile.TemporaryDirectory(prefix="factor-v3-daily-basic-spec-") as temporary:
-        candidate_path = Path(temporary) / "candidate.json"
-        candidate_path.write_bytes(first_bytes)
-        loaded = runner_module.load_factor_v3_daily_basic_run_spec(candidate_path)
+    loaded = runner_module.validate_factor_v3_daily_basic_run_spec_bytes(
+        first_bytes
+    )
     if _canonical_bytes(loaded) != first_bytes:
         raise FormalRunSpecError("formal run spec load verification drifted")
     _assert_formal_candidate(loaded)
@@ -1524,7 +1522,7 @@ def _validated_trusted_action_config(
     if (
         fields != _TRUSTED_ACTION_CONFIG_FIELDS
         or any(type(value) is not str or not value for value in values.values())
-        or values["action"] not in {"build-spec", "run", "verify"}
+        or values["action"] not in {"build-spec", "preflight", "run", "verify"}
         or values["formal_input_root"] != FORMAL_INPUT_ROOT_SHA256
         or Path(values["formal_output_root"]) != SPEC_OUTPUT_ROOT
         or Path(values["run_root"]) != PLANNED_RUN_ROOT
@@ -1734,14 +1732,16 @@ def trusted_dispatch(
         )
     runner = _load_runner(context)
     action = config["action"]
-    if action == "build-spec":
+    if action in {"build-spec", "preflight"}:
         verify_planned_run_root()
         candidate, content = build_and_verify_candidate(runner)
-        publish_candidate(content)
+        published = action == "build-spec"
+        if published:
+            publish_candidate(content)
         result = safe_summary(
             candidate,
             content,
-            published=True,
+            published=published,
         )
     elif action == "run":
         try:

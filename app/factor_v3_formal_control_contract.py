@@ -24,12 +24,14 @@ EXECUTION_REPLAY_SCOPE = "factor-v3-formal-bootstrap-execution/v1"
 STDLIB_ROOT_ENVIRONMENT = "FACTOR_V3_FORMAL_STDLIB_INVENTORY_ROOT_SHA256"
 WORKER_ACTION_BY_LAUNCH_ACTION = {
     "build-spec": "build-spec",
+    "preflight": "preflight",
     "resume": "run",
     "run": "run",
     "verify": "verify",
 }
 ACTION_SECRET_ENVIRONMENT = {
     "build-spec": [],
+    "preflight": [],
     "resume": ["JIAOCH_TOKEN"],
     "run": ["JIAOCH_TOKEN"],
     "verify": [],
