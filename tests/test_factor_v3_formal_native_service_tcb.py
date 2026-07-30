@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -14,7 +15,9 @@ import uuid
 import pytest
 
 from app import factor_v3_formal_trusted_supervisor as formal_supervisor
+from app import factor_v3_formal_supervisor_control as formal_control
 from tests.test_factor_v3_formal_trusted_supervisor import (
+    _cas_write,
     _canonical_bytes,
     _file_sha256,
     _fixture,
@@ -464,6 +467,141 @@ def _build_production_validation_fixture(
         payload,
         pins,
     )
+
+
+def _build_native_supervisor_e2e_fixture(root: Path) -> tuple[Path, Path, bytes]:
+    from app import factor_v3_formal_native_broker as broker
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    pins, payload, _launch, _environment, _writes = _fixture(
+        root,
+        now_utc=now,
+    )
+    bootstrap_root = Path(str(payload["bootstrap_output_root"]))
+    supervisor_raw = formal_supervisor._render_supervisor_with_test_pins(pins)
+    supervisor_path, supervisor_sha256 = _cas_write(
+        bootstrap_root,
+        "supervisors",
+        supervisor_raw,
+        ".py",
+    )
+    public_der = base64.b64decode(pins.execution_public_key_spki_der_base64)
+    stdlib_policy = json.loads(
+        Path(str(payload["stdlib_policy_path"])).read_bytes()
+    )
+    loader_raw = formal_control._loader_source(
+        artifact_path=supervisor_path,
+        artifact_sha256=supervisor_sha256,
+        public_der=public_der,
+        stdlib_policy=stdlib_policy,
+        template_raw=formal_control.SUPERVISOR_EXTERNAL_LOADER_TEMPLATE.encode(
+            "utf-8"
+        ),
+    )
+    loader_path, loader_sha256 = _cas_write(
+        bootstrap_root,
+        "supervisor_loaders",
+        loader_raw,
+        ".py",
+    )
+    receipt = json.loads(
+        Path(str(payload["supervisor_publication_receipt_path"])).read_bytes()
+    )
+    receipt.update(
+        {
+            "executed_supervisor_bytes": len(supervisor_raw),
+            "executed_supervisor_relative_path": supervisor_path.relative_to(
+                bootstrap_root
+            ).as_posix(),
+            "executed_supervisor_sha256": supervisor_sha256,
+            "supervisor_loader_bytes": len(loader_raw),
+            "supervisor_loader_relative_path": loader_path.relative_to(
+                bootstrap_root
+            ).as_posix(),
+            "supervisor_loader_sha256": loader_sha256,
+        }
+    )
+    receipt_path, receipt_sha256 = _cas_write(
+        bootstrap_root,
+        "supervisor_publication_receipts",
+        _canonical_bytes(receipt),
+        ".json",
+    )
+    payload.update(
+        {
+            "executed_supervisor_path": str(supervisor_path),
+            "executed_supervisor_sha256": supervisor_sha256,
+            "supervisor_loader_bytes": len(loader_raw),
+            "supervisor_loader_path": str(loader_path),
+            "supervisor_loader_sha256": loader_sha256,
+            "supervisor_publication_receipt_path": str(receipt_path),
+            "supervisor_publication_receipt_sha256": receipt_sha256,
+        }
+    )
+    launch_authorization = _rewrite_authorization(
+        root,
+        payload,
+        root / "execution-key" / "execution-private.pem",
+    )
+    candidate = broker.build_factor_v3_formal_native_broker_candidate(
+        action="run",
+        authorization_path=payload["bootstrap_execution_authorization_path"],
+        completion_marker_path=payload["publication_completion_marker_path"],
+        publication_receipt_path=payload["supervisor_publication_receipt_path"],
+        launch_authorization_path=launch_authorization,
+        execution_ledger_root=payload["execution_ledger_root"],
+    )
+    publication = broker.publish_factor_v3_formal_native_broker_candidate(
+        candidate_output_root=root / "native-candidates",
+        candidate=candidate,
+    )
+    modulus, exponent = formal_supervisor._parse_rsa3072_spki(public_der)
+    runtime = Path(str(payload["python_executable_path"]))
+    credential = Path(str(payload["credential_path"]))
+    manifest = root / "native_supervisor_e2e_manifest.h"
+    manifest.write_text(
+        "\n".join(
+            (
+                '#define F3_BROKER_RUNTIME_PATH L"' + _c_wide(runtime) + '"',
+                '#define F3_BROKER_RUNTIME_SHA256 L"'
+                + hashlib.sha256(runtime.read_bytes()).hexdigest()
+                + '"',
+                '#define F3_BROKER_SOURCE_PATH L"' + _c_wide(loader_path) + '"',
+                f'#define F3_BROKER_SOURCE_SHA256 L"{loader_sha256}"',
+                '#define F3_BROKER_CREDENTIAL_SLOT_PATH L"'
+                + _c_wide(credential)
+                + '"',
+                (
+                    '#define F3_BROKER_CNG_PROVIDER '
+                    'L"Microsoft Software Key Storage Provider"'
+                ),
+                '#define F3_BROKER_CNG_KEY_NAME L"unused-disposable-test-key"',
+                "#define F3_BROKER_CNG_ALGORITHM NCRYPT_RSA_ALGORITHM",
+                '#define F3_BROKER_SERVICE_NAME L"DisposableFixtureService"',
+                '#define F3_BROKER_SERVICE_SID L"S-1-5-18"',
+                '#define F3_BROKER_RESTRICTING_SID L"S-1-5-4"',
+                '#define F3_BROKER_EXECUTION_PUBLIC_MODULUS_HEX "'
+                + modulus.to_bytes(384, "big").hex()
+                + '"',
+                f"#define F3_BROKER_EXECUTION_PUBLIC_EXPONENT {exponent}u",
+                "#define F3_BROKER_TESTING 1",
+                "#define F3_BROKER_DISPOSABLE_TEST_MANIFEST 1",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    native = root / "factor_v3_formal_native_broker-supervisor-e2e.exe"
+    _compile_source(
+        source=BROKER_SOURCE,
+        output=native,
+        includes=[root, BROKER_ROOT],
+        definitions=[
+            '-DF3_BROKER_MANIFEST_HEADER="native_supervisor_e2e_manifest.h"',
+        ],
+        libraries=["-lncrypt"],
+    )
+    return native, Path(publication["candidate_path"]), credential.read_bytes()
 
 
 def test_native_manifest_uses_fixed_cng_identity_and_no_private_key_file_slot() -> None:
@@ -942,3 +1080,36 @@ def test_restricted_child_gets_credential_only_after_bound_ready_and_broker_comp
     finally:
         _grant_cleanup_access(root)
         shutil.rmtree(root)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_native_broker_launches_rendered_supervisor_and_synthetic_worker_e2e(
+    tmp_path: Path,
+) -> None:
+    native, candidate, secret = _build_native_supervisor_e2e_fixture(tmp_path)
+
+    completed = subprocess.run(
+        [
+            str(native),
+            "--test-production-supervisor-launch",
+            str(candidate),
+        ],
+        check=False,
+        capture_output=True,
+        timeout=180,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode(
+        "utf-8",
+        errors="replace",
+    )
+    assert completed.stderr == b""
+    assert completed.stdout.startswith(
+        b"COMPLETED factor-v3-formal-native-broker-supervisor/v1\n"
+    )
+    assert b"launch_authorization_sha256=" in completed.stdout
+    assert b"claim_sha256=" in completed.stdout
+    assert b"supervisor_completed_sha256=" in completed.stdout
+    assert b"worker_terminal_sha256=" in completed.stdout
+    assert secret not in completed.stdout
+    assert secret not in completed.stderr

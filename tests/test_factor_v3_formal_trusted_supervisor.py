@@ -192,6 +192,7 @@ def _fixture(
     wrong_launch_sha: bool = False,
     fail: bool = False,
     review_key_same_as_execution: bool = False,
+    now_utc: datetime | None = None,
 ) -> tuple[
     supervisor._SupervisorPins,
     dict[str, Any],
@@ -277,7 +278,7 @@ def _fixture(
         stdlib_policy_raw,
         ".json",
     )
-    now = datetime(2026, 7, 30, 12, 0, 0, tzinfo=timezone.utc)
+    now = now_utc or datetime(2026, 7, 30, 12, 0, 0, tzinfo=timezone.utc)
     execution_key_sha256 = _sha256(execution_public_der)
     bootstrap_authorization_payload = {
         "action": worker_action,
