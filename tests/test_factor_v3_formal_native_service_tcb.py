@@ -37,6 +37,7 @@ def _compile_test_broker(tmp_path: Path) -> Path:
             "-Wall",
             "-Wextra",
             "-Werror",
+            "-static",
             "-DF3_BROKER_TESTING=1",
             "-DF3_BROKER_DISPOSABLE_TEST_MANIFEST=1",
             f"-I{BROKER_ROOT}",
@@ -110,17 +111,34 @@ def _compile_source(
     assert completed.returncode == 0, completed.stderr
 
 
-def _replace_acl_with_broker_only(path: Path) -> None:
+def _replace_acl(
+    path: Path,
+    *,
+    builtin_users_rights: str | None,
+    grant_current_user: bool = True,
+    interactive_rights: str | None = None,
+) -> None:
     account = f"{os.environ['USERDOMAIN']}\\{os.environ['USERNAME']}"
+    inherit = "(OI)(CI)" if path.is_dir() else ""
+    grants = [
+        f"*S-1-5-18:{inherit}(F)",
+        f"*S-1-5-32-544:{inherit}(F)",
+    ]
+    if grant_current_user:
+        grants.append(f"{account}:{inherit}(F)")
+    if builtin_users_rights is not None:
+        grants.append(
+            f"*S-1-5-32-545:{inherit}({builtin_users_rights})"
+        )
+    if interactive_rights is not None:
+        grants.append(f"*S-1-5-4:{inherit}({interactive_rights})")
     completed = subprocess.run(
         [
             "icacls",
             str(path),
             "/inheritance:r",
             "/grant:r",
-            f"{account}:(OI)(CI)(F)",
-            "*S-1-5-18:(OI)(CI)(F)",
-            "*S-1-5-32-544:(OI)(CI)(F)",
+            *grants,
         ],
         check=False,
         capture_output=True,
@@ -130,22 +148,65 @@ def _replace_acl_with_broker_only(path: Path) -> None:
     assert completed.returncode == 0, completed.stderr
 
 
+def _grant_cleanup_access(root: Path) -> None:
+    account = f"{os.environ['USERDOMAIN']}\\{os.environ['USERNAME']}"
+    subprocess.run(
+        [
+            "icacls",
+            str(root),
+            "/grant",
+            f"{account}:(OI)(CI)(F)",
+            "/T",
+            "/C",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
 def _build_handoff_fixture(root: Path) -> tuple[Path, Path, Path, Path, bytes, str]:
     from app import factor_v3_formal_native_broker as broker
 
     public = root / "public"
-    provisional_root = public / "provisional"
+    runtime_root = root / "runtime-readonly"
+    source_root = root / "source-readonly"
+    provisional_root = root / "worker-provisional"
     completed_root = root / "broker-completed"
     secret_root = root / "broker-secret"
-    for path in (public, provisional_root, completed_root, secret_root):
+    for path in (
+        public,
+        runtime_root,
+        source_root,
+        provisional_root,
+        completed_root,
+        secret_root,
+    ):
         path.mkdir(parents=True)
-    _replace_acl_with_broker_only(completed_root)
-    _replace_acl_with_broker_only(secret_root)
+    _replace_acl(provisional_root, builtin_users_rights="M")
+    _replace_acl(
+        completed_root,
+        builtin_users_rights=None,
+        grant_current_user=False,
+        interactive_rights="F",
+    )
+    _replace_acl(
+        secret_root,
+        builtin_users_rights=None,
+        grant_current_user=False,
+        interactive_rights="F",
+    )
 
     secret_value = f"disposable-credential-{uuid.uuid4()}".encode("ascii")
     credential = secret_root / "points-primary.slot"
     credential.write_bytes(secret_value)
-    _replace_acl_with_broker_only(credential)
+    _replace_acl(
+        credential,
+        builtin_users_rights=None,
+        grant_current_user=False,
+        interactive_rights="R",
+    )
 
     paths = {
         "authorization_path": public / "bootstrap-authorization.json",
@@ -190,6 +251,8 @@ def _build_handoff_fixture(root: Path) -> tuple[Path, Path, Path, Path, bytes, s
             (
                 '#define F3_HANDOFF_SECRET_PATH L"' + _c_wide(credential) + '"',
                 '#define F3_HANDOFF_COMPLETED_PATH L"' + _c_wide(completed) + '"',
+                '#define F3_HANDOFF_RUNTIME_ROOT L"' + _c_wide(runtime_root) + '"',
+                '#define F3_HANDOFF_DISABLED_SID L"S-1-5-4"',
                 (
                     '#define F3_HANDOFF_EXPECTED_SECRET_SHA256 L"'
                     + __import__("hashlib").sha256(secret_value).hexdigest()
@@ -219,7 +282,7 @@ def _build_handoff_fixture(root: Path) -> tuple[Path, Path, Path, Path, bytes, s
         ),
         encoding="utf-8",
     )
-    child = public / "factor_v3_credential_handoff_child.exe"
+    child = runtime_root / "factor_v3_credential_handoff_child.exe"
     _compile_source(
         source=HANDOFF_CHILD_SOURCE,
         output=child,
@@ -229,9 +292,19 @@ def _build_handoff_fixture(root: Path) -> tuple[Path, Path, Path, Path, bytes, s
         ],
         libraries=[],
     )
+    _replace_acl(
+        runtime_root,
+        builtin_users_rights="RX",
+        grant_current_user=False,
+    )
 
-    reviewed_source = public / "reviewed-source.txt"
+    reviewed_source = source_root / "reviewed-source.txt"
     reviewed_source.write_bytes(b"reviewed disposable native handoff source\n")
+    _replace_acl(
+        source_root,
+        builtin_users_rights="RX",
+        grant_current_user=False,
+    )
     broker_manifest = root / "handoff_broker_manifest.h"
     broker_manifest.write_text(
         "\n".join(
@@ -261,7 +334,7 @@ def _build_handoff_fixture(root: Path) -> tuple[Path, Path, Path, Path, bytes, s
                 "#define F3_BROKER_CNG_ALGORITHM NCRYPT_RSA_ALGORITHM",
                 '#define F3_BROKER_SERVICE_NAME L"DisposableFixtureService"',
                 '#define F3_BROKER_SERVICE_SID L"S-1-5-18"',
-                '#define F3_BROKER_RESTRICTING_SID L"S-1-5-32-545"',
+                '#define F3_BROKER_RESTRICTING_SID L"S-1-5-4"',
                 f'#define F3_BROKER_HANDOFF_ORIGINAL_SCHEMA "{original_schema}"',
                 f'#define F3_BROKER_HANDOFF_ORIGINAL_ACTION "{original_action}"',
                 (
@@ -413,6 +486,7 @@ def test_restricted_child_gets_credential_only_after_bound_ready_and_broker_comp
             "pre_claim_secret_open_denied=1\n"
             "credential_handle_read_ok=1\n"
             "post_claim_secret_reopen_denied=1\n"
+            "runtime_namespace_write_denied=1\n"
             "completed_path_write_denied=1\n"
             "status=provisional\n"
         )
@@ -439,4 +513,5 @@ def test_restricted_child_gets_credential_only_after_bound_ready_and_broker_comp
             source.index("validate_bound_ready"),
         )
     finally:
+        _grant_cleanup_access(root)
         shutil.rmtree(root)

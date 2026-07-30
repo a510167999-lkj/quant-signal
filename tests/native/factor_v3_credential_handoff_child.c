@@ -4,6 +4,7 @@
 
 #include <windows.h>
 #include <bcrypt.h>
+#include <sddl.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <wchar.h>
@@ -107,8 +108,92 @@ static int completed_write_denied(void) {
     return GetLastError() == ERROR_ACCESS_DENIED;
 }
 
+static int runtime_write_denied(void) {
+    wchar_t path[32768];
+    HANDLE handle;
+    if (swprintf(
+            path,
+            sizeof(path) / sizeof(path[0]),
+            L"%ls\\restricted-child-write-probe.tmp",
+            F3_HANDOFF_RUNTIME_ROOT
+        ) < 0) {
+        return 0;
+    }
+    handle = CreateFileW(
+        path,
+        GENERIC_WRITE,
+        0,
+        NULL,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(handle);
+        DeleteFileW(path);
+        return 0;
+    }
+    return GetLastError() == ERROR_ACCESS_DENIED;
+}
+
 static int token_is_restricted(void) {
-    return IsTokenRestricted(NULL) != 0;
+    HANDLE token = NULL;
+    PSID expected = NULL;
+    TOKEN_GROUPS *groups = NULL;
+    DWORD size = 0;
+    DWORD index;
+    int restricted = 0;
+    if (!OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY,
+            &token
+        )
+        || !ConvertStringSidToSidW(
+            F3_HANDOFF_DISABLED_SID,
+            &expected
+        )) {
+        goto cleanup;
+    }
+    GetTokenInformation(token, TokenGroups, NULL, 0, &size);
+    if (size == 0) {
+        goto cleanup;
+    }
+    groups = (TOKEN_GROUPS *)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        size
+    );
+    if (groups == NULL
+        || !GetTokenInformation(
+            token,
+            TokenGroups,
+            groups,
+            size,
+            &size
+        )) {
+        goto cleanup;
+    }
+    for (index = 0; index < groups->GroupCount; ++index) {
+        if (EqualSid(groups->Groups[index].Sid, expected)
+            && (groups->Groups[index].Attributes
+                & SE_GROUP_USE_FOR_DENY_ONLY) != 0) {
+            restricted = 1;
+            break;
+        }
+    }
+
+cleanup:
+    if (groups != NULL) {
+        SecureZeroMemory(groups, size);
+        HeapFree(GetProcessHeap(), 0, groups);
+    }
+    if (expected != NULL) {
+        LocalFree(expected);
+    }
+    if (token != NULL) {
+        CloseHandle(token);
+    }
+    return restricted;
 }
 
 static int write_all(HANDLE handle, const void *data, DWORD size) {
@@ -147,6 +232,7 @@ int wmain(int argc, wchar_t **argv) {
         "pre_claim_secret_open_denied=1\n"
         "credential_handle_read_ok=1\n"
         "post_claim_secret_reopen_denied=1\n"
+        "runtime_namespace_write_denied=1\n"
         "completed_path_write_denied=1\n"
         "status=provisional\n";
     HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
@@ -162,11 +248,22 @@ int wmain(int argc, wchar_t **argv) {
     int ok = 0;
     if (argc != 2
         || input == INVALID_HANDLE_VALUE
-        || output == INVALID_HANDLE_VALUE
-        || !token_is_restricted()
-        || !secret_open_denied()
-        || !completed_write_denied()
-        || !write_all(output, ready, (DWORD)(sizeof(ready) - 1))
+        || output == INVALID_HANDLE_VALUE) {
+        return 41;
+    }
+    if (!token_is_restricted()) {
+        return 42;
+    }
+    if (!secret_open_denied()) {
+        return 43;
+    }
+    if (!runtime_write_denied()) {
+        return 44;
+    }
+    if (!completed_write_denied()) {
+        return 45;
+    }
+    if (!write_all(output, ready, (DWORD)(sizeof(ready) - 1))
         || !FlushFileBuffers(output)
         || !ReadFile(
             input,
@@ -205,6 +302,7 @@ int wmain(int argc, wchar_t **argv) {
         || !hash_bytes(secret, total, digest)
         || !digest_matches(digest, F3_HANDOFF_EXPECTED_SECRET_SHA256)
         || !secret_open_denied()
+        || !runtime_write_denied()
         || !completed_write_denied()
         || _wfopen_s(&provisional_file, argv[1], L"wb") != 0
         || provisional_file == NULL
