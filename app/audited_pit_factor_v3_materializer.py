@@ -21,6 +21,7 @@ import re
 from typing import Any
 
 from app import audited_pit_factor_v3_points_contract as points
+from app import research_scope
 from app.research_scope import is_mainboard_chinext_symbol
 
 
@@ -166,6 +167,7 @@ def factor_v3_materializer_producer_binding() -> dict[str, Any]:
     modules = {
         "materializer": Path(__file__),
         "points_contract": Path(str(points.__file__)),
+        "research_scope": Path(str(research_scope.__file__)),
     }
     repository_root = Path(__file__).resolve().parents[1]
     files = {
@@ -232,7 +234,7 @@ def _assert_safe_existing_path(path: Path, *, label: str) -> None:
 
 
 def _assert_no_live_store_sidecars(path: Path, *, label: str) -> None:
-    if Path(f"{path}-wal").exists() or Path(f"{path}-shm").exists():
+    if any(Path(f"{path}{suffix}").exists() for suffix in ("-wal", "-shm", "-WAL", "-SHM")):
         raise ValueError(f"{label} has WAL/SHM live store sidecars")
     if path.suffix.lower() in {".sqlite", ".sqlite3", ".db"}:
         raise ValueError(f"{label} must not be a live store")
@@ -245,6 +247,14 @@ def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
         and left.st_ino == right.st_ino
         and left.st_dev == right.st_dev
     )
+
+
+def _directory_identity(path: Path, *, label: str) -> tuple[int, int]:
+    _assert_safe_existing_path(path, label=label)
+    if not path.is_dir():
+        raise ValueError(f"{label} must be a directory")
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino
 
 
 def _read_regular_bytes_no_follow(path: Path, *, label: str) -> bytes:
@@ -378,7 +388,7 @@ def _load_pinned_input_authority(
             raise ValueError("input authority snapshot must not contain a symlink or reparse point")
         if member.is_file() and member.name not in allowed_names:
             raise ValueError("input authority snapshot contains an unbound file")
-        if member.name.endswith(("-wal", "-shm")) or member.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
+        if member.name.lower().endswith(("-wal", "-shm")) or member.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
             raise ValueError("input authority snapshot must not contain a live store or WAL/SHM")
     identities = _strict_mapping(descriptor.get("authority_identities"), label="descriptor authority identities")
     if set(identities) != _REQUIRED_IDENTITIES:
@@ -1296,7 +1306,7 @@ def _safe_output_root(path_value: str | Path) -> Path:
     for child in path.rglob("*"):
         if _is_reparse_point(child):
             raise ValueError("candidate output root must not contain a symlink or reparse point")
-        if child.name.endswith(("-wal", "-shm")) or child.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
+        if child.name.lower().endswith(("-wal", "-shm")) or child.suffix.lower() in {".db", ".sqlite", ".sqlite3"}:
             raise ValueError("candidate output root must not contain a live store or WAL/SHM")
     return path
 
@@ -1312,6 +1322,7 @@ def _receipt_path(output_root: Path, *, receipt_sha256: str) -> Path:
 def _write_create_only(path: Path, raw: bytes, *, label: str) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     _assert_safe_existing_path(path.parent, label=f"{label} parent")
+    expected_parent_identity = _directory_identity(path.parent, label=f"{label} parent")
     try:
         descriptor = os.open(
             str(path),
@@ -1323,7 +1334,12 @@ def _write_create_only(path: Path, raw: bytes, *, label: str) -> bool:
         )
     except FileExistsError:
         _assert_safe_existing_path(path, label=label)
-        if not path.is_file() or _read_regular_bytes_no_follow(path, label=label) != raw:
+        if (
+            _directory_identity(path.parent, label=f"{label} parent")
+            != expected_parent_identity
+            or not path.is_file()
+            or _read_regular_bytes_no_follow(path, label=label) != raw
+        ):
             raise ValueError(f"{label} content-addressed candidate already exists with different bytes")
         return False
     try:
@@ -1334,7 +1350,9 @@ def _write_create_only(path: Path, raw: bytes, *, label: str) -> bool:
     except Exception:
         raise
     if (
-        not path.is_file()
+        _directory_identity(path.parent, label=f"{label} parent")
+        != expected_parent_identity
+        or not path.is_file()
         or _is_reparse_point(path)
         or _read_regular_bytes_no_follow(path, label=label) != raw
     ):
@@ -1348,7 +1366,7 @@ def _read_candidate_or_receipt(path_value: str | Path, *, label: str) -> tuple[P
     _assert_no_live_store_sidecars(path, label=label)
     if not path.is_file() or path.suffix.lower() != ".json":
         raise ValueError(f"{label} must be a regular JSON file")
-    raw = path.read_bytes()
+    raw = _read_regular_bytes_no_follow(path, label=label)
     return path, _strict_json_loads(raw, label=label), _sha256_bytes(raw)
 
 

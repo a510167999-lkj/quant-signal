@@ -507,6 +507,11 @@ def test_materializes_only_development_candidate_with_exact_pit_ledger(
     }
     assert receipt["factor_v2_evaluation"] == bundle["factor_v2_evaluation"]
     assert candidate["producer_binding"]["root_sha256"] == receipt["producer_binding"]["root_sha256"]
+    assert set(candidate["producer_binding"]["files"]) == {
+        "materializer",
+        "points_contract",
+        "research_scope",
+    }
     assert "publication_capability" not in candidate_path.read_text(encoding="utf-8")
     assert "publication_capability" not in receipt_path.read_text(encoding="utf-8")
     assert result["verification"]["verified"] is True
@@ -750,7 +755,7 @@ def test_create_only_post_verifier_and_unsafe_inputs_fail_closed(
         bundle,
         verified,
     )
-    Path(f"{descriptor_path}-wal").write_text("live-store-sidecar", encoding="utf-8")
+    Path(f"{descriptor_path}-WAL").write_text("live-store-sidecar", encoding="utf-8")
     with pytest.raises(ValueError, match="WAL|SHM|live store"):
         materializer.materialize_factor_v3_development_candidate(
             input_authority_descriptor_path=descriptor_path,
