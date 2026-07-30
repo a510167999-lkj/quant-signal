@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import py_compile
-import shutil
 import subprocess
 import sys
 
@@ -717,28 +716,50 @@ def test_actual_completion_supervisor_runtime_and_be3_dispatch_chain(
     )
 
     now = datetime.now(timezone.utc).replace(microsecond=0)
-    config, execution_payload, execution_authorization_path, public_der = (
-        _be3_crossline_authorized_fixture(
-            tmp_path,
-            authorization_now=now,
-        )
-    )
     source_app = Path(__file__).resolve().parents[1] / "app"
-    reviewed_app = Path(str(config["repo_root"])) / "app"
-    for name in (
-        "factor_v3_formal_control_contract.py",
-        "factor_v3_formal_supervisor_loader_runtime.py",
-        "factor_v3_formal_trusted_supervisor.py",
-    ):
-        shutil.copyfile(source_app / name, reviewed_app / name)
-    exclude_path = Path(str(config["repo_root"])) / ".git" / "info" / "exclude"
-    with exclude_path.open("a", encoding="utf-8", newline="\n") as stream:
+    reviewed_sources = {
+        f"app/{name}": (source_app / name).read_bytes()
         for name in (
             "factor_v3_formal_control_contract.py",
             "factor_v3_formal_supervisor_loader_runtime.py",
             "factor_v3_formal_trusted_supervisor.py",
-        ):
-            stream.write(f"/app/{name}\n")
+        )
+    }
+    config, execution_payload, execution_authorization_path, public_der = (
+        _be3_crossline_authorized_fixture(
+            tmp_path,
+            authorization_now=now,
+            extra_reviewed_sources=reviewed_sources,
+        )
+    )
+    repo_root = Path(str(config["repo_root"]))
+    assert subprocess.run(
+        [
+            str(config["git_executable_path"]),
+            "-C",
+            str(repo_root),
+            "status",
+            "--porcelain",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout == b""
+    assert (
+        subprocess.run(
+            [
+                str(config["git_executable_path"]),
+                "-C",
+                str(repo_root),
+                "rev-parse",
+                "HEAD",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="ascii",
+        ).stdout.strip()
+        == config["expected_commit"]
+    )
     completion_payload = renderer._plan_factor_v3_formal_bootstrap_publication_with_test_trust(
         authorization_path=execution_authorization_path,
         trusted_public_key_spki_der=public_der,
@@ -770,7 +791,7 @@ def test_actual_completion_supervisor_runtime_and_be3_dispatch_chain(
             ],
             private_key_path=private_key_path,
             trusted_public_key_spki_der=public_der,
-            verify_reviewed_sources=False,
+            verify_reviewed_sources=True,
             action="verify",
             execution_ledger_root=ledger_root,
             now_utc=now,

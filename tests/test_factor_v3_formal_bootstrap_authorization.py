@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
-from typing import Callable
+from typing import Callable, Mapping
 
 import pytest
 
@@ -243,11 +243,13 @@ def _authorized_fixture(
     dispatch_body: str | None = None,
     import_marker: Path | None = None,
     mutate_payload: Callable[[dict[str, object]], None] | None = None,
+    extra_reviewed_sources: Mapping[str, bytes] | None = None,
 ) -> tuple[dict[str, object], dict[str, object], Path, bytes]:
     config = _fixture_config(
         tmp_path,
         dispatch_body=dispatch_body,
         import_marker=import_marker,
+        extra_reviewed_sources=extra_reviewed_sources,
     )
     config["action"] = action
     payload = _authorization_payload(tmp_path, config)
@@ -286,6 +288,7 @@ def _be3_crossline_authorized_fixture(
     tmp_path: Path,
     *,
     authorization_now: datetime | None = None,
+    extra_reviewed_sources: Mapping[str, bytes] | None = None,
 ) -> tuple[dict[str, object], dict[str, object], Path, bytes]:
     config = _fixture_config(tmp_path)
     repo = Path(str(config["repo_root"]))
@@ -337,6 +340,10 @@ def _be3_crossline_authorized_fixture(
         encoding="utf-8",
         newline="\n",
     )
+    for relative_path, raw in (extra_reviewed_sources or {}).items():
+        destination = repo / Path(*relative_path.split("/"))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(raw)
     _git(repo, "add", "--all")
     commit = _git(repo, "commit", "-m", "be3 crossline fixture")
     assert commit

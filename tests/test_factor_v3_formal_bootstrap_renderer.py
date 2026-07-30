@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Mapping
 
 import pytest
 
@@ -134,6 +134,7 @@ def _fixture_config(
     *,
     dispatch_body: str | None = None,
     import_marker: Path | None = None,
+    extra_reviewed_sources: Mapping[str, bytes] | None = None,
 ) -> dict[str, object]:
     repo = (tmp_path / "reviewed-repo").resolve()
     (repo / "app").mkdir(parents=True)
@@ -270,6 +271,10 @@ def _fixture_config(
             "raise RuntimeError('reviewed unloaded fixture must not execute')\n",
             encoding="utf-8",
         )
+    for relative_path, raw in (extra_reviewed_sources or {}).items():
+        destination = repo / Path(*relative_path.split("/"))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(raw)
     _git(repo.parent, "init", str(repo))
     _git(repo, "add", "--all")
     _git(repo, "commit", "-m", "fixture")
