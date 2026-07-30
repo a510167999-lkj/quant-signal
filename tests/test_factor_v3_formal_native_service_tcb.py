@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import uuid
 
 import pytest
+
+from app import factor_v3_formal_trusted_supervisor as formal_supervisor
+from tests.test_factor_v3_formal_trusted_supervisor import _fixture
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -372,6 +378,74 @@ def _build_handoff_fixture(root: Path) -> tuple[Path, Path, Path, Path, bytes, s
     return native, candidate_path, provisional, completed, secret_value, claim_sha256
 
 
+def _build_production_validation_fixture(root: Path) -> tuple[Path, Path]:
+    from app import factor_v3_formal_native_broker as broker
+
+    pins, payload, launch_authorization, _environment, _writes = _fixture(root)
+    candidate = broker.build_factor_v3_formal_native_broker_candidate(
+        action="run",
+        authorization_path=payload["bootstrap_execution_authorization_path"],
+        completion_marker_path=payload["publication_completion_marker_path"],
+        publication_receipt_path=payload["supervisor_publication_receipt_path"],
+        launch_authorization_path=launch_authorization,
+        execution_ledger_root=payload["execution_ledger_root"],
+    )
+    publication = broker.publish_factor_v3_formal_native_broker_candidate(
+        candidate_output_root=root / "native-candidates",
+        candidate=candidate,
+    )
+    public_der = base64.b64decode(pins.execution_public_key_spki_der_base64)
+    modulus, exponent = formal_supervisor._parse_rsa3072_spki(public_der)
+    source = REPO_ROOT / "app" / "factor_v3_formal_supervisor_loader_runtime.py"
+    credential = Path(str(payload["credential_path"]))
+    manifest = root / "production_validation_manifest.h"
+    manifest.write_text(
+        "\n".join(
+            (
+                '#define F3_BROKER_RUNTIME_PATH L"' + _c_wide(Path(sys.executable)) + '"',
+                '#define F3_BROKER_RUNTIME_SHA256 L"'
+                + hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest()
+                + '"',
+                '#define F3_BROKER_SOURCE_PATH L"' + _c_wide(source) + '"',
+                '#define F3_BROKER_SOURCE_SHA256 L"'
+                + hashlib.sha256(source.read_bytes()).hexdigest()
+                + '"',
+                '#define F3_BROKER_CREDENTIAL_SLOT_PATH L"'
+                + _c_wide(credential)
+                + '"',
+                (
+                    '#define F3_BROKER_CNG_PROVIDER '
+                    'L"Microsoft Software Key Storage Provider"'
+                ),
+                '#define F3_BROKER_CNG_KEY_NAME L"unused-disposable-test-key"',
+                "#define F3_BROKER_CNG_ALGORITHM NCRYPT_RSA_ALGORITHM",
+                '#define F3_BROKER_SERVICE_NAME L"DisposableFixtureService"',
+                '#define F3_BROKER_SERVICE_SID L"S-1-5-18"',
+                '#define F3_BROKER_RESTRICTING_SID L"S-1-5-4"',
+                '#define F3_BROKER_EXECUTION_PUBLIC_MODULUS_HEX "'
+                + modulus.to_bytes(384, "big").hex()
+                + '"',
+                f"#define F3_BROKER_EXECUTION_PUBLIC_EXPONENT {exponent}u",
+                "#define F3_BROKER_TESTING 1",
+                "#define F3_BROKER_DISPOSABLE_TEST_MANIFEST 1",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    native = root / "factor_v3_formal_native_broker-production-validation-test.exe"
+    _compile_source(
+        source=BROKER_SOURCE,
+        output=native,
+        includes=[root, BROKER_ROOT],
+        definitions=[
+            '-DF3_BROKER_MANIFEST_HEADER="production_validation_manifest.h"',
+        ],
+        libraries=["-lncrypt"],
+    )
+    return native, Path(publication["candidate_path"])
+
+
 def test_native_manifest_uses_fixed_cng_identity_and_no_private_key_file_slot() -> None:
     source = BROKER_SOURCE.read_text(encoding="utf-8")
     manifest = BROKER_MANIFEST.read_text(encoding="utf-8")
@@ -466,6 +540,19 @@ def test_production_launch_checks_service_and_fixed_namespace_chains_before_fail
     assert "F3_BROKER_CREDENTIAL_SLOT_PATH" in production_check
     assert "ACCESS_ALLOWED_ACE_TYPE" in source
     assert "AccessCheck" in source
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_native_production_candidate_verifies_signed_v2_launch_authorization(
+    tmp_path: Path,
+) -> None:
+    native, candidate = _build_production_validation_fixture(tmp_path)
+
+    completed = _run(native, "--test-validate-production-candidate", str(candidate))
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == ""
+    assert completed.stderr == ""
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
