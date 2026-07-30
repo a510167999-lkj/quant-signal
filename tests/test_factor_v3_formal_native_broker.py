@@ -61,10 +61,20 @@ def _compile(
     output: Path,
     extra: list[str] | None = None,
 ) -> None:
+    completed = _compile_result(source=source, output=output, extra=extra)
+    assert completed.returncode == 0, completed.stderr
+
+
+def _compile_result(
+    *,
+    source: Path,
+    output: Path,
+    extra: list[str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     gcc = shutil.which("gcc")
     if gcc is None:
         pytest.skip("Win32 GCC is unavailable")
-    completed = subprocess.run(
+    return subprocess.run(
         [
             gcc,
             "-std=c11",
@@ -87,7 +97,6 @@ def _compile(
         text=True,
         timeout=60,
     )
-    assert completed.returncode == 0, completed.stderr
 
 
 def _helper_source() -> str:
@@ -227,6 +236,7 @@ def _compile_fixture_broker(tmp_path: Path) -> tuple[Path, Path]:
                 + _c_wide(credential)
                 + '"',
                 "#define F3_BROKER_TESTING 1",
+                "#define F3_BROKER_DISPOSABLE_TEST_MANIFEST 1",
                 "",
             )
         ),
@@ -641,6 +651,7 @@ def test_native_acl_probe_distinguishes_mutable_user_tree_from_system_protected_
         output=native,
         extra=[
             "-DF3_BROKER_TESTING=1",
+            "-DF3_BROKER_DISPOSABLE_TEST_MANIFEST=1",
             f"-I{BROKER_INCLUDE}",
         ],
     )
@@ -666,6 +677,53 @@ def test_native_acl_probe_distinguishes_mutable_user_tree_from_system_protected_
     assert protected.returncode == 0, protected.stderr
     assert protected.stdout == ""
     assert protected.stderr == ""
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+@pytest.mark.parametrize(
+    ("disposable_marker", "production_ready"),
+    [(0, 0), (1, 1)],
+)
+def test_native_build_rejects_unsealed_test_production_combinations(
+    tmp_path: Path,
+    disposable_marker: int,
+    production_ready: int,
+) -> None:
+    manifest = tmp_path / "unsafe_test_manifest.h"
+    manifest.write_text(
+        "\n".join(
+            (
+                '#define F3_BROKER_RUNTIME_PATH L""',
+                '#define F3_BROKER_RUNTIME_SHA256 L""',
+                '#define F3_BROKER_SOURCE_PATH L""',
+                '#define F3_BROKER_SOURCE_SHA256 L""',
+                '#define F3_BROKER_SIGNING_KEY_SLOT_PATH L""',
+                '#define F3_BROKER_CREDENTIAL_SLOT_PATH L""',
+                "#define F3_BROKER_TESTING 1",
+                (
+                    "#define F3_BROKER_DISPOSABLE_TEST_MANIFEST "
+                    f"{disposable_marker}"
+                ),
+                (
+                    "#define F3_BROKER_PRODUCTION_HANDOFF_READY "
+                    f"{production_ready}"
+                ),
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    completed = _compile_result(
+        source=BROKER_SOURCE,
+        output=tmp_path / "unsafe-test-broker.exe",
+        extra=[
+            '-DF3_BROKER_MANIFEST_HEADER="unsafe_test_manifest.h"',
+            f"-I{tmp_path}",
+            f"-I{BROKER_INCLUDE}",
+        ],
+    )
+    assert completed.returncode != 0
+    assert "F3_BROKER_TESTING" in completed.stderr
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
