@@ -1383,6 +1383,16 @@ def render_factor_v3_formal_bootstrap_from_authorization(
     )
 
 
+def validate_factor_v3_formal_bootstrap_execution_authorization(
+    *,
+    authorization_path: Path | str,
+) -> dict[str, Any]:
+    return _authorized_config(
+        authorization_path=authorization_path,
+        trusted_public_key_spki_der=(_production_execution_authorization_public_key_der()),
+    )
+
+
 def _render_factor_v3_formal_bootstrap_with_test_trust(
     *,
     authorization_path: Path | str,

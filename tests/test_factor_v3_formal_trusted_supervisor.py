@@ -423,6 +423,53 @@ def _fixture(
         completion_raw,
         ".json",
     )
+    executed_supervisor_raw = source_path.read_bytes()
+    executed_supervisor_path, executed_supervisor_sha256 = _cas_write(
+        bootstrap_output_root,
+        "supervisors",
+        executed_supervisor_raw,
+        ".py",
+    )
+    supervisor_loader_raw = b"fixture-supervisor-loader"
+    supervisor_loader_path, supervisor_loader_sha256 = _cas_write(
+        bootstrap_output_root,
+        "supervisor_loaders",
+        supervisor_loader_raw,
+        ".py",
+    )
+    supervisor_publication_receipt = {
+        "bootstrap_completion_marker_sha256": completion_sha256,
+        "bootstrap_execution_authorization_sha256": (bootstrap_execution_authorization_sha256),
+        "control_contract_source_sha256": supervisor._CONTROL_CONTRACT_SOURCE_SHA256,
+        "executed_supervisor_bytes": len(executed_supervisor_raw),
+        "executed_supervisor_relative_path": executed_supervisor_path.relative_to(
+            bootstrap_output_root
+        ).as_posix(),
+        "executed_supervisor_sha256": executed_supervisor_sha256,
+        "reviewed_commit": supervisor_expected_commit,
+        "schema": supervisor.SUPERVISOR_PUBLICATION_RECEIPT_SCHEMA,
+        "stdlib_inventory_root_sha256": stdlib_inventory_root_sha256,
+        "supervisor_loader_bytes": len(supervisor_loader_raw),
+        "supervisor_loader_relative_path": supervisor_loader_path.relative_to(
+            bootstrap_output_root
+        ).as_posix(),
+        "supervisor_loader_sha256": supervisor_loader_sha256,
+        "supervisor_source_sha256": supervisor_source_sha256,
+    }
+    (
+        supervisor_publication_receipt_path,
+        supervisor_publication_receipt_sha256,
+    ) = _cas_write(
+        bootstrap_output_root,
+        "supervisor_publication_receipts",
+        _canonical_bytes(supervisor_publication_receipt),
+        ".json",
+    )
+    credential_path = (tmp_path / "points-primary.token").resolve()
+    credential_path.write_text(
+        "fixture-secret-must-never-be-logged",
+        encoding="utf-8",
+    )
     pins = supervisor._SupervisorPins(
         base_python_executable_path=str(base_python_path),
         base_python_executable_sha256=_file_sha256(base_python_path),
@@ -449,6 +496,8 @@ def _fixture(
         "authorization_nonce_sha256": authorization_nonce_sha256,
         "base_python_executable_path": str(base_python_path),
         "base_python_executable_sha256": pins.base_python_executable_sha256,
+        "bootstrap_authorization_id_sha256": authorization_id_sha256,
+        "bootstrap_authorization_nonce_sha256": authorization_nonce_sha256,
         "bootstrap_execution_authorization_sha256": (bootstrap_execution_authorization_sha256),
         "bootstrap_execution_authorization_path": str(bootstrap_execution_authorization_path),
         "bootstrap_output_root": str(bootstrap_output_root),
@@ -456,8 +505,13 @@ def _fixture(
         "bootstrap_worker_sha256": worker_sha256,
         "control_contract_descriptor_sha256": (contract.control_contract_descriptor_sha256()),
         "control_contract_source_sha256": pins.control_contract_source_sha256,
+        "credential_path": (str(credential_path) if action in {"run", "resume"} else None),
+        "credential_slot_id": ("points-primary" if action in {"run", "resume"} else None),
         "environment_policy": supervisor.WORKER_ENVIRONMENT_POLICY,
+        "executed_supervisor_path": str(executed_supervisor_path),
+        "executed_supervisor_sha256": executed_supervisor_sha256,
         "execution_key_id": f"sha256:{pins.execution_public_key_spki_sha256}",
+        "execution_key_role": supervisor.BOOTSTRAP_EXECUTION_AUTHORIZATION_KEY_ROLE,
         "execution_ledger_root": str(ledger_root),
         "expires_at_utc": (now + timedelta(minutes=30)).isoformat(timespec="seconds"),
         "formal_input_root_path": str(formal_input_root),
@@ -466,6 +520,7 @@ def _fixture(
         "git_executable_path": str(git_path),
         "git_executable_sha256": pins.git_executable_sha256,
         "issued_at_utc": now.isoformat(timespec="seconds"),
+        "not_before_utc": now.isoformat(timespec="seconds"),
         "project_id": "quant-signal-lkj",
         "publication_completion_marker_path": str(completion_path),
         "publication_completion_marker_sha256": completion_sha256,
@@ -486,12 +541,17 @@ def _fixture(
         "run_root": str(run_root),
         "run_spec_path": str(run_spec_path),
         "run_spec_sha256": _sha256(run_spec_raw),
-        "schema": "factor-v3-formal-supervisor-launch-authorization/v1",
+        "schema": supervisor.LAUNCH_AUTHORIZATION_SCHEMA,
         "source_root_sha256": _sha256(b"reviewed-source-root"),
         "stdlib_inventory_root_sha256": stdlib_inventory_root_sha256,
         "stdlib_policy_path": str(stdlib_policy_path),
         "stdlib_policy_sha256": stdlib_policy_sha256,
         "supervisor_expected_commit": pins.supervisor_expected_commit,
+        "supervisor_loader_bytes": len(supervisor_loader_raw),
+        "supervisor_loader_path": str(supervisor_loader_path),
+        "supervisor_loader_sha256": supervisor_loader_sha256,
+        "supervisor_publication_receipt_path": str(supervisor_publication_receipt_path),
+        "supervisor_publication_receipt_sha256": (supervisor_publication_receipt_sha256),
         "supervisor_source_sha256": pins.supervisor_source_sha256,
         "worker_action": worker_action,
         "worker_argv": [
@@ -528,7 +588,6 @@ def _fixture(
         for name in supervisor.WORKER_ENVIRONMENT_POLICY["public_passthrough_names"]
         if name in os.environ
     }
-    environment["JIAOCH_TOKEN"] = "fixture-secret-must-never-be-logged"
     writes: list[bytes] = []
     return pins, payload, authorization_path, environment, writes
 
@@ -548,12 +607,18 @@ def _run_fixture(
     environment: dict[str, str],
     writes: list[bytes],
 ) -> dict[str, Any]:
+    authorization = json.loads(authorization_path.read_text(encoding="utf-8"))
+    payload = authorization["payload"]
     return supervisor._supervise_with_pins(
         authorization_path=authorization_path,
         pins=pins,
         now_utc=datetime(2026, 7, 30, 12, 1, 0, tzinfo=timezone.utc),
         environment_snapshot=environment,
         output_writer=_writer(writes),
+        trusted_executed_supervisor_path=payload["executed_supervisor_path"],
+        trusted_executed_supervisor_sha256=payload["executed_supervisor_sha256"],
+        trusted_supervisor_loader_path=payload["supervisor_loader_path"],
+        trusted_supervisor_loader_sha256=payload["supervisor_loader_sha256"],
     )
 
 
@@ -741,7 +806,10 @@ def test_signed_completion_marker_is_the_only_publication_selection_record(
         tmp_path / "execution-key" / "execution-private.pem",
     )
 
-    with pytest.raises(supervisor.FormalSupervisorError, match="completion"):
+    with pytest.raises(
+        supervisor.FormalSupervisorError,
+        match="completion|supervisor publication receipt",
+    ):
         _run_fixture(drifted_pins, authorization_path, environment, writes)
 
     assert writes == []
@@ -887,6 +955,10 @@ def test_artifact_claim_and_completed_files_remain_held_through_success_output(
         now_utc=datetime(2026, 7, 30, 12, 1, 0, tzinfo=timezone.utc),
         environment_snapshot=environment,
         output_writer=writer,
+        trusted_executed_supervisor_path=payload["executed_supervisor_path"],
+        trusted_executed_supervisor_sha256=payload["executed_supervisor_sha256"],
+        trusted_supervisor_loader_path=payload["supervisor_loader_path"],
+        trusted_supervisor_loader_sha256=payload["supervisor_loader_sha256"],
     )
 
     assert blocked == [True, True, True, True]

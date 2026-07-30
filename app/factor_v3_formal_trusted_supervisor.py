@@ -102,10 +102,11 @@ worker_environment_policy = _CONTROL_CONTRACT["worker_environment_policy"]
 worker_protocol_descriptor = _CONTROL_CONTRACT["worker_protocol_descriptor"]
 
 
-LAUNCH_AUTHORIZATION_SCHEMA = "factor-v3-formal-supervisor-launch-authorization/v1"
+LAUNCH_AUTHORIZATION_SCHEMA = "factor-v3-formal-supervisor-launch-authorization/v2"
 BOOTSTRAP_EXECUTION_AUTHORIZATION_SCHEMA = "factor-v3-formal-bootstrap-execution-authorization/v2"
 BOOTSTRAP_EXECUTION_AUTHORIZATION_KEY_ROLE = "factor-v3-bootstrap-execution-authorization"
 PUBLICATION_RECEIPT_SCHEMA = "factor-v3-formal-bootstrap-publication-receipt/v1"
+SUPERVISOR_PUBLICATION_RECEIPT_SCHEMA = "factor-v3-formal-supervisor-publication-receipt/v1"
 STDLIB_INVENTORY_SCHEMA = STDLIB_POLICY_SCHEMA
 CLAIM_SCHEMA = "factor-v3-formal-supervisor-execution-claim/v1"
 COMPLETED_SCHEMA = "factor-v3-formal-supervisor-execution-completed/v1"
@@ -132,13 +133,20 @@ _LAUNCH_FIELDS = {
     "base_python_executable_sha256",
     "bootstrap_execution_authorization_sha256",
     "bootstrap_execution_authorization_path",
+    "bootstrap_authorization_id_sha256",
+    "bootstrap_authorization_nonce_sha256",
     "bootstrap_output_root",
     "bootstrap_worker_path",
     "bootstrap_worker_sha256",
     "control_contract_descriptor_sha256",
     "control_contract_source_sha256",
+    "credential_path",
+    "credential_slot_id",
     "environment_policy",
+    "executed_supervisor_path",
+    "executed_supervisor_sha256",
     "execution_key_id",
+    "execution_key_role",
     "execution_ledger_root",
     "expires_at_utc",
     "formal_input_root_path",
@@ -147,6 +155,7 @@ _LAUNCH_FIELDS = {
     "git_executable_path",
     "git_executable_sha256",
     "issued_at_utc",
+    "not_before_utc",
     "project_id",
     "publication_completion_marker_path",
     "publication_completion_marker_sha256",
@@ -173,6 +182,11 @@ _LAUNCH_FIELDS = {
     "stdlib_policy_path",
     "stdlib_policy_sha256",
     "supervisor_expected_commit",
+    "supervisor_loader_bytes",
+    "supervisor_loader_path",
+    "supervisor_loader_sha256",
+    "supervisor_publication_receipt_path",
+    "supervisor_publication_receipt_sha256",
     "supervisor_source_sha256",
     "worker_action",
     "worker_argv",
@@ -233,6 +247,11 @@ _BOOTSTRAP_EXECUTION_AUTHORIZATION_FIELDS = {
     "supervisor_protocol",
 }
 
+_TRUSTED_EXECUTED_SUPERVISOR_PATH = globals().get("_TRUSTED_EXECUTED_SUPERVISOR_PATH")
+_TRUSTED_EXECUTED_SUPERVISOR_SHA256 = globals().get("_TRUSTED_EXECUTED_SUPERVISOR_SHA256")
+_TRUSTED_SUPERVISOR_LOADER_PATH = globals().get("_TRUSTED_SUPERVISOR_LOADER_PATH")
+_TRUSTED_SUPERVISOR_LOADER_SHA256 = globals().get("_TRUSTED_SUPERVISOR_LOADER_SHA256")
+
 
 @dataclass(frozen=True)
 class _SupervisorPins:
@@ -263,28 +282,57 @@ def _pinned_control_contract_path(pins: _SupervisorPins) -> Path:
     return Path(pins.repo_root) / "app" / _CONTROL_CONTRACT_SOURCE_NAME
 
 
-def _render_supervisor_with_test_pins(pins: _SupervisorPins) -> bytes:
+def _render_supervisor_with_pins(
+    pins: _SupervisorPins,
+    *,
+    source_raw: bytes | None = None,
+    control_contract_raw: bytes | None = None,
+) -> bytes:
     _validate_pins(pins)
-    source_path = Path(__file__).resolve()
-    raw = source_path.read_bytes().replace(b"\r\n", b"\n")
+    if source_raw is None:
+        source_path = Path(__file__).resolve()
+        source = _HeldFile(
+            source_path,
+            expected_sha256=pins.supervisor_source_sha256,
+            label="trusted supervisor source",
+            max_bytes=_MAX_WORKER_BYTES,
+        )
+        try:
+            source_raw = source.raw
+            source.postverify()
+        finally:
+            source.close()
+    if (
+        type(source_raw) is not bytes
+        or not source_raw
+        or hashlib.sha256(source_raw).hexdigest() != pins.supervisor_source_sha256
+    ):
+        raise FormalSupervisorError("trusted supervisor source rejected")
+    raw = source_raw.replace(b"\r\n", b"\n")
     pins_marker = b"_FIXED_PINS: _SupervisorPins | None" + b" = None"
     pins_replacement = f"_FIXED_PINS: _SupervisorPins = {pins!r}".encode("utf-8")
     contract_marker = b"_EMBEDDED_CONTROL_CONTRACT_SOURCE: bytes | None" + b" = None"
-    contract_source = _HeldFile(
-        _pinned_control_contract_path(pins),
-        expected_sha256=pins.control_contract_source_sha256,
-        label="pinned control contract source",
-        max_bytes=_MAX_WORKER_BYTES,
-    )
-    try:
-        if contract_source.raw != _fixed_control_contract_source():
-            raise FormalSupervisorError("pinned control contract source rejected")
-        contract_replacement = b"_EMBEDDED_CONTROL_CONTRACT_SOURCE: bytes = " + repr(
-            contract_source.raw
-        ).encode("ascii")
-        contract_source.postverify()
-    finally:
-        contract_source.close()
+    if control_contract_raw is None:
+        contract_source = _HeldFile(
+            _pinned_control_contract_path(pins),
+            expected_sha256=pins.control_contract_source_sha256,
+            label="pinned control contract source",
+            max_bytes=_MAX_WORKER_BYTES,
+        )
+        try:
+            control_contract_raw = contract_source.raw
+            contract_source.postverify()
+        finally:
+            contract_source.close()
+    if (
+        type(control_contract_raw) is not bytes
+        or hashlib.sha256(control_contract_raw).hexdigest() != pins.control_contract_source_sha256
+        or control_contract_raw != _fixed_control_contract_source()
+    ):
+        raise FormalSupervisorError("pinned control contract source rejected")
+    contract_replacement = b"_EMBEDDED_CONTROL_CONTRACT_SOURCE: bytes = " + repr(
+        control_contract_raw
+    ).encode("ascii")
     if raw.count(pins_marker) != 1 or raw.count(contract_marker) != 1:
         raise FormalSupervisorError("supervisor template marker rejected")
     rendered = raw.replace(pins_marker, pins_replacement).replace(
@@ -296,6 +344,10 @@ def _render_supervisor_with_test_pins(pins: _SupervisorPins) -> bytes:
     except (SyntaxError, ValueError) as exc:
         raise FormalSupervisorError("rendered supervisor rejected") from exc
     return rendered
+
+
+def _render_supervisor_with_test_pins(pins: _SupervisorPins) -> bytes:
+    return _render_supervisor_with_pins(pins)
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -924,6 +976,42 @@ def _validate_cas_path(
         raise FormalSupervisorError(f"{label} CAS rejected")
 
 
+def _validate_supervisor_publication_receipt(
+    raw: bytes,
+    *,
+    executed_supervisor_raw: bytes,
+    payload: Mapping[str, Any],
+) -> None:
+    receipt = _strict_canonical_json(raw, label="supervisor publication receipt")
+    expected = {
+        "bootstrap_completion_marker_sha256": payload["publication_completion_marker_sha256"],
+        "bootstrap_execution_authorization_sha256": payload[
+            "bootstrap_execution_authorization_sha256"
+        ],
+        "control_contract_source_sha256": payload["control_contract_source_sha256"],
+        "executed_supervisor_bytes": len(executed_supervisor_raw),
+        "executed_supervisor_relative_path": (
+            Path(str(payload["executed_supervisor_path"]))
+            .relative_to(Path(str(payload["bootstrap_output_root"])))
+            .as_posix()
+        ),
+        "executed_supervisor_sha256": payload["executed_supervisor_sha256"],
+        "reviewed_commit": payload["reviewed_commit"],
+        "schema": SUPERVISOR_PUBLICATION_RECEIPT_SCHEMA,
+        "stdlib_inventory_root_sha256": payload["stdlib_inventory_root_sha256"],
+        "supervisor_loader_bytes": payload["supervisor_loader_bytes"],
+        "supervisor_loader_relative_path": (
+            Path(str(payload["supervisor_loader_path"]))
+            .relative_to(Path(str(payload["bootstrap_output_root"])))
+            .as_posix()
+        ),
+        "supervisor_loader_sha256": payload["supervisor_loader_sha256"],
+        "supervisor_source_sha256": payload["supervisor_source_sha256"],
+    }
+    if receipt != expected:
+        raise FormalSupervisorError("supervisor publication receipt rejected")
+
+
 def _parse_utc(value: Any, *, label: str) -> datetime:
     if type(value) is not str:
         raise FormalSupervisorError(f"{label} rejected")
@@ -1004,7 +1092,31 @@ def _validate_launch_payload(
     *,
     pins: _SupervisorPins,
     now_utc: datetime,
+    trusted_executed_supervisor_path: str | None = None,
+    trusted_executed_supervisor_sha256: str | None = None,
+    trusted_supervisor_loader_path: str | None = None,
+    trusted_supervisor_loader_sha256: str | None = None,
 ) -> dict[str, Any]:
+    executed_supervisor_path = (
+        _TRUSTED_EXECUTED_SUPERVISOR_PATH
+        if trusted_executed_supervisor_path is None
+        else trusted_executed_supervisor_path
+    )
+    executed_supervisor_sha256 = (
+        _TRUSTED_EXECUTED_SUPERVISOR_SHA256
+        if trusted_executed_supervisor_sha256 is None
+        else trusted_executed_supervisor_sha256
+    )
+    supervisor_loader_path = (
+        _TRUSTED_SUPERVISOR_LOADER_PATH
+        if trusted_supervisor_loader_path is None
+        else trusted_supervisor_loader_path
+    )
+    supervisor_loader_sha256 = (
+        _TRUSTED_SUPERVISOR_LOADER_SHA256
+        if trusted_supervisor_loader_sha256 is None
+        else trusted_supervisor_loader_sha256
+    )
     if (
         type(value) is not dict
         or set(value) != _LAUNCH_FIELDS
@@ -1021,10 +1133,13 @@ def _validate_launch_payload(
         "authorization_id_sha256",
         "authorization_nonce_sha256",
         "base_python_executable_sha256",
+        "bootstrap_authorization_id_sha256",
+        "bootstrap_authorization_nonce_sha256",
         "bootstrap_execution_authorization_sha256",
         "bootstrap_worker_sha256",
         "control_contract_descriptor_sha256",
         "control_contract_source_sha256",
+        "executed_supervisor_sha256",
         "formal_input_root_sha256",
         "git_executable_sha256",
         "publication_completion_marker_sha256",
@@ -1034,11 +1149,14 @@ def _validate_launch_payload(
         "source_root_sha256",
         "stdlib_inventory_root_sha256",
         "stdlib_policy_sha256",
+        "supervisor_loader_sha256",
+        "supervisor_publication_receipt_sha256",
         "supervisor_source_sha256",
     ):
         _require_sha256(payload.get(field), label=field)
     if (
         payload["execution_key_id"] != f"sha256:{pins.execution_public_key_spki_sha256}"
+        or payload["execution_key_role"] != BOOTSTRAP_EXECUTION_AUTHORIZATION_KEY_ROLE
         or payload["review_public_key_spki_sha256"] == pins.execution_public_key_spki_sha256
         or payload["publication_completion_marker_path"] != pins.bootstrap_completion_marker_path
         or payload["publication_completion_marker_sha256"]
@@ -1049,6 +1167,10 @@ def _validate_launch_payload(
         or payload["control_contract_descriptor_sha256"] != control_contract_descriptor_sha256()
         or payload["control_contract_source_sha256"] != pins.control_contract_source_sha256
         or payload["replay_scope"] != EXECUTION_REPLAY_SCOPE
+        or payload["executed_supervisor_path"] != executed_supervisor_path
+        or payload["executed_supervisor_sha256"] != executed_supervisor_sha256
+        or payload["supervisor_loader_path"] != supervisor_loader_path
+        or payload["supervisor_loader_sha256"] != supervisor_loader_sha256
     ):
         raise FormalSupervisorError("execution/review key role or protocol pins rejected")
     if (
@@ -1070,6 +1192,7 @@ def _validate_launch_payload(
             "bootstrap_worker_path",
             "bootstrap_execution_authorization_path",
             "execution_ledger_root",
+            "executed_supervisor_path",
             "formal_input_root_path",
             "formal_output_root",
             "publication_completion_marker_path",
@@ -1077,9 +1200,63 @@ def _validate_launch_payload(
             "run_root",
             "run_spec_path",
             "stdlib_policy_path",
+            "supervisor_loader_path",
+            "supervisor_publication_receipt_path",
             "worker_pycache_prefix",
         )
     }
+    _validate_cas_path(
+        paths["executed_supervisor_path"],
+        str(payload["executed_supervisor_sha256"]),
+        category="supervisors",
+        suffix=".py",
+        label="executed supervisor",
+    )
+    _validate_cas_path(
+        paths["supervisor_loader_path"],
+        str(payload["supervisor_loader_sha256"]),
+        category="supervisor_loaders",
+        suffix=".py",
+        label="supervisor loader",
+    )
+    _validate_cas_path(
+        paths["supervisor_publication_receipt_path"],
+        str(payload["supervisor_publication_receipt_sha256"]),
+        category="supervisor_publication_receipts",
+        suffix=".json",
+        label="supervisor publication receipt",
+    )
+    bootstrap_root = paths["bootstrap_output_root"]
+    expected_supervisor_path = (
+        bootstrap_root
+        / "supervisors"
+        / "sha256"
+        / str(payload["executed_supervisor_sha256"])[:2]
+        / f"{payload['executed_supervisor_sha256']}.py"
+    )
+    expected_supervisor_receipt_path = (
+        bootstrap_root
+        / "supervisor_publication_receipts"
+        / "sha256"
+        / str(payload["supervisor_publication_receipt_sha256"])[:2]
+        / f"{payload['supervisor_publication_receipt_sha256']}.json"
+    )
+    expected_supervisor_loader_path = (
+        bootstrap_root
+        / "supervisor_loaders"
+        / "sha256"
+        / str(payload["supervisor_loader_sha256"])[:2]
+        / f"{payload['supervisor_loader_sha256']}.py"
+    )
+    if (
+        os.path.normcase(str(paths["executed_supervisor_path"]))
+        != os.path.normcase(str(expected_supervisor_path))
+        or os.path.normcase(str(paths["supervisor_loader_path"]))
+        != os.path.normcase(str(expected_supervisor_loader_path))
+        or os.path.normcase(str(paths["supervisor_publication_receipt_path"]))
+        != os.path.normcase(str(expected_supervisor_receipt_path))
+    ):
+        raise FormalSupervisorError("supervisor publication root rejected")
     exact_argv = exact_worker_argv(
         python_executable_path=pins.python_executable_path,
         bootstrap_worker_path=str(paths["bootstrap_worker_path"]),
@@ -1125,12 +1302,13 @@ def _validate_launch_payload(
     ):
         raise FormalSupervisorError("non-resume authorization rejected")
     issued_at = _parse_utc(payload.get("issued_at_utc"), label="issued time")
+    not_before = _parse_utc(payload.get("not_before_utc"), label="not before time")
     expires_at = _parse_utc(payload.get("expires_at_utc"), label="expiry time")
     if (
         now_utc.tzinfo != timezone.utc
         or now_utc.microsecond != 0
-        or not issued_at <= now_utc < expires_at
-        or expires_at <= issued_at
+        or not issued_at <= not_before <= now_utc < expires_at
+        or expires_at <= not_before
         or (expires_at - issued_at).total_seconds() > _MAX_AUTHORIZATION_LIFETIME_SECONDS
     ):
         raise FormalSupervisorError("launch authorization validity rejected")
@@ -1141,6 +1319,24 @@ def _validate_launch_payload(
         or not 0 < timeout <= _MAX_WORKER_TIMEOUT_SECONDS
     ):
         raise FormalSupervisorError("worker timeout rejected")
+    loader_bytes = payload.get("supervisor_loader_bytes")
+    if (
+        type(loader_bytes) is not int
+        or isinstance(loader_bytes, bool)
+        or not 0 < loader_bytes <= _MAX_WORKER_BYTES
+    ):
+        raise FormalSupervisorError("supervisor loader size rejected")
+    if payload["action"] in {"run", "resume"}:
+        if (
+            payload.get("credential_slot_id") != "points-primary"
+            or type(payload.get("credential_path")) is not str
+        ):
+            raise FormalSupervisorError("credential slot rejected")
+        _absolute_path(payload["credential_path"], label="credential path")
+    elif (
+        payload.get("credential_slot_id") is not None or payload.get("credential_path") is not None
+    ):
+        raise FormalSupervisorError("non-run credential slot rejected")
     return payload
 
 
@@ -1158,6 +1354,7 @@ def _public_environment(snapshot: Mapping[str, str]) -> dict[str, str]:
 def _worker_environment(
     payload: Mapping[str, Any],
     *,
+    credential_value: str | None,
     launch_authorization_sha256: str,
     snapshot: Mapping[str, str],
 ) -> tuple[dict[str, str], tuple[str, ...]]:
@@ -1165,11 +1362,14 @@ def _worker_environment(
     secret_names = tuple(
         _fresh_environment_policy()["required_secret_names_by_action"][payload["action"]]
     )
-    for name in secret_names:
-        value = snapshot.get(name)
-        if type(value) is not str or not value:
+    if any(name in snapshot for name in secret_names):
+        raise FormalSupervisorError("credential present before trusted boundary")
+    if secret_names:
+        if len(secret_names) != 1 or type(credential_value) is not str or not credential_value:
             raise FormalSupervisorError("required worker credential unavailable")
-        environment[name] = value
+        environment[secret_names[0]] = credential_value
+    elif credential_value is not None:
+        raise FormalSupervisorError("unexpected worker credential")
     environment.update(
         {
             "FACTOR_V3_FORMAL_LAUNCH_ACTION": str(payload["action"]),
@@ -1186,6 +1386,34 @@ def _worker_environment(
     if not set(environment).issubset(allowed_names):
         raise FormalSupervisorError("worker environment rejected")
     return environment, secret_names
+
+
+def _held_run_credential(
+    payload: Mapping[str, Any],
+    *,
+    stack: ExitStack,
+) -> tuple[str | None, _HeldFile | None]:
+    if payload["action"] not in {"run", "resume"}:
+        return None, None
+    handle = _HeldFile(
+        Path(str(payload["credential_path"])),
+        expected_sha256=None,
+        label="points-primary credential slot",
+        max_bytes=4096,
+    )
+    stack.callback(handle.close)
+    try:
+        value = handle.raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise FormalSupervisorError("points-primary credential slot rejected") from None
+    if (
+        not value
+        or len(value) > 4096
+        or value != value.strip()
+        or any(character in value for character in ("\x00", "\r", "\n"))
+    ):
+        raise FormalSupervisorError("points-primary credential slot rejected")
+    return value, handle
 
 
 def _git_head(pins: _SupervisorPins, snapshot: Mapping[str, str]) -> str:
@@ -1419,12 +1647,10 @@ def _reject_credential_shape(value: Any) -> None:
 def _contains_secret(
     raw: bytes,
     *,
-    snapshot: Mapping[str, str],
-    secret_names: tuple[str, ...],
+    credential_values: tuple[str, ...],
 ) -> bool:
-    for name in secret_names:
-        value = snapshot.get(name)
-        if type(value) is str and value and value.encode("utf-8") in raw:
+    for value in credential_values:
+        if value and value.encode("utf-8") in raw:
             return True
     return False
 
@@ -1447,7 +1673,8 @@ def _parse_worker_terminal(
         or frame.get("launch_authorization_sha256") != authorization_sha256
         or frame.get("bootstrap_execution_authorization_sha256")
         != payload["bootstrap_execution_authorization_sha256"]
-        or frame.get("authorization_nonce_sha256") != payload["authorization_nonce_sha256"]
+        or frame.get("authorization_nonce_sha256")
+        != payload["bootstrap_authorization_nonce_sha256"]
         or frame.get("stdlib_inventory_root_sha256") != payload["stdlib_inventory_root_sha256"]
         or type(frame.get("result")) is not dict
     ):
@@ -1554,8 +1781,9 @@ def _validated_publication_completion(
         or completion.get("schema") != payload["publication_completion_schema"]
         or completion.get("status") != "completed"
         or completion.get("action") != payload["worker_action"]
-        or completion.get("authorization_id_sha256") != payload["authorization_id_sha256"]
-        or completion.get("authorization_nonce_sha256") != payload["authorization_nonce_sha256"]
+        or completion.get("authorization_id_sha256") != payload["bootstrap_authorization_id_sha256"]
+        or completion.get("authorization_nonce_sha256")
+        != payload["bootstrap_authorization_nonce_sha256"]
         or completion.get("bootstrap_output_root") != payload["bootstrap_output_root"]
         or completion.get("bootstrap_sha256") != payload["bootstrap_worker_sha256"]
         or completion.get("execution_authorization_sha256")
@@ -1689,8 +1917,8 @@ def _validated_bootstrap_execution_authorization(
     validation_clock = now_utc or not_before
     expected = {
         "action": payload["worker_action"],
-        "authorization_id_sha256": payload["authorization_id_sha256"],
-        "authorization_nonce_sha256": payload["authorization_nonce_sha256"],
+        "authorization_id_sha256": payload["bootstrap_authorization_id_sha256"],
+        "authorization_nonce_sha256": payload["bootstrap_authorization_nonce_sha256"],
         "control_contract_descriptor_sha256": payload["control_contract_descriptor_sha256"],
         "replay_scope": payload["replay_scope"],
         "stdlib_policy_root_sha256": payload["stdlib_inventory_root_sha256"],
@@ -1916,6 +2144,10 @@ def _supervise_with_pins(
     now_utc: datetime,
     environment_snapshot: Mapping[str, str],
     output_writer: Any = _OS_WRITE,
+    trusted_executed_supervisor_path: str | None = None,
+    trusted_executed_supervisor_sha256: str | None = None,
+    trusted_supervisor_loader_path: str | None = None,
+    trusted_supervisor_loader_sha256: str | None = None,
 ) -> dict[str, Any]:
     if os.name != "nt":
         raise FormalSupervisorError("trusted supervisor requires Windows")
@@ -1961,6 +2193,10 @@ def _supervise_with_pins(
             outer.get("payload"),
             pins=pins,
             now_utc=now_utc,
+            trusted_executed_supervisor_path=trusted_executed_supervisor_path,
+            trusted_executed_supervisor_sha256=trusted_executed_supervisor_sha256,
+            trusted_supervisor_loader_path=trusted_supervisor_loader_path,
+            trusted_supervisor_loader_sha256=trusted_supervisor_loader_sha256,
         )
         _verify_signature(
             _canonical_bytes(payload),
@@ -1977,6 +2213,25 @@ def _supervise_with_pins(
             max_bytes=_MAX_WORKER_BYTES,
         )
         stack.callback(self_source.close)
+        executed_supervisor = _HeldFile(
+            Path(str(payload["executed_supervisor_path"])),
+            expected_sha256=str(payload["executed_supervisor_sha256"]),
+            label="executed supervisor",
+            max_bytes=_MAX_WORKER_BYTES,
+        )
+        stack.callback(executed_supervisor.close)
+        supervisor_publication_receipt = _HeldFile(
+            Path(str(payload["supervisor_publication_receipt_path"])),
+            expected_sha256=str(payload["supervisor_publication_receipt_sha256"]),
+            label="supervisor publication receipt",
+            max_bytes=_MAX_AUTHORIZATION_BYTES,
+        )
+        stack.callback(supervisor_publication_receipt.close)
+        _validate_supervisor_publication_receipt(
+            supervisor_publication_receipt.raw,
+            executed_supervisor_raw=executed_supervisor.raw,
+            payload=payload,
+        )
         control_contract_source = _HeldFile(
             _pinned_control_contract_path(pins),
             expected_sha256=pins.control_contract_source_sha256,
@@ -2138,11 +2393,6 @@ def _supervise_with_pins(
             stack=stack,
         )
         _validate_resume_status(payload, stack)
-        worker_environment, secret_names = _worker_environment(
-            payload,
-            launch_authorization_sha256=authorization_sha256,
-            snapshot=environment_snapshot,
-        )
         ledger_chain = stack.enter_context(
             _held_directory_chain(Path(str(payload["execution_ledger_root"])))
         )
@@ -2215,6 +2465,17 @@ def _supervise_with_pins(
                     replay_label=replay_label,
                 )
                 ledger_handles.append(replay_handle)
+        credential_value, credential_handle = _held_run_credential(
+            payload,
+            stack=stack,
+        )
+        worker_environment, _secret_names = _worker_environment(
+            payload,
+            credential_value=credential_value,
+            launch_authorization_sha256=authorization_sha256,
+            snapshot=environment_snapshot,
+        )
+        credential_values = () if credential_value is None else (credential_value,)
         returncode, stdout, stderr = _run_worker(
             list(payload["worker_argv"]),
             cwd=str(payload["repo_root"]),
@@ -2225,8 +2486,7 @@ def _supervise_with_pins(
         if (
             _contains_secret(
                 stdout + stderr,
-                snapshot=environment_snapshot,
-                secret_names=secret_names,
+                credential_values=credential_values,
             )
             or returncode != 0
             or stderr
@@ -2248,6 +2508,8 @@ def _supervise_with_pins(
         terminal_handles = (
             authorization_handle,
             self_source,
+            executed_supervisor,
+            supervisor_publication_receipt,
             control_contract_source,
             python_handle,
             base_python_handle,
@@ -2261,6 +2523,7 @@ def _supervise_with_pins(
             *stdlib_handles,
             *artifact_handles,
             *ledger_handles,
+            *((credential_handle,) if credential_handle is not None else ()),
         )
         for handle in terminal_handles:
             handle.postverify()
