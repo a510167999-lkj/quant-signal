@@ -459,6 +459,77 @@ def test_only_a_signed_completion_marker_can_select_a_bootstrap(
             )
 
 
+@pytest.mark.parametrize("mutation", ("unlink", "replace"))
+def test_completion_selection_holds_and_validates_published_stdlib_policy(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    (
+        _config,
+        _payload,
+        authorization_path,
+        trusted_public_der,
+    ) = _authorized_fixture(tmp_path)
+    completion_payload = renderer._plan_factor_v3_formal_bootstrap_publication_with_test_trust(
+        authorization_path=authorization_path,
+        trusted_public_key_spki_der=trusted_public_der,
+    )
+    completion_path = _write_completion_authorization(
+        tmp_path,
+        completion_payload,
+    )
+    publication = renderer._publish_factor_v3_formal_bootstrap_with_test_trust(
+        authorization_path=authorization_path,
+        completion_authorization_path=completion_path,
+        trusted_public_key_spki_der=trusted_public_der,
+    )
+    policy_path = Path(publication["stdlib_policy_path"])
+    if mutation == "unlink":
+        policy_path.unlink()
+    else:
+        policy_path.write_bytes(b"{}")
+
+    with pytest.raises(
+        renderer.FormalBootstrapRenderError,
+        match="stdlib policy|completion",
+    ):
+        renderer._validate_factor_v3_formal_bootstrap_completion_marker_with_test_trust(
+            completion_marker_path=publication["completion_marker_path"],
+            trusted_public_key_spki_der=trusted_public_der,
+        )
+
+
+def test_completion_selection_returns_bound_stdlib_policy_path(
+    tmp_path: Path,
+) -> None:
+    (
+        _config,
+        _payload,
+        authorization_path,
+        trusted_public_der,
+    ) = _authorized_fixture(tmp_path)
+    completion_payload = renderer._plan_factor_v3_formal_bootstrap_publication_with_test_trust(
+        authorization_path=authorization_path,
+        trusted_public_key_spki_der=trusted_public_der,
+    )
+    completion_path = _write_completion_authorization(
+        tmp_path,
+        completion_payload,
+    )
+    publication = renderer._publish_factor_v3_formal_bootstrap_with_test_trust(
+        authorization_path=authorization_path,
+        completion_authorization_path=completion_path,
+        trusted_public_key_spki_der=trusted_public_der,
+    )
+
+    selection = renderer._validate_factor_v3_formal_bootstrap_completion_marker_with_test_trust(
+        completion_marker_path=publication["completion_marker_path"],
+        trusted_public_key_spki_der=trusted_public_der,
+    )
+
+    assert selection["stdlib_policy_path"] == publication["stdlib_policy_path"]
+
+
 def test_saved_stdout_descriptors_cannot_escape_worker_capture(
     tmp_path: Path,
 ) -> None:

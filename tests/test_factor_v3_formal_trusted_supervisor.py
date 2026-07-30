@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from typing import Any
 
 import pytest
@@ -858,3 +859,188 @@ def test_held_directory_chain_denies_rename_until_released(tmp_path: Path) -> No
 
     root.rename(replacement)
     assert replacement.is_dir()
+
+
+def test_bootstrap_execution_authorization_requires_exact_shared_v2_payload(
+    tmp_path: Path,
+) -> None:
+    pins, payload, _authorization_path, _environment, _writes = _fixture(tmp_path)
+    authorization_path = Path(str(payload["bootstrap_execution_authorization_path"]))
+    outer = json.loads(authorization_path.read_text(encoding="utf-8"))
+    public_der = base64.b64decode(pins.execution_public_key_spki_der_base64)
+
+    for mutation in ("missing_schema", "old_schema", "extra_field"):
+        candidate = dict(outer["payload"])
+        if mutation == "missing_schema":
+            candidate.pop("schema", None)
+        elif mutation == "old_schema":
+            candidate["schema"] = "factor-v3-formal-bootstrap-execution-authorization/v1"
+        else:
+            candidate["unreviewed_extra"] = True
+        signed = _canonical_bytes(
+            {
+                "payload": candidate,
+                "signature_base64": base64.b64encode(
+                    _sign(
+                        tmp_path / "execution-key" / "execution-private.pem",
+                        _canonical_bytes(candidate),
+                        tmp_path / "execution-key",
+                    )
+                ).decode("ascii"),
+            }
+        )
+        with pytest.raises(
+            supervisor.FormalSupervisorError,
+            match="authorization",
+        ):
+            supervisor._validated_bootstrap_execution_authorization(
+                signed,
+                payload=payload,
+                public_der=public_der,
+            )
+
+
+@pytest.mark.parametrize("injection", ("extra_source", "absent_zip"))
+def test_stdlib_exact_set_is_locked_before_terminal_filesystem_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    injection: str,
+) -> None:
+    pins, payload, authorization_path, environment, writes = _fixture(tmp_path)
+    policy = json.loads(Path(str(payload["stdlib_policy_path"])).read_text(encoding="utf-8"))
+    target = (
+        Path(policy["roots"][1]["path"]) / "late_injected.py"
+        if injection == "extra_source"
+        else Path(policy["absent_paths"][0])
+    )
+    original = supervisor.validate_stdlib_policy
+    filesystem_validations = 0
+    injection_blocked = False
+
+    def observed_validate(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal filesystem_validations, injection_blocked
+        result = original(*args, **kwargs)
+        if kwargs.get("require_filesystem"):
+            filesystem_validations += 1
+            if filesystem_validations == 2:
+                try:
+                    target.write_bytes(b"LEAK = True\n")
+                except OSError:
+                    injection_blocked = True
+        return result
+
+    monkeypatch.setattr(supervisor, "validate_stdlib_policy", observed_validate)
+
+    with pytest.raises(
+        supervisor.FormalSupervisorError,
+        match="stdlib|filesystem|directory",
+    ):
+        _run_fixture(pins, authorization_path, environment, writes)
+
+    assert injection_blocked or target.exists()
+    assert not target.exists()
+
+
+def test_original_and_resume_share_one_atomic_worker_and_terminal_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pins, payload, authorization_path, environment, original_writes = _fixture(tmp_path)
+    original_sha256 = _file_sha256(authorization_path)
+    entered_original = threading.Event()
+    entered_resume = threading.Event()
+    release_original = threading.Event()
+    release_resume = threading.Event()
+    real_run_worker = supervisor._run_worker
+    worker_actions: list[str] = []
+
+    def controlled_worker(
+        argv: list[str],
+        *,
+        cwd: str,
+        environment: dict[str, str],
+        timeout_seconds: int,
+    ) -> tuple[int, bytes, bytes]:
+        action = environment["FACTOR_V3_FORMAL_LAUNCH_ACTION"]
+        worker_actions.append(action)
+        if action == "resume":
+            entered_resume.set()
+            assert release_resume.wait(10)
+        else:
+            entered_original.set()
+            assert release_original.wait(10)
+        return real_run_worker(
+            argv,
+            cwd=cwd,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+        )
+
+    monkeypatch.setattr(supervisor, "_run_worker", controlled_worker)
+    outcomes: dict[str, object] = {}
+
+    def run_original() -> None:
+        try:
+            outcomes["original"] = _run_fixture(
+                pins,
+                authorization_path,
+                environment,
+                original_writes,
+            )
+        except BaseException as exc:
+            outcomes["original"] = exc
+
+    original_thread = threading.Thread(target=run_original)
+    original_thread.start()
+    assert entered_original.wait(10)
+    claim_path = supervisor.claim_path_for_authorization(
+        Path(str(payload["execution_ledger_root"])),
+        original_sha256,
+    )
+    assert claim_path.is_file()
+    payload.update(
+        {
+            "action": "resume",
+            "resume_of_authorization_id_sha256": payload["authorization_id_sha256"],
+            "resume_of_authorization_sha256": original_sha256,
+            "resume_of_authorization_nonce_sha256": payload["authorization_nonce_sha256"],
+            "resume_of_bootstrap_execution_authorization_sha256": payload[
+                "bootstrap_execution_authorization_sha256"
+            ],
+            "resume_of_replay_scope": payload["replay_scope"],
+            "resume_status_path": str(claim_path),
+            "resume_status_sha256": _file_sha256(claim_path),
+        }
+    )
+    resume_path = _rewrite_authorization(
+        tmp_path,
+        payload,
+        tmp_path / "execution-key" / "execution-private.pem",
+    )
+    resume_writes: list[bytes] = []
+
+    def run_resume() -> None:
+        try:
+            outcomes["resume"] = _run_fixture(
+                pins,
+                resume_path,
+                environment,
+                resume_writes,
+            )
+        except BaseException as exc:
+            outcomes["resume"] = exc
+
+    resume_thread = threading.Thread(target=run_resume)
+    resume_thread.start()
+    if entered_resume.wait(1):
+        release_resume.set()
+        resume_thread.join(10)
+    release_original.set()
+    original_thread.join(10)
+    resume_thread.join(10)
+
+    assert worker_actions == ["run"]
+    assert isinstance(outcomes["original"], dict)
+    assert isinstance(outcomes["resume"], supervisor.FormalSupervisorError)
+    assert len(original_writes) == 1
+    assert resume_writes == []

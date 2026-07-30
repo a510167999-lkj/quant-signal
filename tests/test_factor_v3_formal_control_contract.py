@@ -7,7 +7,9 @@ import inspect
 import json
 import os
 from pathlib import Path
+import py_compile
 import subprocess
+import sys
 
 import pytest
 
@@ -64,6 +66,75 @@ def test_shared_contract_is_the_only_v2_protocol_definition() -> None:
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
         }
         assert copied_literals.isdisjoint(literals)
+
+
+def test_supervisor_import_cannot_execute_dirty_shared_contract_before_pins(
+    tmp_path: Path,
+) -> None:
+    package = (tmp_path / "untrusted-active-worktree" / "app").resolve()
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_bytes(b"")
+    supervisor_source = Path(supervisor.__file__).read_bytes()
+    (package / "factor_v3_formal_trusted_supervisor.py").write_bytes(supervisor_source)
+    leak_path = (tmp_path / "shared-contract-token-leak.txt").resolve()
+    (package / "factor_v3_formal_control_contract.py").write_text(
+        "\n".join(
+            (
+                "import os",
+                "from pathlib import Path",
+                "Path(os.environ['LEAK_PATH']).write_text(",
+                "    os.environ['JIAOCH_TOKEN'], encoding='utf-8'",
+                ")",
+                "EXECUTION_REPLAY_SCOPE = 'dirty'",
+                "PUBLICATION_COMPLETION_SCHEMA = 'dirty'",
+                "STDLIB_POLICY_SCHEMA = 'dirty'",
+                "STDLIB_ROOT_ENVIRONMENT = 'DIRTY'",
+                "WORKER_ACTION_BY_LAUNCH_ACTION = {}",
+                "WORKER_PROTOCOL = 'dirty'",
+                "WORKER_TERMINAL_FIELDS = []",
+                "WORKER_TERMINAL_SCHEMA = 'dirty'",
+                "def control_contract_descriptor_sha256(): return '0' * 64",
+                "def exact_worker_argv(**_kwargs): return []",
+                "def validate_stdlib_policy(value, **_kwargs): return value",
+                "def worker_environment_policy():",
+                "    return {'public_passthrough_names': [], "
+                "'required_secret_names_by_action': {}, 'marker_names': []}",
+            )
+        ),
+        encoding="utf-8",
+    )
+    environment = {
+        name: os.environ[name]
+        for name in ("SYSTEMROOT", "TEMP", "TMP", "WINDIR")
+        if name in os.environ
+    }
+    environment.update(
+        {
+            "JIAOCH_TOKEN": "fake-token-must-not-be-observable",
+            "LEAK_PATH": str(leak_path),
+        }
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            (
+                f"import sys;sys.path.insert(0,{str(package.parent)!r});"
+                "import app.factor_v3_formal_trusted_supervisor"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=environment,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0
+    assert not leak_path.exists()
 
 
 def test_flat_stdlib_policy_root_is_canonical_and_binds_absence_and_empty_pycache(
@@ -183,6 +254,176 @@ def test_flat_stdlib_policy_root_is_canonical_and_binds_absence_and_empty_pycach
             expected_root_sha256=root_sha256,
             require_filesystem=True,
         )
+
+
+def test_signed_pycache_location_cannot_accept_late_unchecked_pyc(
+    tmp_path: Path,
+) -> None:
+    stdlib = (tmp_path / "Lib").resolve()
+    platstdlib = (tmp_path / "DLLs").resolve()
+    stdlib.mkdir()
+    platstdlib.mkdir()
+    victim = stdlib / "victim.py"
+    malicious_source = tmp_path / "malicious-victim.py"
+    leak_path = (tmp_path / "pycache-token-leak.txt").resolve()
+    malicious = (
+        "import os\n"
+        "from pathlib import Path\n"
+        f"Path({str(leak_path)!r}).write_text("
+        "os.environ['JIAOCH_TOKEN'], encoding='utf-8')\n"
+    ).encode()
+    harmless = b"VALUE = 1\n#" + b" " * (len(malicious) - len(b"VALUE = 1\n#"))
+    victim.write_bytes(harmless)
+    malicious_source.write_bytes(malicious)
+    timestamp = 1_700_000_000
+    os.utime(victim, (timestamp, timestamp))
+    os.utime(malicious_source, (timestamp, timestamp))
+    entry = _entry(stdlib, "victim.py", "victim")
+    canonical_parameters = inspect.signature(contract.canonical_stdlib_policy).parameters
+    if "pycache_blocker" in canonical_parameters:
+        blocker = (tmp_path / "signed-pycache-blocker").resolve()
+        blocker.write_bytes(b"factor-v3-pycache-blocker/v1\n")
+        policy = contract.canonical_stdlib_policy(
+            roots=[
+                {"path": str(platstdlib), "role": "platstdlib"},
+                {"path": str(stdlib), "role": "stdlib"},
+            ],
+            entries=[entry],
+            absent_paths=[str(tmp_path / "python311.zip")],
+            pycache_blocker={
+                "bytes": blocker.stat().st_size,
+                "path": str(blocker),
+                "sha256": contract.sha256_bytes(blocker.read_bytes()),
+            },
+        )
+        prefix = blocker
+    else:
+        prefix = (tmp_path / "signed-empty-pycache").resolve()
+        prefix.mkdir()
+        policy = contract.canonical_stdlib_policy(
+            roots=[
+                {"path": str(platstdlib), "role": "platstdlib"},
+                {"path": str(stdlib), "role": "stdlib"},
+            ],
+            entries=[entry],
+            absent_paths=[str(tmp_path / "python311.zip")],
+            pycache_prefix=str(prefix),
+        )
+    contract.validate_stdlib_policy(policy, require_filesystem=True)
+    previous_prefix = sys.pycache_prefix
+    try:
+        sys.pycache_prefix = str(prefix)
+        injected_pyc = Path(__import__("importlib").util.cache_from_source(str(victim)))
+    finally:
+        sys.pycache_prefix = previous_prefix
+    try:
+        injected_pyc.parent.mkdir(parents=True, exist_ok=True)
+        py_compile.compile(
+            str(malicious_source),
+            cfile=str(injected_pyc),
+            dfile=str(victim),
+            doraise=True,
+        )
+    except OSError:
+        pass
+    environment = {
+        name: os.environ[name]
+        for name in ("SYSTEMROOT", "TEMP", "TMP", "WINDIR")
+        if name in os.environ
+    }
+    environment["JIAOCH_TOKEN"] = "fake-token-must-not-be-observable"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-X",
+            f"pycache_prefix={prefix}",
+            "-c",
+            f"import sys;sys.path.insert(0,{str(stdlib)!r});import victim",
+        ],
+        check=False,
+        capture_output=True,
+        env=environment,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0
+    assert not leak_path.exists()
+
+
+def test_stdlib_zero_byte_rules_are_kind_exact(tmp_path: Path) -> None:
+    stdlib = (tmp_path / "Lib").resolve()
+    platstdlib = (tmp_path / "DLLs").resolve()
+    pycache = (tmp_path / "pycache").resolve()
+    stdlib.mkdir()
+    platstdlib.mkdir()
+    pycache.mkdir()
+    empty_source = stdlib / "empty.py"
+    empty_source.write_bytes(b"")
+    source_entry = _entry(stdlib, "empty.py", "empty")
+
+    policy = contract.canonical_stdlib_policy(
+        roots=[
+            {"path": str(platstdlib), "role": "platstdlib"},
+            {"path": str(stdlib), "role": "stdlib"},
+        ],
+        entries=[source_entry],
+        absent_paths=[str(tmp_path / "python311.zip")],
+        pycache_prefix=str(pycache),
+    )
+    assert contract.validate_stdlib_policy(policy, require_filesystem=True) == policy
+
+    for kind in ("extension", "dll"):
+        binary = dict(source_entry)
+        binary.update(
+            {
+                "is_package": False,
+                "kind": kind,
+                "module": "empty_binary" if kind == "extension" else None,
+                "relative_path": "empty_binary.pyd" if kind == "extension" else "empty.dll",
+            }
+        )
+        binary_path = (platstdlib / str(binary["relative_path"])).resolve()
+        binary_path.write_bytes(b"")
+        binary["path"] = str(binary_path)
+        binary["root"] = str(platstdlib)
+        with pytest.raises(
+            contract.FormalControlContractError,
+            match="entry",
+        ):
+            contract.canonical_stdlib_policy(
+                roots=[
+                    {"path": str(platstdlib), "role": "platstdlib"},
+                    {"path": str(stdlib), "role": "stdlib"},
+                ],
+                entries=[binary],
+                absent_paths=[str(tmp_path / "python311.zip")],
+                pycache_prefix=str(pycache),
+            )
+
+
+def test_runtime_installs_early_exact_loader_before_filesystem_imports() -> None:
+    source = Path(runtime.__file__).read_text(encoding="utf-8")
+    marker = "# EARLY_EXACT_IMPORT_BOUNDARY_COMPLETE"
+    assert marker in source
+    prefix = source.split(marker, 1)[0]
+    assert "import sys" in prefix
+    assert "from pathlib import Path" not in prefix
+    assert "\nimport os\n" not in prefix
+    assert "\nimport importlib.machinery\n" not in prefix
+
+
+def test_rendered_supervisor_has_a_real_public_cli_entrypoint() -> None:
+    source = Path(supervisor.__file__).read_text(encoding="utf-8")
+    assert 'if __name__ == "__main__":' in source
+    assert (
+        "supervise_factor_v3_formal_execution"
+        in source.split(
+            'if __name__ == "__main__":',
+            1,
+        )[1]
+    )
 
 
 def test_exact_worker_argv_signs_empty_pycache_prefix(tmp_path: Path) -> None:
