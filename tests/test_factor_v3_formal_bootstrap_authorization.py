@@ -132,6 +132,10 @@ def _authorization_payload(
     _execution_private_key, execution_public_der = _execution_test_key(tmp_path)
     execution_key_sha256 = _sha256(execution_public_der)
     authorization_nonce_sha256 = _sha256(f"authorization:{config['action']}".encode())
+    stdlib_policy = renderer._trusted_stdlib_policy_for_base_python(
+        Path(str(config["base_python_executable_path"]))
+    )
+    config["_test_stdlib_inventory_root_sha256"] = stdlib_policy["inventory_root_sha256"]
     return {
         "action": config["action"],
         "authorization_id_sha256": _sha256(
@@ -179,9 +183,7 @@ def _authorization_payload(
         "shim_sha256": config["shim_sha256"],
         "source_manifest": config["source_manifest"],
         "source_root_sha256": config["source_root_sha256"],
-        "stdlib_policy": renderer._trusted_stdlib_policy_for_base_python(
-            Path(str(config["base_python_executable_path"]))
-        ),
+        "stdlib_policy": stdlib_policy,
         "supervisor_protocol": renderer._supervisor_protocol_descriptor(),
     }
 
@@ -440,6 +442,7 @@ def _run_as_synthetic_supervisor(
     tmp_path: Path,
     *,
     launch_action: str | None = None,
+    include_stdlib_prelock: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     selected_action = str(config["action"]) if launch_action is None else launch_action
     bootstrap_sha256 = _sha256(rendered)
@@ -461,6 +464,10 @@ def _run_as_synthetic_supervisor(
             "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL": ("factor-v3-formal-supervisor-worker/v1"),
         }
     )
+    if include_stdlib_prelock:
+        environment["FACTOR_V3_FORMAL_STDLIB_PRELOCKED_ROOT_SHA256"] = str(
+            config["_test_stdlib_inventory_root_sha256"]
+        )
     if selected_action in {"run", "resume"}:
         environment["JIAOCH_TOKEN"] = "test-only-never-log"
     return subprocess.run(

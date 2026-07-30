@@ -14,6 +14,7 @@ from tests.test_factor_v3_formal_bootstrap_authorization import (
     _authorized_fixture,
     _render_authorized,
     _run_as_synthetic_supervisor,
+    _write_completion_authorization,
 )
 from tests.test_factor_v3_formal_bootstrap_renderer import _run_rendered
 
@@ -117,7 +118,9 @@ def test_stdlib_policy_uses_exact_roots_and_content_inventory() -> None:
         "inventory_root_sha256",
         "roots",
         "schema",
+        "supervisor_prelocked",
     }
+    assert policy["supervisor_prelocked"] is True
     assert [item["kind"] for item in policy["roots"]] == [
         "stdlib",
         "platstdlib",
@@ -126,6 +129,7 @@ def test_stdlib_policy_uses_exact_roots_and_content_inventory() -> None:
     assert all(
         set(item)
         == {
+            "entries",
             "inventory_sha256",
             "kind",
             "path",
@@ -133,6 +137,46 @@ def test_stdlib_policy_uses_exact_roots_and_content_inventory() -> None:
         for item in policy["roots"]
     )
     assert all(len(item["inventory_sha256"]) == 64 for item in policy["roots"])
+    entries = [entry for root in policy["roots"] for entry in root["entries"]]
+    assert entries
+    assert all(set(entry) == {"bytes", "kind", "module", "path", "sha256"} for entry in entries)
+    assert all(
+        isinstance(entry["module"], str)
+        and entry["module"]
+        and entry["kind"] in {"bytecode", "dll", "extension", "source"}
+        and len(entry["sha256"]) == 64
+        for entry in entries
+    )
+
+
+def _overlong_execution_replay_claim() -> dict[str, str]:
+    return {
+        "authorization_id_sha256": "1" * 64,
+        "authorization_nonce_sha256": "2" * 64,
+        "expires_at_utc": "2026-07-31T12:00:01+00:00",
+        "issued_at_utc": "2026-07-30T12:00:00+00:00",
+        "not_before_utc": "2026-07-30T12:00:00+00:00",
+        "replay_scope": "factor-v3-formal-bootstrap-execution/v1",
+    }
+
+
+def test_execution_authorization_lifetime_is_capped_in_renderer() -> None:
+    with pytest.raises(
+        renderer.FormalBootstrapRenderError,
+        match="replay",
+    ):
+        renderer._validated_replay_claim(
+            _overlong_execution_replay_claim(),
+            now_utc="2026-07-30T12:05:00+00:00",
+        )
+
+
+def test_execution_authorization_lifetime_is_capped_in_worker() -> None:
+    with pytest.raises(runtime._BootstrapError, match="replay"):
+        runtime._validated_replay_claim(
+            _overlong_execution_replay_claim(),
+            now_utc=__import__("datetime").datetime.fromisoformat("2026-07-30T12:05:00+00:00"),
+        )
 
 
 def test_runtime_template_identity_is_canonical_lf_and_rejects_mixed_eol(
@@ -182,10 +226,35 @@ def test_win32_directory_handle_chain_blocks_parent_replacement(
         root=root,
         directories=(root, shard.parent.parent, shard.parent, shard),
     ) as identities:
-        assert len(identities) == 4
+        assert identities[-1]["path"] == str(shard)
         assert all(item["reparse"] is False for item in identities)
         with pytest.raises(OSError):
             shard.rename(replacement)
+
+
+def test_win32_directory_chain_holds_every_ancestor_from_volume_root(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "ancestor" / "publication-root").resolve()
+    shard = root / "bootstraps" / "sha256" / "ab"
+    shard.mkdir(parents=True)
+    expected_paths: list[str] = []
+    current = Path(root.anchor)
+    expected_paths.append(str(current))
+    for part in root.parts[1:]:
+        current /= part
+        expected_paths.append(str(current))
+    for part in ("bootstraps", "sha256", "ab"):
+        current /= part
+        expected_paths.append(str(current))
+
+    with renderer._held_win32_directory_chain(
+        root=root,
+        directories=(root, shard),
+    ) as identities:
+        assert [item["path"] for item in identities] == expected_paths
+        with pytest.raises(OSError):
+            (tmp_path / "ancestor").rename(tmp_path / "replacement")
 
 
 def test_publish_requires_a_signed_completion_marker() -> None:
@@ -200,6 +269,10 @@ def test_publish_requires_a_signed_completion_marker() -> None:
         renderer,
         "plan_factor_v3_formal_bootstrap_publication",
     )
+    selection_parameters = inspect.signature(
+        renderer.validate_factor_v3_formal_bootstrap_completion_marker
+    ).parameters
+    assert set(selection_parameters) == {"completion_marker_path"}
 
 
 def test_invalid_completion_leaves_no_selectable_bootstrap(
@@ -264,6 +337,118 @@ def test_completion_marker_is_the_last_and_only_selection_record(
     ]
 
 
+def test_publication_holds_all_three_files_until_marker_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        _config,
+        _payload,
+        authorization_path,
+        trusted_public_der,
+    ) = _authorized_fixture(tmp_path)
+    completion_payload = renderer._plan_factor_v3_formal_bootstrap_publication_with_test_trust(
+        authorization_path=authorization_path,
+        trusted_public_key_spki_der=trusted_public_der,
+    )
+    completion_path = _write_completion_authorization(
+        tmp_path,
+        completion_payload,
+    )
+    original_publish = renderer._safe_cas_publish
+    published_paths: dict[str, Path] = {}
+    mutation_blocked: dict[str, bool] = {}
+    flushed: list[Path] = []
+
+    def observed_publish(**kwargs: object) -> tuple[Path, str]:
+        category = str(kwargs["category"])
+        result = original_publish(**kwargs)
+        published_paths[category] = result[0]
+        if category == "completion_markers":
+            for name, path in published_paths.items():
+                try:
+                    path.write_bytes(f"tampered-{name}".encode())
+                except OSError:
+                    mutation_blocked[name] = True
+                else:
+                    mutation_blocked[name] = False
+        return result
+
+    def observed_flush(*, path: Path, handle: object) -> None:
+        del handle
+        flushed.append(path)
+
+    monkeypatch.setattr(renderer, "_safe_cas_publish", observed_publish)
+    monkeypatch.setattr(
+        renderer,
+        "_flush_held_win32_directory",
+        observed_flush,
+        raising=False,
+    )
+
+    publication = renderer._publish_factor_v3_formal_bootstrap_with_test_trust(
+        authorization_path=authorization_path,
+        completion_authorization_path=completion_path,
+        trusted_public_key_spki_der=trusted_public_der,
+    )
+
+    assert mutation_blocked == {
+        "bootstraps": True,
+        "completion_markers": True,
+        "publication_receipts": True,
+    }
+    assert {
+        Path(publication["bootstrap_path"]).parent,
+        Path(publication["completion_marker_path"]).parent,
+        Path(publication["receipt_path"]).parent,
+    }.issubset(set(flushed))
+
+
+def test_only_a_signed_completion_marker_can_select_a_bootstrap(
+    tmp_path: Path,
+) -> None:
+    (
+        _config,
+        _payload,
+        authorization_path,
+        trusted_public_der,
+    ) = _authorized_fixture(tmp_path)
+    completion_payload = renderer._plan_factor_v3_formal_bootstrap_publication_with_test_trust(
+        authorization_path=authorization_path,
+        trusted_public_key_spki_der=trusted_public_der,
+    )
+    completion_path = _write_completion_authorization(
+        tmp_path,
+        completion_payload,
+    )
+    publication = renderer._publish_factor_v3_formal_bootstrap_with_test_trust(
+        authorization_path=authorization_path,
+        completion_authorization_path=completion_path,
+        trusted_public_key_spki_der=trusted_public_der,
+    )
+
+    selection = renderer._validate_factor_v3_formal_bootstrap_completion_marker_with_test_trust(
+        completion_marker_path=publication["completion_marker_path"],
+        trusted_public_key_spki_der=trusted_public_der,
+    )
+
+    assert selection["bootstrap_path"] == publication["bootstrap_path"]
+    assert selection["receipt_path"] == publication["receipt_path"]
+    assert selection["completion_marker_path"] == publication["completion_marker_path"]
+    for unselectable in (
+        publication["bootstrap_path"],
+        publication["receipt_path"],
+    ):
+        with pytest.raises(
+            renderer.FormalBootstrapRenderError,
+            match="completion",
+        ):
+            renderer._validate_factor_v3_formal_bootstrap_completion_marker_with_test_trust(
+                completion_marker_path=unselectable,
+                trusted_public_key_spki_der=trusted_public_der,
+            )
+
+
 def test_saved_stdout_descriptors_cannot_escape_worker_capture(
     tmp_path: Path,
 ) -> None:
@@ -304,6 +489,7 @@ def test_supervisor_protocol_and_terminal_frame_are_exact() -> None:
             "FACTOR_V3_FORMAL_LAUNCH_ACTION",
             "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256",
             "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL",
+            "FACTOR_V3_FORMAL_STDLIB_PRELOCKED_ROOT_SHA256",
         }
     )
     assert runtime._SUPERVISOR_ACTION_SECRET_ENVIRONMENT == {
@@ -322,6 +508,7 @@ def test_supervisor_protocol_and_terminal_frame_are_exact() -> None:
             "result",
             "schema",
             "status",
+            "stdlib_inventory_root_sha256",
             "worker_action",
         }
     )
@@ -375,6 +562,7 @@ def test_synthetic_supervisor_receives_one_canonical_terminal_frame(
         },
         "schema": WORKER_TERMINAL_SCHEMA,
         "status": "completed",
+        "stdlib_inventory_root_sha256": payload["stdlib_policy"]["inventory_root_sha256"],
         "worker_action": "verify",
     }
     assert completed.stdout.encode("utf-8") == (
@@ -414,6 +602,28 @@ def test_supervisor_environment_policy_is_action_exact(
             environment,
             worker_action="run" if launch_action == "resume" else launch_action,
         )
+
+
+def test_worker_rejects_missing_stdlib_prelock_proof(
+    tmp_path: Path,
+) -> None:
+    (
+        config,
+        _payload,
+        authorization_path,
+        trusted_public_der,
+    ) = _authorized_fixture(tmp_path)
+    rendered = _render_authorized(authorization_path, trusted_public_der)
+
+    completed = _run_as_synthetic_supervisor(
+        rendered,
+        config,
+        tmp_path,
+        include_stdlib_prelock=False,
+    )
+
+    assert completed.returncode != 0
+    assert completed.stdout == ""
 
 
 def test_terminal_artifacts_are_exact_sorted_and_root_bounded(
