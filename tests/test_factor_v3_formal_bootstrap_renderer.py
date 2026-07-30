@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
@@ -418,10 +417,14 @@ def _run_rendered(
 def test_renderer_is_deterministic_self_contained_and_has_no_placeholder(
     tmp_path: Path,
 ) -> None:
-    config = _fixture_config(tmp_path)
+    from tests.test_factor_v3_formal_bootstrap_authorization import (
+        _authorized_fixture,
+        _render_authorized,
+    )
 
-    first = renderer.render_factor_v3_formal_bootstrap(config)
-    second = renderer.render_factor_v3_formal_bootstrap(deepcopy(config))
+    _config, _payload, authorization_path, trusted_public_der = _authorized_fixture(tmp_path)
+    first = _render_authorized(authorization_path, trusted_public_der)
+    second = _render_authorized(authorization_path, trusted_public_der)
 
     assert first == second
     assert first == renderer.validate_rendered_factor_v3_formal_bootstrap(first)
@@ -435,8 +438,13 @@ def test_renderer_is_deterministic_self_contained_and_has_no_placeholder(
 def test_rendered_bootstrap_executes_only_verified_held_source_bytes(
     tmp_path: Path,
 ) -> None:
-    config = _fixture_config(tmp_path)
-    rendered = renderer.render_factor_v3_formal_bootstrap(config)
+    from tests.test_factor_v3_formal_bootstrap_authorization import (
+        _authorized_fixture,
+        _render_authorized,
+    )
+
+    config, _payload, authorization_path, trusted_public_der = _authorized_fixture(tmp_path)
+    rendered = _render_authorized(authorization_path, trusted_public_der)
 
     completed = _run_rendered(rendered, config)
 
@@ -445,7 +453,7 @@ def test_rendered_bootstrap_executes_only_verified_held_source_bytes(
     assert json.loads(completed.stdout) == {
         "action": "verify",
         "fake_file_rejected": True,
-        "formal_input_root": str(config["formal_input_root"]),
+        "formal_input_root": str(config["formal_input_root_sha256"]),
         "loader_identity": "factor-v3-verified-source-loader/v1",
         "nonverified_loader_rejected": True,
         "rejected_unreviewed": True,
@@ -460,9 +468,17 @@ def test_rendered_bootstrap_executes_only_verified_held_source_bytes(
 def test_rendered_bootstrap_rejects_caller_arguments_before_repo_import(
     tmp_path: Path,
 ) -> None:
+    from tests.test_factor_v3_formal_bootstrap_authorization import (
+        _authorized_fixture,
+        _render_authorized,
+    )
+
     marker = tmp_path / "repository-imported.marker"
-    config = _fixture_config(tmp_path, import_marker=marker)
-    rendered = renderer.render_factor_v3_formal_bootstrap(config)
+    config, _payload, authorization_path, trusted_public_der = _authorized_fixture(
+        tmp_path,
+        import_marker=marker,
+    )
+    rendered = _render_authorized(authorization_path, trusted_public_der)
 
     completed = _run_rendered(rendered, config, "--action=run")
 
@@ -475,7 +491,12 @@ def test_rendered_bootstrap_rejects_caller_arguments_before_repo_import(
 def test_rendered_bootstrap_never_flushes_buffered_success_after_failure(
     tmp_path: Path,
 ) -> None:
-    config = _fixture_config(
+    from tests.test_factor_v3_formal_bootstrap_authorization import (
+        _authorized_fixture,
+        _render_authorized,
+    )
+
+    config, _payload, authorization_path, trusted_public_der = _authorized_fixture(
         tmp_path,
         dispatch_body=(
             "    context.validate_action_config(frozen_action_config)\n"
@@ -483,7 +504,7 @@ def test_rendered_bootstrap_never_flushes_buffered_success_after_failure(
             "    raise RuntimeError('fixture failure after buffered success')\n"
         ),
     )
-    rendered = renderer.render_factor_v3_formal_bootstrap(config)
+    rendered = _render_authorized(authorization_path, trusted_public_der)
 
     completed = _run_rendered(rendered, config)
 
@@ -512,7 +533,7 @@ def test_renderer_rejects_credentials_and_private_key_shapes(
     config[forbidden] = "forbidden"
 
     with pytest.raises(renderer.FormalBootstrapRenderError, match="credential"):
-        renderer.render_factor_v3_formal_bootstrap(config)
+        renderer._validated_config(config)
 
 
 def test_renderer_rejects_manifest_outside_app_and_scripts(
@@ -531,7 +552,7 @@ def test_renderer_rejects_manifest_outside_app_and_scripts(
     config["source_root_sha256"] = _sha256(_canonical_bytes(manifest))
 
     with pytest.raises(renderer.FormalBootstrapRenderError, match="manifest"):
-        renderer.render_factor_v3_formal_bootstrap(config)
+        renderer._validated_config(config)
 
 
 def test_renderer_requires_signed_app_package_initializer(
@@ -543,7 +564,7 @@ def test_renderer_requires_signed_app_package_initializer(
     config["source_root_sha256"] = _sha256(_canonical_bytes(manifest))
 
     with pytest.raises(renderer.FormalBootstrapRenderError, match="app/__init__"):
-        renderer.render_factor_v3_formal_bootstrap(config)
+        renderer._validated_config(config)
 
 
 def test_renderer_rejects_mismatched_executable_identity(tmp_path: Path) -> None:
@@ -551,7 +572,7 @@ def test_renderer_rejects_mismatched_executable_identity(tmp_path: Path) -> None
     config["python_executable_sha256"] = "0" * 64
 
     with pytest.raises(renderer.FormalBootstrapRenderError, match="identity"):
-        renderer.render_factor_v3_formal_bootstrap(config)
+        renderer._validated_config(config)
 
 
 def test_renderer_rejects_noncanonical_public_key_encoding(
@@ -561,7 +582,7 @@ def test_renderer_rejects_noncanonical_public_key_encoding(
     config["review_public_key_spki_der_base64"] = "!"
 
     with pytest.raises(renderer.FormalBootstrapRenderError, match="public key"):
-        renderer.render_factor_v3_formal_bootstrap(config)
+        renderer._validated_config(config)
 
 
 def test_renderer_rejects_mismatched_public_key_identity(tmp_path: Path) -> None:
@@ -569,7 +590,7 @@ def test_renderer_rejects_mismatched_public_key_identity(tmp_path: Path) -> None
     config["review_public_key_spki_sha256"] = "0" * 64
 
     with pytest.raises(renderer.FormalBootstrapRenderError, match="public key"):
-        renderer.render_factor_v3_formal_bootstrap(config)
+        renderer._validated_config(config)
 
 
 def test_renderer_rejects_traversing_trusted_entrypoint(tmp_path: Path) -> None:
@@ -577,14 +598,19 @@ def test_renderer_rejects_traversing_trusted_entrypoint(tmp_path: Path) -> None:
     config["builder_relative_path"] = "scripts/../unreviewed.py"
 
     with pytest.raises(renderer.FormalBootstrapRenderError, match="builder"):
-        renderer.render_factor_v3_formal_bootstrap(config)
+        renderer._validated_config(config)
 
 
 def test_rendered_validator_rejects_corrupt_compressed_payload(
     tmp_path: Path,
 ) -> None:
-    config = _fixture_config(tmp_path)
-    rendered = renderer.render_factor_v3_formal_bootstrap(config)
+    from tests.test_factor_v3_formal_bootstrap_authorization import (
+        _authorized_fixture,
+        _render_authorized,
+    )
+
+    _config, _payload, authorization_path, trusted_public_der = _authorized_fixture(tmp_path)
+    rendered = _render_authorized(authorization_path, trusted_public_der)
     payload_offset = len(renderer._WRAPPER_PREFIX)
     corrupted = rendered[:payload_offset] + b"!" + rendered[payload_offset + 1 :]
 

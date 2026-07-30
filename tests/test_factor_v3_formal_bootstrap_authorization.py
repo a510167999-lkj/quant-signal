@@ -12,17 +12,62 @@ import pytest
 from app import factor_v3_formal_bootstrap_renderer as renderer
 from app import factor_v3_formal_bootstrap_runtime as runtime
 from tests.test_factor_v3_formal_bootstrap_renderer import (
+    _GIT,
     _OPENSSL,
     _canonical_bytes,
     _cas_write,
+    _file_sha256,
     _fixture_config,
+    _git,
     _run_rendered,
     _sha256,
     _sign,
+    _source_entry,
+    _test_rsa_key,
 )
 
 
 AUTHORIZATION_SCHEMA = "factor-v3-formal-bootstrap-execution-authorization/v1"
+BE3_FORMAL_COMMIT = "be3f985a0cd52f4092441e45056c3ec9da94668e"
+BE3_REVIEWED_PATHS = (
+    "scripts/build_factor_v3_daily_basic_formal_run_spec.py",
+    "scripts/run_factor_v3_daily_basic_formal.py",
+    "app/__init__.py",
+    "app/audited_pit_factor_v3_feature_history_authority.py",
+    "app/audited_pit_factor_v3_points_contract.py",
+    "app/current_pool.py",
+    "app/current_pool_gate.py",
+    "app/durable_io.py",
+    "app/factor_v3_daily_basic_733_exact_set_authority.py",
+    "app/factor_v3_daily_basic_runner.py",
+    "app/factor_v3_feature_history_frozen_source_attestation.py",
+    "app/factor_v3_feature_history_runner.py",
+    "app/jiaoch_credential_slots.py",
+    "app/jiaoch_daily_basic_collection_set.py",
+    "app/jiaoch_daily_basic_exact_set_authority.py",
+    "app/jiaoch_minute_collection_set.py",
+    "app/jiaoch_minute_raw_authority.py",
+    "app/jiaoch_minute_reconciliation.py",
+    "app/jiaoch_points_collection_set.py",
+    "app/jiaoch_points_raw_authority.py",
+    "app/jiaoch_points_response_normalization.py",
+    "app/jiaoch_trade_cal_authority.py",
+    "app/research_market_data.py",
+    "app/research_membership.py",
+    "app/research_partitions.py",
+    "app/research_pit_collector.py",
+    "app/research_pit_contracts.py",
+    "app/research_pit_sources.py",
+    "app/research_pit_store.py",
+    "app/research_pit_transport.py",
+    "app/research_provider_evidence_partitions.py",
+    "app/research_provider_pit_tail.py",
+    "app/research_provider_pit_tail_v2.py",
+    "app/research_proxy_data.py",
+    "app/research_scope.py",
+    "app/research_security_code_transition.py",
+    "app/research_suspension_evidence.py",
+)
 
 
 def _trusted_public_der(tmp_path: Path) -> bytes:
@@ -85,6 +130,7 @@ def _authorization_payload(
         "review_protocol_sha256": config["review_protocol_sha256"],
         "review_public_key_spki_der_base64": config["review_public_key_spki_der_base64"],
         "review_public_key_spki_sha256": config["review_public_key_spki_sha256"],
+        "review_receipt_path": config["review_receipt_path"],
         "review_receipt_sha256": config["review_receipt_sha256"],
         "run_root": config["run_root"],
         "run_spec_path": str(run_spec_path),
@@ -123,9 +169,14 @@ def _authorized_fixture(
     *,
     action: str = "verify",
     dispatch_body: str | None = None,
+    import_marker: Path | None = None,
     mutate_payload: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[dict[str, object], dict[str, object], Path, bytes]:
-    config = _fixture_config(tmp_path, dispatch_body=dispatch_body)
+    config = _fixture_config(
+        tmp_path,
+        dispatch_body=dispatch_body,
+        import_marker=import_marker,
+    )
     config["action"] = action
     payload = _authorization_payload(tmp_path, config)
     if mutate_payload is not None:
@@ -135,6 +186,174 @@ def _authorized_fixture(
         payload,
     )
     return config, payload, authorization_path, _trusted_public_der(tmp_path)
+
+
+def _be3_source(relative_path: str) -> bytes:
+    project_root = Path(__file__).resolve().parents[1]
+    return subprocess.run(
+        [
+            str(_GIT),
+            "-C",
+            str(project_root),
+            "show",
+            f"{BE3_FORMAL_COMMIT}:{relative_path}",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+
+
+def _insert_before_trusted_dispatch(source: bytes, override: str) -> bytes:
+    text = source.decode("utf-8")
+    marker = "\ndef trusted_dispatch("
+    assert text.count(marker) == 1
+    return text.replace(marker, f"\n{override}\n\ndef trusted_dispatch(", 1).encode()
+
+
+def _be3_crossline_authorized_fixture(
+    tmp_path: Path,
+) -> tuple[dict[str, object], dict[str, object], Path, bytes]:
+    config = _fixture_config(tmp_path)
+    repo = Path(str(config["repo_root"]))
+    for directory in (repo / "app", repo / "scripts"):
+        for path in directory.glob("*.py"):
+            path.unlink()
+    for relative_path in BE3_REVIEWED_PATHS:
+        destination = repo / Path(*relative_path.split("/"))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(_be3_source(relative_path))
+
+    formal_input_root_sha256 = _sha256(b"be3-crossline-formal-input")
+    builder_path = repo / "scripts" / "build_factor_v3_daily_basic_formal_run_spec.py"
+    builder_override = (
+        f"FORMAL_WORKTREE_ROOT = Path({str(repo)!r})\n"
+        f"EXPECTED_BRANCH = {config['expected_branch']!r}\n"
+        f"SPEC_OUTPUT_ROOT = Path({config['formal_output_root']!r})\n"
+        f"PLANNED_RUN_ROOT = Path({config['run_root']!r})\n"
+        f"FORMAL_INPUT_ROOT_SHA256 = {formal_input_root_sha256!r}"
+    )
+    builder_path.write_bytes(
+        _insert_before_trusted_dispatch(
+            builder_path.read_bytes(),
+            builder_override,
+        )
+    )
+    shim_path = repo / "scripts" / "run_factor_v3_daily_basic_formal.py"
+    shim_path.write_bytes(
+        _insert_before_trusted_dispatch(
+            shim_path.read_bytes(),
+            f"_WORKTREE_ROOT = Path({str(repo)!r})",
+        )
+    )
+    runner_path = repo / "app" / "factor_v3_daily_basic_runner.py"
+    runner_path.write_text(
+        "from __future__ import annotations\n\n"
+        "def verify_factor_v3_daily_basic_run(*, run_spec_path, run_root):\n"
+        "    return {\n"
+        "        'run_root': run_root,\n"
+        "        'run_spec_path': run_spec_path,\n"
+        "        'source': 'be3-crossline-lightweight-runner',\n"
+        "        'status': 'verified',\n"
+        "    }\n\n"
+        "def run_factor_v3_daily_basic_collection(*, run_spec_path, run_root):\n"
+        "    return verify_factor_v3_daily_basic_run(\n"
+        "        run_spec_path=run_spec_path,\n"
+        "        run_root=run_root,\n"
+        "    )\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    _git(repo, "add", "--all")
+    commit = _git(repo, "commit", "-m", "be3 crossline fixture")
+    assert commit
+    reviewed_commit = _git(repo, "rev-parse", "HEAD")
+    source_manifest = [_source_entry(repo, relative_path) for relative_path in BE3_REVIEWED_PATHS]
+    assert len(source_manifest) == 37
+    source_root_sha256 = _sha256(_canonical_bytes(source_manifest))
+    public_der = _trusted_public_der(tmp_path)
+    public_der_sha256 = _sha256(public_der)
+    feature_attestation_sha256 = _sha256(b"be3-crossline-feature-attestation")
+    formal_runner_sha256 = _file_sha256(runner_path)
+    review_payload = {
+        "branch": config["expected_branch"],
+        "decision": "APPROVED_NO_P0_P1_P2",
+        "feature_attestation_sha256": feature_attestation_sha256,
+        "formal_input_root_sha256": formal_input_root_sha256,
+        "formal_runner_sha256": formal_runner_sha256,
+        "issued_at_utc": "2026-07-30T00:00:00+00:00",
+        "project_id": "quant-signal-lkj",
+        "review_nonce_sha256": _sha256(b"be3-crossline-review-nonce"),
+        "review_protocol_sha256": config["review_protocol_sha256"],
+        "reviewed_commit": reviewed_commit,
+        "reviewed_source_manifest": source_manifest,
+        "reviewed_source_root_sha256": source_root_sha256,
+        "reviewer_key_id": f"sha256:{public_der_sha256}",
+        "schema": "factor-v3-daily-basic-formal-review-signed-payload/v1",
+        "signature_scheme": "RSASSA-PKCS1-v1_5-SHA256",
+    }
+    review_payload_raw = _canonical_bytes(review_payload)
+    receipt_raw = _canonical_bytes(
+        {
+            "payload": review_payload,
+            "signature_base64": base64.b64encode(
+                _sign(
+                    tmp_path,
+                    tmp_path / "test-only-review-private.pem",
+                    review_payload_raw,
+                )
+            ).decode("ascii"),
+        }
+    )
+    receipt_path, receipt_sha256 = _cas_write(
+        (tmp_path / "be3-crossline-receipts").resolve(),
+        receipt_raw,
+    )
+    claim = {
+        "base_python_executable_path": config["base_python_executable_path"],
+        "base_python_executable_sha256": config["base_python_executable_sha256"],
+        "branch": config["expected_branch"],
+        "builder_sha256": _file_sha256(builder_path),
+        "formal_input_root_sha256": formal_input_root_sha256,
+        "git_executable_path": config["git_executable_path"],
+        "git_executable_sha256": config["git_executable_sha256"],
+        "project_id": "quant-signal-lkj",
+        "python_executable_path": config["python_executable_path"],
+        "python_executable_sha256": config["python_executable_sha256"],
+        "review_payload_sha256": _sha256(review_payload_raw),
+        "review_public_key_spki_sha256": public_der_sha256,
+        "review_receipt_sha256": receipt_sha256,
+        "reviewed_commit": reviewed_commit,
+        "reviewed_source_root_sha256": source_root_sha256,
+        "schema": "factor-v3-daily-basic-formal-bootstrap-claim/v1",
+        "shim_sha256": _file_sha256(shim_path),
+    }
+    claim_path, claim_sha256 = _cas_write(
+        (tmp_path / "be3-crossline-claims").resolve(),
+        _canonical_bytes(claim),
+    )
+    config.update(
+        {
+            "bootstrap_claim_path": str(claim_path),
+            "bootstrap_claim_sha256": claim_sha256,
+            "builder_sha256": claim["builder_sha256"],
+            "expected_commit": reviewed_commit,
+            "formal_input_root_sha256": formal_input_root_sha256,
+            "review_payload_sha256": claim["review_payload_sha256"],
+            "review_public_key_spki_der_base64": base64.b64encode(public_der).decode("ascii"),
+            "review_public_key_spki_sha256": public_der_sha256,
+            "review_receipt_path": str(receipt_path),
+            "review_receipt_sha256": receipt_sha256,
+            "shim_sha256": claim["shim_sha256"],
+            "source_manifest": source_manifest,
+            "source_root_sha256": source_root_sha256,
+        }
+    )
+    payload = _authorization_payload(tmp_path, config)
+    authorization_path, _authorization_sha256 = _write_authorization(
+        tmp_path,
+        payload,
+    )
+    return config, payload, authorization_path, public_der
 
 
 def _render_authorized(
@@ -175,6 +394,29 @@ def test_authorized_execution_passes_formal_input_semantic_sha(
     assert json.loads(completed.stdout)["formal_input_root"] == payload["formal_input_root_sha256"]
 
 
+def test_actual_be3_control_line_runs_through_b2_authorized_bootstrap(
+    tmp_path: Path,
+) -> None:
+    (
+        config,
+        payload,
+        authorization_path,
+        trusted_public_der,
+    ) = _be3_crossline_authorized_fixture(tmp_path)
+
+    rendered = _render_authorized(authorization_path, trusted_public_der)
+    completed = _run_rendered(rendered, config)
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert json.loads(completed.stdout) == {
+        "run_root": payload["run_root"],
+        "run_spec_path": payload["run_spec_path"],
+        "source": "be3-crossline-lightweight-runner",
+        "status": "verified",
+    }
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     (
@@ -207,6 +449,24 @@ def test_authorization_tampering_requires_a_new_signature(
         match="signature",
     ):
         _render_authorized(tampered_path, trusted_public_der)
+
+
+def test_authorization_rejects_an_untrusted_signing_key(tmp_path: Path) -> None:
+    (
+        _config,
+        _payload,
+        authorization_path,
+        _trusted_public_der_value,
+    ) = _authorized_fixture(tmp_path)
+    wrong_key_root = tmp_path / "wrong-authorization-key"
+    wrong_key_root.mkdir()
+    _private_key, wrong_public_der = _test_rsa_key(wrong_key_root)
+
+    with pytest.raises(
+        renderer.FormalBootstrapRenderError,
+        match="authorization signature",
+    ):
+        _render_authorized(authorization_path, wrong_public_der)
 
 
 def test_each_action_requires_an_independent_authorization(
@@ -347,6 +607,41 @@ def test_runtime_rejects_xoptions_before_repository_import(
             "-S",
             "-X",
             "dev",
+            "-c",
+            rendered.decode("utf-8"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env={},
+        timeout=60,
+    )
+
+    assert completed.returncode != 0
+    assert completed.stdout == ""
+    assert not marker.exists()
+
+
+def test_runtime_rejects_additional_python_switch_before_repository_import(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "repository-imported.marker"
+    config = _fixture_config(tmp_path, import_marker=marker)
+    payload = _authorization_payload(tmp_path, config)
+    authorization_path, _digest = _write_authorization(tmp_path, payload)
+    rendered = _render_authorized(
+        authorization_path,
+        _trusted_public_der(tmp_path),
+    )
+
+    completed = subprocess.run(
+        [
+            str(config["python_executable_path"]),
+            "-I",
+            "-B",
+            "-S",
+            "-u",
             "-c",
             rendered.decode("utf-8"),
         ],

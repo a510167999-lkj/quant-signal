@@ -5,6 +5,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 import ctypes
 from ctypes import wintypes
+import errno
 import hashlib
 import hmac
 import importlib
@@ -30,6 +31,7 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _LOADER_IDENTITY = "factor-v3-verified-source-loader/v1"
 _CONFIG_SCHEMA = "factor-v3-formal-bootstrap-render-config/v1"
+_AUTHORIZATION_SCHEMA = "factor-v3-formal-bootstrap-execution-authorization/v1"
 _CLAIM_SCHEMA = "factor-v3-daily-basic-formal-bootstrap-claim/v1"
 _RECEIPT_SCHEMA = "factor-v3-daily-basic-formal-review-signed-payload/v1"
 _MAX_JSON_BYTES = 4 * 1024 * 1024
@@ -38,6 +40,10 @@ _MAX_EXECUTABLE_BYTES = 64 * 1024 * 1024
 _MAX_CAPTURE_CHARS = 1024 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024
 _REPARSE_ATTRIBUTE = 0x00000400
+_OS_WRITE = os.write
+_OS_CLOSE = os.close
+_OS_DUP = os.dup
+_OS_DUP2 = os.dup2
 
 
 class _BootstrapError(RuntimeError):
@@ -118,6 +124,28 @@ def _require_sha256(value: Any, *, label: str) -> str:
     if type(value) is not str or _SHA256_RE.fullmatch(value) is None:
         raise _BootstrapError(f"{label} rejected")
     return value
+
+
+def _write_all(
+    descriptor: int,
+    raw: bytes,
+    *,
+    writer: Any = _OS_WRITE,
+) -> None:
+    view = memoryview(raw)
+    offset = 0
+    while offset < len(view):
+        try:
+            written = writer(descriptor, view[offset:])
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            if exc.errno == errno.EINTR:
+                continue
+            raise
+        if type(written) is not int or isinstance(written, bool) or written <= 0:
+            raise _BootstrapError("terminal output write rejected")
+        offset += written
 
 
 def _is_reparse(path: Path) -> bool:
@@ -392,7 +420,7 @@ class _FrozenActionConfig(Mapping[str, str]):
         self._values = MappingProxyType(
             {
                 "action": str(config["action"]),
-                "formal_input_root": str(config["formal_input_root"]),
+                "formal_input_root": str(config["formal_input_root_sha256"]),
                 "formal_output_root": str(config["formal_output_root"]),
                 "run_root": str(config["run_root"]),
                 "run_spec_path": str(config["run_spec_path"]),
@@ -557,6 +585,9 @@ class _TrustedBootstrapContext:
         loaded_ledger: dict[str, dict[str, Any]],
         module_entries: Mapping[str, Mapping[str, Any]],
         nonce: object,
+        import_path: tuple[str, ...],
+        path_hooks: tuple[Any, ...],
+        importer_cache: Mapping[str, Any],
         source_registry: Mapping[str, Mapping[str, Any]],
         stdout_sink: _BoundedTextSink,
         stderr_sink: _BoundedTextSink,
@@ -568,6 +599,9 @@ class _TrustedBootstrapContext:
         self._loaded_ledger = loaded_ledger
         self._module_entries = {key: dict(value) for key, value in module_entries.items()}
         self._nonce = nonce
+        self._import_path = import_path
+        self._path_hooks = path_hooks
+        self._importer_cache = dict(importer_cache)
         self._source_registry = MappingProxyType(
             {key: MappingProxyType(dict(value)) for key, value in source_registry.items()}
         )
@@ -642,6 +676,16 @@ class _TrustedBootstrapContext:
         )
         if tuple(sys.meta_path) != expected_meta_path:
             raise _BootstrapError("verified import policy drifted")
+        if (
+            tuple(sys.path) != self._import_path
+            or tuple(sys.path_hooks) != self._path_hooks
+            or set(sys.path_importer_cache) != set(self._importer_cache)
+            or any(
+                sys.path_importer_cache[key] is not value
+                for key, value in self._importer_cache.items()
+            )
+        ):
+            raise _BootstrapError("verified import boundary drifted")
         for handle in self._handles:
             handle.postverify()
         loaded_names = {
@@ -784,17 +828,26 @@ def _validated_config() -> dict[str, Any]:
     )
     fields = {
         "action",
+        "authorization_issued_at_utc",
+        "authorization_nonce_sha256",
         "base_python_executable_path",
         "base_python_executable_sha256",
         "bootstrap_claim_path",
         "bootstrap_claim_sha256",
+        "bootstrap_output_root",
         "builder_relative_path",
         "builder_sha256",
         "expected_branch",
         "expected_commit",
+        "execution_authorization_path",
+        "execution_authorization_public_key_spki_der_base64",
+        "execution_authorization_public_key_spki_sha256",
+        "execution_authorization_sha256",
+        "feature_attestation_sha256",
         "formal_input_root",
         "formal_input_root_sha256",
         "formal_output_root",
+        "formal_runner_sha256",
         "git_executable_path",
         "git_executable_sha256",
         "project_id",
@@ -809,6 +862,8 @@ def _validated_config() -> dict[str, Any]:
         "review_receipt_sha256",
         "run_root",
         "run_spec_path",
+        "run_spec_sha256",
+        "runtime_template_sha256",
         "schema",
         "shim_relative_path",
         "shim_sha256",
@@ -824,19 +879,32 @@ def _validated_config() -> dict[str, Any]:
         or type(config.get("expected_branch")) is not str
         or not config["expected_branch"]
         or _COMMIT_RE.fullmatch(str(config.get("expected_commit"))) is None
+        or re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+            r"[0-9]{2}:[0-9]{2}:[0-9]{2}\+00:00",
+            str(config.get("authorization_issued_at_utc")),
+        )
+        is None
     ):
         raise _BootstrapError("embedded configuration rejected")
     for field in (
         "base_python_executable_sha256",
+        "authorization_nonce_sha256",
         "bootstrap_claim_sha256",
         "builder_sha256",
+        "execution_authorization_public_key_spki_sha256",
+        "execution_authorization_sha256",
+        "feature_attestation_sha256",
         "formal_input_root_sha256",
+        "formal_runner_sha256",
         "git_executable_sha256",
         "python_executable_sha256",
         "review_payload_sha256",
         "review_protocol_sha256",
         "review_public_key_spki_sha256",
         "review_receipt_sha256",
+        "run_spec_sha256",
+        "runtime_template_sha256",
         "shim_sha256",
         "source_root_sha256",
     ):
@@ -844,6 +912,8 @@ def _validated_config() -> dict[str, Any]:
     for field in (
         "base_python_executable_path",
         "bootstrap_claim_path",
+        "bootstrap_output_root",
+        "execution_authorization_path",
         "formal_input_root",
         "formal_output_root",
         "git_executable_path",
@@ -856,19 +926,29 @@ def _validated_config() -> dict[str, Any]:
         _safe_absolute_path(config.get(field), label=field)
     manifest = _validated_manifest(config)
     config["source_manifest"] = manifest
-    try:
-        public_der = base64.b64decode(
-            str(config["review_public_key_spki_der_base64"]).encode("ascii"),
-            validate=True,
-        )
-    except (UnicodeEncodeError, ValueError):
-        raise _BootstrapError("embedded public key rejected") from None
-    if (
-        base64.b64encode(public_der).decode("ascii") != config["review_public_key_spki_der_base64"]
-        or hashlib.sha256(public_der).hexdigest() != config["review_public_key_spki_sha256"]
+    for base64_field, sha_field in (
+        (
+            "review_public_key_spki_der_base64",
+            "review_public_key_spki_sha256",
+        ),
+        (
+            "execution_authorization_public_key_spki_der_base64",
+            "execution_authorization_public_key_spki_sha256",
+        ),
     ):
-        raise _BootstrapError("embedded public key rejected")
-    _parse_rsa3072_spki_der(public_der)
+        try:
+            public_der = base64.b64decode(
+                str(config[base64_field]).encode("ascii"),
+                validate=True,
+            )
+        except (UnicodeEncodeError, ValueError):
+            raise _BootstrapError("embedded public key rejected") from None
+        if (
+            base64.b64encode(public_der).decode("ascii") != config[base64_field]
+            or hashlib.sha256(public_der).hexdigest() != config[sha_field]
+        ):
+            raise _BootstrapError("embedded public key rejected")
+        _parse_rsa3072_spki_der(public_der)
     return config
 
 
@@ -1007,10 +1087,10 @@ def _validate_claim_and_receipt(
         or payload.get("reviewed_source_root_sha256") != config["source_root_sha256"]
         or payload.get("formal_input_root_sha256") != config["formal_input_root_sha256"]
         or payload.get("review_protocol_sha256") != config["review_protocol_sha256"]
+        or payload.get("feature_attestation_sha256") != config["feature_attestation_sha256"]
+        or payload.get("formal_runner_sha256") != config["formal_runner_sha256"]
         or payload.get("reviewer_key_id") != f"sha256:{config['review_public_key_spki_sha256']}"
         or payload.get("signature_scheme") != "RSASSA-PKCS1-v1_5-SHA256"
-        or _SHA256_RE.fullmatch(str(payload.get("feature_attestation_sha256"))) is None
-        or _SHA256_RE.fullmatch(str(payload.get("formal_runner_sha256"))) is None
         or _SHA256_RE.fullmatch(str(payload.get("review_nonce_sha256"))) is None
         or re.fullmatch(
             r"[0-9]{4}-[0-9]{2}-[0-9]{2}T"
@@ -1040,6 +1120,94 @@ def _validate_claim_and_receipt(
         modulus=modulus,
         exponent=exponent,
     )
+    runner_entry = next(
+        (
+            item
+            for item in config["source_manifest"]
+            if item.get("path") == "app/factor_v3_daily_basic_runner.py"
+        ),
+        None,
+    )
+    if runner_entry is None or runner_entry.get("sha256") != config["formal_runner_sha256"]:
+        raise _BootstrapError("formal runner sha256 semantic field rejected")
+
+
+def _validate_execution_authorization(
+    config: Mapping[str, Any],
+    *,
+    authorization_raw: bytes,
+    public_der: bytes,
+) -> None:
+    outer = _strict_canonical_json(
+        authorization_raw,
+        label="execution authorization",
+    )
+    if set(outer) != {"payload", "signature_base64"}:
+        raise _BootstrapError("execution authorization rejected")
+    expected_payload = {
+        "action": config["action"],
+        "authorization_nonce_sha256": config["authorization_nonce_sha256"],
+        "base_python_executable_path": config["base_python_executable_path"],
+        "base_python_executable_sha256": config["base_python_executable_sha256"],
+        "bootstrap_claim_path": config["bootstrap_claim_path"],
+        "bootstrap_claim_sha256": config["bootstrap_claim_sha256"],
+        "bootstrap_output_root": config["bootstrap_output_root"],
+        "builder_relative_path": config["builder_relative_path"],
+        "builder_sha256": config["builder_sha256"],
+        "expected_branch": config["expected_branch"],
+        "expected_commit": config["expected_commit"],
+        "feature_attestation_sha256": config["feature_attestation_sha256"],
+        "formal_input_root_path": config["formal_input_root"],
+        "formal_input_root_sha256": config["formal_input_root_sha256"],
+        "formal_output_root": config["formal_output_root"],
+        "formal_runner_sha256": config["formal_runner_sha256"],
+        "git_executable_path": config["git_executable_path"],
+        "git_executable_sha256": config["git_executable_sha256"],
+        "issued_at_utc": config["authorization_issued_at_utc"],
+        "project_id": config["project_id"],
+        "python_executable_path": config["python_executable_path"],
+        "python_executable_sha256": config["python_executable_sha256"],
+        "repo_root": config["repo_root"],
+        "review_payload_sha256": config["review_payload_sha256"],
+        "review_protocol_sha256": config["review_protocol_sha256"],
+        "review_public_key_spki_der_base64": config["review_public_key_spki_der_base64"],
+        "review_public_key_spki_sha256": config["review_public_key_spki_sha256"],
+        "review_receipt_path": config["review_receipt_path"],
+        "review_receipt_sha256": config["review_receipt_sha256"],
+        "run_root": config["run_root"],
+        "run_spec_path": config["run_spec_path"],
+        "run_spec_sha256": config["run_spec_sha256"],
+        "runtime_template_sha256": config["runtime_template_sha256"],
+        "schema": _AUTHORIZATION_SCHEMA,
+        "shim_relative_path": config["shim_relative_path"],
+        "shim_sha256": config["shim_sha256"],
+        "source_manifest": config["source_manifest"],
+        "source_root_sha256": config["source_root_sha256"],
+    }
+    if outer.get("payload") != expected_payload:
+        raise _BootstrapError("execution authorization payload rejected")
+    signature_text = outer.get("signature_base64")
+    if type(signature_text) is not str:
+        raise _BootstrapError("execution authorization signature rejected")
+    try:
+        signature = base64.b64decode(
+            signature_text.encode("ascii"),
+            validate=True,
+        )
+    except (UnicodeEncodeError, ValueError):
+        raise _BootstrapError("execution authorization signature rejected") from None
+    if base64.b64encode(signature).decode("ascii") != signature_text:
+        raise _BootstrapError("execution authorization signature rejected")
+    modulus, exponent = _parse_rsa3072_spki_der(public_der)
+    try:
+        _verify_rsa3072_signature(
+            _canonical_bytes(expected_payload),
+            signature,
+            modulus=modulus,
+            exponent=exponent,
+        )
+    except _BootstrapError as exc:
+        raise _BootstrapError("execution authorization signature rejected") from exc
 
 
 def _module_entries(
@@ -1068,13 +1236,126 @@ def _module_entries(
     return entries, source_bytes
 
 
+def _is_within(path: Path, roots: tuple[Path, ...]) -> bool:
+    candidate = os.path.normcase(str(path.resolve(strict=False)))
+    for root in roots:
+        root_text = os.path.normcase(str(root))
+        try:
+            if os.path.commonpath((candidate, root_text)) == root_text:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _freeze_stdlib_import_boundary(
+    *,
+    repo_root: Path,
+) -> tuple[tuple[str, ...], tuple[Any, ...], dict[str, Any]]:
+    roots = tuple(
+        dict.fromkeys(
+            Path(value).resolve(strict=True)
+            for value in (sys.base_prefix, sys.base_exec_prefix)
+            if type(value) is str and value
+        )
+    )
+    if not roots:
+        raise _BootstrapError("stdlib import roots rejected")
+    import_path: list[str] = []
+    for value in sys.path:
+        if type(value) is not str or not value:
+            raise _BootstrapError("stdlib import path rejected")
+        candidate = Path(value)
+        if (
+            not candidate.is_absolute()
+            or candidate.resolve(strict=False) == repo_root
+            or not _is_within(candidate, roots)
+        ):
+            raise _BootstrapError("stdlib import path rejected")
+        import_path.append(value)
+    if len(import_path) != len(set(map(os.path.normcase, import_path))):
+        raise _BootstrapError("stdlib import path rejected")
+    cache: dict[str, Any] = {}
+    for key, value in sys.path_importer_cache.items():
+        if (
+            type(key) is not str
+            or not key
+            or not Path(key).is_absolute()
+            or not _is_within(Path(key), roots)
+        ):
+            raise _BootstrapError("stdlib importer cache rejected")
+        cache[key] = value
+    hooks = tuple(sys.path_hooks)
+    if not hooks:
+        raise _BootstrapError("stdlib path hooks rejected")
+    sys.path = list(import_path)
+    return tuple(import_path), hooks, cache
+
+
+def _capture_fd_output(callback: Any) -> Any:
+    duplicate = _OS_DUP
+    duplicate_to = _OS_DUP2
+    close_descriptor = _OS_CLOSE
+    saved_stdout = duplicate(1)
+    try:
+        saved_stderr = duplicate(2)
+    except BaseException:
+        close_descriptor(saved_stdout)
+        raise
+    try:
+        with tempfile.TemporaryFile(mode="w+b") as stdout_capture:
+            with tempfile.TemporaryFile(mode="w+b") as stderr_capture:
+                sys.stdout.flush()
+                sys.stderr.flush()
+                duplicate_to(stdout_capture.fileno(), 1)
+                duplicate_to(stderr_capture.fileno(), 2)
+                try:
+                    value = callback()
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                finally:
+                    duplicate_to(saved_stdout, 1)
+                    duplicate_to(saved_stderr, 2)
+                stdout_capture.seek(0)
+                stderr_capture.seek(0)
+                captured_stdout = stdout_capture.read(_MAX_OUTPUT_BYTES + 1)
+                captured_stderr = stderr_capture.read(_MAX_OUTPUT_BYTES + 1)
+                if captured_stdout or captured_stderr:
+                    raise _BootstrapError("direct descriptor output rejected")
+                return value
+    finally:
+        close_descriptor(saved_stdout)
+        close_descriptor(saved_stderr)
+
+
 def _trusted_run() -> bytes:
     if (
         os.name != "nt"
         or sys.argv != ["-c"]
+        or type(sys.orig_argv) is not list
+        or len(sys.orig_argv) != 6
+        or sys.orig_argv[1:5] != ["-I", "-B", "-S", "-c"]
+        or type(sys.orig_argv[5]) is not str
+        or not sys.orig_argv[5]
         or sys.flags.isolated != 1
-        or not sys.dont_write_bytecode
+        or sys.flags.ignore_environment != 1
+        or sys.flags.no_user_site != 1
+        or sys.flags.safe_path is not True
+        or sys.flags.optimize != 0
+        or sys.flags.debug != 0
+        or sys.flags.verbose != 0
+        or sys.flags.inspect != 0
+        or sys.flags.interactive != 0
+        or sys.flags.bytes_warning != 0
+        or sys.flags.quiet != 0
+        or sys.flags.dev_mode is not False
+        or sys.flags.utf8_mode != 0
+        or sys.flags.warn_default_encoding != 0
+        or sys.flags.dont_write_bytecode != 1
+        or sys.dont_write_bytecode is not True
         or sys.flags.no_site != 1
+        or sys._xoptions != {}
+        or sys.warnoptions != []
         or any(
             name == "app"
             or name.startswith("app.")
@@ -1089,6 +1370,7 @@ def _trusted_run() -> bytes:
     base_python_path = Path(str(config["base_python_executable_path"]))
     if (
         Path(sys.executable) != python_path
+        or Path(sys.orig_argv[0]) != base_python_path
         or type(sys._base_executable) is not str
         or Path(sys._base_executable) != base_python_path
     ):
@@ -1097,12 +1379,31 @@ def _trusted_run() -> bytes:
         Path(str(config["repo_root"])),
         label="repository root",
     )
+    for field in (
+        "bootstrap_output_root",
+        "formal_input_root",
+        "formal_output_root",
+        "run_root",
+    ):
+        resolved = _safe_existing_directory(
+            Path(str(config[field])),
+            label=field,
+        )
+        if str(resolved) != config[field]:
+            raise _BootstrapError(f"{field} rejected")
     claim_path = Path(str(config["bootstrap_claim_path"]))
+    authorization_path = Path(str(config["execution_authorization_path"]))
     receipt_path = Path(str(config["review_receipt_path"]))
+    run_spec_path = Path(str(config["run_spec_path"]))
     _validate_cas_path(
         claim_path,
         str(config["bootstrap_claim_sha256"]),
         label="bootstrap claim",
+    )
+    _validate_cas_path(
+        authorization_path,
+        str(config["execution_authorization_sha256"]),
+        label="execution authorization",
     )
     _validate_cas_path(
         receipt_path,
@@ -1110,8 +1411,12 @@ def _trusted_run() -> bytes:
         label="review receipt",
     )
     try:
-        public_der = base64.b64decode(
+        review_public_der = base64.b64decode(
             str(config["review_public_key_spki_der_base64"]).encode("ascii"),
+            validate=True,
+        )
+        authorization_public_der = base64.b64decode(
+            str(config["execution_authorization_public_key_spki_der_base64"]).encode("ascii"),
             validate=True,
         )
     except (UnicodeEncodeError, ValueError):
@@ -1154,12 +1459,28 @@ def _trusted_run() -> bytes:
                 max_bytes=_MAX_EXECUTABLE_BYTES,
                 allow_hardlinks=True,
             )
+            authorization_handle = _open_held(
+                stack,
+                handles,
+                authorization_path,
+                expected_sha256=str(config["execution_authorization_sha256"]),
+                label="execution authorization",
+                max_bytes=_MAX_JSON_BYTES,
+            )
             claim_handle = _open_held(
                 stack,
                 handles,
                 claim_path,
                 expected_sha256=str(config["bootstrap_claim_sha256"]),
                 label="bootstrap claim",
+                max_bytes=_MAX_JSON_BYTES,
+            )
+            _open_held(
+                stack,
+                handles,
+                run_spec_path,
+                expected_sha256=str(config["run_spec_sha256"]),
+                label="run spec",
                 max_bytes=_MAX_JSON_BYTES,
             )
             receipt_handle = _open_held(
@@ -1192,7 +1513,12 @@ def _trusted_run() -> bytes:
                 config,
                 claim_raw=claim_handle.raw,
                 receipt_raw=receipt_handle.raw,
-                public_der=public_der,
+                public_der=review_public_der,
+            )
+            _validate_execution_authorization(
+                config,
+                authorization_raw=authorization_handle.raw,
+                public_der=authorization_public_der,
             )
             git_path = git_handle.path
             identity = {
@@ -1265,8 +1591,9 @@ def _trusted_run() -> bytes:
                 importlib.machinery.FrozenImporter,
                 importlib.machinery.PathFinder,
             ]
-            sys.path = [value for value in sys.path if value and Path(value).resolve() != repo_root]
-            sys.path_importer_cache.clear()
+            import_path, path_hooks, importer_cache = _freeze_stdlib_import_boundary(
+                repo_root=repo_root
+            )
             stdout_sink = _BoundedTextSink()
             stderr_sink = _BoundedTextSink()
             action_config = _FrozenActionConfig(config)
@@ -1277,43 +1604,50 @@ def _trusted_run() -> bytes:
                 loaded_ledger=loaded_ledger,
                 module_entries=entries,
                 nonce=nonce,
+                import_path=import_path,
+                path_hooks=path_hooks,
+                importer_cache=importer_cache,
                 source_registry=source_registry,
                 stdout_sink=stdout_sink,
                 stderr_sink=stderr_sink,
             )
-            with redirect_stdout(stdout_sink), redirect_stderr(stderr_sink):
-                importlib.import_module("app")
-                builder_name = "scripts." + str(config["builder_relative_path"])[8:-3].replace(
-                    "/",
-                    ".",
-                )
-                shim_name = "scripts." + str(config["shim_relative_path"])[8:-3].replace(
-                    "/",
-                    ".",
-                )
-                importlib.import_module(builder_name)
-                shim = importlib.import_module(shim_name)
-                context.assert_verified_module(
-                    builder_name,
-                    str(config["builder_relative_path"]),
-                    str(config["builder_sha256"]),
-                )
-                context.assert_verified_module(
-                    shim_name,
-                    str(config["shim_relative_path"]),
-                    str(config["shim_sha256"]),
-                )
-                dispatch = getattr(shim, "trusted_dispatch", None)
-                if not callable(dispatch):
-                    raise _BootstrapError("trusted dispatch unavailable")
-                dispatch_result = dispatch(context, action_config)
-                if (
-                    type(dispatch_result) is not int
-                    or isinstance(dispatch_result, bool)
-                    or dispatch_result != 0
-                ):
-                    raise _BootstrapError("trusted dispatch rejected")
-                context.postverify()
+
+            def dispatch_reviewed_source() -> None:
+                with redirect_stdout(stdout_sink), redirect_stderr(stderr_sink):
+                    importlib.import_module("app")
+                    builder_name = "scripts." + str(config["builder_relative_path"])[8:-3].replace(
+                        "/",
+                        ".",
+                    )
+                    shim_name = "scripts." + str(config["shim_relative_path"])[8:-3].replace(
+                        "/",
+                        ".",
+                    )
+                    importlib.import_module(builder_name)
+                    shim = importlib.import_module(shim_name)
+                    context.assert_verified_module(
+                        builder_name,
+                        str(config["builder_relative_path"]),
+                        str(config["builder_sha256"]),
+                    )
+                    context.assert_verified_module(
+                        shim_name,
+                        str(config["shim_relative_path"]),
+                        str(config["shim_sha256"]),
+                    )
+                    dispatch = getattr(shim, "trusted_dispatch", None)
+                    if not callable(dispatch):
+                        raise _BootstrapError("trusted dispatch unavailable")
+                    dispatch_result = dispatch(context, action_config)
+                    if (
+                        type(dispatch_result) is not int
+                        or isinstance(dispatch_result, bool)
+                        or dispatch_result != 0
+                    ):
+                        raise _BootstrapError("trusted dispatch rejected")
+                    context.postverify()
+
+            _capture_fd_output(dispatch_reviewed_source)
             result = context.buffered_output()
     if result is None:
         raise _BootstrapError("trusted output unavailable")
@@ -1325,12 +1659,12 @@ def _main() -> int:
         output = _trusted_run()
     except BaseException:
         try:
-            os.write(2, b"factor-v3 formal bootstrap rejected\n")
+            _write_all(2, b"factor-v3 formal bootstrap rejected\n")
         except BaseException:
             pass
         return 2
     try:
-        os.write(1, output)
+        _write_all(1, output)
     except BaseException:
         return 2
     return 0
