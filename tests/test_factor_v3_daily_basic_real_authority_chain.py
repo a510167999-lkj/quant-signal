@@ -547,6 +547,18 @@ def test_real_chain_fixture_uses_trusted_dispatch_and_buffers_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     authority_binding = {"binding_sha256": "9" * 64}
+    spec_output_root = (tmp_path / "formal-specs" / "sha256").resolve()
+    planned_run_root = (tmp_path / "daily-basic-run").resolve()
+    monkeypatch.setattr(
+        formal_spec,
+        "SPEC_OUTPUT_ROOT",
+        spec_output_root,
+    )
+    monkeypatch.setattr(
+        formal_spec,
+        "PLANNED_RUN_ROOT",
+        planned_run_root,
+    )
 
     class FrozenConfig(Mapping[str, object]):
         def __init__(self) -> None:
@@ -557,7 +569,7 @@ def test_real_chain_fixture_uses_trusted_dispatch_and_buffers_binding(
                 "run_spec_path": str(
                     (tmp_path / "daily-basic-run-spec.json").resolve()
                 ),
-                "run_root": str((tmp_path / "daily-basic-run").resolve()),
+                "run_root": str(planned_run_root),
             }
 
         def __getitem__(self, key: str) -> object:

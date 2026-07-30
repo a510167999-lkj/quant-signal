@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import argparse
 import base64
+from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
 from datetime import date
 import hashlib
 import hmac
+import importlib
 import json
 import os
 from pathlib import Path
@@ -82,6 +83,7 @@ BASE_PYTHON_EXECUTABLE_SHA256 = (
 FORMAL_REVIEW_SOURCE_RELATIVE_PATHS = (
     "scripts/build_factor_v3_daily_basic_formal_run_spec.py",
     "scripts/run_factor_v3_daily_basic_formal.py",
+    "app/__init__.py",
     "app/audited_pit_factor_v3_feature_history_authority.py",
     "app/audited_pit_factor_v3_points_contract.py",
     "app/current_pool.py",
@@ -1440,44 +1442,215 @@ def safe_summary(
     }
 
 
-def _load_runner() -> ModuleType:
-    runner_path = FORMAL_WORKTREE_ROOT / "app/factor_v3_daily_basic_runner.py"
-    with _open_pinned_file(
-        runner_path,
-        expected_sha256=FACTOR_V3_DAILY_BASIC_RUNNER_SHA256,
-        label="factor-v3 daily-basic runner source",
-        max_bytes=4 * 1024 * 1024,
-    ) as (candidate, handle):
-        worktree = str(FORMAL_WORKTREE_ROOT)
-        if worktree not in sys.path:
-            sys.path.insert(0, worktree)
-        from app import factor_v3_daily_basic_runner
+_TRUSTED_ACTION_CONFIG_FIELDS = frozenset(
+    {
+        "action",
+        "formal_input_root",
+        "formal_output_root",
+        "run_spec_path",
+        "run_root",
+    }
+)
+_TRUSTED_CONTEXT_METHODS = (
+    "assert_verified_module",
+    "emit_json",
+    "postverify",
+    "validate_action_config",
+    "verified_ledger_entry",
+)
+_VERIFIED_LEDGER_ENTRY_FIELDS = frozenset(
+    {
+        "absolute_path",
+        "byte_count",
+        "is_package",
+        "loader_identity",
+        "module_name",
+        "relative_path",
+        "source_sha256",
+    }
+)
+_BUILDER_MODULE_NAME = (
+    "scripts.build_factor_v3_daily_basic_formal_run_spec"
+)
+_BUILDER_RELATIVE_PATH = (
+    "scripts/build_factor_v3_daily_basic_formal_run_spec.py"
+)
+_SHIM_MODULE_NAME = "scripts.run_factor_v3_daily_basic_formal"
+_SHIM_RELATIVE_PATH = "scripts/run_factor_v3_daily_basic_formal.py"
+_RUNNER_MODULE_NAME = "app.factor_v3_daily_basic_runner"
+_RUNNER_RELATIVE_PATH = "app/factor_v3_daily_basic_runner.py"
 
-        imported_path = Path(
-            factor_v3_daily_basic_runner.__file__
-        ).resolve(strict=True)
-        if imported_path != candidate:
-            raise FormalRunSpecError("formal runner import identity rejected")
-        _postverify_pinned_file(
-            candidate,
-            handle,
-            expected_sha256=FACTOR_V3_DAILY_BASIC_RUNNER_SHA256,
-            label="factor-v3 daily-basic runner source",
-            max_bytes=4 * 1024 * 1024,
+
+def _trusted_context_method(context: Any, name: str) -> Any:
+    if isinstance(context, Mapping):
+        raise FormalRunSpecError(
+            "formal trusted bootstrap context required"
         )
-        return factor_v3_daily_basic_runner
+    method = getattr(context, name, None)
+    if not callable(method):
+        raise FormalRunSpecError(
+            "formal trusted bootstrap context required"
+        )
+    return method
 
 
-def _postverify_loaded_review_modules(
+def _validated_trusted_action_config(
+    context: Any,
+    frozen_action_config: Any,
+) -> dict[str, str]:
+    for method_name in _TRUSTED_CONTEXT_METHODS:
+        _trusted_context_method(context, method_name)
+    if (
+        isinstance(frozen_action_config, dict)
+        or not isinstance(frozen_action_config, Mapping)
+    ):
+        raise FormalRunSpecError(
+            "formal trusted bootstrap action config required"
+        )
+    try:
+        _trusted_context_method(
+            context,
+            "validate_action_config",
+        )(frozen_action_config)
+        fields = set(frozen_action_config)
+        values = {
+            key: frozen_action_config[key]
+            for key in _TRUSTED_ACTION_CONFIG_FIELDS
+        }
+    except BaseException as exc:
+        raise FormalRunSpecError(
+            "formal trusted bootstrap action config rejected"
+        ) from exc
+    if (
+        fields != _TRUSTED_ACTION_CONFIG_FIELDS
+        or any(type(value) is not str or not value for value in values.values())
+        or values["action"] not in {"build-spec", "run", "verify"}
+        or values["formal_input_root"] != FORMAL_INPUT_ROOT_SHA256
+        or Path(values["formal_output_root"]) != SPEC_OUTPUT_ROOT
+        or Path(values["run_root"]) != PLANNED_RUN_ROOT
+        or not Path(values["run_spec_path"]).is_absolute()
+    ):
+        raise FormalRunSpecError(
+            "formal trusted bootstrap action config rejected"
+        )
+    return values
+
+
+def _module_name_for_reviewed_source(relative_path: str) -> str:
+    if relative_path.endswith("/__init__.py"):
+        return relative_path[: -len("/__init__.py")].replace("/", ".")
+    return relative_path[:-3].replace("/", ".")
+
+
+def _validated_verified_ledger_entry(
+    context: Any,
+    *,
+    module_name: str,
+    relative_path: str,
+    expected_sha256: str | None = None,
+    assert_loaded: bool,
+) -> dict[str, Any]:
+    try:
+        entry = _trusted_context_method(
+            context,
+            "verified_ledger_entry",
+        )(module_name)
+    except BaseException as exc:
+        raise FormalRunSpecError(
+            "formal verified loader ledger rejected"
+        ) from exc
+    expected_path = FORMAL_WORKTREE_ROOT / Path(
+        *relative_path.split("/")
+    )
+    expected_package = relative_path.endswith("/__init__.py")
+    if (
+        not isinstance(entry, Mapping)
+        or set(entry) != _VERIFIED_LEDGER_ENTRY_FIELDS
+        or entry.get("module_name") != module_name
+        or entry.get("relative_path") != relative_path
+        or entry.get("absolute_path") != str(expected_path)
+        or type(entry.get("byte_count")) is not int
+        or entry["byte_count"] <= 0
+        or type(entry.get("source_sha256")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", entry["source_sha256"]) is None
+        or (
+            expected_sha256 is not None
+            and not hmac.compare_digest(
+                entry["source_sha256"],
+                expected_sha256,
+            )
+        )
+        or type(entry.get("is_package")) is not bool
+        or entry["is_package"] is not expected_package
+        or type(entry.get("loader_identity")) is not str
+        or not entry["loader_identity"]
+    ):
+        raise FormalRunSpecError(
+            "formal verified loader ledger rejected"
+        )
+    if assert_loaded:
+        try:
+            _trusted_context_method(
+                context,
+                "assert_verified_module",
+            )(
+                module_name,
+                relative_path,
+                entry["source_sha256"],
+            )
+        except BaseException as exc:
+            raise FormalRunSpecError(
+                "formal verified loader ledger rejected"
+            ) from exc
+    return dict(entry)
+
+
+def _trusted_source_manifest(context: Any) -> list[dict[str, Any]]:
+    manifest = []
+    for relative_path in FORMAL_REVIEW_SOURCE_RELATIVE_PATHS:
+        module_name = _module_name_for_reviewed_source(relative_path)
+        entry = _validated_verified_ledger_entry(
+            context,
+            module_name=module_name,
+            relative_path=relative_path,
+            assert_loaded=False,
+        )
+        manifest.append(
+            {
+                "bytes": entry["byte_count"],
+                "path": relative_path,
+                "sha256": entry["source_sha256"],
+            }
+        )
+    return manifest
+
+
+def _load_runner(context: Any) -> ModuleType:
+    try:
+        runner = importlib.import_module(_RUNNER_MODULE_NAME)
+    except BaseException as exc:
+        raise FormalRunSpecError(
+            "formal verified runner import rejected"
+        ) from exc
+    _validated_verified_ledger_entry(
+        context,
+        module_name=_RUNNER_MODULE_NAME,
+        relative_path=_RUNNER_RELATIVE_PATH,
+        assert_loaded=True,
+    )
+    return runner
+
+
+def _postverify_verified_module_ledger(
+    context: Any,
     source_manifest: list[dict[str, Any]],
 ) -> None:
     reviewed_modules = {
-        item["path"][:-3].replace("/", "."): item
+        _module_name_for_reviewed_source(item["path"]): item
         for item in source_manifest
         if (
             type(item) is dict
             and type(item.get("path")) is str
-            and item["path"].startswith("app/")
             and item["path"].endswith(".py")
         )
     }
@@ -1486,113 +1659,131 @@ def _postverify_loaded_review_modules(
         for name, module in sys.modules.items()
         if (
             module is not None
-            and name.startswith("app.")
+            and (
+                name == "app"
+                or name.startswith("app.")
+                or name in {_BUILDER_MODULE_NAME, _SHIM_MODULE_NAME}
+            )
         )
     }
-    if not loaded_names or loaded_names - set(reviewed_modules):
+    complete_manifest_paths = {
+        item["path"]
+        for item in source_manifest
+        if type(item) is dict and type(item.get("path")) is str
+    }
+    if (
+        complete_manifest_paths == set(FORMAL_REVIEW_SOURCE_RELATIVE_PATHS)
+        and loaded_names - set(reviewed_modules)
+    ):
         raise FormalRunSpecError(
             "formal loaded application module closure rejected"
         )
-    for name in sorted(loaded_names):
-        module = sys.modules[name]
-        expected = reviewed_modules[name]
-        module_file = getattr(module, "__file__", None)
-        expected_path = FORMAL_WORKTREE_ROOT / Path(
-            *expected["path"].split("/")
-        )
-        if (
-            type(module_file) is not str
-            or Path(module_file).resolve(strict=True) != expected_path
-        ):
-            raise FormalRunSpecError(
-                "formal loaded application module identity rejected"
+    loaded_names &= set(reviewed_modules)
+    try:
+        for name in sorted(loaded_names):
+            expected = reviewed_modules[name]
+            _validated_verified_ledger_entry(
+                context,
+                module_name=name,
+                relative_path=expected["path"],
+                expected_sha256=expected["sha256"],
+                assert_loaded=True,
             )
-        raw = _read_safe_file(
-            expected_path,
-            label="formal loaded application module",
-            max_bytes=4 * 1024 * 1024,
-        )
-        if (
-            len(raw) != expected.get("bytes")
-            or hashlib.sha256(raw).hexdigest()
-            != expected.get("sha256")
-        ):
-            raise FormalRunSpecError(
-                "formal loaded application module source rejected"
-            )
+    except FormalRunSpecError:
+        raise
+    except BaseException as exc:
+        raise FormalRunSpecError(
+            "formal verified loader ledger rejected"
+        ) from exc
 
 
-def main(
-    argv: list[str] | None = None,
-    *,
-    expected_bootstrap_claim_sha256: str,
+def _emit_trusted_json(context: Any, value: Any) -> None:
+    _assert_no_credential_shape(value)
+    try:
+        _trusted_context_method(context, "emit_json")(value)
+    except BaseException as exc:
+        raise FormalRunSpecError(
+            "formal trusted output buffer rejected"
+        ) from exc
+
+
+def trusted_dispatch(
+    context: Any,
+    frozen_action_config: Any,
 ) -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--write", action="store_true")
-    args = parser.parse_args(argv)
-    _validated_fixed_runtime_identity()
-    with _locked_formal_review_sources(
-        expected_bootstrap_claim_sha256=(
-            expected_bootstrap_claim_sha256
-        )
+    config = _validated_trusted_action_config(
+        context,
+        frozen_action_config,
+    )
+    source_manifest = _trusted_source_manifest(context)
+    for module_name, relative_path in (
+        (_BUILDER_MODULE_NAME, _BUILDER_RELATIVE_PATH),
+        (_SHIM_MODULE_NAME, _SHIM_RELATIVE_PATH),
     ):
-        evidence = verify_formal_worktree(
-            expected_bootstrap_claim_sha256=(
-                expected_bootstrap_claim_sha256
-            )
+        expected = next(
+            item
+            for item in source_manifest
+            if item["path"] == relative_path
         )
+        _validated_verified_ledger_entry(
+            context,
+            module_name=module_name,
+            relative_path=relative_path,
+            expected_sha256=expected["sha256"],
+            assert_loaded=True,
+        )
+    runner = _load_runner(context)
+    action = config["action"]
+    if action == "build-spec":
         verify_planned_run_root()
-        runner = _load_runner()
+        candidate, content = build_and_verify_candidate(runner)
+        publish_candidate(content)
+        result = safe_summary(
+            candidate,
+            content,
+            published=True,
+        )
+    elif action == "run":
         try:
-            candidate, content = build_and_verify_candidate(runner)
-            if args.write:
-                publish_candidate(content)
-            print(
-                json.dumps(
-                    safe_summary(
-                        candidate,
-                        content,
-                        published=args.write,
-                    ),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
+            result = runner.run_factor_v3_daily_basic_collection(
+                run_spec_path=config["run_spec_path"],
+                run_root=config["run_root"],
             )
-        finally:
-            _postverify_loaded_review_modules(
-                evidence["source_manifest"]
+        except (ValueError, RuntimeError) as exc:
+            raise FormalRunSpecError(
+                "formal daily-basic run rejected"
+            ) from exc
+    else:
+        try:
+            result = runner.verify_factor_v3_daily_basic_run(
+                run_spec_path=config["run_spec_path"],
+                run_root=config["run_root"],
             )
+        except (ValueError, RuntimeError) as exc:
+            raise FormalRunSpecError(
+                "formal daily-basic verification rejected"
+            ) from exc
+    _postverify_verified_module_ledger(context, source_manifest)
+    _emit_trusted_json(context, result)
     return 0
+
+
+def main(argv: list[str] | None = None, **_kwargs: Any) -> int:
+    del argv
+    raise FormalRunSpecError(
+        "formal trusted bootstrap context required"
+    )
 
 
 def run_locked_runner_cli(
     argv: list[str],
-    *,
-    expected_bootstrap_claim_sha256: str,
+    **_kwargs: Any,
 ) -> int:
-    _validated_fixed_runtime_identity()
-    with _locked_formal_review_sources(
-        expected_bootstrap_claim_sha256=(
-            expected_bootstrap_claim_sha256
-        )
-    ):
-        evidence = verify_formal_worktree(
-            expected_bootstrap_claim_sha256=(
-                expected_bootstrap_claim_sha256
-            )
-        )
-        runner = _load_runner()
-        try:
-            return int(runner.main(argv))
-        finally:
-            _postverify_loaded_review_modules(
-                evidence["source_manifest"]
-            )
+    del argv
+    raise FormalRunSpecError(
+        "formal trusted bootstrap context required"
+    )
 
 
 if __name__ == "__main__":
-    raise SystemExit(
-        "use scripts/run_factor_v3_daily_basic_formal.py with an external "
-        "bootstrap claim"
-    )
+    raise SystemExit("external trusted bootstrap context required")

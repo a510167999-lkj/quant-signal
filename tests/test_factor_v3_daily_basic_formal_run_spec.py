@@ -154,9 +154,14 @@ class _TrustedBootstrapContext:
         self,
         config: _FrozenActionConfig,
         *,
+        ledger_overrides: Mapping[
+            str,
+            Mapping[str, object],
+        ] | None = None,
         rejected_modules: set[str] | None = None,
     ) -> None:
         self._config = config
+        self._ledger_overrides = dict(ledger_overrides or {})
         self._rejected_modules = set(rejected_modules or ())
         self.asserted_modules: list[tuple[str, str, str]] = []
         self.buffered: list[object] = []
@@ -172,7 +177,7 @@ class _TrustedBootstrapContext:
             if module_name == "app"
             else f"{module_name.replace('.', '/')}.py"
         )
-        return {
+        entry = {
             "absolute_path": str(
                 formal.FORMAL_WORKTREE_ROOT
                 / Path(*relative_path.split("/"))
@@ -184,6 +189,8 @@ class _TrustedBootstrapContext:
             "relative_path": relative_path,
             "source_sha256": hashlib.sha256(module_name.encode()).hexdigest(),
         }
+        entry.update(self._ledger_overrides.get(module_name, {}))
+        return entry
 
     def assert_verified_module(
         self,
@@ -1003,7 +1010,10 @@ def test_formal_runtime_holds_source_claim_receipt_key_and_executables(
 
 
 def test_formal_runner_load_requires_external_verified_loader_ledger() -> None:
-    source = inspect.getsource(formal._load_runner)
+    source = (
+        inspect.getsource(formal._load_runner)
+        + inspect.getsource(formal._validated_verified_ledger_entry)
+    )
 
     assert "assert_verified_module" in source
     assert "verified_ledger_entry" in source
@@ -1017,8 +1027,11 @@ def test_formal_dispatch_requires_exact_trusted_context_api() -> None:
         "context",
         "frozen_action_config",
     )
-    source = inspect.getsource(formal.trusted_dispatch)
-    assert "validate_action_config" in source
+    source = (
+        inspect.getsource(formal.trusted_dispatch)
+        + inspect.getsource(formal._emit_trusted_json)
+    )
+    assert "_validated_trusted_action_config" in source
     assert "_postverify_verified_module_ledger" in source
     assert "emit_json" in source
     assert "print(" not in source
@@ -1220,6 +1233,16 @@ def test_loaded_application_modules_require_external_ledger_proof(
     config = _frozen_action_config()
     context = _TrustedBootstrapContext(
         config,
+        ledger_overrides={
+            "app": {
+                "byte_count": len(package_raw),
+                "source_sha256": hashlib.sha256(package_raw).hexdigest(),
+            },
+            "app.reviewed": {
+                "byte_count": len(raw),
+                "source_sha256": hashlib.sha256(raw).hexdigest(),
+            },
+        },
         rejected_modules={"app.reviewed"},
     )
     monkeypatch.setitem(
@@ -1261,6 +1284,12 @@ def test_custom_meta_path_and_forged_file_cannot_replace_ledger_proof(
     config = _frozen_action_config()
     context = _TrustedBootstrapContext(
         config,
+        ledger_overrides={
+            "app.reviewed": {
+                "byte_count": len(raw),
+                "source_sha256": digest,
+            },
+        },
         rejected_modules={"app.reviewed"},
     )
 
