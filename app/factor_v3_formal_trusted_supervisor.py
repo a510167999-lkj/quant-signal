@@ -277,6 +277,9 @@ _TRUSTED_EXECUTED_SUPERVISOR_PATH = globals().get("_TRUSTED_EXECUTED_SUPERVISOR_
 _TRUSTED_EXECUTED_SUPERVISOR_SHA256 = globals().get("_TRUSTED_EXECUTED_SUPERVISOR_SHA256")
 _TRUSTED_SUPERVISOR_LOADER_PATH = globals().get("_TRUSTED_SUPERVISOR_LOADER_PATH")
 _TRUSTED_SUPERVISOR_LOADER_SHA256 = globals().get("_TRUSTED_SUPERVISOR_LOADER_SHA256")
+_TRUSTED_NATIVE_BROKER_CREDENTIAL_PROVIDER = globals().get(
+    "_TRUSTED_NATIVE_BROKER_CREDENTIAL_PROVIDER"
+)
 
 
 @dataclass(frozen=True)
@@ -2852,7 +2855,75 @@ def supervise_factor_v3_formal_execution(
     )
 
 
+def _supervise_with_native_broker(
+    *,
+    authorization_path: Path | str,
+    pins: _SupervisorPins,
+    now_utc: datetime,
+    environment_snapshot: Mapping[str, str],
+    native_credential_provider: Any,
+    terminal_writer: Any = _OS_WRITE,
+    trusted_executed_supervisor_path: str | None = None,
+    trusted_executed_supervisor_sha256: str | None = None,
+    trusted_supervisor_loader_path: str | None = None,
+    trusted_supervisor_loader_sha256: str | None = None,
+) -> dict[str, Any]:
+    worker_terminal = bytearray()
+
+    def capture(_descriptor: int, raw: bytes | memoryview) -> int:
+        value = bytes(raw)
+        worker_terminal.extend(value)
+        return len(value)
+
+    try:
+        result = _supervise_with_pins(
+            authorization_path=authorization_path,
+            pins=pins,
+            now_utc=now_utc,
+            environment_snapshot=environment_snapshot,
+            output_writer=capture,
+            trusted_executed_supervisor_path=trusted_executed_supervisor_path,
+            trusted_executed_supervisor_sha256=trusted_executed_supervisor_sha256,
+            trusted_supervisor_loader_path=trusted_supervisor_loader_path,
+            trusted_supervisor_loader_sha256=trusted_supervisor_loader_sha256,
+            native_credential_provider=native_credential_provider,
+        )
+        if (
+            not worker_terminal
+            or hashlib.sha256(worker_terminal).hexdigest()
+            != result["worker_terminal_sha256"]
+        ):
+            raise FormalSupervisorError("native supervisor terminal binding rejected")
+        terminal = (
+            "COMPLETED factor-v3-formal-native-broker-supervisor/v1\n"
+            f"launch_authorization_sha256={result['launch_authorization_sha256']}\n"
+            f"claim_sha256={result['claim_sha256']}\n"
+            f"supervisor_completed_sha256={result['completed_sha256']}\n"
+            f"worker_terminal_sha256={result['worker_terminal_sha256']}\n"
+        ).encode("ascii")
+        _write_all(1, terminal, writer=terminal_writer)
+        return result
+    finally:
+        worker_terminal[:] = b"\x00" * len(worker_terminal)
+
+
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         raise FormalSupervisorError("exactly one launch authorization path is required")
-    supervise_factor_v3_formal_execution(sys.argv[1])
+    if _TRUSTED_NATIVE_BROKER_CREDENTIAL_PROVIDER is None:
+        supervise_factor_v3_formal_execution(sys.argv[1])
+    else:
+        pins = _FIXED_PINS
+        if pins is None:
+            raise FormalSupervisorError("fixed production supervisor pins unavailable")
+        _supervise_with_native_broker(
+            authorization_path=sys.argv[1],
+            pins=pins,
+            now_utc=datetime.now(timezone.utc).replace(microsecond=0),
+            environment_snapshot=os.environ,
+            native_credential_provider=_TRUSTED_NATIVE_BROKER_CREDENTIAL_PROVIDER,
+            trusted_executed_supervisor_path=_TRUSTED_EXECUTED_SUPERVISOR_PATH,
+            trusted_executed_supervisor_sha256=_TRUSTED_EXECUTED_SUPERVISOR_SHA256,
+            trusted_supervisor_loader_path=_TRUSTED_SUPERVISOR_LOADER_PATH,
+            trusted_supervisor_loader_sha256=_TRUSTED_SUPERVISOR_LOADER_SHA256,
+        )
