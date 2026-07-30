@@ -33,6 +33,39 @@ from tests import test_research_security_code_transition as transition_fixture
 PARTITION_PATH = Path("data/research_partitions/frozen-v1.json")
 
 
+def _immutable_tree_metadata(root: Path) -> dict[str, dict[str, object]]:
+    snapshot = {}
+    for path in sorted(root.rglob("*")):
+        metadata = path.lstat()
+        snapshot[path.relative_to(root).as_posix()] = {
+            "ctime_ns": metadata.st_ctime_ns,
+            "device": metadata.st_dev,
+            "file_attributes": int(getattr(metadata, "st_file_attributes", 0)),
+            "inode": metadata.st_ino,
+            "links": metadata.st_nlink,
+            "mode": metadata.st_mode,
+            "mtime_ns": metadata.st_mtime_ns,
+            "size": metadata.st_size,
+            "type": "directory" if path.is_dir() else "file",
+        }
+    return snapshot
+
+
+def _run_sidecars(root: Path) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            path.relative_to(root).as_posix()
+            for path in root.rglob("*")
+            if path.is_file()
+            and (
+                path.name.endswith(("-wal", "-shm", ".partial", ".tmp"))
+                or ".partial." in path.name
+                or ".tmp." in path.name
+            )
+        )
+    )
+
+
 def _daily_authority_code(session: str) -> str:
     if session == "2025-02-14":
         return "300114.SZ"
@@ -673,6 +706,9 @@ def test_real_b805_attestation_builds_capability_free_250_plus_483_spec(
 ) -> None:
     output_root = (tmp_path / "frozen-attestation").resolve()
     output_root.mkdir()
+    frozen_run_before = _immutable_tree_metadata(frozen.FROZEN_FEATURE_RUN_ROOT)
+    sidecars_before = _run_sidecars(frozen.FROZEN_FEATURE_RUN_ROOT)
+    assert sidecars_before == ()
     publication = frozen.publish_factor_v3_feature_history_frozen_source_attestation(
         frozen_source_root=frozen.FROZEN_SOURCE_ROOT,
         expected_frozen_source_commit=frozen.FROZEN_SOURCE_COMMIT,
@@ -700,6 +736,8 @@ def test_real_b805_attestation_builds_capability_free_250_plus_483_spec(
     assert b'"publication_capability":' not in raw
     assert b'"token":' not in raw
     assert b'"secret":' not in raw
+    assert _immutable_tree_metadata(frozen.FROZEN_FEATURE_RUN_ROOT) == frozen_run_before
+    assert _run_sidecars(frozen.FROZEN_FEATURE_RUN_ROOT) == sidecars_before
 
 
 def authority_tests_sessions() -> tuple[list[str], list[str]]:
