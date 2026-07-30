@@ -570,6 +570,43 @@ def test_native_broker_rejects_reparse_directory_in_candidate_chain(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
+def test_native_acl_probe_distinguishes_mutable_user_tree_from_system_protected_tree(
+    tmp_path: Path,
+) -> None:
+    native = tmp_path / "factor_v3_formal_native_broker-acl-probe.exe"
+    _compile(
+        source=BROKER_SOURCE,
+        output=native,
+        extra=[
+            "-DF3_BROKER_TESTING=1",
+            f"-I{BROKER_INCLUDE}",
+        ],
+    )
+
+    mutable = subprocess.run(
+        [str(native), "--test-current-token-readonly-root", str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert mutable.returncode == 25
+    assert "mutable" in mutable.stderr.lower()
+
+    protected_root = Path(os.environ["SystemRoot"]) / "System32"
+    protected = subprocess.run(
+        [str(native), "--test-current-token-readonly-root", str(protected_root)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert protected.returncode == 0, protected.stderr
+    assert protected.stdout == ""
+    assert protected.stderr == ""
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
 def test_default_binary_is_compileable_but_production_launch_fails_closed(
     tmp_path: Path,
 ) -> None:
