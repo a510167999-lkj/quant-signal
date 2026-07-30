@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import sys
+
+
+if sys.flags.isolated != 1:
+    raise RuntimeError("legacy artifact probe requires Python -I")
+
+
 import argparse
 import json
 import os
 from pathlib import Path
-import sys
 
 
 try:
@@ -39,7 +45,10 @@ _LEGACY_MANIFEST_RELATIVE_PATH = (
 
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Offline-verify the sealed legacy Jiaoch trade-calendar artifact."
+        description=(
+            "Offline-verify the sealed legacy Jiaoch trade-calendar artifact. "
+            "Invoke only with python -I -B."
+        )
     )
     parser.add_argument("--artifact-root", required=True, type=Path)
     parser.add_argument(
