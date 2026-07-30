@@ -7,9 +7,25 @@ from pathlib import Path
 import sys
 
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+try:
+    _REPO_ROOT = Path(__file__).resolve(strict=True).parents[1]
+except (OSError, RuntimeError, ValueError) as exc:
+    raise RuntimeError("legacy artifact probe repository root resolution failed") from exc
+
+
+def _resolved_import_path(entry: object) -> Path:
+    if type(entry) is not str:
+        raise RuntimeError("legacy artifact probe import path entry rejected")
+    try:
+        return Path(entry).resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError("legacy artifact probe import path resolution failed") from exc
+
+
+_remaining_sys_path = [
+    entry for entry in sys.path if _resolved_import_path(entry) != _REPO_ROOT
+]
+sys.path[:] = [str(_REPO_ROOT), *_remaining_sys_path]
 
 
 _LEGACY_MANIFEST_SHA256 = (
