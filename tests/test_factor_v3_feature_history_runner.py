@@ -268,7 +268,6 @@ def test_run_uses_only_five_frozen_interfaces_and_two_sequential_collectors(
         collection_publication_output_root: object,
         collection_plan: object,
         development_session_refs: object,
-        pit_store_root: object,
         temporal_partition_contract: object,
         trade_cal_output_root: object,
         trade_cal_publication: object,
@@ -279,7 +278,6 @@ def test_run_uses_only_five_frozen_interfaces_and_two_sequential_collectors(
                 "collection_publication_output_root": collection_publication_output_root,
                 "collection_plan": collection_plan,
                 "development_session_refs": development_session_refs,
-                "pit_store_root": pit_store_root,
                 "temporal_partition_contract": temporal_partition_contract,
                 "trade_cal_output_root": trade_cal_output_root,
                 "trade_cal_publication": trade_cal_publication,
@@ -339,7 +337,7 @@ def test_run_uses_only_five_frozen_interfaces_and_two_sequential_collectors(
     assert len(verifier_calls) == 1
     assert "collection_publication_output_root" in verifier_calls[0]
     assert "collection_publication" in verifier_calls[0]
-    assert "pit_store_root" in verifier_calls[0]
+    assert "pit_store_root" not in verifier_calls[0]
     assert "expected_pit_store_database_sha256" not in verifier_calls[0]
     assert "session_authority_refs" not in verifier_calls[0]
     for path in (tmp_path / "run" / "run-spec.json", tmp_path / "run" / "state.json"):
