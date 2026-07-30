@@ -1227,7 +1227,7 @@ def _validate_launch_payload(
         or payload["python_executable_sha256"] != pins.python_executable_sha256
         or payload["supervisor_expected_commit"] != pins.supervisor_expected_commit
         or payload["supervisor_source_sha256"] != pins.supervisor_source_sha256
-        or _COMMIT_RE.fullmatch(str(payload.get("reviewed_commit"))) is None
+        or payload["reviewed_commit"] != pins.supervisor_expected_commit
     ):
         raise FormalSupervisorError("fixed supervisor identity rejected")
     paths = {
