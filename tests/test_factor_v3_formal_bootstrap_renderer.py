@@ -139,12 +139,12 @@ def _fixture_config(
     repo = (tmp_path / "reviewed-repo").resolve()
     (repo / "app").mkdir(parents=True)
     (repo / "scripts").mkdir()
-    unloaded_relative_paths = (
-        "app/reviewed_unloaded.py",
+    reviewed_app_relative_paths = (
+        "app/factor_v3_daily_basic_runner.py",
         *(f"app/reviewed_unloaded_{index:02}.py" for index in range(33)),
     )
-    unloaded_module_names = tuple(
-        relative_path[:-3].replace("/", ".") for relative_path in unloaded_relative_paths
+    reviewed_app_module_names = tuple(
+        relative_path[:-3].replace("/", ".") for relative_path in reviewed_app_relative_paths
     )
     marker_statement = (
         ""
@@ -160,7 +160,7 @@ def _fixture_config(
         "    context.assert_verified_module(\n"
         "        __name__, entry['relative_path'], entry['source_sha256']\n"
         "    )\n"
-        f"    unloaded_modules = {unloaded_module_names!r}\n"
+        f"    unloaded_modules = {reviewed_app_module_names!r}\n"
         "    unloaded_entries = [\n"
         "        context.verified_ledger_entry(name)\n"
         "        for name in unloaded_modules\n"
@@ -169,7 +169,8 @@ def _fixture_config(
         "    unloaded_ledger = (\n"
         "        len(unloaded_entries) == 34\n"
         "        and all(item['byte_count'] > 0 for item in unloaded_entries)\n"
-        "        and unloaded_entry['relative_path'] == 'app/reviewed_unloaded.py'\n"
+        "        and unloaded_entry['relative_path']\n"
+        "        == 'app/factor_v3_daily_basic_runner.py'\n"
         "        and unloaded_entry['loader_identity']\n"
         "        == 'factor-v3-verified-source-loader/v1'\n"
         "    )\n"
@@ -221,6 +222,7 @@ def _fixture_config(
         "        replacement_blocked = False\n"
         "    context.emit_json({\n"
         "        'action': frozen_action_config['action'],\n"
+        "        'formal_input_root': frozen_action_config['formal_input_root'],\n"
         "        'loader_identity': entry['loader_identity'],\n"
         "        'fake_file_rejected': fake_file_rejected,\n"
         "        'nonverified_loader_rejected': nonverified_loader_rejected,\n"
@@ -264,7 +266,7 @@ def _fixture_config(
         '"""Signed fixture package."""\n',
         encoding="utf-8",
     )
-    for relative_path in unloaded_relative_paths:
+    for relative_path in reviewed_app_relative_paths:
         (repo / Path(*relative_path.split("/"))).write_text(
             "raise RuntimeError('reviewed unloaded fixture must not execute')\n",
             encoding="utf-8",
@@ -281,7 +283,7 @@ def _fixture_config(
             "scripts/build_factor_v3_daily_basic_formal_run_spec.py",
             "scripts/run_factor_v3_daily_basic_formal.py",
             "app/__init__.py",
-            *unloaded_relative_paths,
+            *reviewed_app_relative_paths,
         )
     ]
     source_root_sha256 = _sha256(_canonical_bytes(source_manifest))
@@ -294,7 +296,7 @@ def _fixture_config(
         "decision": "APPROVED_NO_P0_P1_P2",
         "feature_attestation_sha256": _sha256(b"fixture-feature-attestation"),
         "formal_input_root_sha256": formal_input_root_sha256,
-        "formal_runner_sha256": _sha256(builder),
+        "formal_runner_sha256": _file_sha256(repo / "app" / "factor_v3_daily_basic_runner.py"),
         "issued_at_utc": "2026-07-30T00:00:00+00:00",
         "project_id": "quant-signal-lkj",
         "review_nonce_sha256": _sha256(b"fixture-review-nonce"),
@@ -443,6 +445,7 @@ def test_rendered_bootstrap_executes_only_verified_held_source_bytes(
     assert json.loads(completed.stdout) == {
         "action": "verify",
         "fake_file_rejected": True,
+        "formal_input_root": str(config["formal_input_root"]),
         "loader_identity": "factor-v3-verified-source-loader/v1",
         "nonverified_loader_rejected": True,
         "rejected_unreviewed": True,
