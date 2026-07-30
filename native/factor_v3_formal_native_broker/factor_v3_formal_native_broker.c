@@ -543,6 +543,78 @@ static int value_equals(const char *value, size_t length, const char *expected) 
     return length == expected_length && memcmp(value, expected, length) == 0;
 }
 
+static wchar_t ascii_upper(wchar_t value) {
+    if (value >= L'a' && value <= L'z') {
+        return value - (L'a' - L'A');
+    }
+    return value;
+}
+
+static int reserved_windows_component(
+    const wchar_t *component,
+    size_t length
+) {
+    size_t stem_length = 0;
+    wchar_t first;
+    wchar_t second;
+    wchar_t third;
+    while (stem_length < length && component[stem_length] != L'.') {
+        ++stem_length;
+    }
+    if (stem_length < 3 || stem_length > 4) {
+        return 0;
+    }
+    first = ascii_upper(component[0]);
+    second = ascii_upper(component[1]);
+    third = ascii_upper(component[2]);
+    if (stem_length == 3) {
+        return (first == L'A' && second == L'U' && third == L'X')
+            || (first == L'C' && second == L'O' && third == L'N')
+            || (first == L'N' && second == L'U' && third == L'L')
+            || (first == L'P' && second == L'R' && third == L'N');
+    }
+    return ((first == L'C' && second == L'O' && third == L'M')
+            || (first == L'L' && second == L'P' && third == L'T'))
+        && component[3] >= L'1'
+        && component[3] <= L'9';
+}
+
+static int strict_windows_candidate_path(const wchar_t *path) {
+    size_t length;
+    size_t component_start = 3;
+    size_t index;
+    if (path == NULL || !is_drive_absolute(path) || path[2] != L'\\') {
+        return 0;
+    }
+    length = wcslen(path);
+    if (length < 4) {
+        return 0;
+    }
+    for (index = 3; index <= length; ++index) {
+        wchar_t value = path[index];
+        if (value == L'/'
+            || value == L':'
+            || value == L'~'
+            || (value != L'\0' && (value < 32 || value == 127))) {
+            return 0;
+        }
+        if (value == L'\\' || value == L'\0') {
+            size_t component_length = index - component_start;
+            if (component_length == 0
+                || path[index - 1] == L'.'
+                || path[index - 1] == L' '
+                || reserved_windows_component(
+                    path + component_start,
+                    component_length
+                )) {
+                return 0;
+            }
+            component_start = index + 1;
+        }
+    }
+    return 1;
+}
+
 static int candidate_absolute_path(const char *value, size_t length) {
     wchar_t normalized[32768];
     wchar_t *wide = NULL;
@@ -580,6 +652,7 @@ static int candidate_absolute_path(const char *value, size_t length) {
         wide_length
     );
     if (converted == wide_length
+        && strict_windows_candidate_path(wide)
         && canonical_path(
             wide,
             normalized,

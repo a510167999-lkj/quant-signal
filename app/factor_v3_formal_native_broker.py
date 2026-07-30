@@ -35,19 +35,41 @@ _CANDIDATE_FIELDS = (
     "source_manifest_schema",
 )
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_WINDOWS_RESERVED_NAMES = {
+    "AUX",
+    "CON",
+    "NUL",
+    "PRN",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
 
 
 def _path_text(value: Path | str, *, label: str) -> str:
     if not isinstance(value, (Path, str)):
         raise FactorV3FormalNativeBrokerError(f"{label} candidate path rejected")
+    original = str(value)
     path = Path(value)
+    text = str(path)
     if (
-        not path.is_absolute()
-        or any(part in {"", ".", ".."} for part in path.parts[1:])
+        original != text
+        or len(text) < 4
+        or not text[0].isalpha()
+        or text[1:3] != ":\\"
+        or "/" in text
+        or ":" in text[2:]
     ):
         raise FactorV3FormalNativeBrokerError(f"{label} candidate path rejected")
-    text = str(path)
-    if any(marker in text for marker in ("\x00", "\r", "\n")):
+    components = text[3:].split("\\")
+    if not components or any(
+        not component
+        or component in {".", ".."}
+        or component[-1] in {".", " "}
+        or "~" in component
+        or any(ord(character) < 32 or ord(character) == 127 for character in component)
+        or component.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES
+        for component in components
+    ):
         raise FactorV3FormalNativeBrokerError(f"{label} candidate path rejected")
     return text
 
