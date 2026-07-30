@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 from typing import Any, Mapping, Sequence
 
 
@@ -199,6 +200,7 @@ def _normalized_entry(value: Any, *, roots: set[str]) -> dict[str, Any]:
         or byte_count < 0
         or type(is_package) is not bool
         or kind not in _ENTRY_KINDS
+        or (kind in {"extension", "dll"} and byte_count == 0)
         or type(relative_path) is not str
         or not relative_path
         or "\\" in relative_path
@@ -355,10 +357,15 @@ def validate_stdlib_policy(
             if Path(value_path).exists():
                 raise FormalControlContractError("stdlib absent path exists")
         pycache = Path(normalized["pycache_prefix"])
+        try:
+            pycache_metadata = pycache.lstat()
+        except OSError:
+            raise FormalControlContractError("stdlib pycache blocker rejected") from None
         if (
-            not pycache.is_dir()
+            not stat.S_ISREG(pycache_metadata.st_mode)
             or pycache.is_symlink()
-            or next(pycache.iterdir(), None) is not None
+            or pycache_metadata.st_size <= 0
+            or int(getattr(pycache_metadata, "st_nlink", 1)) != 1
         ):
-            raise FormalControlContractError("stdlib pycache prefix rejected")
+            raise FormalControlContractError("stdlib pycache blocker rejected")
     return normalized

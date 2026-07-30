@@ -20,7 +20,6 @@ import re
 import stat
 import sys
 from typing import Any, Mapping
-import zlib
 
 from app.factor_v3_formal_control_contract import (
     EXECUTION_REPLAY_SCOPE,
@@ -41,7 +40,7 @@ class FormalBootstrapRenderError(RuntimeError):
 
 
 CONFIG_SCHEMA = "factor-v3-formal-bootstrap-render-config/v1"
-RUNTIME_TEMPLATE_SHA256 = "1ab5c395b0223d100c4f39c16eae1483d67e50d466d0b693a659c7524eac0d9a"
+RUNTIME_TEMPLATE_SHA256 = "078881dc426951b9ddd212bca74ef13d1371e73696c03413b6ab82f69aaa151a"
 AUTHORIZATION_SCHEMA = "factor-v3-formal-bootstrap-execution-authorization/v2"
 PUBLICATION_RECEIPT_SCHEMA = "factor-v3-formal-bootstrap-publication-receipt/v1"
 COMPLETION_SCHEMA = PUBLICATION_COMPLETION_SCHEMA
@@ -61,6 +60,8 @@ _CONFIG_MARKER = b"_EMBEDDED_CONFIG_JSON: bytes | None = None"
 _RENDERED_CONFIG_PREFIX = b"_EMBEDDED_CONFIG_JSON: bytes = "
 _CONTROL_CONTRACT_MARKER = b"_EMBEDDED_CONTROL_CONTRACT_JSON: bytes | None = None"
 _RENDERED_CONTROL_CONTRACT_PREFIX = b"_EMBEDDED_CONTROL_CONTRACT_JSON: bytes = "
+_EARLY_STDLIB_ENTRIES_MARKER = b"_EARLY_STDLIB_ENTRIES: tuple[dict[str, object], ...] | None = None"
+_RENDERED_EARLY_STDLIB_ENTRIES_PREFIX = b"_EARLY_STDLIB_ENTRIES: tuple[dict[str, object], ...] = "
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _MAX_CONFIG_BYTES = 4 * 1024 * 1024
@@ -69,8 +70,6 @@ _MAX_EXECUTABLE_BYTES = 64 * 1024 * 1024
 _MAX_RUNTIME_BYTES = 8 * 1024 * 1024
 _MAX_EXECUTION_AUTHORIZATION_LIFETIME_SECONDS = 24 * 60 * 60
 _REPARSE_ATTRIBUTE = 0x00000400
-_WRAPPER_PREFIX = b"import base64,zlib;exec(compile(zlib.decompress(base64.b64decode(b'"
-_WRAPPER_SUFFIX = b"')),'<factor-v3-formal-bootstrap>','exec'))"
 _CONFIG_FIELDS = {
     "action",
     "base_python_executable_path",
@@ -603,20 +602,23 @@ def _trusted_stdlib_policy_for_base_python(
     pycache_prefix: Path,
 ) -> dict[str, Any]:
     roots, entries, absent_zip = _trusted_stdlib_inventory_for_base_python(base_python_executable)
-    cache_root = _safe_existing_directory(
-        _absolute_path(str(pycache_prefix), label="signed pycache prefix"),
-        label="signed pycache prefix",
+    blocker_path = _absolute_path(
+        str(pycache_prefix),
+        label="signed pycache blocker",
     )
-    if next(cache_root.iterdir(), None) is not None:
-        raise FormalBootstrapRenderError("signed pycache prefix is not empty")
+    _read_safe_file(
+        blocker_path,
+        label="signed pycache blocker",
+        max_bytes=_MAX_CONFIG_BYTES,
+    )
     try:
         policy = canonical_stdlib_policy(
             roots=roots,
             entries=entries,
             absent_paths=[absent_zip],
-            pycache_prefix=str(cache_root),
+            pycache_prefix=str(blocker_path),
         )
-        return validate_stdlib_policy(policy)
+        return validate_stdlib_policy(policy, require_filesystem=True)
     except ValueError as exc:
         raise FormalBootstrapRenderError("stdlib policy rejected") from exc
 
@@ -1308,6 +1310,7 @@ def _runtime_template_bytes() -> bytes:
         hashlib.sha256(raw).hexdigest() != RUNTIME_TEMPLATE_SHA256
         or raw.count(_CONFIG_MARKER) != 1
         or raw.count(_CONTROL_CONTRACT_MARKER) != 1
+        or raw.count(_EARLY_STDLIB_ENTRIES_MARKER) != 1
     ):
         raise FormalBootstrapRenderError("bootstrap runtime template rejected")
     return raw
@@ -1335,8 +1338,24 @@ def _render_embedded_config(config: Mapping[str, Any]) -> bytes:
         _CONTROL_CONTRACT_MARKER,
         _RENDERED_CONTROL_CONTRACT_PREFIX + repr(control_raw).encode("ascii"),
     )
+    stdlib_policy = config.get("stdlib_policy")
+    if type(stdlib_policy) is not dict or type(stdlib_policy.get("entries")) is not list:
+        raise FormalBootstrapRenderError("stdlib policy rejected")
+    early_entries = tuple(
+        dict(entry)
+        for entry in stdlib_policy["entries"]
+        if type(entry) is dict
+        and entry.get("module") is not None
+        and entry.get("kind") in {"source", "extension"}
+    )
+    if not early_entries:
+        raise FormalBootstrapRenderError("stdlib policy rejected")
+    runtime = runtime.replace(
+        _EARLY_STDLIB_ENTRIES_MARKER,
+        _RENDERED_EARLY_STDLIB_ENTRIES_PREFIX + ascii(early_entries).encode("ascii"),
+    )
     runtime = runtime.rstrip(b"\r\n")
-    rendered = _WRAPPER_PREFIX + base64.b64encode(zlib.compress(runtime, level=9)) + _WRAPPER_SUFFIX
+    rendered = runtime
     if not rendered or rendered.endswith(b"\n") or len(rendered) > _MAX_RUNTIME_BYTES:
         raise FormalBootstrapRenderError("rendered bootstrap rejected")
     try:
@@ -2288,12 +2307,14 @@ def _validate_factor_v3_formal_bootstrap_completion_marker_with_test_trust(
             raise FormalBootstrapRenderError("completion marker root rejected")
         bootstrap_path = root / Path(*payload["bootstrap_relative_path"].split("/"))
         receipt_path = root / Path(*payload["receipt_relative_path"].split("/"))
+        stdlib_policy_path = root / Path(*payload["stdlib_policy_relative_path"].split("/"))
         with _held_win32_directory_chain(
             root=root,
             directories=(
                 marker_path.parent,
                 bootstrap_path.parent,
                 receipt_path.parent,
+                stdlib_policy_path.parent,
             ),
         ):
             bootstrap, bootstrap_raw = _opened_completion_file(
@@ -2308,11 +2329,22 @@ def _validate_factor_v3_formal_bootstrap_completion_marker_with_test_trust(
                 max_bytes=_MAX_CONFIG_BYTES,
             )
             held_files.append((receipt, receipt_raw))
+            try:
+                stdlib_policy, stdlib_policy_raw = _opened_completion_file(
+                    stdlib_policy_path,
+                    label="completion stdlib policy",
+                    max_bytes=_MAX_CONFIG_BYTES,
+                )
+            except FormalBootstrapRenderError as exc:
+                raise FormalBootstrapRenderError("completion stdlib policy rejected") from exc
+            held_files.append((stdlib_policy, stdlib_policy_raw))
             if (
                 len(bootstrap_raw) != payload["bootstrap_bytes"]
                 or hashlib.sha256(bootstrap_raw).hexdigest() != payload["bootstrap_sha256"]
                 or len(receipt_raw) != payload["receipt_bytes"]
                 or hashlib.sha256(receipt_raw).hexdigest() != payload["receipt_sha256"]
+                or len(stdlib_policy_raw) != payload["stdlib_policy_bytes"]
+                or hashlib.sha256(stdlib_policy_raw).hexdigest() != payload["stdlib_policy_sha256"]
             ):
                 raise FormalBootstrapRenderError("completion content rejected")
             validate_rendered_factor_v3_formal_bootstrap(bootstrap_raw)
@@ -2328,6 +2360,16 @@ def _validate_factor_v3_formal_bootstrap_completion_marker_with_test_trust(
             }
             if receipt_payload != expected_receipt:
                 raise FormalBootstrapRenderError("completion receipt rejected")
+            try:
+                published_policy = _strict_canonical_json(stdlib_policy_raw)
+                normalized_policy = validate_stdlib_policy(
+                    published_policy,
+                    expected_root_sha256=payload["stdlib_inventory_root_sha256"],
+                )
+            except (FormalBootstrapRenderError, ValueError) as exc:
+                raise FormalBootstrapRenderError("completion stdlib policy rejected") from exc
+            if normalized_policy != published_policy:
+                raise FormalBootstrapRenderError("completion stdlib policy rejected")
             for held, expected_raw in held_files:
                 held.terminal_verify(expected_raw)
             return {
@@ -2336,6 +2378,7 @@ def _validate_factor_v3_formal_bootstrap_completion_marker_with_test_trust(
                 "completion_marker_path": str(marker_path),
                 "completion_marker_sha256": marker_digest,
                 "receipt_path": str(receipt_path),
+                "stdlib_policy_path": str(stdlib_policy_path),
             }
     finally:
         for held, _expected_raw in reversed(held_files):
@@ -2358,33 +2401,16 @@ def validate_rendered_factor_v3_formal_bootstrap(raw: bytes) -> bytes:
         or not raw
         or raw.endswith(b"\n")
         or len(raw) > _MAX_RUNTIME_BYTES
-        or not raw.startswith(_WRAPPER_PREFIX)
-        or not raw.endswith(_WRAPPER_SUFFIX)
+        or not raw.startswith(b"# ruff: noqa: E402\nfrom __future__ import annotations")
     ):
         raise FormalBootstrapRenderError("rendered bootstrap rejected")
     try:
-        encoded = raw[len(_WRAPPER_PREFIX) : -len(_WRAPPER_SUFFIX)]
-        compressed = base64.b64decode(encoded, validate=True)
-        decompressor = zlib.decompressobj()
-        runtime_raw = decompressor.decompress(
-            compressed,
-            _MAX_RUNTIME_BYTES + 1,
-        )
-        runtime_raw += decompressor.flush()
-        if (
-            not decompressor.eof
-            or decompressor.unused_data
-            or decompressor.unconsumed_tail
-            or len(runtime_raw) > _MAX_RUNTIME_BYTES
-        ):
-            raise FormalBootstrapRenderError("rendered bootstrap rejected")
-        source = runtime_raw.decode("utf-8")
+        source = raw.decode("utf-8")
         tree = ast.parse(source, filename="<factor-v3-formal-bootstrap>")
     except (
         UnicodeDecodeError,
         SyntaxError,
         ValueError,
-        zlib.error,
     ) as exc:
         raise FormalBootstrapRenderError("rendered bootstrap rejected") from exc
     values = []

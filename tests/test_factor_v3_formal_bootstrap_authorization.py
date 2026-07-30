@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timedelta
 import errno
 import json
 import os
@@ -132,7 +133,7 @@ def _authorization_payload(
     execution_key_sha256 = _sha256(execution_public_der)
     authorization_nonce_sha256 = _sha256(f"authorization:{config['action']}".encode())
     pycache_prefix = (tmp_path / "signed-empty-pycache").resolve()
-    pycache_prefix.mkdir(exist_ok=True)
+    pycache_prefix.write_bytes(b"factor-v3-pycache-blocker/v1\n")
     stdlib_policy = renderer._trusted_stdlib_policy_for_base_python(
         Path(str(config["base_python_executable_path"])),
         pycache_prefix,
@@ -283,6 +284,8 @@ def _insert_before_trusted_dispatch(source: bytes, override: str) -> bytes:
 
 def _be3_crossline_authorized_fixture(
     tmp_path: Path,
+    *,
+    authorization_now: datetime | None = None,
 ) -> tuple[dict[str, object], dict[str, object], Path, bytes]:
     config = _fixture_config(tmp_path)
     repo = Path(str(config["repo_root"]))
@@ -420,6 +423,12 @@ def _be3_crossline_authorized_fixture(
         }
     )
     payload = _authorization_payload(tmp_path, config)
+    if authorization_now is not None:
+        payload["issued_at_utc"] = authorization_now.isoformat(timespec="seconds")
+        payload["not_before_utc"] = authorization_now.isoformat(timespec="seconds")
+        payload["expires_at_utc"] = (authorization_now + timedelta(minutes=30)).isoformat(
+            timespec="seconds"
+        )
     authorization_path, _authorization_sha256 = _write_authorization(
         tmp_path,
         payload,

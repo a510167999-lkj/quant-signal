@@ -432,8 +432,14 @@ def test_renderer_is_deterministic_self_contained_and_has_no_placeholder(
     assert first == second
     assert first == renderer.validate_rendered_factor_v3_formal_bootstrap(first)
     assert not first.endswith(b"\n")
-    assert b"{{" not in first
-    assert b"}}" not in first
+    assert renderer._CONFIG_MARKER not in first
+    assert renderer._CONTROL_CONTRACT_MARKER not in first
+    assert renderer._EARLY_STDLIB_ENTRIES_MARKER not in first
+    early_prefix = first.split(b"# EARLY_EXACT_IMPORT_BOUNDARY_COMPLETE", 1)[0]
+    assert b"import _frozen_importlib as _early_importlib" in early_prefix
+    assert b"\nimport base64\n" not in early_prefix
+    assert b"\nimport os\n" not in early_prefix
+    assert b"\nfrom pathlib import Path\n" not in early_prefix
     assert len(first) <= 8 * 1024 * 1024
     compile(first, "<factor-v3-formal-bootstrap>", "exec")
 
@@ -609,7 +615,7 @@ def test_renderer_rejects_traversing_trusted_entrypoint(tmp_path: Path) -> None:
         renderer._validated_config(config)
 
 
-def test_rendered_validator_rejects_corrupt_compressed_payload(
+def test_rendered_validator_rejects_corrupt_embedded_payload(
     tmp_path: Path,
 ) -> None:
     from tests.test_factor_v3_formal_bootstrap_authorization import (
@@ -619,8 +625,19 @@ def test_rendered_validator_rejects_corrupt_compressed_payload(
 
     _config, _payload, authorization_path, trusted_public_der = _authorized_fixture(tmp_path)
     rendered = _render_authorized(authorization_path, trusted_public_der)
-    payload_offset = len(renderer._WRAPPER_PREFIX)
-    corrupted = rendered[:payload_offset] + b"!" + rendered[payload_offset + 1 :]
+    marker = b"_EMBEDDED_CONFIG_JSON: bytes = b'"
+    assert rendered.count(marker) == 1
+    corrupted = rendered.replace(marker, marker + b"!", 1)
 
     with pytest.raises(renderer.FormalBootstrapRenderError, match="rejected"):
         renderer.validate_rendered_factor_v3_formal_bootstrap(corrupted)
+
+    early_module = b"'module': 'base64'"
+    assert rendered.count(early_module) >= 1
+    drifted_early_inventory = rendered.replace(
+        early_module,
+        b"'module': 'base6X'",
+        1,
+    )
+    with pytest.raises(renderer.FormalBootstrapRenderError, match="drifted"):
+        renderer.validate_rendered_factor_v3_formal_bootstrap(drifted_early_inventory)

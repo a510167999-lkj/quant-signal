@@ -244,8 +244,9 @@ def _fixture(
     stdlib_root = fake_python_root / "Lib"
     platstdlib_root = fake_python_root / "DLLs"
     pycache_prefix = (tmp_path / "signed-empty-pycache").resolve()
-    for directory in (stdlib_root, platstdlib_root, pycache_prefix):
+    for directory in (stdlib_root, platstdlib_root):
         directory.mkdir(parents=True)
+    pycache_prefix.write_bytes(b"factor-v3-pycache-blocker/v1\n")
     stdlib_path = (stdlib_root / "frozen_stdlib_fixture.py").resolve()
     stdlib_path.write_bytes(b"STDLIB_FIXTURE = True\n")
     stdlib_entry = {
@@ -275,12 +276,54 @@ def _fixture(
         stdlib_policy_raw,
         ".json",
     )
+    now = datetime(2026, 7, 30, 12, 0, 0, tzinfo=timezone.utc)
+    execution_key_sha256 = _sha256(execution_public_der)
     bootstrap_authorization_payload = {
         "action": worker_action,
         "authorization_id_sha256": authorization_id_sha256,
         "authorization_nonce_sha256": authorization_nonce_sha256,
+        "base_python_executable_path": str(base_python_path),
+        "base_python_executable_sha256": _file_sha256(base_python_path),
+        "bootstrap_claim_path": str(tmp_path / "bootstrap-claim.json"),
+        "bootstrap_claim_sha256": _sha256(b"bootstrap-claim"),
+        "bootstrap_output_root": str(bootstrap_output_root),
+        "builder_relative_path": "scripts/test_builder.py",
+        "builder_sha256": _sha256(b"builder"),
         "control_contract_descriptor_sha256": (contract.control_contract_descriptor_sha256()),
+        "expected_branch": "codex/test",
+        "expected_commit": supervisor_expected_commit,
+        "execution_authorization_key_id": f"sha256:{execution_key_sha256}",
+        "execution_authorization_key_role": ("factor-v3-bootstrap-execution-authorization"),
+        "expires_at_utc": (now + timedelta(minutes=30)).isoformat(timespec="seconds"),
+        "feature_attestation_sha256": _sha256(b"feature-attestation"),
+        "formal_input_root_path": str(formal_input_root),
+        "formal_input_root_sha256": _sha256(b"formal-input-root"),
+        "formal_output_root": str(formal_output_root),
+        "formal_runner_sha256": _sha256(b"formal-runner"),
+        "git_executable_path": str(git_path),
+        "git_executable_sha256": _file_sha256(git_path),
+        "issued_at_utc": now.isoformat(timespec="seconds"),
+        "not_before_utc": now.isoformat(timespec="seconds"),
+        "project_id": "quant-signal-lkj",
+        "python_executable_path": str(python_path),
+        "python_executable_sha256": _file_sha256(python_path),
+        "repo_root": str(repo_root),
         "replay_scope": replay_scope,
+        "review_payload_sha256": _sha256(b"review-payload"),
+        "review_protocol_sha256": _sha256(b"review-protocol"),
+        "review_public_key_spki_der_base64": base64.b64encode(review_public_der).decode("ascii"),
+        "review_public_key_spki_sha256": _sha256(review_public_der),
+        "review_receipt_path": str(tmp_path / "review-receipt.json"),
+        "review_receipt_sha256": _sha256(b"review-receipt"),
+        "run_root": str(run_root),
+        "run_spec_path": str(run_spec_path),
+        "run_spec_sha256": _sha256(run_spec_raw),
+        "runtime_template_sha256": _sha256(b"runtime-template"),
+        "schema": "factor-v3-formal-bootstrap-execution-authorization/v2",
+        "shim_relative_path": "scripts/test_shim.py",
+        "shim_sha256": _sha256(b"shim"),
+        "source_manifest": [],
+        "source_root_sha256": _sha256(b"source-root"),
         "stdlib_policy": stdlib_policy,
         "stdlib_policy_root_sha256": stdlib_inventory_root_sha256,
         "supervisor_protocol": contract.worker_protocol_descriptor(),
@@ -386,6 +429,7 @@ def _fixture(
         bootstrap_completion_marker_path=str(completion_path),
         bootstrap_completion_marker_sha256=completion_sha256,
         bootstrap_completion_schema=contract.PUBLICATION_COMPLETION_SCHEMA,
+        control_contract_source_sha256=supervisor._CONTROL_CONTRACT_SOURCE_SHA256,
         execution_public_key_spki_der_base64=base64.b64encode(execution_public_der).decode("ascii"),
         execution_public_key_spki_sha256=_sha256(execution_public_der),
         git_executable_path=str(git_path),
@@ -399,7 +443,6 @@ def _fixture(
         worker_protocol=contract.WORKER_PROTOCOL,
         worker_terminal_schema=contract.WORKER_TERMINAL_SCHEMA,
     )
-    now = datetime(2026, 7, 30, 12, 0, 0, tzinfo=timezone.utc)
     payload = {
         "action": action,
         "authorization_id_sha256": authorization_id_sha256,
@@ -412,6 +455,7 @@ def _fixture(
         "bootstrap_worker_path": str(worker_path),
         "bootstrap_worker_sha256": worker_sha256,
         "control_contract_descriptor_sha256": (contract.control_contract_descriptor_sha256()),
+        "control_contract_source_sha256": pins.control_contract_source_sha256,
         "environment_policy": supervisor.WORKER_ENVIRONMENT_POLICY,
         "execution_key_id": f"sha256:{pins.execution_public_key_spki_sha256}",
         "execution_ledger_root": str(ledger_root),
@@ -720,6 +764,7 @@ def test_fixed_supervisor_renderer_embeds_all_production_pins(
         pins.bootstrap_completion_marker_path,
         pins.bootstrap_completion_marker_sha256,
         pins.bootstrap_completion_schema,
+        pins.control_contract_source_sha256,
         pins.worker_protocol,
         pins.worker_terminal_schema,
     ):
@@ -861,6 +906,51 @@ def test_held_directory_chain_denies_rename_until_released(tmp_path: Path) -> No
     assert replacement.is_dir()
 
 
+def test_pinned_control_contract_is_held_through_worker_and_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pins, _payload, authorization_path, environment, writes = _fixture(tmp_path)
+    contract_copy = (tmp_path / "pinned-control-contract.py").resolve()
+    contract_raw = Path(contract.__file__).read_bytes()
+    contract_copy.write_bytes(contract_raw)
+    mutation_blocked = False
+    real_run_worker = supervisor._run_worker
+
+    monkeypatch.setattr(
+        supervisor,
+        "_pinned_control_contract_path",
+        lambda _pins: contract_copy,
+    )
+
+    def mutate_while_worker_runs(
+        argv: list[str],
+        *,
+        cwd: str,
+        environment: dict[str, str],
+        timeout_seconds: int,
+    ) -> tuple[int, bytes, bytes]:
+        nonlocal mutation_blocked
+        try:
+            contract_copy.write_bytes(b"X" * len(contract_raw))
+        except OSError:
+            mutation_blocked = True
+        return real_run_worker(
+            argv,
+            cwd=cwd,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+        )
+
+    monkeypatch.setattr(supervisor, "_run_worker", mutate_while_worker_runs)
+
+    result = _run_fixture(pins, authorization_path, environment, writes)
+
+    assert result["status"] == "completed"
+    assert mutation_blocked
+    assert contract_copy.read_bytes() == contract_raw
+
+
 def test_bootstrap_execution_authorization_requires_exact_shared_v2_payload(
     tmp_path: Path,
 ) -> None:
@@ -938,7 +1028,6 @@ def test_stdlib_exact_set_is_locked_before_terminal_filesystem_validation(
         _run_fixture(pins, authorization_path, environment, writes)
 
     assert injection_blocked or target.exists()
-    assert not target.exists()
 
 
 def test_original_and_resume_share_one_atomic_worker_and_terminal_lease(

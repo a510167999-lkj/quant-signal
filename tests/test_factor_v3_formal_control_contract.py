@@ -133,11 +133,11 @@ def test_supervisor_import_cannot_execute_dirty_shared_contract_before_pins(
         timeout=30,
     )
 
-    assert completed.returncode == 0
+    assert completed.returncode != 0
     assert not leak_path.exists()
 
 
-def test_flat_stdlib_policy_root_is_canonical_and_binds_absence_and_empty_pycache(
+def test_flat_stdlib_policy_root_is_canonical_and_binds_absence_and_pycache_blocker(
     tmp_path: Path,
 ) -> None:
     stdlib = tmp_path / "Lib"
@@ -145,7 +145,7 @@ def test_flat_stdlib_policy_root_is_canonical_and_binds_absence_and_empty_pycach
     pycache = tmp_path / "signed-empty-pycache"
     stdlib.mkdir()
     platstdlib.mkdir()
-    pycache.mkdir()
+    pycache.write_bytes(b"factor-v3-pycache-blocker/v1\n")
     (stdlib / "alpha.py").write_bytes(b"VALUE = 1\n")
     (platstdlib / "beta.py").write_bytes(b"VALUE = 2\n")
     absent_zip = tmp_path / "python313.zip"
@@ -206,6 +206,15 @@ def test_flat_stdlib_policy_root_is_canonical_and_binds_absence_and_empty_pycach
         )
         == policy
     )
+    hardlink = tmp_path / "pycache-blocker-hardlink"
+    os.link(pycache, hardlink)
+    with pytest.raises(contract.FormalControlContractError, match="pycache"):
+        contract.validate_stdlib_policy(
+            policy,
+            expected_root_sha256=root_sha256,
+            require_filesystem=True,
+        )
+    hardlink.unlink()
 
     for mutation in (
         {**policy, "absent_paths": []},
@@ -238,15 +247,16 @@ def test_flat_stdlib_policy_root_is_canonical_and_binds_absence_and_empty_pycach
             require_filesystem=True,
         )
     new_module.unlink()
-    injected_pyc = pycache / "alpha.pyc"
-    injected_pyc.write_bytes(b"untrusted-pyc")
+    pycache.unlink()
+    pycache.mkdir()
     with pytest.raises(contract.FormalControlContractError, match="pycache"):
         contract.validate_stdlib_policy(
             policy,
             expected_root_sha256=root_sha256,
             require_filesystem=True,
         )
-    injected_pyc.unlink()
+    pycache.rmdir()
+    pycache.write_bytes(b"factor-v3-pycache-blocker/v1\n")
     absent_zip.write_bytes(b"untrusted-zip")
     with pytest.raises(contract.FormalControlContractError, match="absent"):
         contract.validate_stdlib_policy(
@@ -299,7 +309,7 @@ def test_signed_pycache_location_cannot_accept_late_unchecked_pyc(
         prefix = blocker
     else:
         prefix = (tmp_path / "signed-empty-pycache").resolve()
-        prefix.mkdir()
+        prefix.write_bytes(b"factor-v3-pycache-blocker/v1\n")
         policy = contract.canonical_stdlib_policy(
             roots=[
                 {"path": str(platstdlib), "role": "platstdlib"},
@@ -358,7 +368,7 @@ def test_stdlib_zero_byte_rules_are_kind_exact(tmp_path: Path) -> None:
     pycache = (tmp_path / "pycache").resolve()
     stdlib.mkdir()
     platstdlib.mkdir()
-    pycache.mkdir()
+    pycache.write_bytes(b"factor-v3-pycache-blocker/v1\n")
     empty_source = stdlib / "empty.py"
     empty_source.write_bytes(b"")
     source_entry = _entry(stdlib, "empty.py", "empty")
@@ -412,6 +422,8 @@ def test_runtime_installs_early_exact_loader_before_filesystem_imports() -> None
     assert "from pathlib import Path" not in prefix
     assert "\nimport os\n" not in prefix
     assert "\nimport importlib.machinery\n" not in prefix
+    for raw in (b"", b"abc", bytes(range(256))):
+        assert runtime._early_sha256(raw) == contract.sha256_bytes(raw)
 
 
 def test_rendered_supervisor_has_a_real_public_cli_entrypoint() -> None:
@@ -487,8 +499,12 @@ def test_actual_completion_supervisor_runtime_and_be3_dispatch_chain(
         _write_completion_authorization,
     )
 
+    now = datetime.now(timezone.utc).replace(microsecond=0)
     config, execution_payload, execution_authorization_path, public_der = (
-        _be3_crossline_authorized_fixture(tmp_path)
+        _be3_crossline_authorized_fixture(
+            tmp_path,
+            authorization_now=now,
+        )
     )
     completion_payload = renderer._plan_factor_v3_formal_bootstrap_publication_with_test_trust(
         authorization_path=execution_authorization_path,
@@ -521,6 +537,7 @@ def test_actual_completion_supervisor_runtime_and_be3_dispatch_chain(
         bootstrap_completion_marker_path=str(completion_path),
         bootstrap_completion_marker_sha256=contract.sha256_bytes(completion_path.read_bytes()),
         bootstrap_completion_schema=contract.PUBLICATION_COMPLETION_SCHEMA,
+        control_contract_source_sha256=supervisor._CONTROL_CONTRACT_SOURCE_SHA256,
         execution_public_key_spki_der_base64=base64.b64encode(public_der).decode("ascii"),
         execution_public_key_spki_sha256=contract.sha256_bytes(public_der),
         git_executable_path=str(git_path),
@@ -534,7 +551,6 @@ def test_actual_completion_supervisor_runtime_and_be3_dispatch_chain(
         worker_protocol=contract.WORKER_PROTOCOL,
         worker_terminal_schema=contract.WORKER_TERMINAL_SCHEMA,
     )
-    now = datetime(2026, 7, 30, 12, 5, 0, tzinfo=timezone.utc)
     ledger_root = (tmp_path / "actual-combined-ledger").resolve()
     ledger_root.mkdir()
     launch_payload = {
@@ -551,6 +567,7 @@ def test_actual_completion_supervisor_runtime_and_be3_dispatch_chain(
         "bootstrap_worker_path": publication["bootstrap_path"],
         "bootstrap_worker_sha256": publication["bootstrap_sha256"],
         "control_contract_descriptor_sha256": (contract.control_contract_descriptor_sha256()),
+        "control_contract_source_sha256": pins.control_contract_source_sha256,
         "environment_policy": contract.worker_environment_policy(),
         "execution_key_id": f"sha256:{pins.execution_public_key_spki_sha256}",
         "execution_ledger_root": str(ledger_root),
@@ -620,19 +637,24 @@ def test_actual_completion_supervisor_runtime_and_be3_dispatch_chain(
     environment = {
         name: os.environ[name] for name in contract.PUBLIC_ENVIRONMENT if name in os.environ
     }
-    writes: list[bytes] = []
-
-    result = supervisor._supervise_with_pins(
-        authorization_path=launch_path,
-        pins=pins,
-        now_utc=now,
-        environment_snapshot=environment,
-        output_writer=lambda _descriptor, raw: writes.append(bytes(raw)) or len(bytes(raw)),
+    rendered_supervisor_path = (tmp_path / "rendered-formal-supervisor.py").resolve()
+    rendered_supervisor_path.write_bytes(supervisor._render_supervisor_with_test_pins(pins))
+    completed = subprocess.run(
+        [
+            pins.python_executable_path,
+            "-B",
+            str(rendered_supervisor_path),
+            str(launch_path),
+        ],
+        check=False,
+        capture_output=True,
+        env=environment,
+        timeout=180,
     )
 
-    assert result["status"] == "completed"
-    assert len(writes) == 1
-    frame = json.loads(writes[0])
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
+    assert completed.stderr == b""
+    frame = json.loads(completed.stdout)
     assert frame["schema"] == contract.WORKER_TERMINAL_SCHEMA
     assert frame["result"] == {
         "run_root": execution_payload["run_root"],

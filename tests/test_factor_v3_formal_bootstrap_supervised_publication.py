@@ -110,7 +110,7 @@ def test_execution_authorization_replay_window_is_fail_closed() -> None:
 
 def test_stdlib_policy_uses_exact_roots_and_content_inventory(tmp_path: Path) -> None:
     pycache_prefix = (tmp_path / "pycache").resolve()
-    pycache_prefix.mkdir()
+    pycache_prefix.write_bytes(b"factor-v3-pycache-blocker/v1\n")
     policy = renderer._trusted_stdlib_policy_for_base_python(
         Path(__import__("sys")._base_executable),
         pycache_prefix,

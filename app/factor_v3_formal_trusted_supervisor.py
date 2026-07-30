@@ -17,31 +17,94 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
 import threading
 import time
 from typing import Any, Iterator
-
-from app.factor_v3_formal_control_contract import (
-    EXECUTION_REPLAY_SCOPE,
-    PUBLICATION_COMPLETION_SCHEMA,
-    STDLIB_POLICY_SCHEMA,
-    STDLIB_ROOT_ENVIRONMENT,
-    WORKER_ACTION_BY_LAUNCH_ACTION,
-    WORKER_PROTOCOL,
-    WORKER_TERMINAL_FIELDS,
-    WORKER_TERMINAL_SCHEMA,
-    control_contract_descriptor_sha256,
-    exact_worker_argv,
-    validate_stdlib_policy,
-    worker_environment_policy,
-)
 
 
 class FormalSupervisorError(RuntimeError):
     pass
 
 
+_EMBEDDED_CONTROL_CONTRACT_SOURCE: bytes | None = None
+_CONTROL_CONTRACT_SOURCE_NAME = "factor_v3_formal_control_contract.py"
+_CONTROL_CONTRACT_SOURCE_SHA256 = "a821ff1b3d338528ca9b63918a5d5f7453513b6f54ee1b8a3c06e811ef9cfad6"
+
+
+def _fixed_control_contract_source() -> bytes:
+    raw = _EMBEDDED_CONTROL_CONTRACT_SOURCE
+    if raw is None:
+        path = Path(__file__).resolve().with_name(_CONTROL_CONTRACT_SOURCE_NAME)
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            raise FormalSupervisorError("fixed control contract unavailable") from None
+    if (
+        type(raw) is not bytes
+        or not raw
+        or hashlib.sha256(raw).hexdigest() != _CONTROL_CONTRACT_SOURCE_SHA256
+    ):
+        raise FormalSupervisorError("fixed control contract identity rejected")
+    return raw
+
+
+def _load_fixed_control_contract() -> dict[str, Any]:
+    raw = _fixed_control_contract_source()
+    namespace: dict[str, Any] = {
+        "__file__": f"<{_CONTROL_CONTRACT_SOURCE_NAME}>",
+        "__name__": "_factor_v3_fixed_control_contract",
+    }
+    try:
+        code = compile(
+            raw,
+            namespace["__file__"],
+            "exec",
+            dont_inherit=True,
+            optimize=0,
+        )
+        exec(code, namespace)
+    except BaseException as exc:
+        raise FormalSupervisorError("fixed control contract rejected") from exc
+    required = {
+        "EXECUTION_REPLAY_SCOPE",
+        "PUBLICATION_COMPLETION_SCHEMA",
+        "STDLIB_POLICY_SCHEMA",
+        "STDLIB_ROOT_ENVIRONMENT",
+        "WORKER_ACTION_BY_LAUNCH_ACTION",
+        "WORKER_PROTOCOL",
+        "WORKER_TERMINAL_FIELDS",
+        "WORKER_TERMINAL_SCHEMA",
+        "control_contract_descriptor_sha256",
+        "exact_worker_argv",
+        "validate_stdlib_policy",
+        "worker_environment_policy",
+        "worker_protocol_descriptor",
+    }
+    if not required.issubset(namespace):
+        raise FormalSupervisorError("fixed control contract rejected")
+    return namespace
+
+
+_CONTROL_CONTRACT = _load_fixed_control_contract()
+EXECUTION_REPLAY_SCOPE = _CONTROL_CONTRACT["EXECUTION_REPLAY_SCOPE"]
+PUBLICATION_COMPLETION_SCHEMA = _CONTROL_CONTRACT["PUBLICATION_COMPLETION_SCHEMA"]
+STDLIB_POLICY_SCHEMA = _CONTROL_CONTRACT["STDLIB_POLICY_SCHEMA"]
+STDLIB_ROOT_ENVIRONMENT = _CONTROL_CONTRACT["STDLIB_ROOT_ENVIRONMENT"]
+WORKER_ACTION_BY_LAUNCH_ACTION = _CONTROL_CONTRACT["WORKER_ACTION_BY_LAUNCH_ACTION"]
+WORKER_PROTOCOL = _CONTROL_CONTRACT["WORKER_PROTOCOL"]
+WORKER_TERMINAL_FIELDS = _CONTROL_CONTRACT["WORKER_TERMINAL_FIELDS"]
+WORKER_TERMINAL_SCHEMA = _CONTROL_CONTRACT["WORKER_TERMINAL_SCHEMA"]
+control_contract_descriptor_sha256 = _CONTROL_CONTRACT["control_contract_descriptor_sha256"]
+exact_worker_argv = _CONTROL_CONTRACT["exact_worker_argv"]
+validate_stdlib_policy = _CONTROL_CONTRACT["validate_stdlib_policy"]
+worker_environment_policy = _CONTROL_CONTRACT["worker_environment_policy"]
+worker_protocol_descriptor = _CONTROL_CONTRACT["worker_protocol_descriptor"]
+
+
 LAUNCH_AUTHORIZATION_SCHEMA = "factor-v3-formal-supervisor-launch-authorization/v1"
+BOOTSTRAP_EXECUTION_AUTHORIZATION_SCHEMA = "factor-v3-formal-bootstrap-execution-authorization/v2"
+BOOTSTRAP_EXECUTION_AUTHORIZATION_KEY_ROLE = "factor-v3-bootstrap-execution-authorization"
 PUBLICATION_RECEIPT_SCHEMA = "factor-v3-formal-bootstrap-publication-receipt/v1"
 STDLIB_INVENTORY_SCHEMA = STDLIB_POLICY_SCHEMA
 CLAIM_SCHEMA = "factor-v3-formal-supervisor-execution-claim/v1"
@@ -73,6 +136,7 @@ _LAUNCH_FIELDS = {
     "bootstrap_worker_path",
     "bootstrap_worker_sha256",
     "control_contract_descriptor_sha256",
+    "control_contract_source_sha256",
     "environment_policy",
     "execution_key_id",
     "execution_ledger_root",
@@ -118,6 +182,56 @@ _LAUNCH_FIELDS = {
     "worker_timeout_seconds",
 }
 _TERMINAL_FIELDS = set(WORKER_TERMINAL_FIELDS)
+_BOOTSTRAP_EXECUTION_AUTHORIZATION_FIELDS = {
+    "action",
+    "authorization_id_sha256",
+    "authorization_nonce_sha256",
+    "base_python_executable_path",
+    "base_python_executable_sha256",
+    "bootstrap_claim_path",
+    "bootstrap_claim_sha256",
+    "bootstrap_output_root",
+    "builder_relative_path",
+    "builder_sha256",
+    "control_contract_descriptor_sha256",
+    "expected_branch",
+    "expected_commit",
+    "execution_authorization_key_id",
+    "execution_authorization_key_role",
+    "expires_at_utc",
+    "feature_attestation_sha256",
+    "formal_input_root_path",
+    "formal_input_root_sha256",
+    "formal_output_root",
+    "formal_runner_sha256",
+    "git_executable_path",
+    "git_executable_sha256",
+    "issued_at_utc",
+    "not_before_utc",
+    "project_id",
+    "python_executable_path",
+    "python_executable_sha256",
+    "repo_root",
+    "replay_scope",
+    "review_payload_sha256",
+    "review_protocol_sha256",
+    "review_public_key_spki_der_base64",
+    "review_public_key_spki_sha256",
+    "review_receipt_path",
+    "review_receipt_sha256",
+    "run_root",
+    "run_spec_path",
+    "run_spec_sha256",
+    "runtime_template_sha256",
+    "schema",
+    "shim_relative_path",
+    "shim_sha256",
+    "source_manifest",
+    "source_root_sha256",
+    "stdlib_policy",
+    "stdlib_policy_root_sha256",
+    "supervisor_protocol",
+}
 
 
 @dataclass(frozen=True)
@@ -127,6 +241,7 @@ class _SupervisorPins:
     bootstrap_completion_marker_path: str
     bootstrap_completion_marker_sha256: str
     bootstrap_completion_schema: str
+    control_contract_source_sha256: str
     execution_public_key_spki_der_base64: str
     execution_public_key_spki_sha256: str
     git_executable_path: str
@@ -144,15 +259,38 @@ class _SupervisorPins:
 _FIXED_PINS: _SupervisorPins | None = None
 
 
+def _pinned_control_contract_path(pins: _SupervisorPins) -> Path:
+    return Path(pins.repo_root) / "app" / _CONTROL_CONTRACT_SOURCE_NAME
+
+
 def _render_supervisor_with_test_pins(pins: _SupervisorPins) -> bytes:
     _validate_pins(pins)
     source_path = Path(__file__).resolve()
     raw = source_path.read_bytes().replace(b"\r\n", b"\n")
-    marker = b"_FIXED_PINS: _SupervisorPins | None" + b" = None"
-    replacement = f"_FIXED_PINS: _SupervisorPins = {pins!r}".encode("utf-8")
-    if raw.count(marker) != 1:
+    pins_marker = b"_FIXED_PINS: _SupervisorPins | None" + b" = None"
+    pins_replacement = f"_FIXED_PINS: _SupervisorPins = {pins!r}".encode("utf-8")
+    contract_marker = b"_EMBEDDED_CONTROL_CONTRACT_SOURCE: bytes | None" + b" = None"
+    contract_source = _HeldFile(
+        _pinned_control_contract_path(pins),
+        expected_sha256=pins.control_contract_source_sha256,
+        label="pinned control contract source",
+        max_bytes=_MAX_WORKER_BYTES,
+    )
+    try:
+        if contract_source.raw != _fixed_control_contract_source():
+            raise FormalSupervisorError("pinned control contract source rejected")
+        contract_replacement = b"_EMBEDDED_CONTROL_CONTRACT_SOURCE: bytes = " + repr(
+            contract_source.raw
+        ).encode("ascii")
+        contract_source.postverify()
+    finally:
+        contract_source.close()
+    if raw.count(pins_marker) != 1 or raw.count(contract_marker) != 1:
         raise FormalSupervisorError("supervisor template marker rejected")
-    rendered = raw.replace(marker, replacement)
+    rendered = raw.replace(pins_marker, pins_replacement).replace(
+        contract_marker,
+        contract_replacement,
+    )
     try:
         compile(rendered, "<rendered-factor-v3-supervisor>", "exec")
     except (SyntaxError, ValueError) as exc:
@@ -812,6 +950,7 @@ def _validate_pins(pins: _SupervisorPins) -> None:
     for field in (
         "base_python_executable_sha256",
         "bootstrap_completion_marker_sha256",
+        "control_contract_source_sha256",
         "execution_public_key_spki_sha256",
         "git_executable_sha256",
         "python_executable_sha256",
@@ -821,7 +960,10 @@ def _validate_pins(pins: _SupervisorPins) -> None:
     if _COMMIT_RE.fullmatch(pins.supervisor_expected_commit) is None:
         raise FormalSupervisorError("supervisor commit pin rejected")
     if (
-        pins.bootstrap_completion_schema != PUBLICATION_COMPLETION_SCHEMA
+        pins.control_contract_source_sha256 != _CONTROL_CONTRACT_SOURCE_SHA256
+        or hashlib.sha256(_fixed_control_contract_source()).hexdigest()
+        != pins.control_contract_source_sha256
+        or pins.bootstrap_completion_schema != PUBLICATION_COMPLETION_SCHEMA
         or pins.worker_protocol != WORKER_PROTOCOL
         or pins.worker_terminal_schema != WORKER_TERMINAL_SCHEMA
     ):
@@ -882,6 +1024,7 @@ def _validate_launch_payload(
         "bootstrap_execution_authorization_sha256",
         "bootstrap_worker_sha256",
         "control_contract_descriptor_sha256",
+        "control_contract_source_sha256",
         "formal_input_root_sha256",
         "git_executable_sha256",
         "publication_completion_marker_sha256",
@@ -904,6 +1047,7 @@ def _validate_launch_payload(
         or payload["worker_protocol"] != pins.worker_protocol
         or payload["worker_terminal_schema"] != pins.worker_terminal_schema
         or payload["control_contract_descriptor_sha256"] != control_contract_descriptor_sha256()
+        or payload["control_contract_source_sha256"] != pins.control_contract_source_sha256
         or payload["replay_scope"] != EXECUTION_REPLAY_SCOPE
     ):
         raise FormalSupervisorError("execution/review key role or protocol pins rejected")
@@ -1503,12 +1647,18 @@ def _validated_bootstrap_execution_authorization(
     *,
     payload: Mapping[str, Any],
     public_der: bytes,
+    now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     outer = _strict_canonical_json(raw, label="bootstrap execution authorization")
     if set(outer) != {"payload", "signature_base64"}:
         raise FormalSupervisorError("bootstrap execution authorization rejected")
     authorization = outer.get("payload")
-    if type(authorization) is not dict:
+    if (
+        type(authorization) is not dict
+        or set(authorization) != _BOOTSTRAP_EXECUTION_AUTHORIZATION_FIELDS
+        or authorization.get("schema") != BOOTSTRAP_EXECUTION_AUTHORIZATION_SCHEMA
+        or authorization.get("project_id") != "quant-signal-lkj"
+    ):
         raise FormalSupervisorError("bootstrap execution authorization rejected")
     _verify_signature(
         _canonical_bytes(authorization),
@@ -1520,10 +1670,23 @@ def _validated_bootstrap_execution_authorization(
         normalized_policy = validate_stdlib_policy(
             policy,
             expected_root_sha256=str(payload["stdlib_inventory_root_sha256"]),
-            require_filesystem=True,
+            require_filesystem=False,
         )
     except ValueError as exc:
         raise FormalSupervisorError("bootstrap stdlib policy rejected") from exc
+    issued_at = _parse_utc(
+        authorization.get("issued_at_utc"),
+        label="bootstrap authorization issuance",
+    )
+    not_before = _parse_utc(
+        authorization.get("not_before_utc"),
+        label="bootstrap authorization activation",
+    )
+    expires_at = _parse_utc(
+        authorization.get("expires_at_utc"),
+        label="bootstrap authorization expiry",
+    )
+    validation_clock = now_utc or not_before
     expected = {
         "action": payload["worker_action"],
         "authorization_id_sha256": payload["authorization_id_sha256"],
@@ -1531,10 +1694,7 @@ def _validated_bootstrap_execution_authorization(
         "control_contract_descriptor_sha256": payload["control_contract_descriptor_sha256"],
         "replay_scope": payload["replay_scope"],
         "stdlib_policy_root_sha256": payload["stdlib_inventory_root_sha256"],
-        "supervisor_protocol": {
-            "protocol": payload["worker_protocol"],
-            "terminal_schema": payload["worker_terminal_schema"],
-        },
+        "supervisor_protocol": worker_protocol_descriptor(),
     }
     if (
         any(
@@ -1542,15 +1702,40 @@ def _validated_bootstrap_execution_authorization(
             for key, value in expected.items()
             if key != "supervisor_protocol"
         )
-        or type(authorization.get("supervisor_protocol")) is not dict
-        or authorization["supervisor_protocol"].get("protocol")
-        != expected["supervisor_protocol"]["protocol"]
-        or authorization["supervisor_protocol"].get("terminal_schema")
-        != expected["supervisor_protocol"]["terminal_schema"]
+        or authorization.get("execution_authorization_key_id") != payload["execution_key_id"]
+        or authorization.get("execution_authorization_key_role")
+        != BOOTSTRAP_EXECUTION_AUTHORIZATION_KEY_ROLE
+        or authorization.get("supervisor_protocol") != expected["supervisor_protocol"]
         or normalized_policy["pycache_prefix"] != payload["worker_pycache_prefix"]
+        or not issued_at <= not_before < expires_at
+        or not not_before <= validation_clock <= expires_at
+        or (expires_at - issued_at).total_seconds() > _MAX_AUTHORIZATION_LIFETIME_SECONDS
     ):
         raise FormalSupervisorError("bootstrap execution authorization binding rejected")
     return dict(authorization)
+
+
+class _StdlibInventoryGuard:
+    def __init__(
+        self,
+        policy: Mapping[str, Any],
+        *,
+        expected_root_sha256: str,
+    ) -> None:
+        self._policy = dict(policy)
+        self._expected_root_sha256 = expected_root_sha256
+
+    def postverify(self) -> None:
+        try:
+            observed = validate_stdlib_policy(
+                self._policy,
+                expected_root_sha256=self._expected_root_sha256,
+                require_filesystem=True,
+            )
+        except ValueError as exc:
+            raise FormalSupervisorError("stdlib policy drifted") from exc
+        if observed != self._policy:
+            raise FormalSupervisorError("stdlib policy drifted")
 
 
 def _hold_stdlib_inventory(
@@ -1559,10 +1744,22 @@ def _hold_stdlib_inventory(
     payload: Mapping[str, Any],
     authorization: Mapping[str, Any],
     stack: ExitStack,
-) -> tuple[_HeldFile, ...]:
+) -> tuple[Any, ...]:
     policy = _strict_canonical_json(raw, label="stdlib policy")
     if policy != authorization["stdlib_policy"]:
         raise FormalSupervisorError("stdlib policy publication rejected")
+    try:
+        policy = validate_stdlib_policy(
+            policy,
+            expected_root_sha256=str(payload["stdlib_inventory_root_sha256"]),
+            require_filesystem=False,
+        )
+    except ValueError as exc:
+        raise FormalSupervisorError("stdlib policy rejected") from exc
+    frozen_directories = tuple(Path(str(item["path"])) for item in policy["roots"]) + tuple(
+        Path(path).parent for path in policy["absent_paths"]
+    )
+    stack.enter_context(_held_frozen_directory_tree(frozen_directories))
     try:
         policy = validate_stdlib_policy(
             policy,
@@ -1571,13 +1768,20 @@ def _hold_stdlib_inventory(
         )
     except ValueError as exc:
         raise FormalSupervisorError("stdlib policy rejected") from exc
-    frozen_directories = (
-        tuple(Path(str(item["path"])) for item in policy["roots"])
-        + tuple(Path(path).parent for path in policy["absent_paths"])
-        + (Path(str(policy["pycache_prefix"])),)
-    )
-    stack.enter_context(_held_frozen_directory_tree(frozen_directories))
     handles: list[_HeldFile] = []
+    pycache_blocker = _HeldFile(
+        _absolute_path(
+            policy["pycache_prefix"],
+            label="stdlib pycache blocker",
+        ),
+        expected_sha256=None,
+        label="stdlib pycache blocker",
+        max_bytes=_MAX_AUTHORIZATION_BYTES,
+        allow_empty=False,
+        allow_hardlinks=False,
+    )
+    stack.callback(pycache_blocker.close)
+    handles.append(pycache_blocker)
     for item in policy["entries"]:
         path = _absolute_path(item.get("path"), label="stdlib inventory path")
         byte_count = item.get("bytes")
@@ -1589,14 +1793,33 @@ def _hold_stdlib_inventory(
             expected_sha256=digest,
             label="stdlib inventory file",
             max_bytes=_MAX_EXECUTABLE_BYTES,
-            allow_empty=True,
+            allow_empty=item["kind"] == "source",
             allow_hardlinks=True,
         )
         stack.callback(held.close)
         if len(held.raw) != byte_count:
             raise FormalSupervisorError("stdlib inventory rejected")
         handles.append(held)
-    return tuple(handles)
+    try:
+        validate_stdlib_policy(
+            policy,
+            expected_root_sha256=str(payload["stdlib_inventory_root_sha256"]),
+            require_filesystem=True,
+        )
+        validate_stdlib_policy(
+            policy,
+            expected_root_sha256=str(payload["stdlib_inventory_root_sha256"]),
+            require_filesystem=True,
+        )
+    except ValueError as exc:
+        raise FormalSupervisorError("stdlib policy rejected") from exc
+    return (
+        *handles,
+        _StdlibInventoryGuard(
+            policy,
+            expected_root_sha256=str(payload["stdlib_inventory_root_sha256"]),
+        ),
+    )
 
 
 def _validate_resume_status(
@@ -1754,6 +1977,15 @@ def _supervise_with_pins(
             max_bytes=_MAX_WORKER_BYTES,
         )
         stack.callback(self_source.close)
+        control_contract_source = _HeldFile(
+            _pinned_control_contract_path(pins),
+            expected_sha256=pins.control_contract_source_sha256,
+            label="pinned control contract source",
+            max_bytes=_MAX_WORKER_BYTES,
+        )
+        stack.callback(control_contract_source.close)
+        if control_contract_source.raw != _fixed_control_contract_source():
+            raise FormalSupervisorError("pinned control contract source rejected")
         python_handle = _HeldFile(
             Path(pins.python_executable_path),
             expected_sha256=pins.python_executable_sha256,
@@ -1897,6 +2129,7 @@ def _supervise_with_pins(
             bootstrap_authorization_handle.raw,
             payload=payload,
             public_der=public_der,
+            now_utc=now_utc,
         )
         stdlib_handles = _hold_stdlib_inventory(
             stdlib_policy_handle.raw,
@@ -2015,6 +2248,7 @@ def _supervise_with_pins(
         terminal_handles = (
             authorization_handle,
             self_source,
+            control_contract_source,
             python_handle,
             base_python_handle,
             git_handle,
@@ -2080,3 +2314,9 @@ def supervise_factor_v3_formal_execution(
         now_utc=datetime.now(timezone.utc).replace(microsecond=0),
         environment_snapshot=os.environ,
     )
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        raise FormalSupervisorError("exactly one launch authorization path is required")
+    supervise_factor_v3_formal_execution(sys.argv[1])
