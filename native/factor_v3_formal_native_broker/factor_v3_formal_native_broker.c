@@ -793,12 +793,6 @@ static int append_environment_entry(
 }
 
 static wchar_t *sanitized_environment(void) {
-    static const wchar_t *public_names[] = {
-        L"SYSTEMROOT",
-        L"TEMP",
-        L"TMP",
-        L"WINDIR"
-    };
     const size_t capacity = 32768;
     wchar_t *block = (wchar_t *)HeapAlloc(
         GetProcessHeap(),
@@ -806,7 +800,8 @@ static wchar_t *sanitized_environment(void) {
         capacity * sizeof(wchar_t)
     );
     size_t offset = 0;
-    size_t index;
+    wchar_t windows_directory[32768];
+    UINT windows_directory_length;
     if (block == NULL) {
         return NULL;
     }
@@ -820,38 +815,53 @@ static wchar_t *sanitized_environment(void) {
         HeapFree(GetProcessHeap(), 0, block);
         return NULL;
     }
-    for (index = 0; index < sizeof(public_names) / sizeof(public_names[0]); ++index) {
-        wchar_t value[32768];
-        DWORD length = GetEnvironmentVariableW(
-            public_names[index],
-            value,
-            (DWORD)(sizeof(value) / sizeof(value[0]))
-        );
-        if (length == 0) {
-            if (GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
-                continue;
-            }
-            SecureZeroMemory(block, capacity * sizeof(wchar_t));
-            HeapFree(GetProcessHeap(), 0, block);
-            return NULL;
-        }
-        if (length >= sizeof(value) / sizeof(value[0])
-            || !append_environment_entry(
-                block,
-                capacity,
-                &offset,
-                public_names[index],
-                value
-            )) {
-            SecureZeroMemory(value, sizeof(value));
-            SecureZeroMemory(block, capacity * sizeof(wchar_t));
-            HeapFree(GetProcessHeap(), 0, block);
-            return NULL;
-        }
-        SecureZeroMemory(value, sizeof(value));
+    windows_directory_length = GetSystemWindowsDirectoryW(
+        windows_directory,
+        (UINT)(sizeof(windows_directory) / sizeof(windows_directory[0]))
+    );
+    if (windows_directory_length == 0
+        || windows_directory_length
+            >= sizeof(windows_directory) / sizeof(windows_directory[0])
+        || !append_environment_entry(
+            block,
+            capacity,
+            &offset,
+            L"SYSTEMROOT",
+            windows_directory
+        )
+        || !append_environment_entry(
+            block,
+            capacity,
+            &offset,
+            L"WINDIR",
+            windows_directory
+        )) {
+        SecureZeroMemory(windows_directory, sizeof(windows_directory));
+        SecureZeroMemory(block, capacity * sizeof(wchar_t));
+        HeapFree(GetProcessHeap(), 0, block);
+        return NULL;
     }
+    SecureZeroMemory(windows_directory, sizeof(windows_directory));
     block[offset] = L'\0';
     return block;
+}
+
+static int parent_directory(
+    const wchar_t *path,
+    wchar_t *output,
+    size_t capacity
+) {
+    wchar_t *separator;
+    if (capacity > UINT_MAX
+        || !canonical_path(path, output, (DWORD)capacity)) {
+        return 0;
+    }
+    separator = wcsrchr(output, L'\\');
+    if (separator == NULL || separator <= output + 2) {
+        return 0;
+    }
+    *separator = L'\0';
+    return 1;
 }
 
 static int quoted_command_line(
@@ -884,6 +894,7 @@ static int launch_test_child(
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
     HANDLE job = NULL;
     wchar_t command_line[32768];
+    wchar_t runtime_directory[32768];
     wchar_t *environment = NULL;
     DWORD exit_code = 1;
     int ok = 0;
@@ -896,6 +907,11 @@ static int launch_test_child(
             output_path,
             command_line,
             sizeof(command_line) / sizeof(command_line[0])
+        )
+        || !parent_directory(
+            F3_BROKER_RUNTIME_PATH,
+            runtime_directory,
+            sizeof(runtime_directory) / sizeof(runtime_directory[0])
         )) {
         goto cleanup;
     }
@@ -922,7 +938,7 @@ static int launch_test_child(
             FALSE,
             CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
             environment,
-            NULL,
+            runtime_directory,
             &startup,
             &process
         )
@@ -975,6 +991,7 @@ cleanup:
         HeapFree(GetProcessHeap(), 0, environment);
     }
     SecureZeroMemory(command_line, sizeof(command_line));
+    SecureZeroMemory(runtime_directory, sizeof(runtime_directory));
     return ok;
 }
 #endif
