@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import errno
 import json
+import os
 from pathlib import Path
 import subprocess
 from typing import Callable
@@ -27,7 +28,7 @@ from tests.test_factor_v3_formal_bootstrap_renderer import (
 )
 
 
-AUTHORIZATION_SCHEMA = "factor-v3-formal-bootstrap-execution-authorization/v1"
+AUTHORIZATION_SCHEMA = "factor-v3-formal-bootstrap-execution-authorization/v2"
 BE3_FORMAL_COMMIT = "be3f985a0cd52f4092441e45056c3ec9da94668e"
 BE3_REVIEWED_PATHS = (
     "scripts/build_factor_v3_daily_basic_formal_run_spec.py",
@@ -70,7 +71,7 @@ BE3_REVIEWED_PATHS = (
 )
 
 
-def _trusted_public_der(tmp_path: Path) -> bytes:
+def _review_public_der(tmp_path: Path) -> bytes:
     return subprocess.run(
         [
             str(_OPENSSL),
@@ -84,6 +85,32 @@ def _trusted_public_der(tmp_path: Path) -> bytes:
         check=True,
         capture_output=True,
     ).stdout
+
+
+def _execution_test_key(tmp_path: Path) -> tuple[Path, bytes]:
+    key_root = tmp_path / "test-only-execution-authorization-key"
+    private_key = key_root / "test-only-review-private.pem"
+    if not private_key.exists():
+        key_root.mkdir()
+        return _test_rsa_key(key_root)
+    public_der = subprocess.run(
+        [
+            str(_OPENSSL),
+            "pkey",
+            "-in",
+            str(private_key),
+            "-pubout",
+            "-outform",
+            "DER",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+    return private_key, public_der
+
+
+def _trusted_public_der(tmp_path: Path) -> bytes:
+    return _execution_test_key(tmp_path)[1]
 
 
 def _authorization_payload(
@@ -102,9 +129,15 @@ def _authorization_payload(
     bootstrap_output_root.mkdir(exist_ok=True)
     receipt_outer = json.loads(Path(str(config["review_receipt_path"])).read_text(encoding="utf-8"))
     review_payload = receipt_outer["payload"]
+    _execution_private_key, execution_public_der = _execution_test_key(tmp_path)
+    execution_key_sha256 = _sha256(execution_public_der)
+    authorization_nonce_sha256 = _sha256(f"authorization:{config['action']}".encode())
     return {
         "action": config["action"],
-        "authorization_nonce_sha256": _sha256(f"authorization:{config['action']}".encode()),
+        "authorization_id_sha256": _sha256(
+            f"authorization-id:{authorization_nonce_sha256}".encode()
+        ),
+        "authorization_nonce_sha256": authorization_nonce_sha256,
         "base_python_executable_path": config["base_python_executable_path"],
         "base_python_executable_sha256": config["base_python_executable_sha256"],
         "bootstrap_claim_path": config["bootstrap_claim_path"],
@@ -114,6 +147,9 @@ def _authorization_payload(
         "builder_sha256": config["builder_sha256"],
         "expected_branch": config["expected_branch"],
         "expected_commit": config["expected_commit"],
+        "execution_authorization_key_id": (f"sha256:{execution_key_sha256}"),
+        "execution_authorization_key_role": ("factor-v3-bootstrap-execution-authorization"),
+        "expires_at_utc": "2026-07-31T00:00:00+00:00",
         "feature_attestation_sha256": review_payload["feature_attestation_sha256"],
         "formal_input_root_path": config["formal_input_root"],
         "formal_input_root_sha256": config["formal_input_root_sha256"],
@@ -122,10 +158,12 @@ def _authorization_payload(
         "git_executable_path": config["git_executable_path"],
         "git_executable_sha256": config["git_executable_sha256"],
         "issued_at_utc": "2026-07-30T12:00:00+00:00",
+        "not_before_utc": "2026-07-30T12:00:00+00:00",
         "project_id": "quant-signal-lkj",
         "python_executable_path": config["python_executable_path"],
         "python_executable_sha256": config["python_executable_sha256"],
         "repo_root": config["repo_root"],
+        "replay_scope": "factor-v3-formal-bootstrap-execution/v1",
         "review_payload_sha256": config["review_payload_sha256"],
         "review_protocol_sha256": config["review_protocol_sha256"],
         "review_public_key_spki_der_base64": config["review_public_key_spki_der_base64"],
@@ -141,6 +179,10 @@ def _authorization_payload(
         "shim_sha256": config["shim_sha256"],
         "source_manifest": config["source_manifest"],
         "source_root_sha256": config["source_root_sha256"],
+        "stdlib_policy": renderer._trusted_stdlib_policy_for_base_python(
+            Path(str(config["base_python_executable_path"]))
+        ),
+        "supervisor_protocol": renderer._supervisor_protocol_descriptor(),
     }
 
 
@@ -148,7 +190,7 @@ def _write_authorization(
     tmp_path: Path,
     payload: dict[str, object],
 ) -> tuple[Path, str]:
-    private_key = tmp_path / "test-only-review-private.pem"
+    private_key, _public_der = _execution_test_key(tmp_path)
     payload_raw = _canonical_bytes(payload)
     envelope_raw = _canonical_bytes(
         {
@@ -162,6 +204,27 @@ def _write_authorization(
         (tmp_path / "execution-authorizations").resolve(),
         envelope_raw,
     )
+
+
+def _write_completion_authorization(
+    tmp_path: Path,
+    payload: dict[str, object],
+) -> Path:
+    private_key, _public_der = _execution_test_key(tmp_path)
+    payload_raw = _canonical_bytes(payload)
+    envelope_raw = _canonical_bytes(
+        {
+            "payload": payload,
+            "signature_base64": base64.b64encode(_sign(tmp_path, private_key, payload_raw)).decode(
+                "ascii"
+            ),
+        }
+    )
+    path, _digest = _cas_write(
+        (tmp_path / "completion-authorizations").resolve(),
+        envelope_raw,
+    )
+    return path
 
 
 def _authorized_fixture(
@@ -270,7 +333,7 @@ def _be3_crossline_authorized_fixture(
     source_manifest = [_source_entry(repo, relative_path) for relative_path in BE3_REVIEWED_PATHS]
     assert len(source_manifest) == 37
     source_root_sha256 = _sha256(_canonical_bytes(source_manifest))
-    public_der = _trusted_public_der(tmp_path)
+    public_der = _review_public_der(tmp_path)
     public_der_sha256 = _sha256(public_der)
     feature_attestation_sha256 = _sha256(b"be3-crossline-feature-attestation")
     formal_runner_sha256 = _file_sha256(runner_path)
@@ -353,16 +416,67 @@ def _be3_crossline_authorized_fixture(
         tmp_path,
         payload,
     )
-    return config, payload, authorization_path, public_der
+    return (
+        config,
+        payload,
+        authorization_path,
+        _trusted_public_der(tmp_path),
+    )
 
 
 def _render_authorized(
     authorization_path: Path,
     trusted_public_der: bytes,
 ) -> bytes:
-    return renderer.render_factor_v3_formal_bootstrap_from_authorization(
+    return renderer._render_factor_v3_formal_bootstrap_with_test_trust(
         authorization_path=authorization_path,
         trusted_public_key_spki_der=trusted_public_der,
+    )
+
+
+def _run_as_synthetic_supervisor(
+    rendered: bytes,
+    config: dict[str, object],
+    tmp_path: Path,
+    *,
+    launch_action: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    selected_action = str(config["action"]) if launch_action is None else launch_action
+    bootstrap_sha256 = _sha256(rendered)
+    bootstrap_directory = tmp_path / "synthetic-bootstrap-cas" / "sha256" / bootstrap_sha256[:2]
+    bootstrap_directory.mkdir(parents=True)
+    bootstrap_path = bootstrap_directory / f"{bootstrap_sha256}.py"
+    bootstrap_path.write_bytes(rendered)
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in {"SYSTEMROOT", "WINDIR", "TEMP", "TMP"}
+    }
+    environment.update(
+        {
+            "FACTOR_V3_FORMAL_LAUNCH_ACTION": selected_action,
+            "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256": _sha256(
+                b"synthetic-supervisor-launch-envelope"
+            ),
+            "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL": ("factor-v3-formal-supervisor-worker/v1"),
+        }
+    )
+    if selected_action in {"run", "resume"}:
+        environment["JIAOCH_TOKEN"] = "test-only-never-log"
+    return subprocess.run(
+        [
+            str(config["python_executable_path"]),
+            "-I",
+            "-B",
+            "-S",
+            str(bootstrap_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=environment,
+        timeout=60,
     )
 
 
@@ -387,11 +501,18 @@ def test_authorized_execution_passes_formal_input_semantic_sha(
     ) = _authorized_fixture(tmp_path)
 
     rendered = _render_authorized(authorization_path, trusted_public_der)
-    completed = _run_rendered(rendered, config)
+    completed = _run_as_synthetic_supervisor(
+        rendered,
+        config,
+        tmp_path,
+    )
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stderr == ""
-    assert json.loads(completed.stdout)["formal_input_root"] == payload["formal_input_root_sha256"]
+    assert (
+        json.loads(completed.stdout)["result"]["formal_input_root"]
+        == (payload["formal_input_root_sha256"])
+    )
 
 
 def test_actual_be3_control_line_runs_through_b2_authorized_bootstrap(
@@ -405,11 +526,15 @@ def test_actual_be3_control_line_runs_through_b2_authorized_bootstrap(
     ) = _be3_crossline_authorized_fixture(tmp_path)
 
     rendered = _render_authorized(authorization_path, trusted_public_der)
-    completed = _run_rendered(rendered, config)
+    completed = _run_as_synthetic_supervisor(
+        rendered,
+        config,
+        tmp_path,
+    )
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stderr == ""
-    assert json.loads(completed.stdout) == {
+    assert json.loads(completed.stdout)["result"] == {
         "run_root": payload["run_root"],
         "run_spec_path": payload["run_spec_path"],
         "source": "be3-crossline-lightweight-runner",
@@ -464,7 +589,7 @@ def test_authorization_rejects_an_untrusted_signing_key(tmp_path: Path) -> None:
 
     with pytest.raises(
         renderer.FormalBootstrapRenderError,
-        match="authorization signature",
+        match="authorization (signature|key role)",
     ):
         _render_authorized(authorization_path, wrong_public_der)
 
@@ -523,18 +648,28 @@ def test_renderer_publishes_bootstrap_and_receipt_with_safe_cas(
         authorization_path,
         trusted_public_der,
     ) = _authorized_fixture(tmp_path)
-
-    first = renderer.publish_factor_v3_formal_bootstrap(
+    completion_payload = renderer._plan_factor_v3_formal_bootstrap_publication_with_test_trust(
         authorization_path=authorization_path,
         trusted_public_key_spki_der=trusted_public_der,
     )
-    second = renderer.publish_factor_v3_formal_bootstrap(
+    completion_authorization_path = _write_completion_authorization(
+        tmp_path,
+        completion_payload,
+    )
+
+    first = renderer._publish_factor_v3_formal_bootstrap_with_test_trust(
         authorization_path=authorization_path,
+        completion_authorization_path=completion_authorization_path,
+        trusted_public_key_spki_der=trusted_public_der,
+    )
+    second = renderer._publish_factor_v3_formal_bootstrap_with_test_trust(
+        authorization_path=authorization_path,
+        completion_authorization_path=completion_authorization_path,
         trusted_public_key_spki_der=trusted_public_der,
     )
 
     assert first == second
-    assert first["schema"] == ("factor-v3-formal-bootstrap-publication-receipt/v1")
+    assert first["schema"] == ("factor-v3-formal-bootstrap-publication-completion/v1")
     root = Path(str(payload["bootstrap_output_root"]))
     bootstrap_path = root / Path(*str(first["bootstrap_relative_path"]).split("/"))
     receipt_path = root / Path(*str(first["receipt_relative_path"]).split("/"))
@@ -547,8 +682,9 @@ def test_renderer_publishes_bootstrap_and_receipt_with_safe_cas(
         renderer.FormalBootstrapRenderError,
         match="content-addressed",
     ):
-        renderer.publish_factor_v3_formal_bootstrap(
+        renderer._publish_factor_v3_formal_bootstrap_with_test_trust(
             authorization_path=authorization_path,
+            completion_authorization_path=completion_authorization_path,
             trusted_public_key_spki_der=trusted_public_der,
         )
 

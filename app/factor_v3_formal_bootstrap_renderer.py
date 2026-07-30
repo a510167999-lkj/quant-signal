@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import ast
 import base64
+from contextlib import contextmanager, ExitStack
+import ctypes
+from ctypes import wintypes
+from datetime import datetime, timezone
 import errno
+from functools import lru_cache
 import hashlib
 import hmac
+import importlib.machinery
 import json
 import os
 from pathlib import Path
 import re
 import stat
+import sys
 from typing import Any, Mapping
 import zlib
 
@@ -21,9 +28,21 @@ class FormalBootstrapRenderError(RuntimeError):
 
 
 CONFIG_SCHEMA = "factor-v3-formal-bootstrap-render-config/v1"
-RUNTIME_TEMPLATE_SHA256 = "adad1d47a03674601bc8bfa8953c15cc11d5ab19f6addc54b80dacd9bdc958a6"
-AUTHORIZATION_SCHEMA = "factor-v3-formal-bootstrap-execution-authorization/v1"
+RUNTIME_TEMPLATE_SHA256 = "bf206a2cb5e17ef96527985445391d3d7ef67bc8563fa3fe64d4edb49c8a110a"
+AUTHORIZATION_SCHEMA = "factor-v3-formal-bootstrap-execution-authorization/v2"
 PUBLICATION_RECEIPT_SCHEMA = "factor-v3-formal-bootstrap-publication-receipt/v1"
+COMPLETION_SCHEMA = "factor-v3-formal-bootstrap-publication-completion/v1"
+PRODUCTION_EXECUTION_AUTHORIZATION_PUBLIC_KEY_PATH = Path(
+    r"E:\AI workspace\quant-signal-lkj\.secrets"
+    r"\factor_v3_execution_authorization_rsa3072_public.pem"
+)
+PRODUCTION_EXECUTION_AUTHORIZATION_SPKI_SHA256 = (
+    "70c8ad8f74cddfe363175d76c433cb145aadcd7cbd8af669768e697d99cccce8"
+)
+_EXECUTION_AUTHORIZATION_KEY_ROLE = "factor-v3-bootstrap-execution-authorization"
+_REPLAY_SCOPE = "factor-v3-formal-bootstrap-execution/v1"
+_SUPERVISOR_PROTOCOL = "factor-v3-formal-supervisor-worker/v1"
+_WORKER_TERMINAL_SCHEMA = "factor-v3-formal-bootstrap-worker-terminal/v1"
 _RUNTIME_TEMPLATE_NAME = "factor_v3_formal_bootstrap_runtime.py"
 _CONFIG_MARKER = b"_EMBEDDED_CONFIG_JSON: bytes | None = None"
 _RENDERED_CONFIG_PREFIX = b"_EMBEDDED_CONFIG_JSON: bytes = "
@@ -72,6 +91,7 @@ _CONFIG_FIELDS = {
 }
 _AUTHORIZATION_FIELDS = {
     "action",
+    "authorization_id_sha256",
     "authorization_nonce_sha256",
     "base_python_executable_path",
     "base_python_executable_sha256",
@@ -82,6 +102,9 @@ _AUTHORIZATION_FIELDS = {
     "builder_sha256",
     "expected_branch",
     "expected_commit",
+    "execution_authorization_key_id",
+    "execution_authorization_key_role",
+    "expires_at_utc",
     "feature_attestation_sha256",
     "formal_input_root_path",
     "formal_input_root_sha256",
@@ -90,10 +113,12 @@ _AUTHORIZATION_FIELDS = {
     "git_executable_path",
     "git_executable_sha256",
     "issued_at_utc",
+    "not_before_utc",
     "project_id",
     "python_executable_path",
     "python_executable_sha256",
     "repo_root",
+    "replay_scope",
     "review_payload_sha256",
     "review_protocol_sha256",
     "review_public_key_spki_der_base64",
@@ -109,8 +134,11 @@ _AUTHORIZATION_FIELDS = {
     "shim_sha256",
     "source_manifest",
     "source_root_sha256",
+    "stdlib_policy",
+    "supervisor_protocol",
 }
 _AUTHORIZED_CONFIG_FIELDS = _CONFIG_FIELDS | {
+    "authorization_id_sha256",
     "authorization_issued_at_utc",
     "authorization_nonce_sha256",
     "bootstrap_output_root",
@@ -118,10 +146,17 @@ _AUTHORIZED_CONFIG_FIELDS = _CONFIG_FIELDS | {
     "execution_authorization_sha256",
     "execution_authorization_public_key_spki_der_base64",
     "execution_authorization_public_key_spki_sha256",
+    "execution_authorization_key_id",
+    "execution_authorization_key_role",
+    "expires_at_utc",
     "feature_attestation_sha256",
     "formal_runner_sha256",
+    "not_before_utc",
+    "replay_scope",
     "run_spec_sha256",
     "runtime_template_sha256",
+    "stdlib_policy",
+    "supervisor_protocol",
 }
 
 
@@ -201,6 +236,83 @@ def _require_sha256(value: Any, *, label: str) -> str:
     if type(value) is not str or _SHA256_RE.fullmatch(value) is None:
         raise FormalBootstrapRenderError(f"{label} rejected")
     return value
+
+
+def _parsed_utc(value: Any, *, label: str) -> datetime:
+    if type(value) is not str:
+        raise FormalBootstrapRenderError(f"{label} rejected")
+    try:
+        parsed = datetime.strptime(
+            value,
+            "%Y-%m-%dT%H:%M:%S+00:00",
+        ).replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise FormalBootstrapRenderError(f"{label} rejected") from None
+    return parsed
+
+
+def _validated_replay_claim(
+    value: Mapping[str, Any],
+    *,
+    now_utc: str | None = None,
+) -> dict[str, Any]:
+    fields = {
+        "authorization_id_sha256",
+        "authorization_nonce_sha256",
+        "expires_at_utc",
+        "issued_at_utc",
+        "not_before_utc",
+        "replay_scope",
+    }
+    if type(value) is not dict or set(value) != fields:
+        raise FormalBootstrapRenderError("authorization replay claim rejected")
+    output = dict(value)
+    for field in (
+        "authorization_id_sha256",
+        "authorization_nonce_sha256",
+    ):
+        _require_sha256(output.get(field), label="authorization replay claim")
+    if output.get("replay_scope") != _REPLAY_SCOPE:
+        raise FormalBootstrapRenderError("authorization replay scope rejected")
+    issued = _parsed_utc(output.get("issued_at_utc"), label="authorization replay claim")
+    not_before = _parsed_utc(
+        output.get("not_before_utc"),
+        label="authorization replay claim",
+    )
+    expires = _parsed_utc(
+        output.get("expires_at_utc"),
+        label="authorization replay claim",
+    )
+    now = (
+        _parsed_utc(now_utc, label="authorization replay clock")
+        if now_utc is not None
+        else datetime.now(timezone.utc).replace(microsecond=0)
+    )
+    if not issued <= not_before < expires or not not_before <= now <= expires:
+        raise FormalBootstrapRenderError("authorization replay window rejected")
+    return output
+
+
+def _validate_distinct_authorization_key_roles(
+    *,
+    review_public_key_spki_sha256: str,
+    execution_public_key_spki_sha256: str,
+) -> None:
+    _require_sha256(
+        review_public_key_spki_sha256,
+        label="review public key identity",
+    )
+    _require_sha256(
+        execution_public_key_spki_sha256,
+        label="execution public key identity",
+    )
+    if hmac.compare_digest(
+        review_public_key_spki_sha256,
+        execution_public_key_spki_sha256,
+    ):
+        raise FormalBootstrapRenderError(
+            "review and execution authorization key roles must be distinct"
+        )
 
 
 def _is_reparse(path: Path) -> bool:
@@ -293,6 +405,194 @@ def _read_safe_file(
         return b"".join(chunks)
     finally:
         os.close(descriptor)
+
+
+def _stdlib_inventory_sha256(path: Path, *, kind: str) -> str:
+    if kind == "stdlib_zip":
+        if not path.exists():
+            return hashlib.sha256(
+                _canonical_bytes(
+                    {
+                        "kind": kind,
+                        "path": str(path),
+                        "state": "absent",
+                    }
+                )
+            ).hexdigest()
+        raw = _read_safe_file(
+            path,
+            label="stdlib zip",
+            max_bytes=_MAX_EXECUTABLE_BYTES,
+            allow_hardlinks=True,
+        )
+        return hashlib.sha256(
+            _canonical_bytes(
+                {
+                    "bytes": len(raw),
+                    "kind": kind,
+                    "path": str(path),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
+            )
+        ).hexdigest()
+    root = _safe_existing_directory(path, label=f"{kind} root")
+    entries: list[dict[str, Any]] = []
+    allowed_suffixes = tuple(
+        dict.fromkeys(
+            (
+                *importlib.machinery.SOURCE_SUFFIXES,
+                *importlib.machinery.BYTECODE_SUFFIXES,
+                *importlib.machinery.EXTENSION_SUFFIXES,
+                ".dll",
+            )
+        )
+    )
+    for directory, names, filenames in os.walk(root, topdown=True):
+        current = Path(directory)
+        names[:] = sorted(
+            name
+            for name in names
+            if name not in {"__pycache__", "site-packages"} and not _is_reparse(current / name)
+        )
+        for filename in sorted(filenames):
+            candidate = current / filename
+            if not filename.endswith(allowed_suffixes) or _is_reparse(candidate):
+                continue
+            metadata = candidate.lstat()
+            if metadata.st_size == 0:
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise FormalBootstrapRenderError(f"{kind} inventory file rejected")
+                raw = b""
+            else:
+                raw = _read_safe_file(
+                    candidate,
+                    label=f"{kind} inventory file",
+                    max_bytes=_MAX_EXECUTABLE_BYTES,
+                    allow_hardlinks=True,
+                )
+            entries.append(
+                {
+                    "bytes": len(raw),
+                    "path": candidate.relative_to(root).as_posix(),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
+            )
+    return hashlib.sha256(
+        _canonical_bytes(
+            {
+                "entries": entries,
+                "kind": kind,
+                "path": str(root),
+            }
+        )
+    ).hexdigest()
+
+
+@lru_cache(maxsize=4)
+def _trusted_stdlib_policy_for_base_python(
+    base_python_executable: Path,
+) -> dict[str, Any]:
+    executable = _absolute_path(
+        str(base_python_executable),
+        label="base Python executable",
+    )
+    base_root = _safe_existing_directory(
+        executable.parent,
+        label="base Python root",
+    )
+    roots = [
+        {
+            "kind": kind,
+            "path": str(path),
+            "inventory_sha256": _stdlib_inventory_sha256(
+                path,
+                kind=kind,
+            ),
+        }
+        for kind, path in (
+            ("stdlib", base_root / "Lib"),
+            ("platstdlib", base_root / "DLLs"),
+            (
+                "stdlib_zip",
+                base_root / f"python{sys.version_info.major}{sys.version_info.minor}.zip",
+            ),
+        )
+    ]
+    importer_policy = {
+        "bytecode_suffixes": list(importlib.machinery.BYTECODE_SUFFIXES),
+        "extension_suffixes": list(importlib.machinery.EXTENSION_SUFFIXES),
+        "finder": "FileFinder",
+        "source_suffixes": list(importlib.machinery.SOURCE_SUFFIXES),
+        "zip_finder": "zipimporter",
+    }
+    return {
+        "importer_policy_sha256": hashlib.sha256(_canonical_bytes(importer_policy)).hexdigest(),
+        "inventory_root_sha256": hashlib.sha256(_canonical_bytes(roots)).hexdigest(),
+        "roots": roots,
+        "schema": "factor-v3-bootstrap-stdlib-policy/v1",
+    }
+
+
+def _supervisor_protocol_descriptor() -> dict[str, Any]:
+    return {
+        "action_secret_environment": {
+            "build-spec": [],
+            "resume": ["JIAOCH_TOKEN"],
+            "run": ["JIAOCH_TOKEN"],
+            "verify": [],
+        },
+        "fixed_environment": [
+            "FACTOR_V3_FORMAL_LAUNCH_ACTION",
+            "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256",
+            "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL",
+        ],
+        "protocol": _SUPERVISOR_PROTOCOL,
+        "public_environment": ["SYSTEMROOT", "TEMP", "TMP", "WINDIR"],
+        "terminal_fields": [
+            "artifacts",
+            "authorization_nonce_sha256",
+            "bootstrap_execution_authorization_sha256",
+            "launch_action",
+            "launch_authorization_sha256",
+            "result",
+            "schema",
+            "status",
+            "worker_action",
+        ],
+        "terminal_schema": _WORKER_TERMINAL_SCHEMA,
+    }
+
+
+def _production_execution_authorization_public_key_der() -> bytes:
+    raw = _read_safe_file(
+        PRODUCTION_EXECUTION_AUTHORIZATION_PUBLIC_KEY_PATH,
+        label="production execution authorization public key",
+        max_bytes=64 * 1024,
+    )
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        raise FormalBootstrapRenderError(
+            "production execution authorization public key rejected"
+        ) from None
+    lines = text.replace("\r\n", "\n").strip().splitlines()
+    if (
+        len(lines) < 3
+        or lines[0] != "-----BEGIN PUBLIC KEY-----"
+        or lines[-1] != "-----END PUBLIC KEY-----"
+    ):
+        raise FormalBootstrapRenderError("production execution authorization public key rejected")
+    body = "".join(lines[1:-1])
+    try:
+        public_der = base64.b64decode(body.encode("ascii"), validate=True)
+    except ValueError:
+        raise FormalBootstrapRenderError(
+            "production execution authorization public key rejected"
+        ) from None
+    if hashlib.sha256(public_der).hexdigest() != PRODUCTION_EXECUTION_AUTHORIZATION_SPKI_SHA256:
+        raise FormalBootstrapRenderError("production execution authorization public key rejected")
+    _parse_rsa3072_spki(public_der)
+    return public_der
 
 
 def _der_length(raw: bytes, offset: int) -> tuple[int, int]:
@@ -734,16 +1034,11 @@ def _validated_execution_authorization(
         or type(payload.get("expected_branch")) is not str
         or not payload["expected_branch"]
         or _COMMIT_RE.fullmatch(str(payload.get("expected_commit"))) is None
-        or re.fullmatch(
-            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T"
-            r"[0-9]{2}:[0-9]{2}:[0-9]{2}\+00:00",
-            str(payload.get("issued_at_utc")),
-        )
-        is None
     ):
         raise FormalBootstrapRenderError("execution authorization rejected")
     _reject_credential_shape(payload)
     for field in (
+        "authorization_id_sha256",
         "authorization_nonce_sha256",
         "base_python_executable_sha256",
         "bootstrap_claim_sha256",
@@ -767,6 +1062,36 @@ def _validated_execution_authorization(
         raise FormalBootstrapRenderError("runtime template SHA rejected")
     if type(trusted_public_key_spki_der) is not bytes:
         raise FormalBootstrapRenderError("authorization public key rejected")
+    execution_key_sha256 = hashlib.sha256(trusted_public_key_spki_der).hexdigest()
+    if (
+        payload.get("execution_authorization_key_id") != f"sha256:{execution_key_sha256}"
+        or payload.get("execution_authorization_key_role") != _EXECUTION_AUTHORIZATION_KEY_ROLE
+    ):
+        raise FormalBootstrapRenderError("execution authorization key role rejected")
+    _validate_distinct_authorization_key_roles(
+        review_public_key_spki_sha256=payload["review_public_key_spki_sha256"],
+        execution_public_key_spki_sha256=execution_key_sha256,
+    )
+    _validated_replay_claim(
+        {
+            field: payload[field]
+            for field in (
+                "authorization_id_sha256",
+                "authorization_nonce_sha256",
+                "expires_at_utc",
+                "issued_at_utc",
+                "not_before_utc",
+                "replay_scope",
+            )
+        }
+    )
+    expected_stdlib_policy = _trusted_stdlib_policy_for_base_python(
+        Path(str(payload["base_python_executable_path"]))
+    )
+    if payload.get("stdlib_policy") != expected_stdlib_policy:
+        raise FormalBootstrapRenderError("stdlib policy rejected")
+    if payload.get("supervisor_protocol") != _supervisor_protocol_descriptor():
+        raise FormalBootstrapRenderError("supervisor protocol rejected")
     _verify_rsa3072_signature(
         _canonical_bytes(payload),
         _decoded_signature(outer.get("signature_base64"), label="authorization"),
@@ -868,11 +1193,19 @@ def _authorized_config(
             "execution_authorization_public_key_spki_sha256": public_der_sha256,
             "feature_attestation_sha256": payload["feature_attestation_sha256"],
             "formal_runner_sha256": payload["formal_runner_sha256"],
+            "authorization_id_sha256": payload["authorization_id_sha256"],
             "authorization_issued_at_utc": payload["issued_at_utc"],
             "authorization_nonce_sha256": payload["authorization_nonce_sha256"],
             "bootstrap_output_root": payload["bootstrap_output_root"],
+            "execution_authorization_key_id": payload["execution_authorization_key_id"],
+            "execution_authorization_key_role": payload["execution_authorization_key_role"],
+            "expires_at_utc": payload["expires_at_utc"],
+            "not_before_utc": payload["not_before_utc"],
+            "replay_scope": payload["replay_scope"],
             "run_spec_sha256": payload["run_spec_sha256"],
             "runtime_template_sha256": payload["runtime_template_sha256"],
+            "stdlib_policy": payload["stdlib_policy"],
+            "supervisor_protocol": payload["supervisor_protocol"],
         }
     )
     if set(config) != _AUTHORIZED_CONFIG_FIELDS:
@@ -882,14 +1215,27 @@ def _authorized_config(
 
 def _runtime_template_bytes() -> bytes:
     path = Path(__file__).resolve().with_name(_RUNTIME_TEMPLATE_NAME)
-    raw = _read_safe_file(
-        path,
-        label="bootstrap runtime template",
-        max_bytes=1024 * 1024,
+    raw = _canonical_runtime_template_bytes(
+        _read_safe_file(
+            path,
+            label="bootstrap runtime template",
+            max_bytes=1024 * 1024,
+        )
     )
     if hashlib.sha256(raw).hexdigest() != RUNTIME_TEMPLATE_SHA256 or raw.count(_CONFIG_MARKER) != 1:
         raise FormalBootstrapRenderError("bootstrap runtime template rejected")
     return raw
+
+
+def _canonical_runtime_template_bytes(raw: bytes) -> bytes:
+    if type(raw) is not bytes or not raw or b"\x00" in raw:
+        raise FormalBootstrapRenderError("bootstrap runtime template line endings rejected")
+    if b"\r" not in raw:
+        return raw
+    without_crlf = raw.replace(b"\r\n", b"")
+    if b"\r" in without_crlf or b"\n" in without_crlf:
+        raise FormalBootstrapRenderError("bootstrap runtime template line endings rejected")
+    return raw.replace(b"\r\n", b"\n")
 
 
 def _render_embedded_config(config: Mapping[str, Any]) -> bytes:
@@ -918,6 +1264,16 @@ def render_factor_v3_formal_bootstrap(
 
 
 def render_factor_v3_formal_bootstrap_from_authorization(
+    *,
+    authorization_path: Path | str,
+) -> bytes:
+    return _render_factor_v3_formal_bootstrap_with_test_trust(
+        authorization_path=authorization_path,
+        trusted_public_key_spki_der=(_production_execution_authorization_public_key_der()),
+    )
+
+
+def _render_factor_v3_formal_bootstrap_with_test_trust(
     *,
     authorization_path: Path | str,
     trusted_public_key_spki_der: bytes,
@@ -972,6 +1328,172 @@ def _ensure_safe_child_directory(root: Path, parts: tuple[str, ...]) -> Path:
             raise FormalBootstrapRenderError("bootstrap output directory rejected")
         current = candidate
     return current
+
+
+@contextmanager
+def _held_win32_directory_chain(
+    *,
+    root: Path,
+    directories: tuple[Path, ...],
+) -> Any:
+    if os.name != "nt" or not directories:
+        raise FormalBootstrapRenderError("Win32 directory handle chain rejected")
+    trusted_root = _safe_existing_directory(
+        root,
+        label="directory handle root",
+    )
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class FileTime(ctypes.Structure):
+        _fields_ = (
+            ("low", wintypes.DWORD),
+            ("high", wintypes.DWORD),
+        )
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = (
+            ("attributes", wintypes.DWORD),
+            ("creation_time", FileTime),
+            ("last_access_time", FileTime),
+            ("last_write_time", FileTime),
+            ("volume_serial", wintypes.DWORD),
+            ("size_high", wintypes.DWORD),
+            ("size_low", wintypes.DWORD),
+            ("link_count", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        )
+
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(ByHandleFileInformation),
+    )
+    get_information.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    invalid_handle = ctypes.c_void_p(-1).value
+    handles: list[tuple[Path, wintypes.HANDLE, dict[str, Any]]] = []
+    seen: set[str] = set()
+
+    def information(
+        path: Path,
+        handle: wintypes.HANDLE,
+    ) -> dict[str, Any]:
+        value = ByHandleFileInformation()
+        if not get_information(handle, ctypes.byref(value)):
+            raise FormalBootstrapRenderError("Win32 directory handle identity rejected")
+        reparse = bool(value.attributes & _REPARSE_ATTRIBUTE)
+        if not value.attributes & 0x00000010 or reparse:
+            raise FormalBootstrapRenderError("Win32 directory handle identity rejected")
+        return {
+            "file_id": (int(value.file_index_high) << 32) | int(value.file_index_low),
+            "path": str(path),
+            "reparse": reparse,
+            "volume_serial": int(value.volume_serial),
+        }
+
+    try:
+        for requested in directories:
+            path = _safe_existing_directory(
+                requested,
+                label="held directory",
+            )
+            normalized = os.path.normcase(str(path))
+            if normalized in seen or os.path.commonpath(
+                (normalized, os.path.normcase(str(trusted_root)))
+            ) != os.path.normcase(str(trusted_root)):
+                raise FormalBootstrapRenderError("Win32 directory handle chain rejected")
+            seen.add(normalized)
+            handle = create_file(
+                str(path),
+                0x00010000 | 0x00000080,
+                0x00000001 | 0x00000002,
+                None,
+                3,
+                0x00200000 | 0x02000000,
+                None,
+            )
+            if handle in (None, invalid_handle):
+                raise FormalBootstrapRenderError("Win32 directory handle chain rejected")
+            try:
+                identity = information(path, handle)
+            except BaseException:
+                close_handle(handle)
+                raise
+            handles.append((path, handle, identity))
+        yield tuple(identity for _path, _handle, identity in handles)
+        for path, handle, identity in handles:
+            if information(path, handle) != identity:
+                raise FormalBootstrapRenderError("Win32 directory handle chain drifted")
+            terminal = _safe_existing_directory(
+                path,
+                label="held directory",
+            )
+            if terminal != path:
+                raise FormalBootstrapRenderError("Win32 directory handle chain drifted")
+    finally:
+        for _path, handle, _identity in reversed(handles):
+            close_handle(handle)
+
+
+@contextmanager
+def _held_publication_directory_tree(
+    *,
+    root: Path,
+    targets: tuple[tuple[str, str], ...],
+) -> Any:
+    trusted_root = _safe_existing_directory(
+        root,
+        label="bootstrap output root",
+    )
+    with ExitStack() as stack:
+        stack.enter_context(
+            _held_win32_directory_chain(
+                root=trusted_root,
+                directories=(trusted_root,),
+            )
+        )
+        held = {os.path.normcase(str(trusted_root))}
+        for category, digest in targets:
+            current = trusted_root
+            for part in (category, "sha256", digest[:2]):
+                if not part or part in {".", ".."} or "/" in part or "\\" in part:
+                    raise FormalBootstrapRenderError("bootstrap output directory rejected")
+                candidate = current / part
+                try:
+                    os.mkdir(candidate)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise FormalBootstrapRenderError("bootstrap output directory rejected") from exc
+                candidate = _safe_existing_directory(
+                    candidate,
+                    label="bootstrap output directory",
+                )
+                normalized = os.path.normcase(str(candidate))
+                if normalized not in held:
+                    stack.enter_context(
+                        _held_win32_directory_chain(
+                            root=trusted_root,
+                            directories=(candidate,),
+                        )
+                    )
+                    held.add(normalized)
+                current = candidate
+        yield
 
 
 def _safe_cas_publish(
@@ -1029,11 +1551,11 @@ def _safe_cas_publish(
     return path, relative
 
 
-def publish_factor_v3_formal_bootstrap(
+def _publication_materials(
     *,
     authorization_path: Path | str,
     trusted_public_key_spki_der: bytes,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], bytes, bytes, dict[str, Any]]:
     config = _authorized_config(
         authorization_path=authorization_path,
         trusted_public_key_spki_der=trusted_public_key_spki_der,
@@ -1041,17 +1563,7 @@ def publish_factor_v3_formal_bootstrap(
     rendered = _render_embedded_config(config)
     validate_rendered_factor_v3_formal_bootstrap(rendered)
     bootstrap_sha256 = hashlib.sha256(rendered).hexdigest()
-    root = _safe_existing_directory(
-        Path(str(config["bootstrap_output_root"])),
-        label="bootstrap output root",
-    )
-    bootstrap_path, bootstrap_relative_path = _safe_cas_publish(
-        root=root,
-        category="bootstraps",
-        digest=bootstrap_sha256,
-        suffix=".py",
-        raw=rendered,
-    )
+    bootstrap_relative_path = f"bootstraps/sha256/{bootstrap_sha256[:2]}/{bootstrap_sha256}.py"
     receipt_payload = {
         "action": config["action"],
         "bootstrap_bytes": len(rendered),
@@ -1063,20 +1575,183 @@ def publish_factor_v3_formal_bootstrap(
     }
     receipt_raw = _canonical_bytes(receipt_payload)
     receipt_sha256 = hashlib.sha256(receipt_raw).hexdigest()
-    receipt_path, receipt_relative_path = _safe_cas_publish(
-        root=root,
-        category="publication_receipts",
-        digest=receipt_sha256,
-        suffix=".json",
-        raw=receipt_raw,
+    receipt_relative_path = (
+        f"publication_receipts/sha256/{receipt_sha256[:2]}/{receipt_sha256}.json"
     )
-    return {
-        **receipt_payload,
-        "bootstrap_path": str(bootstrap_path),
-        "receipt_path": str(receipt_path),
+    completion_payload = {
+        "action": config["action"],
+        "authorization_id_sha256": config["authorization_id_sha256"],
+        "authorization_nonce_sha256": config["authorization_nonce_sha256"],
+        "bootstrap_bytes": len(rendered),
+        "bootstrap_relative_path": bootstrap_relative_path,
+        "bootstrap_sha256": bootstrap_sha256,
+        "bootstrap_output_root": config["bootstrap_output_root"],
+        "execution_authorization_sha256": config["execution_authorization_sha256"],
+        "receipt_bytes": len(receipt_raw),
         "receipt_relative_path": receipt_relative_path,
         "receipt_sha256": receipt_sha256,
+        "runtime_template_sha256": RUNTIME_TEMPLATE_SHA256,
+        "schema": COMPLETION_SCHEMA,
+        "status": "completed",
     }
+    return config, rendered, receipt_raw, completion_payload
+
+
+def _validated_completion_authorization(
+    path_value: Path | str,
+    *,
+    expected_payload: Mapping[str, Any],
+    trusted_public_key_spki_der: bytes,
+) -> tuple[bytes, str]:
+    path = _absolute_path(
+        str(path_value),
+        label="completion authorization path",
+    )
+    raw = _read_safe_file(
+        path,
+        label="completion authorization",
+        max_bytes=_MAX_CONFIG_BYTES,
+    )
+    digest = hashlib.sha256(raw).hexdigest()
+    _validate_cas_path(path, digest, label="completion authorization")
+    outer = _strict_canonical_json(raw)
+    if set(outer) != {"payload", "signature_base64"} or outer.get("payload") != dict(
+        expected_payload
+    ):
+        raise FormalBootstrapRenderError("completion authorization rejected")
+    _verify_rsa3072_signature(
+        _canonical_bytes(dict(expected_payload)),
+        _decoded_signature(
+            outer.get("signature_base64"),
+            label="completion authorization",
+        ),
+        public_der=trusted_public_key_spki_der,
+        label="completion authorization",
+    )
+    return raw, digest
+
+
+def _plan_factor_v3_formal_bootstrap_publication_with_test_trust(
+    *,
+    authorization_path: Path | str,
+    trusted_public_key_spki_der: bytes,
+) -> dict[str, Any]:
+    _config, _rendered, _receipt_raw, completion_payload = _publication_materials(
+        authorization_path=authorization_path,
+        trusted_public_key_spki_der=trusted_public_key_spki_der,
+    )
+    return completion_payload
+
+
+def plan_factor_v3_formal_bootstrap_publication(
+    *,
+    authorization_path: Path | str,
+) -> dict[str, Any]:
+    return _plan_factor_v3_formal_bootstrap_publication_with_test_trust(
+        authorization_path=authorization_path,
+        trusted_public_key_spki_der=(_production_execution_authorization_public_key_der()),
+    )
+
+
+def _publish_prevalidated_completion_for_test(
+    *,
+    root: Path,
+    bootstrap_raw: bytes,
+    receipt_raw: bytes,
+    completion_raw: bytes,
+) -> dict[str, tuple[Path, str]]:
+    bootstrap_sha256 = hashlib.sha256(bootstrap_raw).hexdigest()
+    receipt_sha256 = hashlib.sha256(receipt_raw).hexdigest()
+    completion_sha256 = hashlib.sha256(completion_raw).hexdigest()
+    with _held_publication_directory_tree(
+        root=root,
+        targets=(
+            ("bootstraps", bootstrap_sha256),
+            ("publication_receipts", receipt_sha256),
+            ("completion_markers", completion_sha256),
+        ),
+    ):
+        bootstrap = _safe_cas_publish(
+            root=root,
+            category="bootstraps",
+            digest=bootstrap_sha256,
+            suffix=".py",
+            raw=bootstrap_raw,
+        )
+        receipt = _safe_cas_publish(
+            root=root,
+            category="publication_receipts",
+            digest=receipt_sha256,
+            suffix=".json",
+            raw=receipt_raw,
+        )
+        completion = _safe_cas_publish(
+            root=root,
+            category="completion_markers",
+            digest=completion_sha256,
+            suffix=".json",
+            raw=completion_raw,
+        )
+    return {
+        "bootstrap": bootstrap,
+        "completion": completion,
+        "receipt": receipt,
+    }
+
+
+def _publish_factor_v3_formal_bootstrap_with_test_trust(
+    *,
+    authorization_path: Path | str,
+    completion_authorization_path: Path | str,
+    trusted_public_key_spki_der: bytes,
+) -> dict[str, Any]:
+    config, rendered, receipt_raw, completion_payload = _publication_materials(
+        authorization_path=authorization_path,
+        trusted_public_key_spki_der=trusted_public_key_spki_der,
+    )
+    completion_raw, completion_sha256 = _validated_completion_authorization(
+        completion_authorization_path,
+        expected_payload=completion_payload,
+        trusted_public_key_spki_der=trusted_public_key_spki_der,
+    )
+    root = _safe_existing_directory(
+        Path(str(config["bootstrap_output_root"])),
+        label="bootstrap output root",
+    )
+    published = _publish_prevalidated_completion_for_test(
+        root=root,
+        bootstrap_raw=rendered,
+        receipt_raw=receipt_raw,
+        completion_raw=completion_raw,
+    )
+    bootstrap_path, bootstrap_relative_path = published["bootstrap"]
+    receipt_path, receipt_relative_path = published["receipt"]
+    completion_path, completion_relative_path = published["completion"]
+    if (
+        bootstrap_relative_path != completion_payload["bootstrap_relative_path"]
+        or receipt_relative_path != completion_payload["receipt_relative_path"]
+    ):
+        raise FormalBootstrapRenderError("publication path identity rejected")
+    return {
+        **completion_payload,
+        "bootstrap_path": str(bootstrap_path),
+        "completion_authorization_sha256": completion_sha256,
+        "completion_marker_path": str(completion_path),
+        "completion_marker_relative_path": completion_relative_path,
+        "receipt_path": str(receipt_path),
+    }
+
+
+def publish_factor_v3_formal_bootstrap(
+    *,
+    authorization_path: Path | str,
+    completion_authorization_path: Path | str,
+) -> dict[str, Any]:
+    return _publish_factor_v3_formal_bootstrap_with_test_trust(
+        authorization_path=authorization_path,
+        completion_authorization_path=completion_authorization_path,
+        trusted_public_key_spki_der=(_production_execution_authorization_public_key_der()),
+    )
 
 
 def validate_rendered_factor_v3_formal_bootstrap(raw: bytes) -> bytes:

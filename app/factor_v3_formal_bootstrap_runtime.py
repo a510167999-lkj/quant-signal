@@ -5,6 +5,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 import ctypes
 from ctypes import wintypes
+from datetime import datetime, timezone
 import errno
 import hashlib
 import hmac
@@ -24,6 +25,7 @@ import sys
 import tempfile
 from types import MappingProxyType, ModuleType
 from typing import Any
+import zipimport
 
 
 _EMBEDDED_CONFIG_JSON: bytes | None = None
@@ -31,7 +33,7 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _LOADER_IDENTITY = "factor-v3-verified-source-loader/v1"
 _CONFIG_SCHEMA = "factor-v3-formal-bootstrap-render-config/v1"
-_AUTHORIZATION_SCHEMA = "factor-v3-formal-bootstrap-execution-authorization/v1"
+_AUTHORIZATION_SCHEMA = "factor-v3-formal-bootstrap-execution-authorization/v2"
 _CLAIM_SCHEMA = "factor-v3-daily-basic-formal-bootstrap-claim/v1"
 _RECEIPT_SCHEMA = "factor-v3-daily-basic-formal-review-signed-payload/v1"
 _MAX_JSON_BYTES = 4 * 1024 * 1024
@@ -40,9 +42,40 @@ _MAX_EXECUTABLE_BYTES = 64 * 1024 * 1024
 _MAX_CAPTURE_CHARS = 1024 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024
 _REPARSE_ATTRIBUTE = 0x00000400
+_EXECUTION_AUTHORIZATION_KEY_ROLE = "factor-v3-bootstrap-execution-authorization"
+_EXECUTION_REPLAY_SCOPE = "factor-v3-formal-bootstrap-execution/v1"
+_STDLIB_POLICY_SCHEMA = "factor-v3-bootstrap-stdlib-policy/v1"
+_SUPERVISOR_PROTOCOL = "factor-v3-formal-supervisor-worker/v1"
+_WORKER_TERMINAL_SCHEMA = "factor-v3-formal-bootstrap-worker-terminal/v1"
+_SUPERVISOR_PUBLIC_ENVIRONMENT = frozenset({"SYSTEMROOT", "WINDIR", "TEMP", "TMP"})
+_SUPERVISOR_FIXED_ENVIRONMENT = frozenset(
+    {
+        "FACTOR_V3_FORMAL_LAUNCH_ACTION",
+        "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256",
+        "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL",
+    }
+)
+_SUPERVISOR_ACTION_SECRET_ENVIRONMENT = {
+    "build-spec": frozenset(),
+    "resume": frozenset({"JIAOCH_TOKEN"}),
+    "run": frozenset({"JIAOCH_TOKEN"}),
+    "verify": frozenset(),
+}
+_WORKER_TERMINAL_FIELDS = frozenset(
+    {
+        "artifacts",
+        "authorization_nonce_sha256",
+        "bootstrap_execution_authorization_sha256",
+        "launch_action",
+        "launch_authorization_sha256",
+        "result",
+        "schema",
+        "status",
+        "worker_action",
+    }
+)
 _OS_WRITE = os.write
 _OS_CLOSE = os.close
-_OS_DUP = os.dup
 _OS_DUP2 = os.dup2
 
 
@@ -126,6 +159,58 @@ def _require_sha256(value: Any, *, label: str) -> str:
     return value
 
 
+def _parsed_utc(value: Any, *, label: str) -> datetime:
+    if (
+        type(value) is not str
+        or re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+            r"[0-9]{2}:[0-9]{2}:[0-9]{2}\+00:00",
+            value,
+        )
+        is None
+    ):
+        raise _BootstrapError(f"{label} rejected")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise _BootstrapError(f"{label} rejected") from None
+    if parsed.tzinfo != timezone.utc:
+        raise _BootstrapError(f"{label} rejected")
+    return parsed
+
+
+def _validated_replay_claim(
+    value: Mapping[str, Any],
+    *,
+    now_utc: datetime | None = None,
+) -> dict[str, Any]:
+    fields = {
+        "authorization_id_sha256",
+        "authorization_nonce_sha256",
+        "expires_at_utc",
+        "issued_at_utc",
+        "not_before_utc",
+        "replay_scope",
+    }
+    if type(value) is not dict or set(value) != fields:
+        raise _BootstrapError("execution authorization replay rejected")
+    for field in ("authorization_id_sha256", "authorization_nonce_sha256"):
+        _require_sha256(value.get(field), label=field)
+    issued = _parsed_utc(value.get("issued_at_utc"), label="issued at")
+    not_before = _parsed_utc(value.get("not_before_utc"), label="not before")
+    expires = _parsed_utc(value.get("expires_at_utc"), label="expires at")
+    current = datetime.now(timezone.utc) if now_utc is None else now_utc
+    if (
+        value.get("replay_scope") != _EXECUTION_REPLAY_SCOPE
+        or not_before < issued
+        or expires <= not_before
+        or current < not_before
+        or current > expires
+    ):
+        raise _BootstrapError("execution authorization replay rejected")
+    return dict(value)
+
+
 def _write_all(
     descriptor: int,
     raw: bytes,
@@ -146,6 +231,161 @@ def _write_all(
         if type(written) is not int or isinstance(written, bool) or written <= 0:
             raise _BootstrapError("terminal output write rejected")
         offset += written
+
+
+def _validated_supervisor_environment(
+    environment: Mapping[str, str],
+    *,
+    worker_action: str,
+) -> dict[str, str]:
+    if type(environment) is not dict or worker_action not in {
+        "build-spec",
+        "run",
+        "verify",
+    }:
+        raise _BootstrapError("supervisor environment rejected")
+    canonical: dict[str, str] = {}
+    for key, value in environment.items():
+        if type(key) is not str or type(value) is not str or not value:
+            raise _BootstrapError("supervisor environment rejected")
+        normalized = key.upper()
+        if normalized in canonical:
+            raise _BootstrapError("supervisor environment rejected")
+        canonical[normalized] = value
+    launch_action = canonical.get("FACTOR_V3_FORMAL_LAUNCH_ACTION")
+    expected_worker_action = "run" if launch_action == "resume" else launch_action
+    if expected_worker_action != worker_action:
+        raise _BootstrapError("supervisor environment action rejected")
+    expected_secrets = _SUPERVISOR_ACTION_SECRET_ENVIRONMENT.get(str(launch_action))
+    if expected_secrets is None:
+        raise _BootstrapError("supervisor environment action rejected")
+    names = set(canonical)
+    allowed = _SUPERVISOR_PUBLIC_ENVIRONMENT | _SUPERVISOR_FIXED_ENVIRONMENT | expected_secrets
+    if (
+        not _SUPERVISOR_FIXED_ENVIRONMENT.issubset(names)
+        or names - allowed
+        or names & {"JIAOCH_TOKEN"} != expected_secrets
+        or canonical.get("FACTOR_V3_FORMAL_LAUNCH_PROTOCOL") != _SUPERVISOR_PROTOCOL
+        or _SHA256_RE.fullmatch(str(canonical.get("FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256")))
+        is None
+    ):
+        raise _BootstrapError("supervisor environment rejected")
+    return canonical
+
+
+def _path_within(path: Path, roots: tuple[Path, ...]) -> bool:
+    candidate = os.path.normcase(str(path.resolve(strict=False)))
+    for root in roots:
+        root_text = os.path.normcase(str(root.resolve(strict=False)))
+        try:
+            if os.path.commonpath((candidate, root_text)) == root_text:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _validated_terminal_artifacts(
+    paths: list[str],
+    *,
+    formal_output_root: Path,
+    run_root: Path,
+) -> list[dict[str, Any]]:
+    if type(paths) is not list or any(type(value) is not str for value in paths):
+        raise _BootstrapError("terminal artifact list rejected")
+    roots = (
+        _safe_existing_directory(
+            formal_output_root,
+            label="formal output root",
+        ),
+        _safe_existing_directory(run_root, label="run root"),
+    )
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in paths:
+        path = _safe_absolute_path(value, label="terminal artifact")
+        if str(path) in seen or not _path_within(path, roots):
+            raise _BootstrapError("terminal artifact path rejected")
+        seen.add(str(path))
+        parent = _safe_existing_directory(
+            path.parent,
+            label="terminal artifact parent",
+        )
+        candidate = parent / path.name
+        before = candidate.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or _is_reparse(candidate)
+            or int(getattr(before, "st_nlink", 1)) != 1
+            or before.st_size > _MAX_JSON_BYTES
+        ):
+            raise _BootstrapError("terminal artifact rejected")
+        descriptor = os.open(
+            candidate,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            raw = os.read(descriptor, _MAX_JSON_BYTES + 1)
+            terminal = candidate.lstat()
+            if (
+                len(raw) != opened.st_size
+                or not os.path.samestat(before, opened)
+                or not os.path.samestat(opened, terminal)
+                or _is_reparse(candidate)
+            ):
+                raise _BootstrapError("terminal artifact drifted")
+        finally:
+            os.close(descriptor)
+        output.append(
+            {
+                "bytes": len(raw),
+                "path": str(path),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        )
+    return sorted(output, key=lambda item: item["path"])
+
+
+def _canonical_worker_terminal_frame(
+    *,
+    config: Mapping[str, Any],
+    supervisor_environment: Mapping[str, str],
+    result: Any,
+    artifacts: list[dict[str, Any]],
+) -> bytes:
+    launch_action = supervisor_environment["FACTOR_V3_FORMAL_LAUNCH_ACTION"]
+    frame = {
+        "artifacts": artifacts,
+        "authorization_nonce_sha256": config["authorization_nonce_sha256"],
+        "bootstrap_execution_authorization_sha256": config["execution_authorization_sha256"],
+        "launch_action": launch_action,
+        "launch_authorization_sha256": supervisor_environment[
+            "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256"
+        ],
+        "result": result,
+        "schema": _WORKER_TERMINAL_SCHEMA,
+        "status": "completed",
+        "worker_action": config["action"],
+    }
+    if set(frame) != _WORKER_TERMINAL_FIELDS:
+        raise _BootstrapError("worker terminal frame rejected")
+    _reject_credential_shape(frame)
+    return _canonical_bytes(frame) + b"\n"
+
+
+def _supervisor_protocol_descriptor() -> dict[str, Any]:
+    return {
+        "action_secret_environment": {
+            key: sorted(value)
+            for key, value in sorted(_SUPERVISOR_ACTION_SECRET_ENVIRONMENT.items())
+        },
+        "fixed_environment": sorted(_SUPERVISOR_FIXED_ENVIRONMENT),
+        "protocol": _SUPERVISOR_PROTOCOL,
+        "public_environment": sorted(_SUPERVISOR_PUBLIC_ENVIRONMENT),
+        "terminal_fields": sorted(_WORKER_TERMINAL_FIELDS),
+        "terminal_schema": _WORKER_TERMINAL_SCHEMA,
+    }
 
 
 def _is_reparse(path: Path) -> bool:
@@ -817,6 +1057,150 @@ def _module_name(relative_path: str) -> tuple[str, bool]:
     raise _BootstrapError("source module rejected")
 
 
+def _read_inventory_file(path: Path, *, label: str) -> bytes:
+    parent = _safe_existing_directory(path.parent, label=f"{label} parent")
+    candidate = parent / path.name
+    try:
+        before = candidate.lstat()
+    except OSError:
+        raise _BootstrapError(f"{label} rejected") from None
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or _is_reparse(candidate)
+        or before.st_size > _MAX_EXECUTABLE_BYTES
+    ):
+        raise _BootstrapError(f"{label} rejected")
+    descriptor = os.open(
+        candidate,
+        os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        raw = os.read(descriptor, _MAX_EXECUTABLE_BYTES + 1)
+        terminal = candidate.lstat()
+        if (
+            len(raw) != opened.st_size
+            or not os.path.samestat(before, opened)
+            or not os.path.samestat(opened, terminal)
+            or _is_reparse(candidate)
+        ):
+            raise _BootstrapError(f"{label} drifted")
+        return raw
+    finally:
+        os.close(descriptor)
+
+
+def _stdlib_inventory_sha256(path: Path, *, kind: str) -> str:
+    if kind == "stdlib_zip":
+        if not path.exists():
+            return hashlib.sha256(
+                _canonical_bytes(
+                    {
+                        "kind": kind,
+                        "path": str(path),
+                        "state": "absent",
+                    }
+                )
+            ).hexdigest()
+        raw = _read_inventory_file(path, label="stdlib zip")
+        return hashlib.sha256(
+            _canonical_bytes(
+                {
+                    "bytes": len(raw),
+                    "kind": kind,
+                    "path": str(path),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
+            )
+        ).hexdigest()
+    root = _safe_existing_directory(path, label=f"{kind} root")
+    entries: list[dict[str, Any]] = []
+    allowed_suffixes = tuple(
+        dict.fromkeys(
+            (
+                *importlib.machinery.SOURCE_SUFFIXES,
+                *importlib.machinery.BYTECODE_SUFFIXES,
+                *importlib.machinery.EXTENSION_SUFFIXES,
+                ".dll",
+            )
+        )
+    )
+    for directory, names, filenames in os.walk(root, topdown=True):
+        current = Path(directory)
+        names[:] = sorted(
+            name
+            for name in names
+            if name not in {"__pycache__", "site-packages"} and not _is_reparse(current / name)
+        )
+        for filename in sorted(filenames):
+            candidate = current / filename
+            if not filename.endswith(allowed_suffixes) or _is_reparse(candidate):
+                continue
+            raw = _read_inventory_file(
+                candidate,
+                label=f"{kind} inventory file",
+            )
+            entries.append(
+                {
+                    "bytes": len(raw),
+                    "path": candidate.relative_to(root).as_posix(),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
+            )
+    return hashlib.sha256(
+        _canonical_bytes(
+            {
+                "entries": entries,
+                "kind": kind,
+                "path": str(root),
+            }
+        )
+    ).hexdigest()
+
+
+def _validated_stdlib_policy(
+    value: Any,
+    *,
+    base_python_executable: Path,
+) -> dict[str, Any]:
+    base_root = _safe_existing_directory(
+        base_python_executable.parent,
+        label="base Python root",
+    )
+    expected_paths = (
+        ("stdlib", base_root / "Lib"),
+        ("platstdlib", base_root / "DLLs"),
+        (
+            "stdlib_zip",
+            base_root / f"python{sys.version_info.major}{sys.version_info.minor}.zip",
+        ),
+    )
+    importer_policy = {
+        "bytecode_suffixes": list(importlib.machinery.BYTECODE_SUFFIXES),
+        "extension_suffixes": list(importlib.machinery.EXTENSION_SUFFIXES),
+        "finder": "FileFinder",
+        "source_suffixes": list(importlib.machinery.SOURCE_SUFFIXES),
+        "zip_finder": "zipimporter",
+    }
+    roots = [
+        {
+            "inventory_sha256": _stdlib_inventory_sha256(path, kind=kind),
+            "kind": kind,
+            "path": str(path),
+        }
+        for kind, path in expected_paths
+    ]
+    expected = {
+        "importer_policy_sha256": hashlib.sha256(_canonical_bytes(importer_policy)).hexdigest(),
+        "inventory_root_sha256": hashlib.sha256(_canonical_bytes(roots)).hexdigest(),
+        "roots": roots,
+        "schema": _STDLIB_POLICY_SCHEMA,
+    }
+    if value != expected:
+        raise _BootstrapError("stdlib policy rejected")
+    return expected
+
+
 def _validated_config() -> dict[str, Any]:
     if type(_EMBEDDED_CONFIG_JSON) is not bytes:
         raise _BootstrapError("embedded configuration unavailable")
@@ -828,6 +1212,7 @@ def _validated_config() -> dict[str, Any]:
     )
     fields = {
         "action",
+        "authorization_id_sha256",
         "authorization_issued_at_utc",
         "authorization_nonce_sha256",
         "base_python_executable_path",
@@ -840,20 +1225,25 @@ def _validated_config() -> dict[str, Any]:
         "expected_branch",
         "expected_commit",
         "execution_authorization_path",
+        "execution_authorization_key_id",
+        "execution_authorization_key_role",
         "execution_authorization_public_key_spki_der_base64",
         "execution_authorization_public_key_spki_sha256",
         "execution_authorization_sha256",
         "feature_attestation_sha256",
+        "expires_at_utc",
         "formal_input_root",
         "formal_input_root_sha256",
         "formal_output_root",
         "formal_runner_sha256",
         "git_executable_path",
         "git_executable_sha256",
+        "not_before_utc",
         "project_id",
         "python_executable_path",
         "python_executable_sha256",
         "repo_root",
+        "replay_scope",
         "review_payload_sha256",
         "review_protocol_sha256",
         "review_public_key_spki_der_base64",
@@ -869,6 +1259,8 @@ def _validated_config() -> dict[str, Any]:
         "shim_sha256",
         "source_manifest",
         "source_root_sha256",
+        "stdlib_policy",
+        "supervisor_protocol",
     }
     _reject_credential_shape(config)
     if (
@@ -889,6 +1281,7 @@ def _validated_config() -> dict[str, Any]:
         raise _BootstrapError("embedded configuration rejected")
     for field in (
         "base_python_executable_sha256",
+        "authorization_id_sha256",
         "authorization_nonce_sha256",
         "bootstrap_claim_sha256",
         "builder_sha256",
@@ -909,6 +1302,16 @@ def _validated_config() -> dict[str, Any]:
         "source_root_sha256",
     ):
         _require_sha256(config.get(field), label=field)
+    _validated_replay_claim(
+        {
+            "authorization_id_sha256": config["authorization_id_sha256"],
+            "authorization_nonce_sha256": config["authorization_nonce_sha256"],
+            "expires_at_utc": config["expires_at_utc"],
+            "issued_at_utc": config["authorization_issued_at_utc"],
+            "not_before_utc": config["not_before_utc"],
+            "replay_scope": config["replay_scope"],
+        }
+    )
     for field in (
         "base_python_executable_path",
         "bootstrap_claim_path",
@@ -949,6 +1352,21 @@ def _validated_config() -> dict[str, Any]:
         ):
             raise _BootstrapError("embedded public key rejected")
         _parse_rsa3072_spki_der(public_der)
+    execution_key_sha256 = config["execution_authorization_public_key_spki_sha256"]
+    if (
+        config.get("execution_authorization_key_id") != f"sha256:{execution_key_sha256}"
+        or config.get("execution_authorization_key_role") != _EXECUTION_AUTHORIZATION_KEY_ROLE
+        or hmac.compare_digest(
+            execution_key_sha256,
+            config["review_public_key_spki_sha256"],
+        )
+        or config.get("supervisor_protocol") != _supervisor_protocol_descriptor()
+    ):
+        raise _BootstrapError("embedded authorization policy rejected")
+    _validated_stdlib_policy(
+        config.get("stdlib_policy"),
+        base_python_executable=Path(str(config["base_python_executable_path"])),
+    )
     return config
 
 
@@ -1146,6 +1564,7 @@ def _validate_execution_authorization(
         raise _BootstrapError("execution authorization rejected")
     expected_payload = {
         "action": config["action"],
+        "authorization_id_sha256": config["authorization_id_sha256"],
         "authorization_nonce_sha256": config["authorization_nonce_sha256"],
         "base_python_executable_path": config["base_python_executable_path"],
         "base_python_executable_sha256": config["base_python_executable_sha256"],
@@ -1156,6 +1575,9 @@ def _validate_execution_authorization(
         "builder_sha256": config["builder_sha256"],
         "expected_branch": config["expected_branch"],
         "expected_commit": config["expected_commit"],
+        "execution_authorization_key_id": config["execution_authorization_key_id"],
+        "execution_authorization_key_role": config["execution_authorization_key_role"],
+        "expires_at_utc": config["expires_at_utc"],
         "feature_attestation_sha256": config["feature_attestation_sha256"],
         "formal_input_root_path": config["formal_input_root"],
         "formal_input_root_sha256": config["formal_input_root_sha256"],
@@ -1164,10 +1586,12 @@ def _validate_execution_authorization(
         "git_executable_path": config["git_executable_path"],
         "git_executable_sha256": config["git_executable_sha256"],
         "issued_at_utc": config["authorization_issued_at_utc"],
+        "not_before_utc": config["not_before_utc"],
         "project_id": config["project_id"],
         "python_executable_path": config["python_executable_path"],
         "python_executable_sha256": config["python_executable_sha256"],
         "repo_root": config["repo_root"],
+        "replay_scope": config["replay_scope"],
         "review_payload_sha256": config["review_payload_sha256"],
         "review_protocol_sha256": config["review_protocol_sha256"],
         "review_public_key_spki_der_base64": config["review_public_key_spki_der_base64"],
@@ -1183,6 +1607,8 @@ def _validate_execution_authorization(
         "shim_sha256": config["shim_sha256"],
         "source_manifest": config["source_manifest"],
         "source_root_sha256": config["source_root_sha256"],
+        "stdlib_policy": config["stdlib_policy"],
+        "supervisor_protocol": config["supervisor_protocol"],
     }
     if outer.get("payload") != expected_payload:
         raise _BootstrapError("execution authorization payload rejected")
@@ -1236,71 +1662,119 @@ def _module_entries(
     return entries, source_bytes
 
 
-def _is_within(path: Path, roots: tuple[Path, ...]) -> bool:
-    candidate = os.path.normcase(str(path.resolve(strict=False)))
-    for root in roots:
-        root_text = os.path.normcase(str(root))
-        try:
-            if os.path.commonpath((candidate, root_text)) == root_text:
-                return True
-        except ValueError:
-            continue
-    return False
-
-
 def _freeze_stdlib_import_boundary(
     *,
-    repo_root: Path,
+    stdlib_policy: Mapping[str, Any],
 ) -> tuple[tuple[str, ...], tuple[Any, ...], dict[str, Any]]:
+    if (
+        type(stdlib_policy) is not dict
+        or stdlib_policy.get("schema") != _STDLIB_POLICY_SCHEMA
+        or type(stdlib_policy.get("roots")) is not list
+    ):
+        raise _BootstrapError("stdlib import policy rejected")
+    root_entries = tuple(stdlib_policy["roots"])
+    if [item.get("kind") for item in root_entries] != [
+        "stdlib",
+        "platstdlib",
+        "stdlib_zip",
+    ]:
+        raise _BootstrapError("stdlib import policy rejected")
     roots = tuple(
-        dict.fromkeys(
-            Path(value).resolve(strict=True)
-            for value in (sys.base_prefix, sys.base_exec_prefix)
-            if type(value) is str and value
-        )
+        Path(str(item["path"]))
+        for item in root_entries
+        if item["kind"] != "stdlib_zip" or Path(str(item["path"])).is_file()
     )
     if not roots:
         raise _BootstrapError("stdlib import roots rejected")
-    import_path: list[str] = []
-    for value in sys.path:
-        if type(value) is not str or not value:
-            raise _BootstrapError("stdlib import path rejected")
-        candidate = Path(value)
-        if (
-            not candidate.is_absolute()
-            or candidate.resolve(strict=False) == repo_root
-            or not _is_within(candidate, roots)
-        ):
-            raise _BootstrapError("stdlib import path rejected")
-        import_path.append(value)
-    if len(import_path) != len(set(map(os.path.normcase, import_path))):
-        raise _BootstrapError("stdlib import path rejected")
+    file_finder_hook = importlib.machinery.FileFinder.path_hook(
+        (
+            importlib.machinery.SourceFileLoader,
+            importlib.machinery.SOURCE_SUFFIXES,
+        ),
+        (
+            importlib.machinery.SourcelessFileLoader,
+            importlib.machinery.BYTECODE_SUFFIXES,
+        ),
+        (
+            importlib.machinery.ExtensionFileLoader,
+            importlib.machinery.EXTENSION_SUFFIXES,
+        ),
+    )
+    hooks = (zipimport.zipimporter, file_finder_hook)
+    import_path = tuple(str(path) for path in roots)
     cache: dict[str, Any] = {}
-    for key, value in sys.path_importer_cache.items():
-        if (
-            type(key) is not str
-            or not key
-            or not Path(key).is_absolute()
-            or not _is_within(Path(key), roots)
-        ):
-            raise _BootstrapError("stdlib importer cache rejected")
-        cache[key] = value
-    hooks = tuple(sys.path_hooks)
-    if not hooks:
-        raise _BootstrapError("stdlib path hooks rejected")
+    for entry, path in zip(
+        (
+            item
+            for item in root_entries
+            if item["kind"] != "stdlib_zip" or Path(str(item["path"])).is_file()
+        ),
+        roots,
+        strict=True,
+    ):
+        if entry["kind"] == "stdlib_zip":
+            cache[str(path)] = zipimport.zipimporter(str(path))
+        else:
+            cache[str(path)] = file_finder_hook(str(path))
     sys.path = list(import_path)
-    return tuple(import_path), hooks, cache
+    sys.path_hooks = list(hooks)
+    sys.path_importer_cache.clear()
+    sys.path_importer_cache.update(cache)
+    return import_path, hooks, cache
 
 
 def _capture_fd_output(callback: Any) -> Any:
-    duplicate = _OS_DUP
     duplicate_to = _OS_DUP2
     close_descriptor = _OS_CLOSE
-    saved_stdout = duplicate(1)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    duplicate_handle = kernel32.DuplicateHandle
+    duplicate_handle.argtypes = (
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    )
+    duplicate_handle.restype = wintypes.BOOL
+    current_process = kernel32.GetCurrentProcess()
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    def duplicate_raw_handle(descriptor: int) -> wintypes.HANDLE:
+        source = wintypes.HANDLE(msvcrt.get_osfhandle(descriptor))
+        target = wintypes.HANDLE()
+        if not duplicate_handle(
+            current_process,
+            source,
+            current_process,
+            ctypes.byref(target),
+            0,
+            False,
+            0x00000002,
+        ):
+            raise _BootstrapError("terminal descriptor capture rejected")
+        return target
+
+    def restore_descriptor(target: int, handle: wintypes.HANDLE) -> None:
+        value = int(handle.value)
+        descriptor = msvcrt.open_osfhandle(
+            value,
+            os.O_WRONLY | getattr(os, "O_BINARY", 0),
+        )
+        handle.value = None
+        try:
+            duplicate_to(descriptor, target)
+        finally:
+            close_descriptor(descriptor)
+
+    saved_stdout = duplicate_raw_handle(1)
     try:
-        saved_stderr = duplicate(2)
+        saved_stderr = duplicate_raw_handle(2)
     except BaseException:
-        close_descriptor(saved_stdout)
+        close_handle(saved_stdout)
         raise
     try:
         with tempfile.TemporaryFile(mode="w+b") as stdout_capture:
@@ -1313,9 +1787,17 @@ def _capture_fd_output(callback: Any) -> Any:
                     value = callback()
                     sys.stdout.flush()
                     sys.stderr.flush()
+                    if not os.path.samestat(
+                        os.fstat(1),
+                        os.fstat(stdout_capture.fileno()),
+                    ) or not os.path.samestat(
+                        os.fstat(2),
+                        os.fstat(stderr_capture.fileno()),
+                    ):
+                        raise _BootstrapError("terminal descriptor capture drifted")
                 finally:
-                    duplicate_to(saved_stdout, 1)
-                    duplicate_to(saved_stderr, 2)
+                    restore_descriptor(1, saved_stdout)
+                    restore_descriptor(2, saved_stderr)
                 stdout_capture.seek(0)
                 stderr_capture.seek(0)
                 captured_stdout = stdout_capture.read(_MAX_OUTPUT_BYTES + 1)
@@ -1324,19 +1806,61 @@ def _capture_fd_output(callback: Any) -> Any:
                     raise _BootstrapError("direct descriptor output rejected")
                 return value
     finally:
-        close_descriptor(saved_stdout)
-        close_descriptor(saved_stderr)
+        if saved_stdout.value is not None:
+            close_handle(saved_stdout)
+        if saved_stderr.value is not None:
+            close_handle(saved_stderr)
+
+
+def _validated_bootstrap_script_path(value: Any) -> tuple[Path, str]:
+    path = _safe_absolute_path(value, label="bootstrap script")
+    match = re.fullmatch(r"([0-9a-f]{64})\.py", path.name)
+    if (
+        match is None
+        or path.parent.name != match.group(1)[:2]
+        or path.parent.parent.name != "sha256"
+    ):
+        raise _BootstrapError("bootstrap script CAS identity rejected")
+    raw = _read_inventory_file(path, label="bootstrap script")
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != match.group(1):
+        raise _BootstrapError("bootstrap script CAS identity rejected")
+    return path, digest
+
+
+def _terminal_artifact_paths(
+    value: Any,
+    *,
+    allowed_roots: tuple[Path, ...],
+) -> list[str]:
+    output: set[str] = set()
+
+    def visit(candidate: Any) -> None:
+        if type(candidate) is dict:
+            for nested in candidate.values():
+                visit(nested)
+        elif type(candidate) is list:
+            for nested in candidate:
+                visit(nested)
+        elif type(candidate) is str:
+            path = Path(candidate)
+            if path.is_absolute() and path.is_file() and _path_within(path, allowed_roots):
+                output.add(str(path))
+
+    visit(value)
+    return sorted(output)
 
 
 def _trusted_run() -> bytes:
     if (
         os.name != "nt"
-        or sys.argv != ["-c"]
+        or type(sys.argv) is not list
+        or len(sys.argv) != 1
         or type(sys.orig_argv) is not list
-        or len(sys.orig_argv) != 6
-        or sys.orig_argv[1:5] != ["-I", "-B", "-S", "-c"]
-        or type(sys.orig_argv[5]) is not str
-        or not sys.orig_argv[5]
+        or len(sys.orig_argv) != 5
+        or sys.orig_argv[1:4] != ["-I", "-B", "-S"]
+        or type(sys.orig_argv[4]) is not str
+        or sys.argv != [sys.orig_argv[4]]
         or sys.flags.isolated != 1
         or sys.flags.ignore_environment != 1
         or sys.flags.no_user_site != 1
@@ -1365,7 +1889,12 @@ def _trusted_run() -> bytes:
         )
     ):
         raise _BootstrapError("fixed bootstrap runtime rejected")
+    bootstrap_path, bootstrap_sha256 = _validated_bootstrap_script_path(sys.argv[0])
     config = _validated_config()
+    supervisor_environment = _validated_supervisor_environment(
+        dict(os.environ),
+        worker_action=str(config["action"]),
+    )
     python_path = Path(str(config["python_executable_path"]))
     base_python_path = Path(str(config["base_python_executable_path"]))
     if (
@@ -1432,6 +1961,14 @@ def _trusted_run() -> bytes:
             raise _BootstrapError("isolated pycache rejected")
         sys.pycache_prefix = str(cache_root)
         with ExitStack() as stack:
+            _open_held(
+                stack,
+                handles,
+                bootstrap_path,
+                expected_sha256=bootstrap_sha256,
+                label="bootstrap script",
+                max_bytes=_MAX_JSON_BYTES,
+            )
             _open_held(
                 stack,
                 handles,
@@ -1592,7 +2129,7 @@ def _trusted_run() -> bytes:
                 importlib.machinery.PathFinder,
             ]
             import_path, path_hooks, importer_cache = _freeze_stdlib_import_boundary(
-                repo_root=repo_root
+                stdlib_policy=config["stdlib_policy"]
             )
             stdout_sink = _BoundedTextSink()
             stderr_sink = _BoundedTextSink()
@@ -1651,7 +2188,29 @@ def _trusted_run() -> bytes:
             result = context.buffered_output()
     if result is None:
         raise _BootstrapError("trusted output unavailable")
-    return result
+    if result.count(b"\n") != 1 or not result.endswith(b"\n"):
+        raise _BootstrapError("trusted output rejected")
+    result_value = _strict_canonical_json(
+        result[:-1],
+        label="trusted output",
+    )
+    artifacts = _validated_terminal_artifacts(
+        _terminal_artifact_paths(
+            result_value,
+            allowed_roots=(
+                Path(str(config["formal_output_root"])),
+                Path(str(config["run_root"])),
+            ),
+        ),
+        formal_output_root=Path(str(config["formal_output_root"])),
+        run_root=Path(str(config["run_root"])),
+    )
+    return _canonical_worker_terminal_frame(
+        config=config,
+        supervisor_environment=supervisor_environment,
+        result=result_value,
+        artifacts=artifacts,
+    )
 
 
 def _main() -> int:

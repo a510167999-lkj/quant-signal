@@ -441,16 +441,21 @@ def test_rendered_bootstrap_executes_only_verified_held_source_bytes(
     from tests.test_factor_v3_formal_bootstrap_authorization import (
         _authorized_fixture,
         _render_authorized,
+        _run_as_synthetic_supervisor,
     )
 
     config, _payload, authorization_path, trusted_public_der = _authorized_fixture(tmp_path)
     rendered = _render_authorized(authorization_path, trusted_public_der)
 
-    completed = _run_rendered(rendered, config)
+    completed = _run_as_synthetic_supervisor(
+        rendered,
+        config,
+        tmp_path,
+    )
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stderr == ""
-    assert json.loads(completed.stdout) == {
+    assert json.loads(completed.stdout)["result"] == {
         "action": "verify",
         "fake_file_rejected": True,
         "formal_input_root": str(config["formal_input_root_sha256"]),

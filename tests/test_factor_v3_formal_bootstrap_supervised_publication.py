@@ -4,9 +4,7 @@ from contextlib import contextmanager
 import hashlib
 import inspect
 import json
-import os
 from pathlib import Path
-import subprocess
 
 import pytest
 
@@ -15,6 +13,7 @@ from app import factor_v3_formal_bootstrap_runtime as runtime
 from tests.test_factor_v3_formal_bootstrap_authorization import (
     _authorized_fixture,
     _render_authorized,
+    _run_as_synthetic_supervisor,
 )
 from tests.test_factor_v3_formal_bootstrap_renderer import _run_rendered
 
@@ -28,52 +27,6 @@ PRODUCTION_EXECUTION_PUBLIC_KEY_SPKI_SHA256 = (
 )
 SUPERVISOR_PROTOCOL = "factor-v3-formal-supervisor-worker/v1"
 WORKER_TERMINAL_SCHEMA = "factor-v3-formal-bootstrap-worker-terminal/v1"
-
-
-def _run_as_synthetic_supervisor(
-    rendered: bytes,
-    config: dict[str, object],
-    tmp_path: Path,
-    *,
-    launch_action: str = "verify",
-) -> subprocess.CompletedProcess[str]:
-    bootstrap_sha256 = hashlib.sha256(rendered).hexdigest()
-    bootstrap_directory = tmp_path / "synthetic-bootstrap-cas" / "sha256" / bootstrap_sha256[:2]
-    bootstrap_directory.mkdir(parents=True)
-    bootstrap_path = bootstrap_directory / f"{bootstrap_sha256}.py"
-    bootstrap_path.write_bytes(rendered)
-    launch_authorization_sha256 = hashlib.sha256(
-        b"synthetic-supervisor-launch-envelope"
-    ).hexdigest()
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if key.upper() in {"SYSTEMROOT", "WINDIR", "TEMP", "TMP"}
-    }
-    environment.update(
-        {
-            "FACTOR_V3_FORMAL_LAUNCH_ACTION": launch_action,
-            "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256": (launch_authorization_sha256),
-            "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL": SUPERVISOR_PROTOCOL,
-        }
-    )
-    if launch_action in {"run", "resume"}:
-        environment["JIAOCH_TOKEN"] = "test-only-never-log"
-    return subprocess.run(
-        [
-            str(config["python_executable_path"]),
-            "-I",
-            "-B",
-            "-S",
-            str(bootstrap_path),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        env=environment,
-        timeout=60,
-    )
 
 
 def test_production_renderer_has_a_fixed_execution_authorization_key() -> None:
@@ -185,9 +138,13 @@ def test_stdlib_policy_uses_exact_roots_and_content_inventory() -> None:
 def test_runtime_template_identity_is_canonical_lf_and_rejects_mixed_eol(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime_lf = Path(renderer.__file__).resolve().with_name(
-        "factor_v3_formal_bootstrap_runtime.py"
-    ).read_bytes().replace(b"\r\n", b"\n")
+    runtime_lf = (
+        Path(renderer.__file__)
+        .resolve()
+        .with_name("factor_v3_formal_bootstrap_runtime.py")
+        .read_bytes()
+        .replace(b"\r\n", b"\n")
+    )
     runtime_crlf = runtime_lf.replace(b"\n", b"\r\n")
     expected_sha256 = hashlib.sha256(runtime_lf).hexdigest()
     monkeypatch.setattr(renderer, "RUNTIME_TEMPLATE_SHA256", expected_sha256)
@@ -274,7 +231,7 @@ def test_completion_marker_is_the_last_and_only_selection_record(
     categories: list[str] = []
 
     @contextmanager
-    def fake_chain(**_kwargs: object):
+    def fake_tree(**_kwargs: object):
         yield ()
 
     def fake_publish(
@@ -288,8 +245,8 @@ def test_completion_marker_is_the_last_and_only_selection_record(
 
     monkeypatch.setattr(
         renderer,
-        "_held_win32_directory_chain",
-        fake_chain,
+        "_held_publication_directory_tree",
+        fake_tree,
     )
     monkeypatch.setattr(renderer, "_safe_cas_publish", fake_publish)
 
