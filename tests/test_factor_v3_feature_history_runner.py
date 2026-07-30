@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 import sqlite3
@@ -694,6 +695,52 @@ def test_run_rejects_nonfrozen_jiaoch_source_before_creating_collector(
             run_root=tmp_path / "invalid-source-run",
         )
     assert collector_created == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("token", ""),
+        ("generation_id", "not-a-uuid"),
+        ("row_cap_overrides", ()),
+        ("api_url", "https://other.example.test"),
+        ("allowed_hosts", ("other.example.test",)),
+        ("request_protocol", "tushare-root-post/v1"),
+        ("network_route", "loopback_http_proxy"),
+        ("proxy_url", "http://127.0.0.1:8080"),
+    ],
+)
+def test_frozen_jiaoch_source_guard_rejects_each_authority_field(
+    field: str,
+    value: object,
+) -> None:
+    source = replace(
+        runner._fixed_jiaoch_source(
+            credential="synthetic-token",
+            source_generation_id=SOURCE_GENERATION_ID,
+        ),
+        **{field: value},
+    )
+
+    with pytest.raises(runner.FactorV3FeatureHistoryRunnerError, match="Jiaoch source"):
+        runner._validated_frozen_jiaoch_source(source)
+
+
+def test_frozen_jiaoch_source_guard_requires_exact_source_type() -> None:
+    source = SimpleNamespace(
+        token="synthetic-token",
+        generation_id=SOURCE_GENERATION_ID,
+        name="jiaoch",
+        api_url="https://jiaoch.site",
+        allowed_hosts=("jiaoch.site",),
+        request_protocol="tushare-path-per-interface/v1",
+        row_cap_overrides=(("stk_limit", 10_000),),
+        network_route="direct",
+        proxy_url=None,
+    )
+
+    with pytest.raises(runner.FactorV3FeatureHistoryRunnerError, match="Jiaoch source"):
+        runner._validated_frozen_jiaoch_source(source)
 
 
 def test_verify_does_not_initialize_an_absent_run(
