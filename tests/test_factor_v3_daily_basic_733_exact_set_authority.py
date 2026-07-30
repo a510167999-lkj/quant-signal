@@ -326,3 +326,44 @@ def test_capability_free_verifier_rejects_deleted_or_tampered_terminal_artifacts
         authority.verify_factor_v3_daily_basic_733_exact_set_coverage(
             **_verify_kwargs(kwargs, publication)
         )
+
+
+@pytest.mark.parametrize(
+    "dependency",
+    [
+        "durable_io.py",
+        "jiaoch_points_response_normalization.py",
+        "research_pit_store.py",
+        "research_scope.py",
+        "research_security_code_transition.py",
+    ],
+)
+def test_verifier_rejects_transitive_producer_dependency_drift(
+    dependency: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs, _prewindow, _development = _kwargs(tmp_path, monkeypatch)
+    publication = authority.publish_factor_v3_daily_basic_733_exact_set_coverage(
+        **kwargs
+    )
+    read_safe_file = authority.raw_authority._read_safe_file
+
+    def read_with_dependency_drift(
+        path: str | Path,
+        **read_kwargs: Any,
+    ) -> bytes:
+        raw = read_safe_file(path, **read_kwargs)
+        if Path(path).name == dependency:
+            return raw + b"\n"
+        return raw
+
+    monkeypatch.setattr(
+        authority.raw_authority,
+        "_read_safe_file",
+        read_with_dependency_drift,
+    )
+    with pytest.raises(ValueError):
+        authority.verify_factor_v3_daily_basic_733_exact_set_coverage(
+            **_verify_kwargs(kwargs, publication)
+        )

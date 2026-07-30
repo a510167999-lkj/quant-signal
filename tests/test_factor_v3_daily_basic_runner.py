@@ -2,12 +2,28 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 import json
+import multiprocessing
 from pathlib import Path
 import uuid
 
 import pytest
 
 from app import factor_v3_daily_basic_runner as runner
+
+
+def _hold_run_lock(lock_path: str, acquired: object, release: object) -> None:
+    with runner._run_lock(Path(lock_path)):
+        acquired.set()
+        if not release.wait(30):
+            raise RuntimeError("test lock holder timed out")
+
+
+def _try_run_lock(lock_path: str, outcomes: object) -> None:
+    try:
+        with runner._run_lock(Path(lock_path)):
+            outcomes.put("acquired")
+    except (OSError, runner.FactorV3DailyBasicRunnerError):
+        outcomes.put("rejected")
 
 
 def _sessions(start: date, count: int) -> list[str]:
@@ -392,3 +408,69 @@ def test_already_verified_run_rejects_rehashed_state_receipt_path_drift(
                 runner.FACTOR_V3_DAILY_BASIC_COLLECTION_POLICY_DESCRIPTOR
             ),
         )
+
+
+def test_run_lock_three_processes_remain_fail_closed_after_contention(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    lock_path = tmp_path / "runner.lock"
+    acquired = context.Event()
+    release = context.Event()
+    outcomes = context.Queue()
+    holder = context.Process(
+        target=_hold_run_lock,
+        args=(str(lock_path), acquired, release),
+    )
+    holder.start()
+    assert acquired.wait(20)
+    try:
+        observed = []
+        for _index in range(2):
+            contender = context.Process(
+                target=_try_run_lock,
+                args=(str(lock_path), outcomes),
+            )
+            contender.start()
+            contender.join(20)
+            if contender.is_alive():
+                contender.terminate()
+                contender.join(5)
+            assert contender.exitcode == 0
+            observed.append(outcomes.get(timeout=5))
+        assert observed == ["rejected", "rejected"]
+        assert lock_path.is_file()
+    finally:
+        release.set()
+        holder.join(20)
+        if holder.is_alive():
+            holder.terminate()
+            holder.join(5)
+    assert holder.exitcode == 0
+    assert lock_path.is_file()
+    with runner._run_lock(lock_path):
+        assert lock_path.is_file()
+    assert lock_path.is_file()
+
+
+def test_run_lock_rejects_opened_file_identity_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = tmp_path / "runner.lock"
+    expected.write_bytes(b"\0")
+    substitute = tmp_path / "substitute.lock"
+    substitute.write_bytes(b"\0")
+    real_open = runner.os.open
+
+    def open_substitute(path: str, flags: int, mode: int) -> int:
+        assert Path(path) == expected
+        return real_open(str(substitute), flags, mode)
+
+    monkeypatch.setattr(runner.os, "open", open_substitute)
+    with pytest.raises(
+        runner.FactorV3DailyBasicRunnerError,
+        match="lock unavailable",
+    ):
+        with runner._run_lock(expected):
+            pytest.fail("drifted lock identity must not be acquired")
