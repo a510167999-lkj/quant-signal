@@ -16,6 +16,18 @@
 #define F3_BROKER_PRODUCTION_HANDOFF_READY 0
 #endif
 
+#ifdef F3_BROKER_TESTING
+#ifndef F3_BROKER_DISPOSABLE_TEST_MANIFEST
+#define F3_BROKER_DISPOSABLE_TEST_MANIFEST 0
+#endif
+#if F3_BROKER_DISPOSABLE_TEST_MANIFEST != 1
+#error F3_BROKER_TESTING requires a disposable test manifest
+#endif
+#if F3_BROKER_PRODUCTION_HANDOFF_READY != 0
+#error F3_BROKER_TESTING is forbidden in a production-ready build
+#endif
+#endif
+
 #define F3_CANDIDATE_SCHEMA "factor-v3-formal-native-broker-candidate/v1"
 #define F3_RUNTIME_MANIFEST_SCHEMA "factor-v3-formal-native-broker-runtime-manifest/v1"
 #define F3_SOURCE_MANIFEST_SCHEMA "factor-v3-formal-native-broker-source-manifest/v1"
