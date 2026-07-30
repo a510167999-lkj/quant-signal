@@ -6,7 +6,9 @@ It is deliberately not a production launcher yet.
 Implemented and tested:
 
 - ordinary Python can emit only a deterministic, non-secret candidate;
-- the broker maps the signing-key and credential slot IDs to compile-time paths;
+- the broker maps the credential slot ID to a compile-time path;
+- the signing identity is a fixed CNG provider/key/algorithm, never a private-key
+  file path visible to ordinary Python;
 - candidate, runtime, and reviewed-source files remain open from identity/hash
   validation through child termination;
 - every opened file and every parent directory rejects reparse points, while
@@ -19,8 +21,7 @@ Implemented and tested:
 
 Not implemented, and therefore fail closed:
 
-- Windows service identity and ACL deployment;
-- CNG-backed non-exportable production signing;
+- reviewed Windows service installation and ACL deployment;
 - a native credential-handle protocol consumed by the Python supervisor;
 - production `--launch`.
 
@@ -28,3 +29,8 @@ The checked-in manifest contains no operational paths or digests. A default
 binary compiles, but always rejects production launch as unprovisioned. Test
 builds inject only disposable fixtures with `F3_BROKER_TESTING`; that mode must
 never be used for production.
+
+The Windows kernel, local administrators, SCM, the configured service SID,
+filesystem owner/DACL state, and the Microsoft CNG KSP are explicit external
+TCB assumptions. The installer defaults to dry-run and fails closed because
+this checkout is not provisioned for an administrative deployment.

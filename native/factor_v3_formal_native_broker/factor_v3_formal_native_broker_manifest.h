@@ -5,8 +5,12 @@
 #define F3_BROKER_RUNTIME_SHA256 L""
 #define F3_BROKER_SOURCE_PATH L""
 #define F3_BROKER_SOURCE_SHA256 L""
-#define F3_BROKER_SIGNING_KEY_SLOT_PATH L""
 #define F3_BROKER_CREDENTIAL_SLOT_PATH L""
+#define F3_BROKER_CNG_PROVIDER L"Microsoft Software Key Storage Provider"
+#define F3_BROKER_CNG_KEY_NAME L"quant-signal-lkj-factor-v3-formal"
+#define F3_BROKER_CNG_ALGORITHM NCRYPT_RSA_ALGORITHM
+#define F3_BROKER_SERVICE_NAME L"QuantSignalLkjFactorV3FormalBroker"
+#define F3_BROKER_SERVICE_SID L""
 #define F3_BROKER_PRODUCTION_HANDOFF_READY 0
 
 #endif

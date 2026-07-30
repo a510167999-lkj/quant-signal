@@ -91,6 +91,7 @@ def _compile_result(
             str(output),
             "-ladvapi32",
             "-lbcrypt",
+            "-lncrypt",
         ],
         cwd=REPO_ROOT,
         check=False,
@@ -236,6 +237,14 @@ def _compile_fixture_broker(tmp_path: Path) -> tuple[Path, Path]:
                 '#define F3_BROKER_CREDENTIAL_SLOT_PATH L"'
                 + _c_wide(credential)
                 + '"',
+                (
+                    '#define F3_BROKER_CNG_PROVIDER '
+                    'L"Microsoft Software Key Storage Provider"'
+                ),
+                '#define F3_BROKER_CNG_KEY_NAME L"disposable-fixture-key"',
+                "#define F3_BROKER_CNG_ALGORITHM NCRYPT_RSA_ALGORITHM",
+                '#define F3_BROKER_SERVICE_NAME L"DisposableFixtureService"',
+                '#define F3_BROKER_SERVICE_SID L"S-1-5-18"',
                 "#define F3_BROKER_TESTING 1",
                 "#define F3_BROKER_DISPOSABLE_TEST_MANIFEST 1",
                 "",

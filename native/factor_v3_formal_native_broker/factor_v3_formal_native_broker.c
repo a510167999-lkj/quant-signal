@@ -6,6 +6,8 @@
 #include <aclapi.h>
 #include <bcrypt.h>
 #include <limits.h>
+#include <ncrypt.h>
+#include <sddl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +43,8 @@
 #define F3_MAX_CANDIDATE_BYTES (64u * 1024u)
 #define F3_MAX_MANIFEST_FILE_BYTES (64u * 1024u * 1024u)
 #define F3_MAX_SECRET_SLOT_BYTES (64u * 1024u)
+#define F3_RSA_BITS 2048u
+#define F3_DISPOSABLE_KEY_PREFIX L"quant-signal-lkj-disposable-test-"
 
 typedef struct HeldFile {
     HANDLE handle;
@@ -147,8 +151,41 @@ static int reject_reparse_chain(const wchar_t *path) {
     return 1;
 }
 
-#ifdef F3_BROKER_TESTING
-static int current_token_cannot_mutate_directory(const wchar_t *path) {
+static int sid_matches_well_known(PSID sid, WELL_KNOWN_SID_TYPE kind) {
+    BYTE buffer[SECURITY_MAX_SID_SIZE];
+    DWORD length = sizeof(buffer);
+    return CreateWellKnownSid(kind, NULL, buffer, &length)
+        && EqualSid(sid, buffer);
+}
+
+static int sid_matches_string(PSID sid, const wchar_t *expected) {
+    PSID parsed = NULL;
+    int matches = 0;
+    if (expected != NULL
+        && expected[0] != L'\0'
+        && ConvertStringSidToSidW(expected, &parsed)) {
+        matches = EqualSid(sid, parsed) != 0;
+    }
+    if (parsed != NULL) {
+        LocalFree(parsed);
+    }
+    return matches;
+}
+
+static int trusted_namespace_owner(PSID owner) {
+    static const wchar_t trusted_installer_sid[] =
+        L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+    return owner != NULL
+        && IsValidSid(owner)
+        && (
+            sid_matches_well_known(owner, WinLocalSystemSid)
+            || sid_matches_well_known(owner, WinBuiltinAdministratorsSid)
+            || sid_matches_string(owner, trusted_installer_sid)
+            || sid_matches_string(owner, F3_BROKER_SERVICE_SID)
+        );
+}
+
+int f3_broker_current_token_cannot_mutate_directory(const wchar_t *path) {
     static const DWORD mutation_rights =
         FILE_ADD_FILE
         | FILE_ADD_SUBDIRECTORY
@@ -170,6 +207,7 @@ static int current_token_cannot_mutate_directory(const wchar_t *path) {
     PRIVILEGE_SET *privileges = (PRIVILEGE_SET *)privilege_buffer;
     PSECURITY_DESCRIPTOR descriptor = NULL;
     PACL dacl = NULL;
+    PSID owner = NULL;
     HANDLE directory = INVALID_HANDLE_VALUE;
     HANDLE primary_token = NULL;
     HANDLE impersonation_token = NULL;
@@ -213,13 +251,14 @@ static int current_token_cannot_mutate_directory(const wchar_t *path) {
             OWNER_SECURITY_INFORMATION
                 | GROUP_SECURITY_INFORMATION
                 | DACL_SECURITY_INFORMATION,
-            NULL,
+            &owner,
             NULL,
             &dacl,
             NULL,
             &descriptor
         ) != ERROR_SUCCESS
         || dacl == NULL
+        || !trusted_namespace_owner(owner)
         || !OpenProcessToken(
             GetCurrentProcess(),
             TOKEN_QUERY | TOKEN_DUPLICATE,
@@ -263,6 +302,246 @@ cleanup:
     }
     SecureZeroMemory(privilege_buffer, sizeof(privilege_buffer));
     return immutable;
+}
+
+int f3_broker_current_process_is_expected_service(void) {
+    HANDLE token = NULL;
+    PSID service_sid = NULL;
+    BYTE interactive_buffer[SECURITY_MAX_SID_SIZE];
+    DWORD interactive_size = sizeof(interactive_buffer);
+    DWORD session_id = 1;
+    DWORD returned = 0;
+    BOOL service_member = FALSE;
+    BOOL interactive_member = TRUE;
+    int ok = 0;
+    if (F3_BROKER_SERVICE_SID[0] == L'\0'
+        || !ConvertStringSidToSidW(
+            F3_BROKER_SERVICE_SID,
+            &service_sid
+        )
+        || !CreateWellKnownSid(
+            WinInteractiveSid,
+            NULL,
+            interactive_buffer,
+            &interactive_size
+        )
+        || !OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY,
+            &token
+        )
+        || !GetTokenInformation(
+            token,
+            TokenSessionId,
+            &session_id,
+            sizeof(session_id),
+            &returned
+        )
+        || returned != sizeof(session_id)
+        || !CheckTokenMembership(token, service_sid, &service_member)
+        || !CheckTokenMembership(
+            token,
+            interactive_buffer,
+            &interactive_member
+        )) {
+        goto cleanup;
+    }
+    ok = session_id == 0 && service_member && !interactive_member;
+
+cleanup:
+    if (token != NULL) {
+        CloseHandle(token);
+    }
+    if (service_sid != NULL) {
+        LocalFree(service_sid);
+    }
+    SecureZeroMemory(interactive_buffer, sizeof(interactive_buffer));
+    return ok;
+}
+
+SECURITY_STATUS f3_broker_open_cng_provider(NCRYPT_PROV_HANDLE *provider) {
+    if (provider == NULL) {
+        return NTE_INVALID_PARAMETER;
+    }
+    *provider = 0;
+    return NCryptOpenStorageProvider(
+        provider,
+        F3_BROKER_CNG_PROVIDER,
+        0
+    );
+}
+
+SECURITY_STATUS f3_broker_sign_sha256_with_cng_key(
+    NCRYPT_KEY_HANDLE key,
+    const unsigned char digest[32],
+    unsigned char **signature,
+    DWORD *signature_size
+) {
+    BCRYPT_PKCS1_PADDING_INFO padding = {BCRYPT_SHA256_ALGORITHM};
+    SECURITY_STATUS status;
+    DWORD required = 0;
+    unsigned char *buffer = NULL;
+    if (key == 0
+        || digest == NULL
+        || signature == NULL
+        || signature_size == NULL) {
+        return NTE_INVALID_PARAMETER;
+    }
+    *signature = NULL;
+    *signature_size = 0;
+    status = NCryptSignHash(
+        key,
+        &padding,
+        (PBYTE)digest,
+        32,
+        NULL,
+        0,
+        &required,
+        NCRYPT_PAD_PKCS1_FLAG
+    );
+    if (status != ERROR_SUCCESS || required == 0) {
+        return status == ERROR_SUCCESS ? NTE_INTERNAL_ERROR : status;
+    }
+    buffer = (unsigned char *)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        required
+    );
+    if (buffer == NULL) {
+        return NTE_NO_MEMORY;
+    }
+    status = NCryptSignHash(
+        key,
+        &padding,
+        (PBYTE)digest,
+        32,
+        buffer,
+        required,
+        &required,
+        NCRYPT_PAD_PKCS1_FLAG
+    );
+    if (status != ERROR_SUCCESS) {
+        SecureZeroMemory(buffer, required);
+        HeapFree(GetProcessHeap(), 0, buffer);
+        return status;
+    }
+    *signature = buffer;
+    *signature_size = required;
+    return ERROR_SUCCESS;
+}
+
+#ifdef F3_BROKER_TESTING
+static int cng_key_absent(const wchar_t *key_name) {
+    NCRYPT_PROV_HANDLE provider = 0;
+    NCRYPT_KEY_HANDLE key = 0;
+    SECURITY_STATUS status;
+    int absent = 0;
+    if (f3_broker_open_cng_provider(&provider) != ERROR_SUCCESS) {
+        return 0;
+    }
+    status = NCryptOpenKey(provider, &key, key_name, 0, 0);
+    absent = status == NTE_BAD_KEYSET;
+    if (key != 0) {
+        NCryptFreeObject(key);
+    }
+    NCryptFreeObject(provider);
+    return absent;
+}
+
+static int disposable_cng_sign_test(const wchar_t *key_name) {
+    static const unsigned char digest[32] = {
+        0x62, 0x53, 0x4d, 0x7e, 0x5f, 0xe3, 0x2d, 0x82,
+        0xca, 0x35, 0x6b, 0x19, 0x26, 0x92, 0x7f, 0x9a,
+        0x6a, 0x75, 0x38, 0xec, 0x1b, 0x35, 0x67, 0x2d,
+        0xa2, 0x65, 0xa7, 0x00, 0x29, 0x22, 0x7f, 0x8d
+    };
+    BCRYPT_PKCS1_PADDING_INFO padding = {BCRYPT_SHA256_ALGORITHM};
+    NCRYPT_PROV_HANDLE provider = 0;
+    NCRYPT_KEY_HANDLE key = 0;
+    unsigned char *signature = NULL;
+    DWORD signature_size = 0;
+    DWORD bits = F3_RSA_BITS;
+    DWORD export_policy = 0;
+    DWORD ignored = 0;
+    SECURITY_STATUS status;
+    int deleted = 0;
+    int ok = 0;
+    if (key_name == NULL
+        || wcsncmp(
+            key_name,
+            F3_DISPOSABLE_KEY_PREFIX,
+            wcslen(F3_DISPOSABLE_KEY_PREFIX)
+        ) != 0
+        || !cng_key_absent(key_name)
+        || f3_broker_open_cng_provider(&provider) != ERROR_SUCCESS
+        || NCryptCreatePersistedKey(
+            provider,
+            &key,
+            F3_BROKER_CNG_ALGORITHM,
+            key_name,
+            0,
+            NCRYPT_OVERWRITE_KEY_FLAG
+        ) != ERROR_SUCCESS
+        || NCryptSetProperty(
+            key,
+            NCRYPT_LENGTH_PROPERTY,
+            (PBYTE)&bits,
+            sizeof(bits),
+            0
+        ) != ERROR_SUCCESS
+        || NCryptSetProperty(
+            key,
+            NCRYPT_EXPORT_POLICY_PROPERTY,
+            (PBYTE)&export_policy,
+            sizeof(export_policy),
+            0
+        ) != ERROR_SUCCESS
+        || NCryptFinalizeKey(key, 0) != ERROR_SUCCESS
+        || f3_broker_sign_sha256_with_cng_key(
+            key,
+            digest,
+            &signature,
+            &signature_size
+        ) != ERROR_SUCCESS
+        || NCryptVerifySignature(
+            key,
+            &padding,
+            (PBYTE)digest,
+            sizeof(digest),
+            signature,
+            signature_size,
+            NCRYPT_PAD_PKCS1_FLAG
+        ) != ERROR_SUCCESS) {
+        goto cleanup;
+    }
+    status = NCryptExportKey(
+        key,
+        0,
+        BCRYPT_RSAFULLPRIVATE_BLOB,
+        NULL,
+        NULL,
+        0,
+        &ignored,
+        0
+    );
+    if (status == ERROR_SUCCESS) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (signature != NULL) {
+        SecureZeroMemory(signature, signature_size);
+        HeapFree(GetProcessHeap(), 0, signature);
+    }
+    if (key != 0) {
+        deleted = NCryptDeleteKey(key, 0) == ERROR_SUCCESS;
+        key = 0;
+    }
+    if (provider != 0) {
+        NCryptFreeObject(provider);
+    }
+    return ok && deleted && cng_key_absent(key_name);
 }
 #endif
 
@@ -812,7 +1091,10 @@ static int manifests_provisioned(void) {
         && wcslen(F3_BROKER_RUNTIME_SHA256) == 64
         && F3_BROKER_SOURCE_PATH[0] != L'\0'
         && wcslen(F3_BROKER_SOURCE_SHA256) == 64
-        && F3_BROKER_SIGNING_KEY_SLOT_PATH[0] != L'\0'
+        && F3_BROKER_CNG_PROVIDER[0] != L'\0'
+        && F3_BROKER_CNG_KEY_NAME[0] != L'\0'
+        && F3_BROKER_SERVICE_NAME[0] != L'\0'
+        && F3_BROKER_SERVICE_SID[0] != L'\0'
         && F3_BROKER_CREDENTIAL_SLOT_PATH[0] != L'\0';
 }
 
@@ -1259,7 +1541,6 @@ static int test_launch(
     HeldFile runtime = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile source = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile candidate = {INVALID_HANDLE_VALUE, 0, 0, {0}};
-    HeldFile signing_key = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile credential = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     CandidateAction action = ACTION_INVALID;
     int ok = open_and_validate_public_boundary(
@@ -1270,11 +1551,6 @@ static int test_launch(
         &action
     );
     if (!ok
-        || !open_held_file(
-            F3_BROKER_SIGNING_KEY_SLOT_PATH,
-            F3_MAX_SECRET_SLOT_BYTES,
-            &signing_key
-        )
         || ((action == ACTION_RUN || action == ACTION_RESUME)
             && !open_held_file(
                 F3_BROKER_CREDENTIAL_SLOT_PATH,
@@ -1293,14 +1569,12 @@ static int test_launch(
         ok = held_unchanged(&candidate, NULL)
             && held_unchanged(&source, F3_BROKER_SOURCE_SHA256)
             && held_unchanged(&runtime, F3_BROKER_RUNTIME_SHA256)
-            && held_unchanged(&signing_key, NULL)
             && (credential.handle == INVALID_HANDLE_VALUE
                 || held_unchanged(&credential, NULL));
     }
 
 cleanup:
     close_held(&credential);
-    close_held(&signing_key);
     close_held(&candidate);
     close_held(&source);
     close_held(&runtime);
@@ -1317,6 +1591,35 @@ int wmain(int argc, wchar_t **argv) {
         return 0;
     }
 #ifdef F3_BROKER_TESTING
+    if (argc == 2 && wcscmp(argv[1], L"--test-require-service-identity") == 0) {
+        if (!f3_broker_current_process_is_expected_service()) {
+            fwprintf(stderr, L"native broker service identity rejected\n");
+            return 28;
+        }
+        return 0;
+    }
+    if (argc == 3 && wcscmp(argv[1], L"--test-protected-namespace") == 0) {
+        if (!f3_broker_current_token_cannot_mutate_directory(argv[2])) {
+            fwprintf(stderr, L"native broker protected namespace rejected\n");
+            return 29;
+        }
+        return 0;
+    }
+    if (argc == 3 && wcscmp(argv[1], L"--test-cng-key-absent") == 0) {
+        if (!cng_key_absent(argv[2])) {
+            fwprintf(stderr, L"native broker disposable CNG key still present\n");
+            return 30;
+        }
+        return 0;
+    }
+    if (argc == 3 && wcscmp(argv[1], L"--test-cng-disposable") == 0) {
+        if (!disposable_cng_sign_test(argv[2])) {
+            fwprintf(stderr, L"native broker disposable CNG signing rejected\n");
+            return 31;
+        }
+        fputws(L"CNG_DISPOSABLE_SIGN_OK\n", stdout);
+        return fflush(stdout) == 0 ? 0 : 32;
+    }
     if (argc == 4 && wcscmp(argv[1], L"--test-quote-command") == 0) {
         wchar_t command_line[32768];
         if (!quoted_command_line(
@@ -1338,7 +1641,7 @@ int wmain(int argc, wchar_t **argv) {
         argc == 3
         && wcscmp(argv[1], L"--test-current-token-readonly-root") == 0
     ) {
-        if (!current_token_cannot_mutate_directory(argv[2])) {
+        if (!f3_broker_current_token_cannot_mutate_directory(argv[2])) {
             fwprintf(stderr, L"native broker namespace mutable by caller\n");
             return 25;
         }
@@ -1371,7 +1674,11 @@ int wmain(int argc, wchar_t **argv) {
 #endif
     if (argc == 3 && wcscmp(argv[1], L"--launch") == 0) {
 #if F3_BROKER_PRODUCTION_HANDOFF_READY
-        fwprintf(stderr, L"native broker service/CNG handoff is unimplemented\n");
+        if (!f3_broker_current_process_is_expected_service()) {
+            fwprintf(stderr, L"native broker service identity rejected\n");
+            return 28;
+        }
+        fwprintf(stderr, L"native broker credential handoff is unimplemented\n");
 #else
         fwprintf(stderr, L"native broker production boundary is unprovisioned\n");
 #endif
