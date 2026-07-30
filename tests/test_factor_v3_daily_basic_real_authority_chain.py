@@ -465,17 +465,22 @@ def test_real_250_plus_483_authority_chain_runs_and_cli_reverifies(
         "expected_security_code_transition_contract_sha256": transition_sha256,
     }
     authority_binding = {"binding_sha256": "9" * 64}
+    feature_receipt = history_runner.verify_factor_v3_feature_history_run(
+        run_spec_path=feature_spec_path,
+        run_root=feature_run_root,
+    )["receipt"]
+    assert feature_receipt["session_count"] == len(prewindow)
+    assert feature_receipt[
+        "sessions_sha256"
+    ] == history_runner._canonical_sha256(prewindow)
     monkeypatch.setattr(
         frozen,
         "verify_factor_v3_feature_history_frozen_source_attestation",
-        lambda **kwargs: {
+        lambda **_kwargs: {
             "authority_binding": authority_binding,
-            "receipt_sha256": history_runner.verify_factor_v3_feature_history_run(
-                run_spec_path=kwargs["feature_history_run_spec_path"],
-                run_root=kwargs["feature_history_run_root"],
-            )["receipt"]["receipt_sha256"],
-            "session_count": 250,
-            "sessions_sha256": "f" * 64,
+            "receipt_sha256": feature_receipt["receipt_sha256"],
+            "session_count": feature_receipt["session_count"],
+            "sessions_sha256": feature_receipt["sessions_sha256"],
             "verified": True,
         },
     )
