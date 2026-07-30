@@ -184,6 +184,22 @@ def _bundle(monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, Any], dict[str, 
             ]
         ),
     }
+    per_date_board_ledger = [
+        {
+            "trade_date": trade_date,
+            "raw_source_rows_sha256": _sha(["raw-source", trade_date]),
+            "normalized_rows_sha256": _sha(["normalized-source", trade_date]),
+            "segment_counts": {
+                "BSE": 1,
+                "SSE_MAIN": 1,
+                "SSE_STAR": 1,
+                "SZSE_CHINEXT": 1,
+                "SZSE_MAIN": 1,
+            },
+        }
+        for trade_date in source_dates
+    ]
+    board_ledger_root = _sha(per_date_board_ledger)
     bundle = {
         "schema_version": "audited-pit-factor-v3-development-input-bundle/v1",
         "points_contract_sha256": points.FACTOR_V3_POINTS_CONTRACT_SHA256,
@@ -247,6 +263,8 @@ def _bundle(monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, Any], dict[str, 
                 "SZSE_CHINEXT": 1,
                 "SZSE_MAIN": 1,
             },
+            "per_date": per_date_board_ledger,
+            "per_date_board_ledger_root_sha256": board_ledger_root,
         },
         "factor_v2_evaluation": {
             "terminal_decision_descriptor_sha256": roots[
@@ -282,6 +300,7 @@ def _bundle(monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, Any], dict[str, 
                 "daily_basic_normalized_row_authority_root_sha256"
             ],
             "source_dates_sha256": _sha(source_dates),
+            "upstream_board_ledger_root_sha256": board_ledger_root,
             "factor_v3_development_materialization_input_eligible": True,
             "formal_factor_v3_materialization_performed": False,
         },
@@ -299,16 +318,94 @@ def _write_bundle(tmp_path: Path, bundle: dict[str, Any]) -> Path:
     return path
 
 
+def _write_input_authority_descriptor(
+    tmp_path: Path,
+    bundle: dict[str, Any],
+    verified: dict[str, Any],
+) -> tuple[Path, str]:
+    root = tmp_path / "immutable-input-snapshot"
+    root.mkdir(parents=True, exist_ok=True)
+    source_payloads = {
+        "factor_v2_parent": bundle["factor_v2_parent"],
+        "calendar": bundle["calendar"],
+        "daily_basic": bundle["daily_basic"],
+        "daily_traded_cross_section": bundle["daily_traded_cross_section"],
+        "listing_membership": bundle["listing_membership"],
+        "suspensions": bundle["suspensions"],
+        "security_code_transitions": bundle["security_code_transitions"],
+        "upstream_board_ledger": bundle["upstream_board_ledger"],
+        "factor_v2_evaluation": bundle["factor_v2_evaluation"],
+        "feature_history_receipt": verified["feature_history"],
+        "daily_basic_exact_set_receipt": verified["daily_basic"],
+    }
+    roots = bundle["authority_identities"]
+    receipt_sha256 = {
+        "factor_v2_parent": bundle["factor_v2_parent"]["factor_v2_common_eligible_receipt_sha256"],
+        "calendar": roots["extended_trading_calendar_receipt_sha256"],
+        "daily_basic": roots["daily_basic_coverage_receipt_sha256"],
+        "daily_traded_cross_section": roots["daily_basic_coverage_receipt_sha256"],
+        "listing_membership": roots["pit_listing_membership_root_sha256"],
+        "suspensions": roots["pit_suspension_root_sha256"],
+        "security_code_transitions": roots["security_code_transition_evidence_root_sha256"],
+        "upstream_board_ledger": roots["daily_basic_coverage_receipt_sha256"],
+        "factor_v2_evaluation": roots["factor_v2_evaluator_descriptor_sha256"],
+        "feature_history_receipt": roots[
+            "factor_v3_feature_history_verification_receipt_sha256"
+        ],
+        "daily_basic_exact_set_receipt": roots["daily_basic_coverage_receipt_sha256"],
+    }
+    descriptors: dict[str, dict[str, str]] = {}
+    for name, payload in source_payloads.items():
+        path = root / f"{name}.json"
+        raw = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        path.write_bytes(raw)
+        descriptors[name] = {
+            "relative_path": path.name,
+            "file_sha256": hashlib.sha256(raw).hexdigest(),
+            "receipt_sha256": receipt_sha256[name],
+            "producer_root_sha256": receipt_sha256[name],
+        }
+    descriptor = {
+        "schema_version": "audited-pit-factor-v3-development-input-authority/v1",
+        "authority_status": "VERIFIED_CONCRETE_IMMUTABLE_INPUT_SNAPSHOT",
+        "development_only": True,
+        "points_contract_sha256": bundle["points_contract_sha256"],
+        "authority_identities": roots,
+        "parent_payload_fields": ["frozen_target"],
+        "source_descriptors": descriptors,
+    }
+    descriptor_path = root / "input-authority.json"
+    raw = json.dumps(
+        descriptor,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    descriptor_path.write_bytes(raw)
+    return descriptor_path, hashlib.sha256(raw).hexdigest()
+
+
 def _materialize(
     tmp_path: Path,
     bundle: dict[str, Any],
     verified: dict[str, Any],
 ) -> dict[str, Any]:
+    descriptor_path, descriptor_sha256 = _write_input_authority_descriptor(
+        tmp_path,
+        bundle,
+        verified,
+    )
     return materializer.materialize_factor_v3_development_candidate(
-        input_bundle_path=_write_bundle(tmp_path, bundle),
+        input_authority_descriptor_path=descriptor_path,
+        expected_input_authority_descriptor_sha256=descriptor_sha256,
         output_root=tmp_path / "candidates",
-        verify_feature_history=lambda: deepcopy(verified["feature_history"]),
-        verify_daily_basic=lambda: deepcopy(verified["daily_basic"]),
     )
 
 
@@ -562,24 +659,31 @@ def test_create_only_post_verifier_and_unsafe_inputs_fail_closed(
         _materialize(tmp_path / "capability", bundle, verified)
 
     bundle, verified = _bundle(monkeypatch)
-    bundle_path = _write_bundle(tmp_path / "wal", bundle)
-    Path(f"{bundle_path}-wal").write_text("live-store-sidecar", encoding="utf-8")
+    descriptor_path, descriptor_sha256 = _write_input_authority_descriptor(
+        tmp_path / "wal",
+        bundle,
+        verified,
+    )
+    Path(f"{descriptor_path}-wal").write_text("live-store-sidecar", encoding="utf-8")
     with pytest.raises(ValueError, match="WAL|SHM|live store"):
         materializer.materialize_factor_v3_development_candidate(
-            input_bundle_path=bundle_path,
+            input_authority_descriptor_path=descriptor_path,
+            expected_input_authority_descriptor_sha256=descriptor_sha256,
             output_root=tmp_path / "wal-candidates",
-            verify_feature_history=lambda: deepcopy(verified["feature_history"]),
-            verify_daily_basic=lambda: deepcopy(verified["daily_basic"]),
         )
 
     receipt_path.write_text("tampered", encoding="utf-8")
+    descriptor_path, descriptor_sha256 = _write_input_authority_descriptor(
+        tmp_path / "verify",
+        bundle,
+        verified,
+    )
     with pytest.raises(ValueError, match="receipt"):
         materializer.verify_factor_v3_development_candidate(
             candidate_path=candidate_path,
             receipt_path=receipt_path,
-            input_bundle_path=_write_bundle(tmp_path / "verify", bundle),
+            input_authority_descriptor_path=descriptor_path,
+            expected_input_authority_descriptor_sha256=descriptor_sha256,
             expected_artifact_sha256=result["artifact_sha256"],
             expected_receipt_sha256=result["receipt_sha256"],
-            verify_feature_history=lambda: deepcopy(verified["feature_history"]),
-            verify_daily_basic=lambda: deepcopy(verified["daily_basic"]),
         )
