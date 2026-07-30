@@ -526,6 +526,18 @@ def test_parent_signal_must_be_within_pit_listing_membership_interval(
         _materialize(tmp_path, bundle, verified)
 
 
+def test_parent_payload_cannot_persist_sensitive_or_unregistered_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle, verified = _bundle(monkeypatch)
+    bundle["factor_v2_parent"]["rows"][0]["token"] = "must-never-persist"
+    bundle["factor_v2_parent"]["rows_sha256"] = _sha(bundle["factor_v2_parent"]["rows"])
+
+    with pytest.raises(ValueError, match="parent payload"):
+        _materialize(tmp_path, bundle, verified)
+
+
 def test_create_only_post_verifier_and_unsafe_inputs_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
