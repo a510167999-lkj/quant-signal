@@ -4,6 +4,7 @@ from dataclasses import asdict
 from datetime import date, timedelta
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 from typing import Any
@@ -454,6 +455,56 @@ def test_feature_history_database_lock_denies_write_and_replacement(
         )
     finally:
         handle.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows deny-write/delete contract")
+def test_development_database_is_locked_before_from_file_and_through_query(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = (tmp_path / "metadata.sqlite3").resolve()
+    database.write_bytes(b"development-database")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(b'{"manifest":"development"}')
+    database_replacement = tmp_path / "replacement.sqlite3"
+    database_replacement.write_bytes(b"replacement")
+    manifest_replacement = tmp_path / "replacement.json"
+    manifest_replacement.write_bytes(b'{"manifest":"replacement"}')
+    database_blocked = False
+    manifest_blocked = False
+
+    class ProbeStop(RuntimeError):
+        pass
+
+    def probe_from_file(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal database_blocked, manifest_blocked
+        try:
+            database_replacement.replace(database)
+        except PermissionError:
+            database_blocked = True
+        try:
+            manifest_replacement.replace(manifest)
+        except PermissionError:
+            manifest_blocked = True
+        raise ProbeStop
+
+    monkeypatch.setattr(
+        authority.legacy.AuditedPointInTimeUniverse,
+        "from_file",
+        probe_from_file,
+    )
+
+    with pytest.raises(ProbeStop):
+        authority._load_development_authority(
+            audited_development_universe_sqlite_path=database,
+            expected_development_coverage_audit_sha256="a" * 64,
+            expected_development_artifact_root_sha256="b" * 64,
+            expected_development_temporal_contract_sha256="c" * 64,
+            expected_development_temporal_role="development_4",
+        )
+
+    assert database_blocked is True
+    assert manifest_blocked is True
 
 
 def test_v2_publisher_and_capability_free_verifier_rebuild_exact_733_union(

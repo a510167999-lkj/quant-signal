@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 import hashlib
+import inspect
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -257,6 +260,77 @@ def test_formal_worktree_requires_exact_branch_and_clean_status(
         formal.verify_formal_worktree(
             expected_reviewed_commit=reviewed_commit,
         )
+
+
+def test_formal_worktree_review_anchor_is_not_caller_supplied() -> None:
+    assert inspect.signature(formal.verify_formal_worktree).parameters == {}
+    assert len(formal.FORMAL_REVIEW_RECEIPT_SHA256) == 64
+    assert formal.FORMAL_REVIEW_RECEIPT_PATH == (
+        formal.MAIN_REPO_ROOT
+        / "data/research_artifacts/factor_v3_daily_basic_formal_review_v1"
+        / "review_receipts/sha256"
+        / formal.FORMAL_REVIEW_RECEIPT_SHA256[:2]
+        / f"{formal.FORMAL_REVIEW_RECEIPT_SHA256}.json"
+    )
+
+
+def test_formal_git_executable_sha_is_frozen() -> None:
+    assert formal.GIT_EXECUTABLE_SHA256 == (
+        "c39b1b4f7a57935bbeadf246dc2466316619453a6a9da77c4a9c6bd6d8fb21d3"
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows deny-write/delete contract")
+def test_formal_git_handle_denies_transient_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = (tmp_path / "git.exe").resolve()
+    original = b"pinned-git"
+    executable.write_bytes(original)
+    replacement = tmp_path / "replacement.exe"
+    replacement.write_bytes(b"transient-git")
+    monkeypatch.setattr(formal, "GIT_EXECUTABLE", executable)
+    monkeypatch.setattr(
+        formal,
+        "GIT_EXECUTABLE_SHA256",
+        hashlib.sha256(original).hexdigest(),
+        raising=False,
+    )
+    blocked = False
+
+    def transient_replace(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        nonlocal blocked
+        try:
+            os.replace(replacement, executable)
+        except PermissionError:
+            blocked = True
+        else:
+            executable.write_bytes(original)
+        return SimpleNamespace(stdout="ok\n", stderr="", returncode=0)
+
+    monkeypatch.setattr(formal.subprocess, "run", transient_replace)
+
+    assert formal._git_output("rev-parse", "HEAD") == "ok"
+    assert blocked is True
+    assert executable.read_bytes() == original
+
+
+def test_formal_runner_load_binds_physical_source_through_import_and_postverify() -> None:
+    source = inspect.getsource(formal._load_runner)
+
+    assert "FACTOR_V3_DAILY_BASIC_RUNNER_SHA256" in source
+    assert "_open_pinned_file" in source
+    assert "_postverify_pinned_file" in source
+
+
+def test_formal_spec_publication_reuses_safe_cas_primitives() -> None:
+    source = inspect.getsource(formal.publish_candidate)
+
+    assert "raw_authority._content_addressed_directory" in source
+    assert "raw_authority._write_create_only" in source
+    assert "raw_authority._read_safe_file" in source
+    assert "fsync_directory" in source
 
 
 def test_isolated_cli_shim_delegates_verify_without_import_path_leak(

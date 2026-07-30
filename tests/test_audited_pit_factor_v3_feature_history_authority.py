@@ -17,6 +17,7 @@ import pytest
 
 from app import audited_pit_factor_v3_feature_history_authority as history_authority
 from app import durable_io
+from app import factor_v3_feature_history_frozen_source_attestation as frozen_attestation
 from app import jiaoch_trade_cal_authority
 from app.audited_pit_factor_v3_points_contract import (
     FACTOR_V3_POINTS_CONTRACT_SHA256,
@@ -638,6 +639,95 @@ def _verify_source_bound(
         collection_publication_output_root=publication_output_root,
         collection_publication=collection_publication,
     )
+
+
+def test_attestation_cannot_authorize_a_different_same_producer_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, trade_cal_publication, _sessions, store, _refs, _database_sha256 = (
+        _real_store_fixture(tmp_path, monkeypatch)
+    )
+    output_root, collection_publication = _publish_source_bound(
+        plan=plan,
+        publication=trade_cal_publication,
+        store=store,
+    )
+    attested_run_root = (tmp_path / "attested-run-a").resolve()
+    attested_spec_path = (tmp_path / "attested-spec-a.json").resolve()
+    attested_feature = {
+        "authority_manifest_relative_path": (
+            "feature_history_collection_manifest_candidates/sha256/aa/"
+            f"{'a' * 64}.json"
+        ),
+        "authority_manifest_sha256": "a" * 64,
+        "feature_run_root": str(attested_run_root),
+        "feature_run_spec_file_sha256": "b" * 64,
+        "feature_run_spec_path": str(attested_spec_path),
+        "feature_run_spec_sha256": "c" * 64,
+        "pit_store_database_sha256": "d" * 64,
+        "publication_capability_sha256": "e" * 64,
+        "publication_issuance_relative_path": (
+            "feature_history_collection_publication_receipts/sha256/ff/"
+            f"{'f' * 64}.json"
+        ),
+        "publication_issuance_sha256": "f" * 64,
+        "receipt_sha256": "1" * 64,
+        "session_count": 250,
+        "sessions_sha256": "2" * 64,
+        "snapshot_index_sha256": "3" * 64,
+        "source_authority_root_sha256": "4" * 64,
+    }
+    attested_context = {
+        "attestation": {"artifact": "A"},
+        "attestor_producer": {"root_sha256": "5" * 64},
+        "feature_history": attested_feature,
+        "frozen_source_root": str(tmp_path.resolve()),
+        "physical_binding": {"producer_binding_root_sha256": "6" * 64},
+        "producer_binding": history_authority._producer_binding(),
+        "run_root": str(attested_run_root),
+        "spec_path": str(attested_spec_path),
+    }
+    monkeypatch.setattr(
+        frozen_attestation,
+        "_validated_attested_replay_context",
+        lambda **_kwargs: deepcopy(attested_context),
+    )
+
+    with pytest.raises(ValueError, match="attest|binding|mismatch"):
+        history_authority._verify_feature_history_with_attested_producer_binding(
+            attestation_path=tmp_path / "same-attestation.json",
+            expected_attestation_sha256="7" * 64,
+            frozen_source_root=tmp_path,
+            expected_frozen_source_commit="8" * 40,
+            feature_history_run_spec_path=attested_spec_path,
+            feature_history_run_root=attested_run_root,
+            collection_publication=collection_publication,
+            collection_publication_output_root=output_root,
+            collection_plan=plan,
+            development_session_refs=_development_refs(
+                plan["development_sessions"]["sessions"]
+            ),
+            temporal_partition_contract=load_temporal_partition_contract(
+                PARTITION_V1_PATH
+            ),
+            trade_cal_output_root=Path("synthetic-trade-cal-root"),
+            trade_cal_publication=trade_cal_publication,
+        )
+
+
+def test_collection_manifest_and_issuance_reuse_safe_cas_primitives() -> None:
+    source = inspect.getsource(
+        history_authority._write_collection_content_addressed_candidate
+    )
+    verifier_source = inspect.getsource(
+        history_authority._validated_collection_publication_issuance
+    )
+
+    assert "raw_authority._content_addressed_directory" in source
+    assert "raw_authority._write_create_only" in source
+    assert "raw_authority._read_safe_file" in verifier_source
+    assert "fsync_directory" in source
 
 
 def test_public_surface_is_offline_and_caller_cannot_select_history_window() -> None:
