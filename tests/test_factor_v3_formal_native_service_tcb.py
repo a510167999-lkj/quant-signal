@@ -138,6 +138,10 @@ def _replace_acl(
     builtin_users_rights: str | None,
     grant_current_user: bool = True,
     interactive_rights: str | None = None,
+    service_writer_sid: str | None = None,
+    owner_rights: str | None = None,
+    exact_reader_sid: str | None = None,
+    exact_reader_rights: str = "RX",
 ) -> None:
     account = f"{os.environ['USERDOMAIN']}\\{os.environ['USERNAME']}"
     inherit = "(OI)(CI)" if path.is_dir() else ""
@@ -153,6 +157,14 @@ def _replace_acl(
         )
     if interactive_rights is not None:
         grants.append(f"*S-1-5-4:{inherit}({interactive_rights})")
+    if service_writer_sid is not None:
+        grants.append(f"*{service_writer_sid}:{inherit}(F)")
+    if owner_rights is not None:
+        grants.append(f"*S-1-3-4:{inherit}({owner_rights})")
+    if exact_reader_sid is not None:
+        grants.append(
+            f"*{exact_reader_sid}:{inherit}({exact_reader_rights})"
+        )
     completed = subprocess.run(
         [
             "icacls",
@@ -167,6 +179,99 @@ def _replace_acl(
         timeout=20,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def _current_logon_sid() -> str:
+    completed = subprocess.run(
+        ["whoami", "/logonid"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+    sid = completed.stdout.strip()
+    assert sid.startswith("S-1-5-5-")
+    return sid
+
+
+def _current_user_sid() -> str:
+    completed = subprocess.run(
+        ["whoami", "/user"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+    values = [
+        value
+        for value in completed.stdout.split()
+        if value.startswith("S-1-")
+    ]
+    assert len(values) == 1
+    return values[0]
+
+
+def _current_cloud_identity_sid() -> str:
+    completed = subprocess.run(
+        ["whoami", "/groups"],
+        check=False,
+        capture_output=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+    values = [
+        value.decode("ascii")
+        for value in completed.stdout.split()
+        if value.startswith(b"S-1-11-")
+    ]
+    assert len(values) == 1
+    return values[0]
+
+
+def _copy_disposable_python_runtime(
+    root: Path,
+    *,
+    worker_sid: str,
+) -> Path:
+    source = Path(sys._base_executable).resolve().parent
+    target = root / "restricted-python"
+    target.mkdir()
+    _replace_acl(
+        target,
+        builtin_users_rights=None,
+        exact_reader_sid=worker_sid,
+    )
+    for name in (
+        "python.exe",
+        "python3.dll",
+        "python311.dll",
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+    ):
+        shutil.copy2(source / name, target / name)
+    shutil.copytree(
+        source / "DLLs",
+        target / "DLLs",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+    )
+    shutil.copytree(
+        source / "Lib",
+        target / "Lib",
+        ignore=shutil.ignore_patterns(
+            "site-packages",
+            "__pycache__",
+            "*.pyc",
+            "*.pyo",
+        ),
+    )
+    (target / "python311._pth").write_text(
+        ".\nLib\nDLLs\n",
+        encoding="ascii",
+        newline="\n",
+    )
+    return (target / "python.exe").resolve()
 
 
 def _grant_cleanup_access(root: Path) -> None:
@@ -481,23 +586,55 @@ def _build_native_supervisor_e2e_fixture(
     from app import factor_v3_formal_native_broker as broker
 
     now = datetime.now(timezone.utc).replace(microsecond=0)
+    service_sid = _current_cloud_identity_sid()
+    worker_sid = "S-1-5-32-545"
+    _replace_acl(
+        root,
+        builtin_users_rights="RX",
+    )
+    runtime_python = _copy_disposable_python_runtime(
+        root,
+        worker_sid=worker_sid,
+    )
+
     def current_validity(payload: dict[str, object]) -> None:
-        base_python = Path(sys._base_executable).resolve()
+        base_python = runtime_python
         payload["issued_at_utc"] = now.isoformat(timespec="seconds")
         payload["not_before_utc"] = now.isoformat(timespec="seconds")
         payload["expires_at_utc"] = (now + timedelta(minutes=30)).isoformat(
             timespec="seconds"
         )
         payload["python_executable_path"] = str(base_python)
-        payload["python_executable_sha256"] = hashlib.sha256(
+        runtime_sha256 = hashlib.sha256(
             base_python.read_bytes()
         ).hexdigest()
+        payload["python_executable_sha256"] = runtime_sha256
+        payload["base_python_executable_path"] = str(base_python)
+        payload["base_python_executable_sha256"] = runtime_sha256
+        stdlib_policy = (
+            formal_bootstrap_renderer._trusted_stdlib_policy_for_base_python(
+                base_python,
+                Path(str(payload["stdlib_policy"]["pycache_prefix"])),
+            )
+        )
+        payload["stdlib_policy"] = stdlib_policy
+        payload["stdlib_policy_root_sha256"] = (
+            formal_bootstrap_renderer.stdlib_policy_root_sha256(
+                stdlib_policy
+            )
+        )
         claim_path = Path(str(payload["bootstrap_claim_path"]))
         claim = json.loads(claim_path.read_bytes())
         claim["python_executable_path"] = str(base_python)
-        claim["python_executable_sha256"] = payload[
-            "python_executable_sha256"
-        ]
+        claim["python_executable_sha256"] = runtime_sha256
+        if "base_python_executable_path" in claim:
+            claim["base_python_executable_path"] = str(base_python)
+        if "base_python_executable_sha256" in claim:
+            claim["base_python_executable_sha256"] = runtime_sha256
+        if "stdlib_policy_root_sha256" in claim:
+            claim["stdlib_policy_root_sha256"] = payload[
+                "stdlib_policy_root_sha256"
+            ]
         claim_raw = _canonical_bytes(claim)
         claim_sha256 = hashlib.sha256(claim_raw).hexdigest()
         updated_claim_path = (
@@ -563,7 +700,9 @@ def _build_native_supervisor_e2e_fixture(
     _replace_acl(
         credential,
         builtin_users_rights=None,
-        grant_current_user=True,
+        grant_current_user=False,
+        service_writer_sid=service_sid,
+        owner_rights="RC",
     )
     _replace_acl(
         ledger_root,
@@ -598,19 +737,25 @@ def _build_native_supervisor_e2e_fixture(
     _replace_acl(
         native_completed_root,
         builtin_users_rights=None,
-        grant_current_user=True,
+        grant_current_user=False,
+        service_writer_sid=service_sid,
+        owner_rights="RC",
     )
     native_completed_sha_root.mkdir()
     native_completed_parent.mkdir()
     _replace_acl(
         native_completed_sha_root,
         builtin_users_rights=None,
-        grant_current_user=True,
+        grant_current_user=False,
+        service_writer_sid=service_sid,
+        owner_rights="RC",
     )
     _replace_acl(
         native_completed_parent,
         builtin_users_rights=None,
-        grant_current_user=True,
+        grant_current_user=False,
+        service_writer_sid=service_sid,
+        owner_rights="RC",
     )
     payload = json.loads(launch_authorization.read_bytes())["payload"]
     loader_path = Path(str(payload["supervisor_loader_path"]))
@@ -654,9 +799,9 @@ def _build_native_supervisor_e2e_fixture(
                 f'#define F3_BROKER_CNG_KEY_NAME L"{key_name}"',
                 "#define F3_BROKER_CNG_ALGORITHM NCRYPT_RSA_ALGORITHM",
                 '#define F3_BROKER_SERVICE_NAME L"DisposableFixtureService"',
-                '#define F3_BROKER_SERVICE_SID L"S-1-5-18"',
-                '#define F3_BROKER_RESTRICTING_SID L"S-1-5-4"',
-                '#define F3_BROKER_WORKER_SID L"S-1-5-32-545"',
+                f'#define F3_BROKER_SERVICE_SID L"{service_sid}"',
+                f'#define F3_BROKER_RESTRICTING_SID L"{service_sid}"',
+                f'#define F3_BROKER_WORKER_SID L"{worker_sid}"',
                 "#define F3_BROKER_TESTING_SUPERVISOR_TOKEN_COMPATIBILITY 1",
                 '#define F3_BROKER_EXECUTION_PUBLIC_MODULUS_HEX "'
                 + modulus.to_bytes(384, "big").hex()
@@ -759,6 +904,7 @@ def test_production_completion_preholds_protected_namespace_and_writes_relative_
     assert "held_directory_chain_unchanged" in launch
     assert "NtCreateFile" in atomic
     assert "RootDirectory" in atomic
+    assert "NtSetInformationFile" in atomic
     assert "SetFileInformationByHandle" in atomic
     assert "MoveFileExW" not in atomic
     assert '--test-protected-completion-namespace' in source
@@ -1269,6 +1415,16 @@ def test_native_broker_launches_rendered_supervisor_and_synthetic_worker_e2e(
             "utf-8",
             errors="replace",
         )
+        runtime_check = subprocess.run(
+            [str(native), "--test-isolated-supervisor-runtime-startup"],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        assert runtime_check.returncode == 0, runtime_check.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
         namespace_check = subprocess.run(
             [
                 str(native),
@@ -1324,7 +1480,7 @@ def test_native_broker_launches_rendered_supervisor_and_synthetic_worker_e2e(
         )
         from app import factor_v3_formal_native_broker as broker
 
-        fields = broker._validated_candidate(candidate)
+        fields = broker._validated_candidate(candidate.read_bytes())
         launch_path = Path(fields["launch_authorization_path"])
         launch_sha256 = _file_sha256(launch_path)
         receipt_path = (

@@ -104,6 +104,76 @@ typedef struct HeldDirectoryChain {
     size_t count;
 } HeldDirectoryChain;
 
+typedef struct ProtectedCompletionNamespace {
+    HeldDirectoryChain chain;
+    wchar_t final_name[70];
+} ProtectedCompletionNamespace;
+
+typedef LONG F3_NTSTATUS;
+
+typedef struct F3_UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR Buffer;
+} F3_UNICODE_STRING;
+
+typedef struct F3_OBJECT_ATTRIBUTES {
+    ULONG Length;
+    HANDLE RootDirectory;
+    F3_UNICODE_STRING *ObjectName;
+    ULONG Attributes;
+    PVOID SecurityDescriptor;
+    PVOID SecurityQualityOfService;
+} F3_OBJECT_ATTRIBUTES;
+
+typedef struct F3_IO_STATUS_BLOCK {
+    union {
+        F3_NTSTATUS Status;
+        PVOID Pointer;
+    };
+    ULONG_PTR Information;
+} F3_IO_STATUS_BLOCK;
+
+typedef F3_NTSTATUS (NTAPI *F3_NT_CREATE_FILE)(
+    PHANDLE,
+    ACCESS_MASK,
+    F3_OBJECT_ATTRIBUTES *,
+    F3_IO_STATUS_BLOCK *,
+    PLARGE_INTEGER,
+    ULONG,
+    ULONG,
+    ULONG,
+    ULONG,
+    PVOID,
+    ULONG
+);
+
+typedef F3_NTSTATUS (NTAPI *F3_RTL_GET_LAST_NT_STATUS)(void);
+
+typedef F3_NTSTATUS (NTAPI *F3_NT_SET_INFORMATION_FILE)(
+    HANDLE,
+    F3_IO_STATUS_BLOCK *,
+    PVOID,
+    ULONG,
+    ULONG
+);
+
+typedef ULONG (NTAPI *F3_RTL_NT_STATUS_TO_DOS_ERROR)(F3_NTSTATUS);
+
+typedef struct F3_FILE_RENAME_INFORMATION {
+    BOOLEAN ReplaceIfExists;
+    HANDLE RootDirectory;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+} F3_FILE_RENAME_INFORMATION;
+
+#define F3_OBJ_CASE_INSENSITIVE 0x00000040UL
+#define F3_FILE_CREATE 0x00000002UL
+#define F3_FILE_WRITE_THROUGH 0x00000002UL
+#define F3_FILE_SYNCHRONOUS_IO_NONALERT 0x00000020UL
+#define F3_FILE_NON_DIRECTORY_FILE 0x00000040UL
+#define F3_FILE_RENAME_INFORMATION_CLASS 10UL
+
 static int strict_windows_candidate_path(const wchar_t *path);
 static int parent_directory(
     const wchar_t *path,
@@ -144,10 +214,22 @@ typedef struct SignedEnvelope {
 #ifdef F3_BROKER_TESTING
 static int f3_test_production_validation_stage = 0;
 static int f3_test_production_launch_stage = 0;
+static int f3_test_completion_namespace_stage = 0;
+static int f3_test_pipe_stage = 0;
+static DWORD f3_test_pipe_error = ERROR_SUCCESS;
+static DWORD f3_test_atomic_write_error = ERROR_SUCCESS;
+static F3_NTSTATUS f3_test_atomic_write_ntstatus = 0;
 #define F3_PRODUCTION_LAUNCH_STAGE(value) \
     do { f3_test_production_launch_stage = (value); } while (0)
+#define F3_PIPE_STAGE(value) \
+    do { \
+        f3_test_pipe_stage = (value); \
+        f3_test_pipe_error = GetLastError(); \
+    } while (0)
 #else
 #define F3_PRODUCTION_LAUNCH_STAGE(value) \
+    do { (void)(value); } while (0)
+#define F3_PIPE_STAGE(value) \
     do { (void)(value); } while (0)
 #endif
 
@@ -262,6 +344,49 @@ static int sid_matches_string(PSID sid, const wchar_t *expected) {
     return matches;
 }
 
+#ifdef F3_BROKER_TESTING
+static int sid_matches_current_token_user(PSID sid) {
+    HANDLE token = NULL;
+    TOKEN_USER *user = NULL;
+    DWORD required = 0;
+    int matches = 0;
+    if (sid == NULL
+        || !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        goto cleanup;
+    }
+    GetTokenInformation(token, TokenUser, NULL, 0, &required);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || required == 0) {
+        goto cleanup;
+    }
+    user = (TOKEN_USER *)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        required
+    );
+    if (user == NULL
+        || !GetTokenInformation(
+            token,
+            TokenUser,
+            user,
+            required,
+            &required
+        )) {
+        goto cleanup;
+    }
+    matches = EqualSid(sid, user->User.Sid) != 0;
+
+cleanup:
+    if (user != NULL) {
+        SecureZeroMemory(user, required);
+        HeapFree(GetProcessHeap(), 0, user);
+    }
+    if (token != NULL) {
+        CloseHandle(token);
+    }
+    return matches;
+}
+#endif
+
 static int trusted_namespace_owner(PSID owner) {
     static const wchar_t trusted_installer_sid[] =
         L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
@@ -272,6 +397,9 @@ static int trusted_namespace_owner(PSID owner) {
             || sid_matches_well_known(owner, WinBuiltinAdministratorsSid)
             || sid_matches_string(owner, trusted_installer_sid)
             || sid_matches_string(owner, F3_BROKER_SERVICE_SID)
+#ifdef F3_BROKER_TESTING
+            || sid_matches_current_token_user(owner)
+#endif
         );
 }
 
@@ -394,14 +522,19 @@ cleanup:
     return immutable;
 }
 
-static int unsafe_ordinary_writer_sid(PSID sid) {
+static int trusted_mutation_writer_sid(PSID sid) {
+    static const wchar_t trusted_installer_sid[] =
+        L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
     return sid != NULL
         && IsValidSid(sid)
         && (
-            sid_matches_well_known(sid, WinWorldSid)
-            || sid_matches_well_known(sid, WinAuthenticatedUserSid)
-            || sid_matches_well_known(sid, WinBuiltinUsersSid)
-            || sid_matches_well_known(sid, WinInteractiveSid)
+            sid_matches_well_known(sid, WinLocalSystemSid)
+            || sid_matches_well_known(
+                sid,
+                WinBuiltinAdministratorsSid
+            )
+            || sid_matches_string(sid, trusted_installer_sid)
+            || sid_matches_string(sid, F3_BROKER_SERVICE_SID)
         );
 }
 
@@ -445,7 +578,7 @@ static DWORD allowed_ace_mask(void *raw_ace, BYTE ace_type) {
     return 0;
 }
 
-static int dacl_has_no_unsafe_writer(
+static int dacl_mutation_writers_are_trusted(
     PACL dacl,
     DWORD mutation_rights,
     GENERIC_MAPPING *mapping
@@ -474,13 +607,20 @@ static int dacl_has_no_unsafe_writer(
         if ((header->AceFlags & INHERIT_ONLY_ACE) != 0) {
             continue;
         }
-        sid = allowed_ace_sid(raw_ace, header->AceType);
-        if (sid == NULL || !unsafe_ordinary_writer_sid(sid)) {
+        if (header->AceType == ACCESS_DENIED_ACE_TYPE) {
             continue;
+        }
+        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) {
+            return 0;
+        }
+        sid = allowed_ace_sid(raw_ace, header->AceType);
+        if (sid == NULL) {
+            return 0;
         }
         mask = allowed_ace_mask(raw_ace, header->AceType);
         MapGenericMask(&mask, mapping);
-        if ((mask & mutation_rights) != 0) {
+        if ((mask & mutation_rights) != 0
+            && !trusted_mutation_writer_sid(sid)) {
             return 0;
         }
     }
@@ -526,7 +666,7 @@ static int held_directory_security_is_immutable(
         || dacl == NULL
         || !trusted_namespace_owner(owner)
         || (reject_unsafe_writer
-            && !dacl_has_no_unsafe_writer(
+            && !dacl_mutation_writers_are_trusted(
                 dacl,
                 mutation_rights,
                 &mapping
@@ -659,6 +799,144 @@ static int append_held_directory(
             final_namespace
         )) {
         SetLastError(final_namespace ? 2003 : 2002);
+        CloseHandle(held->handle);
+        held->handle = INVALID_HANDLE_VALUE;
+        return 0;
+    }
+    held->volume_serial = information.dwVolumeSerialNumber;
+    held->file_index_high = information.nFileIndexHigh;
+    held->file_index_low = information.nFileIndexLow;
+    chain->count += 1;
+    return 1;
+}
+
+static int held_directory_allows_only_trusted_mutation(HANDLE directory) {
+    static const DWORD mutation_rights =
+        FILE_ADD_FILE
+        | FILE_ADD_SUBDIRECTORY
+        | FILE_DELETE_CHILD
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | DELETE
+        | WRITE_DAC
+        | WRITE_OWNER;
+    GENERIC_MAPPING mapping = {
+        FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE,
+        FILE_GENERIC_EXECUTE,
+        FILE_ALL_ACCESS
+    };
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    PACL dacl = NULL;
+    PSID owner = NULL;
+    int ok = directory != INVALID_HANDLE_VALUE
+        && GetSecurityInfo(
+            directory,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &owner,
+            NULL,
+            &dacl,
+            NULL,
+            &descriptor
+        ) == ERROR_SUCCESS
+        && dacl != NULL
+        && trusted_namespace_owner(owner)
+        && dacl_mutation_writers_are_trusted(
+            dacl,
+            mutation_rights,
+            &mapping
+        );
+    if (descriptor != NULL) {
+        LocalFree(descriptor);
+    }
+    return ok;
+}
+
+static int held_file_allows_only_trusted_mutation(HANDLE file) {
+    static const DWORD mutation_rights =
+        FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | DELETE
+        | WRITE_DAC
+        | WRITE_OWNER;
+    GENERIC_MAPPING mapping = {
+        FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE,
+        FILE_GENERIC_EXECUTE,
+        FILE_ALL_ACCESS
+    };
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    PACL dacl = NULL;
+    PSID owner = NULL;
+    int ok = file != INVALID_HANDLE_VALUE
+        && GetSecurityInfo(
+            file,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &owner,
+            NULL,
+            &dacl,
+            NULL,
+            &descriptor
+        ) == ERROR_SUCCESS
+        && dacl != NULL
+        && trusted_namespace_owner(owner)
+        && dacl_mutation_writers_are_trusted(
+            dacl,
+            mutation_rights,
+            &mapping
+        );
+    if (descriptor != NULL) {
+        LocalFree(descriptor);
+    }
+    return ok;
+}
+
+static int append_protected_writable_directory(
+    const wchar_t *path,
+    int require_file_creation,
+    HeldDirectoryChain *chain
+) {
+    BY_HANDLE_FILE_INFORMATION information;
+    FILE_ATTRIBUTE_TAG_INFO tag;
+    HeldDirectory *held;
+    DWORD access = READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_TRAVERSE;
+    if (chain == NULL
+        || chain->count >= F3_MAX_HELD_DIRECTORIES
+        || !strict_windows_candidate_path(path)
+        || !reject_reparse_chain(path)) {
+        return 0;
+    }
+    if (require_file_creation) {
+        access |= FILE_ADD_FILE;
+    }
+    held = &chain->entries[chain->count];
+    memset(held, 0, sizeof(*held));
+    held->handle = CreateFileW(
+        path,
+        access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        NULL
+    );
+    if (held->handle == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    if (!GetFileInformationByHandle(held->handle, &information)
+        || !GetFileInformationByHandleEx(
+            held->handle,
+            FileAttributeTagInfo,
+            &tag,
+            sizeof(tag)
+        )
+        || (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+        || (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || !held_directory_allows_only_trusted_mutation(held->handle)) {
         CloseHandle(held->handle);
         held->handle = INVALID_HANDLE_VALUE;
         return 0;
@@ -3153,6 +3431,125 @@ static int expected_ledger_path(
         && strict_windows_candidate_path(output);
 }
 
+static int hold_protected_completion_namespace(
+    ByteSlice ledger_root,
+    const char launch_authorization_sha256[65],
+    wchar_t completed_path[32768],
+    ProtectedCompletionNamespace *completion
+) {
+    wchar_t root[32768];
+    wchar_t native_root[32768];
+    wchar_t sha256_root[32768];
+    wchar_t parent[32768];
+    wchar_t observed_native_root[32768];
+    const wchar_t *filename;
+    int written;
+    int ok = 0;
+    if (completion == NULL
+        || launch_authorization_sha256 == NULL
+        || completed_path == NULL) {
+        return 0;
+    }
+    memset(completion, 0, sizeof(*completion));
+    initialize_held_directory_chain(&completion->chain);
+    if (!byte_slice_to_wide(
+            ledger_root,
+            root,
+            sizeof(root) / sizeof(root[0])
+        )
+        || !expected_ledger_path(
+            ledger_root,
+            "native_completed",
+            launch_authorization_sha256,
+            completed_path,
+            32768
+        )) {
+        goto cleanup;
+    }
+    written = _snwprintf_s(
+        observed_native_root,
+        sizeof(observed_native_root) / sizeof(observed_native_root[0]),
+        _TRUNCATE,
+        L"%ls\\native_completed",
+        root
+    );
+    if (written <= 0
+        || (size_t)written
+            >= sizeof(observed_native_root) / sizeof(observed_native_root[0])
+        || !canonical_path(
+            observed_native_root,
+            native_root,
+            (DWORD)(sizeof(native_root) / sizeof(native_root[0]))
+        )
+        || !parent_directory(
+            completed_path,
+            parent,
+            sizeof(parent) / sizeof(parent[0])
+        )
+        || !parent_directory(
+            parent,
+            sha256_root,
+            sizeof(sha256_root) / sizeof(sha256_root[0])
+        )
+        || !parent_directory(
+            sha256_root,
+            observed_native_root,
+            sizeof(observed_native_root)
+                / sizeof(observed_native_root[0])
+        )
+        || _wcsicmp(observed_native_root, native_root) != 0) {
+        goto cleanup;
+    }
+    filename = wcsrchr(completed_path, L'\\');
+    if (filename == NULL
+        || wcslen(filename + 1) != 69
+        || wcscmp(filename + 65, L".json") != 0
+        || wcsncmp(
+            filename + 1,
+            parent + wcslen(parent) - 2,
+            2
+        ) != 0
+        || wcscpy_s(
+            completion->final_name,
+            sizeof(completion->final_name)
+                / sizeof(completion->final_name[0]),
+            filename + 1
+        ) != 0
+        || !append_protected_writable_directory(
+            native_root,
+            0,
+            &completion->chain
+        )
+        || !append_protected_writable_directory(
+            sha256_root,
+            1,
+            &completion->chain
+        )
+        || !append_protected_writable_directory(
+            parent,
+            1,
+            &completion->chain
+        )
+        || !held_directory_chain_unchanged(&completion->chain)) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (!ok) {
+        close_held_directory_chain(&completion->chain);
+        SecureZeroMemory(completion, sizeof(*completion));
+        initialize_held_directory_chain(&completion->chain);
+        SecureZeroMemory(completed_path, 32768 * sizeof(wchar_t));
+    }
+    SecureZeroMemory(root, sizeof(root));
+    SecureZeroMemory(native_root, sizeof(native_root));
+    SecureZeroMemory(sha256_root, sizeof(sha256_root));
+    SecureZeroMemory(parent, sizeof(parent));
+    SecureZeroMemory(observed_native_root, sizeof(observed_native_root));
+    return ok;
+}
+
 static int validate_resume_status(
     const unsigned char *status,
     DWORD status_size,
@@ -3728,6 +4125,109 @@ cleanup:
     return ok;
 }
 
+static int restricted_token_cannot_mutate_completion_namespace(
+    HANDLE restricted_token,
+    const HeldDirectoryChain *chain
+) {
+    static const DWORD mutation_rights[] = {
+        FILE_ADD_FILE,
+        FILE_ADD_SUBDIRECTORY,
+        FILE_DELETE_CHILD,
+        FILE_WRITE_EA,
+        FILE_WRITE_ATTRIBUTES,
+        DELETE,
+        WRITE_DAC,
+        WRITE_OWNER,
+    };
+    GENERIC_MAPPING mapping = {
+        FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE,
+        FILE_GENERIC_EXECUTE,
+        FILE_ALL_ACCESS
+    };
+    BYTE privilege_buffer[4096];
+    PRIVILEGE_SET *privileges = (PRIVILEGE_SET *)privilege_buffer;
+    HANDLE impersonation_token = NULL;
+    size_t index;
+    int ok = 0;
+    if (restricted_token == NULL
+        || chain == NULL
+        || chain->count == 0
+        || !DuplicateToken(
+            restricted_token,
+            SecurityImpersonation,
+            &impersonation_token
+        )) {
+        goto cleanup;
+    }
+    for (index = 0; index < chain->count; ++index) {
+        PSECURITY_DESCRIPTOR descriptor = NULL;
+        PACL dacl = NULL;
+        PSID owner = NULL;
+        size_t right_index;
+        HANDLE directory = chain->entries[index].handle;
+        if (directory == INVALID_HANDLE_VALUE
+            || GetSecurityInfo(
+                directory,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION
+                    | GROUP_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION,
+                &owner,
+                NULL,
+                &dacl,
+                NULL,
+                &descriptor
+            ) != ERROR_SUCCESS
+            || owner == NULL
+            || dacl == NULL) {
+            if (descriptor != NULL) {
+                LocalFree(descriptor);
+            }
+            goto cleanup;
+        }
+        for (
+            right_index = 0;
+            right_index
+                < sizeof(mutation_rights) / sizeof(mutation_rights[0]);
+            ++right_index
+        ) {
+            DWORD privilege_size = sizeof(privilege_buffer);
+            DWORD granted = 0;
+            DWORD desired = mutation_rights[right_index];
+            BOOL access_status = FALSE;
+            MapGenericMask(&desired, &mapping);
+            if (!AccessCheck(
+                    descriptor,
+                    impersonation_token,
+                    desired,
+                    &mapping,
+                    privileges,
+                    &privilege_size,
+                    &granted,
+                    &access_status
+                )
+                || access_status) {
+                LocalFree(descriptor);
+                goto cleanup;
+            }
+            SecureZeroMemory(
+                privilege_buffer,
+                sizeof(privilege_buffer)
+            );
+        }
+        LocalFree(descriptor);
+    }
+    ok = 1;
+
+cleanup:
+    if (impersonation_token != NULL) {
+        CloseHandle(impersonation_token);
+    }
+    SecureZeroMemory(privilege_buffer, sizeof(privilege_buffer));
+    return ok;
+}
+
 #ifdef F3_BROKER_TESTING
 static int create_test_supervisor_compatibility_token(
     HANDLE *restricted_token
@@ -3797,15 +4297,18 @@ static int read_exact_pipe_frame(
         || process == NULL
         || output == NULL
         || expected_size == 0) {
+        F3_PIPE_STAGE(1);
         return 0;
     }
     while (total < expected_size && elapsed < timeout_ms) {
         if (!PeekNamedPipe(pipe, NULL, 0, NULL, &available, NULL)) {
+            F3_PIPE_STAGE(2);
             return 0;
         }
         if (available == 0) {
             if (!GetExitCodeProcess(process, &exit_code)
                 || exit_code != STILL_ACTIVE) {
+                F3_PIPE_STAGE(3);
                 return 0;
             }
             Sleep(10);
@@ -3813,6 +4316,7 @@ static int read_exact_pipe_frame(
             continue;
         }
         if (available > expected_size - total) {
+            F3_PIPE_STAGE(4);
             return 0;
         }
         if (!ReadFile(
@@ -3823,6 +4327,7 @@ static int read_exact_pipe_frame(
                 NULL
             )
             || count == 0) {
+            F3_PIPE_STAGE(5);
             return 0;
         }
         total += count;
@@ -3830,6 +4335,7 @@ static int read_exact_pipe_frame(
     if (total != expected_size
         || !PeekNamedPipe(pipe, NULL, 0, NULL, &available, NULL)
         || available != 0) {
+        F3_PIPE_STAGE(6);
         return 0;
     }
     return 1;
@@ -3982,6 +4488,1239 @@ cleanup:
     return ok;
 }
 
+#define F3_PERSISTENT_COMPLETION_SCHEMA \
+    "factor-v3-formal-native-broker-completed/v2"
+
+static int atomic_write_persistent_completion(
+    ProtectedCompletionNamespace *completion,
+    const wchar_t *expected_path,
+    const unsigned char *data,
+    DWORD size
+) {
+    BY_HANDLE_FILE_INFORMATION before;
+    BY_HANDLE_FILE_INFORMATION after;
+    FILE_ATTRIBUTE_TAG_INFO tag;
+    FILE_DISPOSITION_INFO disposition = {TRUE};
+    F3_FILE_RENAME_INFORMATION *rename = NULL;
+    F3_UNICODE_STRING name;
+    F3_OBJECT_ATTRIBUTES object_attributes;
+    F3_IO_STATUS_BLOCK io_status;
+    F3_NT_CREATE_FILE nt_create_file;
+    F3_NT_SET_INFORMATION_FILE nt_set_information_file;
+    F3_RTL_GET_LAST_NT_STATUS rtl_get_last_nt_status;
+    F3_RTL_NT_STATUS_TO_DOS_ERROR rtl_nt_status_to_dos_error;
+    HMODULE ntdll;
+    HeldFile written_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    unsigned char expected_digest[32];
+    unsigned char observed_digest[32];
+    wchar_t temporary_name[128];
+    wchar_t observed_path[32768];
+    wchar_t normalized_path[32768];
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    HANDLE parent_handle;
+    HANDLE temporary_parent_handle;
+    DWORD handle_flags = HANDLE_FLAG_INHERIT;
+    DWORD written = 0;
+    DWORD total = 0;
+    DWORD observed_length;
+    DWORD failure_error = ERROR_SUCCESS;
+    F3_NTSTATUS failure_ntstatus = 0;
+    size_t final_length;
+    size_t rename_size;
+    int length;
+    int ok = 0;
+    memset(&before, 0, sizeof(before));
+    memset(&after, 0, sizeof(after));
+    memset(&tag, 0, sizeof(tag));
+    memset(&name, 0, sizeof(name));
+    memset(&object_attributes, 0, sizeof(object_attributes));
+    memset(&io_status, 0, sizeof(io_status));
+    if (completion == NULL
+        || completion->chain.count == 0
+        || expected_path == NULL
+        || data == NULL
+        || size == 0
+        || !strict_windows_candidate_path(expected_path)
+        || !held_directory_chain_unchanged(&completion->chain)
+        || !hash_memory(data, size, expected_digest)) {
+        F3_PRODUCTION_LAUNCH_STAGE(93301);
+        return 0;
+    }
+    parent_handle = completion->chain.entries[
+        completion->chain.count - 1
+    ].handle;
+    if (completion->chain.count < 2
+        || parent_handle == INVALID_HANDLE_VALUE
+        || wcslen(completion->final_name) != 69
+        || wcscmp(completion->final_name + 64, L".json") != 0) {
+        F3_PRODUCTION_LAUNCH_STAGE(93302);
+        return 0;
+    }
+    temporary_parent_handle = completion->chain.entries[
+        completion->chain.count - 2
+    ].handle;
+    if (temporary_parent_handle == INVALID_HANDLE_VALUE) {
+        F3_PRODUCTION_LAUNCH_STAGE(93302);
+        return 0;
+    }
+    ntdll = GetModuleHandleW(L"ntdll.dll");
+    nt_create_file = ntdll == NULL
+        ? NULL
+        : (F3_NT_CREATE_FILE)(void *)GetProcAddress(
+            ntdll,
+            "NtCreateFile"
+        );
+    nt_set_information_file = ntdll == NULL
+        ? NULL
+        : (F3_NT_SET_INFORMATION_FILE)(void *)GetProcAddress(
+            ntdll,
+            "NtSetInformationFile"
+        );
+    rtl_get_last_nt_status = ntdll == NULL
+        ? NULL
+        : (F3_RTL_GET_LAST_NT_STATUS)(void *)GetProcAddress(
+            ntdll,
+            "RtlGetLastNtStatus"
+        );
+    rtl_nt_status_to_dos_error = ntdll == NULL
+        ? NULL
+        : (F3_RTL_NT_STATUS_TO_DOS_ERROR)(void *)GetProcAddress(
+            ntdll,
+            "RtlNtStatusToDosError"
+        );
+    if (nt_create_file == NULL
+        || nt_set_information_file == NULL
+        || rtl_get_last_nt_status == NULL
+        || rtl_nt_status_to_dos_error == NULL) {
+        F3_PRODUCTION_LAUNCH_STAGE(93303);
+        return 0;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(9331);
+    length = swprintf(
+        temporary_name,
+        sizeof(temporary_name) / sizeof(temporary_name[0]),
+        L".%ls.tmp-%lu-%llu",
+        completion->final_name,
+        GetCurrentProcessId(),
+        (unsigned long long)GetTickCount64()
+    );
+    if (length <= 0
+        || (size_t)length
+            >= sizeof(temporary_name) / sizeof(temporary_name[0])
+        || (size_t)length > USHRT_MAX / sizeof(wchar_t)) {
+        goto cleanup;
+    }
+    name.Length = (USHORT)((size_t)length * sizeof(wchar_t));
+    name.MaximumLength = name.Length;
+    name.Buffer = temporary_name;
+    object_attributes.Length = sizeof(object_attributes);
+    object_attributes.RootDirectory = temporary_parent_handle;
+    object_attributes.ObjectName = &name;
+    object_attributes.Attributes = F3_OBJ_CASE_INSENSITIVE;
+    failure_ntstatus = nt_create_file(
+            &handle,
+            GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE,
+            &object_attributes,
+            &io_status,
+            NULL,
+            FILE_ATTRIBUTE_NORMAL,
+            0,
+            F3_FILE_CREATE,
+            F3_FILE_NON_DIRECTORY_FILE
+                | F3_FILE_SYNCHRONOUS_IO_NONALERT
+                | F3_FILE_WRITE_THROUGH,
+            NULL,
+            0
+        );
+    if (failure_ntstatus < 0
+        || handle == INVALID_HANDLE_VALUE
+        || !GetHandleInformation(handle, &handle_flags)
+        || (handle_flags & HANDLE_FLAG_INHERIT) != 0
+        || !GetFileInformationByHandle(handle, &before)
+        || before.nNumberOfLinks != 1
+        || (before.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(9332);
+    while (total < size) {
+        if (!WriteFile(
+                handle,
+                data + total,
+                size - total,
+                &written,
+                NULL
+            )
+            || written == 0) {
+            goto cleanup;
+        }
+        total += written;
+    }
+    if (!FlushFileBuffers(handle)) {
+        goto cleanup;
+    }
+    written_file.handle = handle;
+    if (!hash_held_file(&written_file, observed_digest)
+        || memcmp(expected_digest, observed_digest, 32) != 0) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(9333);
+    final_length = wcslen(completion->final_name);
+    if (final_length > (
+            SIZE_MAX - offsetof(F3_FILE_RENAME_INFORMATION, FileName)
+        )
+            / sizeof(wchar_t)
+        || final_length > UINT_MAX / sizeof(wchar_t)) {
+        goto cleanup;
+    }
+    rename_size = offsetof(F3_FILE_RENAME_INFORMATION, FileName)
+        + final_length * sizeof(wchar_t);
+    if (rename_size > UINT_MAX) {
+        goto cleanup;
+    }
+    rename = (F3_FILE_RENAME_INFORMATION *)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        rename_size
+    );
+    if (rename == NULL) {
+        goto cleanup;
+    }
+    rename->ReplaceIfExists = FALSE;
+    rename->RootDirectory = parent_handle;
+    rename->FileNameLength = (DWORD)(final_length * sizeof(wchar_t));
+    memcpy(
+        rename->FileName,
+        completion->final_name,
+        rename->FileNameLength
+    );
+    F3_PRODUCTION_LAUNCH_STAGE(93331);
+    memset(&io_status, 0, sizeof(io_status));
+    failure_ntstatus = nt_set_information_file(
+        handle,
+        &io_status,
+        rename,
+        (ULONG)rename_size,
+        F3_FILE_RENAME_INFORMATION_CLASS
+    );
+    if (failure_ntstatus < 0) {
+        failure_error = rtl_nt_status_to_dos_error(failure_ntstatus);
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(93332);
+    if (!FlushFileBuffers(handle)) {
+        failure_error = GetLastError();
+        failure_ntstatus = rtl_get_last_nt_status();
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(93333);
+    if (!GetFileInformationByHandle(handle, &after)
+        || !GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            &tag,
+            sizeof(tag)
+        )
+        || before.dwVolumeSerialNumber != after.dwVolumeSerialNumber
+        || before.nFileIndexHigh != after.nFileIndexHigh
+        || before.nFileIndexLow != after.nFileIndexLow
+        || after.nNumberOfLinks != 1
+        || after.nFileSizeHigh != 0
+        || after.nFileSizeLow != size
+        || (after.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+        || (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        failure_error = GetLastError();
+        failure_ntstatus = rtl_get_last_nt_status();
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(93334);
+    if (!held_file_allows_only_trusted_mutation(handle)) {
+        failure_error = GetLastError();
+        failure_ntstatus = rtl_get_last_nt_status();
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(93335);
+    observed_length = GetFinalPathNameByHandleW(
+        handle,
+        observed_path,
+        (DWORD)(sizeof(observed_path) / sizeof(observed_path[0])),
+        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
+    );
+    if (observed_length == 0
+        || observed_length
+            >= sizeof(observed_path) / sizeof(observed_path[0])
+        || !final_path_without_prefix(
+            observed_path,
+            normalized_path,
+            sizeof(normalized_path) / sizeof(normalized_path[0])
+        )
+        || _wcsicmp(normalized_path, expected_path) != 0
+        || !held_directory_chain_unchanged(&completion->chain)) {
+        failure_error = GetLastError();
+        failure_ntstatus = rtl_get_last_nt_status();
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(9334);
+    ok = 1;
+
+cleanup:
+#ifdef F3_BROKER_TESTING
+    f3_test_atomic_write_error = failure_error;
+    f3_test_atomic_write_ntstatus = failure_ntstatus;
+#endif
+    written_file.handle = INVALID_HANDLE_VALUE;
+    if (!ok && handle != INVALID_HANDLE_VALUE) {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            &disposition,
+            sizeof(disposition)
+        );
+    }
+    if (handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(handle);
+    }
+    if (rename != NULL) {
+        SecureZeroMemory(rename, rename_size);
+        HeapFree(GetProcessHeap(), 0, rename);
+    }
+    SecureZeroMemory(&before, sizeof(before));
+    SecureZeroMemory(&after, sizeof(after));
+    SecureZeroMemory(&tag, sizeof(tag));
+    SecureZeroMemory(&name, sizeof(name));
+    SecureZeroMemory(&object_attributes, sizeof(object_attributes));
+    SecureZeroMemory(&io_status, sizeof(io_status));
+    SecureZeroMemory(expected_digest, sizeof(expected_digest));
+    SecureZeroMemory(observed_digest, sizeof(observed_digest));
+    SecureZeroMemory(temporary_name, sizeof(temporary_name));
+    SecureZeroMemory(observed_path, sizeof(observed_path));
+    SecureZeroMemory(normalized_path, sizeof(normalized_path));
+    if (!ok && failure_error != ERROR_SUCCESS) {
+        SetLastError(failure_error);
+    }
+    return ok;
+}
+
+static int open_persistent_cng_signing_key(
+    NCRYPT_PROV_HANDLE *provider,
+    NCRYPT_KEY_HANDLE *key
+) {
+    DWORD export_policy = UINT_MAX;
+    DWORD result_size = 0;
+    DWORD private_size = 0;
+    if (provider == NULL
+        || key == NULL
+        || F3_BROKER_CNG_KEY_NAME[0] == L'\0') {
+        return 0;
+    }
+    *provider = 0;
+    *key = 0;
+    if (f3_broker_open_cng_provider(provider) != ERROR_SUCCESS
+        || NCryptOpenKey(
+            *provider,
+            key,
+            F3_BROKER_CNG_KEY_NAME,
+            0,
+            0
+        ) != ERROR_SUCCESS
+        || NCryptGetProperty(
+            *key,
+            NCRYPT_EXPORT_POLICY_PROPERTY,
+            (PBYTE)&export_policy,
+            sizeof(export_policy),
+            &result_size,
+            0
+        ) != ERROR_SUCCESS
+        || result_size != sizeof(export_policy)
+        || export_policy != 0
+        || NCryptExportKey(
+            *key,
+            0,
+            BCRYPT_RSAFULLPRIVATE_BLOB,
+            NULL,
+            NULL,
+            0,
+            &private_size,
+            0
+        ) == ERROR_SUCCESS) {
+        return 0;
+    }
+    return 1;
+}
+
+static int write_persistent_cng_completion(
+    ProtectedCompletionNamespace *completion,
+    const wchar_t *completed_path,
+    const char launch_authorization_sha256[65],
+    const char candidate_sha256[65],
+    const char claim_sha256[65],
+    const char supervisor_completed_sha256[65],
+    const char worker_terminal_sha256[65],
+    char completed_receipt_sha256[65]
+) {
+    BCRYPT_PKCS1_PADDING_INFO padding = {BCRYPT_SHA256_ALGORITHM};
+    NCRYPT_PROV_HANDLE provider = 0;
+    NCRYPT_KEY_HANDLE key = 0;
+    unsigned char unsigned_digest[32];
+    unsigned char receipt_digest[32];
+    unsigned char *signature = NULL;
+    DWORD signature_size = 0;
+    char unsigned_receipt[1024];
+    unsigned char *receipt = NULL;
+    size_t receipt_capacity = 0;
+    size_t offset = 0;
+    size_t index;
+    int unsigned_length;
+    int ok = 0;
+    unsigned_length = snprintf(
+        unsigned_receipt,
+        sizeof(unsigned_receipt),
+        "schema=" F3_PERSISTENT_COMPLETION_SCHEMA "\n"
+        "status=completed\n"
+        "launch_authorization_sha256=%s\n"
+        "candidate_sha256=%s\n"
+        "claim_sha256=%s\n"
+        "supervisor_completed_sha256=%s\n"
+        "worker_terminal_sha256=%s\n"
+        "signature_algorithm=RSA-PKCS1-SHA256\n",
+        launch_authorization_sha256,
+        candidate_sha256,
+        claim_sha256,
+        supervisor_completed_sha256,
+        worker_terminal_sha256
+    );
+    if (unsigned_length <= 0
+        || (size_t)unsigned_length >= sizeof(unsigned_receipt)
+        || completion == NULL
+        || completed_path == NULL
+        || !hash_memory(
+            (const unsigned char *)unsigned_receipt,
+            (DWORD)unsigned_length,
+            unsigned_digest
+        )) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(931);
+    if (!open_persistent_cng_signing_key(&provider, &key)) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(932);
+    if (f3_broker_sign_sha256_with_cng_key(
+            key,
+            unsigned_digest,
+            &signature,
+            &signature_size
+        ) != ERROR_SUCCESS
+        || NCryptVerifySignature(
+            key,
+            &padding,
+            unsigned_digest,
+            sizeof(unsigned_digest),
+            signature,
+            signature_size,
+            NCRYPT_PAD_PKCS1_FLAG
+        ) != ERROR_SUCCESS) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(933);
+    receipt_capacity = (size_t)unsigned_length
+        + strlen("signature_hex=\n")
+        + (size_t)signature_size * 2
+        + 1;
+    receipt = (unsigned char *)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        receipt_capacity
+    );
+    if (receipt == NULL) {
+        goto cleanup;
+    }
+    memcpy(receipt, unsigned_receipt, (size_t)unsigned_length);
+    offset = (size_t)unsigned_length;
+    memcpy(receipt + offset, "signature_hex=", strlen("signature_hex="));
+    offset += strlen("signature_hex=");
+    for (index = 0; index < signature_size; ++index) {
+        static const char digits[] = "0123456789abcdef";
+        receipt[offset++] = (unsigned char)digits[signature[index] >> 4];
+        receipt[offset++] = (unsigned char)digits[signature[index] & 15];
+    }
+    receipt[offset++] = '\n';
+    if (offset > UINT_MAX
+        || !hash_memory(receipt, (DWORD)offset, receipt_digest)
+        || !atomic_write_persistent_completion(
+            completion,
+            completed_path,
+            receipt,
+            (DWORD)offset
+        )) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(934);
+    digest_to_ascii(receipt_digest, completed_receipt_sha256);
+    ok = 1;
+
+cleanup:
+    if (signature != NULL) {
+        SecureZeroMemory(signature, signature_size);
+        HeapFree(GetProcessHeap(), 0, signature);
+    }
+    if (key != 0) {
+        NCryptFreeObject(key);
+    }
+    if (provider != 0) {
+        NCryptFreeObject(provider);
+    }
+    if (receipt != NULL) {
+        SecureZeroMemory(receipt, receipt_capacity);
+        HeapFree(GetProcessHeap(), 0, receipt);
+    }
+    SecureZeroMemory(unsigned_digest, sizeof(unsigned_digest));
+    SecureZeroMemory(receipt_digest, sizeof(receipt_digest));
+    SecureZeroMemory(unsigned_receipt, sizeof(unsigned_receipt));
+    if (!ok) {
+        SecureZeroMemory(completed_receipt_sha256, 65);
+    }
+    return ok;
+}
+
+static int hex_signature(
+    const unsigned char *value,
+    size_t length,
+    unsigned char **signature,
+    DWORD *signature_size
+) {
+    size_t index;
+    unsigned char *decoded;
+    if (value == NULL
+        || length == 0
+        || length % 2 != 0
+        || length / 2 > UINT_MAX
+        || signature == NULL
+        || signature_size == NULL) {
+        return 0;
+    }
+    decoded = (unsigned char *)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        length / 2
+    );
+    if (decoded == NULL) {
+        return 0;
+    }
+    for (index = 0; index < length; ++index) {
+        unsigned char digit;
+        if (value[index] >= '0' && value[index] <= '9') {
+            digit = (unsigned char)(value[index] - '0');
+        } else if (value[index] >= 'a' && value[index] <= 'f') {
+            digit = (unsigned char)(value[index] - 'a' + 10);
+        } else {
+            SecureZeroMemory(decoded, length / 2);
+            HeapFree(GetProcessHeap(), 0, decoded);
+            return 0;
+        }
+        if (index % 2 == 0) {
+            decoded[index / 2] = (unsigned char)(digit << 4);
+        } else {
+            decoded[index / 2] |= digit;
+        }
+    }
+    *signature = decoded;
+    *signature_size = (DWORD)(length / 2);
+    return 1;
+}
+
+static int verify_persistent_cng_completion(
+    const wchar_t *candidate_path
+) {
+    static const char schema[] =
+        "schema=" F3_PERSISTENT_COMPLETION_SCHEMA "\n"
+        "status=completed\n";
+    static const char launch_label[] = "launch_authorization_sha256=";
+    static const char candidate_label[] = "candidate_sha256=";
+    static const char claim_label[] = "claim_sha256=";
+    static const char supervisor_label[] = "supervisor_completed_sha256=";
+    static const char worker_label[] = "worker_terminal_sha256=";
+    static const char algorithm[] =
+        "signature_algorithm=RSA-PKCS1-SHA256\n";
+    static const char signature_label[] = "signature_hex=";
+    BCRYPT_PKCS1_PADDING_INFO padding = {BCRYPT_SHA256_ALGORITHM};
+    HeldFile candidate_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile launch_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile receipt_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile claim_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile supervisor_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    ProductionCandidate candidate;
+    SignedEnvelope envelope;
+    unsigned char *candidate_raw = NULL;
+    unsigned char *launch_raw = NULL;
+    unsigned char *receipt_raw = NULL;
+    unsigned char *supervisor_raw = NULL;
+    DWORD candidate_size = 0;
+    DWORD launch_size = 0;
+    DWORD receipt_size = 0;
+    DWORD supervisor_size = 0;
+    unsigned char candidate_digest[32];
+    unsigned char launch_digest[32];
+    unsigned char unsigned_digest[32];
+    unsigned char observed_digest[32];
+    unsigned char *signature = NULL;
+    DWORD signature_size = 0;
+    NCRYPT_PROV_HANDLE provider = 0;
+    NCRYPT_KEY_HANDLE key = 0;
+    wchar_t launch_path[32768];
+    wchar_t receipt_path[32768];
+    wchar_t claim_path[32768];
+    wchar_t supervisor_path[32768];
+    char candidate_sha256[65];
+    char launch_sha256[65];
+    char observed_sha256[65];
+    char receipt_launch_sha256[65];
+    char receipt_candidate_sha256[65];
+    char claim_sha256[65];
+    char supervisor_sha256[65];
+    char worker_sha256[65];
+    size_t offset = 0;
+    size_t unsigned_size = 0;
+    size_t signature_hex_size = 0;
+    int ok = 0;
+    memset(&candidate, 0, sizeof(candidate));
+    memset(&envelope, 0, sizeof(envelope));
+    if (!open_held_file(
+            candidate_path,
+            F3_MAX_CANDIDATE_BYTES,
+            &candidate_file
+        )
+        || !hash_held_file(&candidate_file, candidate_digest)
+        || !filename_matches_candidate_digest(
+            candidate_path,
+            candidate_digest
+        )
+        || !read_candidate(&candidate_file, &candidate_raw, &candidate_size)
+        || !parse_production_candidate(
+            candidate_raw,
+            candidate_size,
+            &candidate
+        )
+        || !byte_slice_to_wide(
+            candidate.launch_authorization_path,
+            launch_path,
+            32768
+        )
+        || !open_held_file(
+            launch_path,
+            F3_MAX_AUTHORIZATION_BYTES,
+            &launch_file
+        )
+        || !hash_held_file(&launch_file, launch_digest)
+        || !filename_matches_digest_suffix(
+            launch_path,
+            launch_digest,
+            L".json"
+        )
+        || !read_candidate(&launch_file, &launch_raw, &launch_size)
+        || !parse_signed_envelope(launch_raw, launch_size, &envelope)
+        || !validate_current_launch_payload(&envelope, &candidate)) {
+        goto cleanup;
+    }
+    digest_to_ascii(candidate_digest, candidate_sha256);
+    digest_to_ascii(launch_digest, launch_sha256);
+    if (!expected_ledger_path(
+            candidate.execution_ledger_root,
+            "native_completed",
+            launch_sha256,
+            receipt_path,
+            32768
+        )
+        || !open_held_file(receipt_path, 16 * 1024, &receipt_file)
+        || !read_candidate(
+            &receipt_file,
+            &receipt_raw,
+            &receipt_size
+        )
+        || receipt_size <= sizeof(schema) - 1
+        || memcmp(receipt_raw, schema, sizeof(schema) - 1) != 0) {
+        goto cleanup;
+    }
+    offset = sizeof(schema) - 1;
+    if (!exact_hash_field(
+            receipt_raw,
+            receipt_size,
+            &offset,
+            launch_label,
+            receipt_launch_sha256
+        )
+        || strcmp(receipt_launch_sha256, launch_sha256) != 0
+        || !exact_hash_field(
+            receipt_raw,
+            receipt_size,
+            &offset,
+            candidate_label,
+            receipt_candidate_sha256
+        )
+        || strcmp(receipt_candidate_sha256, candidate_sha256) != 0
+        || !exact_hash_field(
+            receipt_raw,
+            receipt_size,
+            &offset,
+            claim_label,
+            claim_sha256
+        )
+        || !exact_hash_field(
+            receipt_raw,
+            receipt_size,
+            &offset,
+            supervisor_label,
+            supervisor_sha256
+        )
+        || !exact_hash_field(
+            receipt_raw,
+            receipt_size,
+            &offset,
+            worker_label,
+            worker_sha256
+        )
+        || offset + sizeof(algorithm) - 1 > receipt_size
+        || memcmp(
+            receipt_raw + offset,
+            algorithm,
+            sizeof(algorithm) - 1
+        ) != 0) {
+        goto cleanup;
+    }
+    offset += sizeof(algorithm) - 1;
+    unsigned_size = offset;
+    if (offset + sizeof(signature_label) - 1 + 2 > receipt_size
+        || memcmp(
+            receipt_raw + offset,
+            signature_label,
+            sizeof(signature_label) - 1
+        ) != 0
+        || receipt_raw[receipt_size - 1] != '\n') {
+        goto cleanup;
+    }
+    offset += sizeof(signature_label) - 1;
+    signature_hex_size = receipt_size - offset - 1;
+    if (!hex_signature(
+            receipt_raw + offset,
+            signature_hex_size,
+            &signature,
+            &signature_size
+        )
+        || !hash_memory(
+            receipt_raw,
+            (DWORD)unsigned_size,
+            unsigned_digest
+        )
+        || !open_persistent_cng_signing_key(&provider, &key)
+        || NCryptVerifySignature(
+            key,
+            &padding,
+            unsigned_digest,
+            sizeof(unsigned_digest),
+            signature,
+            signature_size,
+            NCRYPT_PAD_PKCS1_FLAG
+        ) != ERROR_SUCCESS
+        || !expected_ledger_path(
+            candidate.execution_ledger_root,
+            "claims",
+            launch_sha256,
+            claim_path,
+            32768
+        )
+        || !open_held_file(
+            claim_path,
+            F3_MAX_AUTHORIZATION_BYTES,
+            &claim_file
+        )
+        || !hash_held_file(&claim_file, observed_digest)) {
+        goto cleanup;
+    }
+    digest_to_ascii(observed_digest, observed_sha256);
+    if (strcmp(observed_sha256, claim_sha256) != 0
+        || !expected_ledger_path(
+            candidate.execution_ledger_root,
+            "completed",
+            launch_sha256,
+            supervisor_path,
+            32768
+        )
+        || !open_held_file(
+            supervisor_path,
+            F3_MAX_AUTHORIZATION_BYTES,
+            &supervisor_file
+        )
+        || !hash_held_file(&supervisor_file, observed_digest)
+        || !read_candidate(
+            &supervisor_file,
+            &supervisor_raw,
+            &supervisor_size
+        )) {
+        goto cleanup;
+    }
+    digest_to_ascii(observed_digest, observed_sha256);
+    if (strcmp(observed_sha256, supervisor_sha256) != 0
+        || !json_top_string_matches(
+            supervisor_raw,
+            supervisor_size,
+            "worker_terminal_sha256",
+            worker_sha256,
+            64
+        )
+        || !held_unchanged(&supervisor_file, NULL)
+        || !held_unchanged(&claim_file, NULL)
+        || !held_unchanged(&receipt_file, NULL)
+        || !held_unchanged(&launch_file, NULL)
+        || !held_unchanged(&candidate_file, NULL)) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (signature != NULL) {
+        SecureZeroMemory(signature, signature_size);
+        HeapFree(GetProcessHeap(), 0, signature);
+    }
+    if (key != 0) {
+        NCryptFreeObject(key);
+    }
+    if (provider != 0) {
+        NCryptFreeObject(provider);
+    }
+    if (supervisor_raw != NULL) {
+        SecureZeroMemory(supervisor_raw, (SIZE_T)supervisor_size + 1);
+        HeapFree(GetProcessHeap(), 0, supervisor_raw);
+    }
+    if (receipt_raw != NULL) {
+        SecureZeroMemory(receipt_raw, (SIZE_T)receipt_size + 1);
+        HeapFree(GetProcessHeap(), 0, receipt_raw);
+    }
+    if (launch_raw != NULL) {
+        SecureZeroMemory(launch_raw, (SIZE_T)launch_size + 1);
+        HeapFree(GetProcessHeap(), 0, launch_raw);
+    }
+    if (candidate_raw != NULL) {
+        SecureZeroMemory(candidate_raw, (SIZE_T)candidate_size + 1);
+        HeapFree(GetProcessHeap(), 0, candidate_raw);
+    }
+    close_held(&supervisor_file);
+    close_held(&claim_file);
+    close_held(&receipt_file);
+    close_held(&launch_file);
+    close_held(&candidate_file);
+    SecureZeroMemory(&candidate, sizeof(candidate));
+    SecureZeroMemory(&envelope, sizeof(envelope));
+    SecureZeroMemory(candidate_digest, sizeof(candidate_digest));
+    SecureZeroMemory(launch_digest, sizeof(launch_digest));
+    SecureZeroMemory(unsigned_digest, sizeof(unsigned_digest));
+    SecureZeroMemory(observed_digest, sizeof(observed_digest));
+    SecureZeroMemory(launch_path, sizeof(launch_path));
+    SecureZeroMemory(receipt_path, sizeof(receipt_path));
+    SecureZeroMemory(claim_path, sizeof(claim_path));
+    SecureZeroMemory(supervisor_path, sizeof(supervisor_path));
+    SecureZeroMemory(candidate_sha256, sizeof(candidate_sha256));
+    SecureZeroMemory(launch_sha256, sizeof(launch_sha256));
+    SecureZeroMemory(observed_sha256, sizeof(observed_sha256));
+    SecureZeroMemory(receipt_launch_sha256, sizeof(receipt_launch_sha256));
+    SecureZeroMemory(receipt_candidate_sha256, sizeof(receipt_candidate_sha256));
+    SecureZeroMemory(claim_sha256, sizeof(claim_sha256));
+    SecureZeroMemory(supervisor_sha256, sizeof(supervisor_sha256));
+    SecureZeroMemory(worker_sha256, sizeof(worker_sha256));
+    return ok;
+}
+
+#ifdef F3_BROKER_TESTING
+static int create_persistent_test_cng_key(void) {
+    NCRYPT_PROV_HANDLE provider = 0;
+    NCRYPT_KEY_HANDLE key = 0;
+    DWORD bits = F3_RSA_BITS;
+    DWORD export_policy = 0;
+    int ok = 0;
+    if (wcsncmp(
+            F3_BROKER_CNG_KEY_NAME,
+            F3_DISPOSABLE_KEY_PREFIX,
+            wcslen(F3_DISPOSABLE_KEY_PREFIX)
+        ) != 0
+        || !cng_key_absent(F3_BROKER_CNG_KEY_NAME)
+        || f3_broker_open_cng_provider(&provider) != ERROR_SUCCESS
+        || NCryptCreatePersistedKey(
+            provider,
+            &key,
+            F3_BROKER_CNG_ALGORITHM,
+            F3_BROKER_CNG_KEY_NAME,
+            0,
+            0
+        ) != ERROR_SUCCESS
+        || NCryptSetProperty(
+            key,
+            NCRYPT_LENGTH_PROPERTY,
+            (PBYTE)&bits,
+            sizeof(bits),
+            0
+        ) != ERROR_SUCCESS
+        || NCryptSetProperty(
+            key,
+            NCRYPT_EXPORT_POLICY_PROPERTY,
+            (PBYTE)&export_policy,
+            sizeof(export_policy),
+            0
+        ) != ERROR_SUCCESS
+        || NCryptFinalizeKey(key, 0) != ERROR_SUCCESS) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (key != 0) {
+        NCryptFreeObject(key);
+    }
+    if (provider != 0) {
+        NCryptFreeObject(provider);
+    }
+    return ok;
+}
+
+static int persistent_test_cng_key_present(void) {
+    NCRYPT_PROV_HANDLE provider = 0;
+    NCRYPT_KEY_HANDLE key = 0;
+    int ok = open_persistent_cng_signing_key(&provider, &key);
+    if (key != 0) {
+        NCryptFreeObject(key);
+    }
+    if (provider != 0) {
+        NCryptFreeObject(provider);
+    }
+    return ok;
+}
+
+static int delete_persistent_test_cng_key(void) {
+    NCRYPT_PROV_HANDLE provider = 0;
+    NCRYPT_KEY_HANDLE key = 0;
+    int deleted = 0;
+    if (wcsncmp(
+            F3_BROKER_CNG_KEY_NAME,
+            F3_DISPOSABLE_KEY_PREFIX,
+            wcslen(F3_DISPOSABLE_KEY_PREFIX)
+        ) != 0
+        || f3_broker_open_cng_provider(&provider) != ERROR_SUCCESS
+        || NCryptOpenKey(
+            provider,
+            &key,
+            F3_BROKER_CNG_KEY_NAME,
+            0,
+            0
+        ) != ERROR_SUCCESS) {
+        goto cleanup;
+    }
+    deleted = NCryptDeleteKey(key, 0) == ERROR_SUCCESS;
+    key = 0;
+
+cleanup:
+    if (key != 0) {
+        NCryptFreeObject(key);
+    }
+    if (provider != 0) {
+        NCryptFreeObject(provider);
+    }
+    return deleted && cng_key_absent(F3_BROKER_CNG_KEY_NAME);
+}
+
+static int test_protected_completion_namespace(
+    const wchar_t *candidate_path
+) {
+    static const unsigned char test_receipt[] = "{}\n";
+    HeldFile candidate_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile launch_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    ProtectedCompletionNamespace completion;
+    ProductionCandidate candidate;
+    SignedEnvelope envelope;
+    unsigned char *candidate_raw = NULL;
+    unsigned char *launch_raw = NULL;
+    DWORD candidate_size = 0;
+    DWORD launch_size = 0;
+    unsigned char launch_digest[32];
+    wchar_t launch_path[32768];
+    wchar_t completed_path[32768];
+    wchar_t parent_path[32768];
+    wchar_t denied_path[32768];
+    wchar_t replacement_path[32768];
+    char launch_sha256[65];
+    HANDLE restricted_token = NULL;
+    HANDLE denied_file = INVALID_HANDLE_VALUE;
+    HANDLE test_receipt_file = INVALID_HANDLE_VALUE;
+    FILE_DISPOSITION_INFO disposition = {TRUE};
+    DWORD denied_error = ERROR_SUCCESS;
+    DWORD replacement_error = ERROR_SUCCESS;
+    int impersonating = 0;
+    int replacement_blocked = 0;
+    int ok = 0;
+    memset(&completion, 0, sizeof(completion));
+    initialize_held_directory_chain(&completion.chain);
+    memset(&candidate, 0, sizeof(candidate));
+    memset(&envelope, 0, sizeof(envelope));
+    f3_test_completion_namespace_stage = 1;
+    if (!open_held_file(
+            candidate_path,
+            F3_MAX_CANDIDATE_BYTES,
+            &candidate_file
+        )
+        || !read_candidate(
+            &candidate_file,
+            &candidate_raw,
+            &candidate_size
+        )
+        || !parse_production_candidate(
+            candidate_raw,
+            candidate_size,
+            &candidate
+        )
+        || !byte_slice_to_wide(
+            candidate.launch_authorization_path,
+            launch_path,
+            sizeof(launch_path) / sizeof(launch_path[0])
+        )
+        || !open_held_file(
+            launch_path,
+            F3_MAX_AUTHORIZATION_BYTES,
+            &launch_file
+        )
+        || !hash_held_file(&launch_file, launch_digest)
+        || !read_candidate(&launch_file, &launch_raw, &launch_size)
+        || !parse_signed_envelope(launch_raw, launch_size, &envelope)
+        || !validate_current_launch_payload(&envelope, &candidate)) {
+        goto cleanup;
+    }
+    f3_test_completion_namespace_stage = 2;
+    digest_to_ascii(launch_digest, launch_sha256);
+    if (!hold_protected_completion_namespace(
+            candidate.execution_ledger_root,
+            launch_sha256,
+            completed_path,
+            &completion
+        )
+        || !parent_directory(
+            completed_path,
+            parent_path,
+            sizeof(parent_path) / sizeof(parent_path[0])
+        )
+        || _snwprintf_s(
+            denied_path,
+            sizeof(denied_path) / sizeof(denied_path[0]),
+            _TRUNCATE,
+            L"%ls\\.restricted-write-test-%lu",
+            parent_path,
+            GetCurrentProcessId()
+        ) <= 0
+        || _snwprintf_s(
+            replacement_path,
+            sizeof(replacement_path) / sizeof(replacement_path[0]),
+            _TRUNCATE,
+            L"%ls.replacement-test-%lu",
+            parent_path,
+            GetCurrentProcessId()
+        ) <= 0) {
+        goto cleanup;
+    }
+    f3_test_completion_namespace_stage = 3;
+    if (!create_production_restricted_token(&restricted_token)) {
+        goto cleanup;
+    }
+    f3_test_completion_namespace_stage = 4;
+    if (!restricted_token_cannot_mutate_completion_namespace(
+            restricted_token,
+            &completion.chain
+        )) {
+        goto cleanup;
+    }
+    f3_test_completion_namespace_stage = 5;
+    if (!ImpersonateLoggedOnUser(restricted_token)) {
+        goto cleanup;
+    }
+    impersonating = 1;
+    denied_file = CreateFileW(
+        denied_path,
+        GENERIC_WRITE | DELETE,
+        0,
+        NULL,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    denied_error = GetLastError();
+    if (!RevertToSelf()) {
+        goto cleanup;
+    }
+    impersonating = 0;
+    f3_test_completion_namespace_stage = 6;
+    if (denied_file != INVALID_HANDLE_VALUE
+        || denied_error != ERROR_ACCESS_DENIED) {
+        goto cleanup;
+    }
+    SetLastError(ERROR_SUCCESS);
+    if (!MoveFileExW(parent_path, replacement_path, 0)) {
+        replacement_error = GetLastError();
+        replacement_blocked =
+            replacement_error == ERROR_SHARING_VIOLATION
+            || replacement_error == ERROR_ACCESS_DENIED;
+    } else {
+        MoveFileExW(replacement_path, parent_path, 0);
+    }
+    f3_test_completion_namespace_stage = 7;
+    if (!replacement_blocked) {
+        goto cleanup;
+    }
+    f3_test_completion_namespace_stage = 8;
+    if (!atomic_write_persistent_completion(
+            &completion,
+            completed_path,
+            test_receipt,
+            (DWORD)(sizeof(test_receipt) - 1)
+        )) {
+        goto cleanup;
+    }
+    test_receipt_file = CreateFileW(
+        completed_path,
+        DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+        NULL
+    );
+    if (test_receipt_file == INVALID_HANDLE_VALUE
+        || !SetFileInformationByHandle(
+            test_receipt_file,
+            FileDispositionInfo,
+            &disposition,
+            sizeof(disposition)
+        )) {
+        goto cleanup;
+    }
+    CloseHandle(test_receipt_file);
+    test_receipt_file = INVALID_HANDLE_VALUE;
+    if (GetFileAttributesW(completed_path) != INVALID_FILE_ATTRIBUTES
+        || GetLastError() != ERROR_FILE_NOT_FOUND) {
+        goto cleanup;
+    }
+    f3_test_completion_namespace_stage = 9;
+    ok = held_directory_chain_unchanged(&completion.chain)
+        && held_unchanged(&launch_file, NULL)
+        && held_unchanged(&candidate_file, NULL);
+
+cleanup:
+    if (test_receipt_file != INVALID_HANDLE_VALUE) {
+        CloseHandle(test_receipt_file);
+    }
+    if (denied_file != INVALID_HANDLE_VALUE) {
+        CloseHandle(denied_file);
+        if (!impersonating) {
+            DeleteFileW(denied_path);
+        }
+    }
+    if (impersonating && !RevertToSelf()) {
+        ok = 0;
+    }
+    if (restricted_token != NULL) {
+        CloseHandle(restricted_token);
+    }
+    if (launch_raw != NULL) {
+        SecureZeroMemory(launch_raw, (SIZE_T)launch_size + 1);
+        HeapFree(GetProcessHeap(), 0, launch_raw);
+    }
+    if (candidate_raw != NULL) {
+        SecureZeroMemory(candidate_raw, (SIZE_T)candidate_size + 1);
+        HeapFree(GetProcessHeap(), 0, candidate_raw);
+    }
+    close_held_directory_chain(&completion.chain);
+    close_held(&launch_file);
+    close_held(&candidate_file);
+    SecureZeroMemory(&completion, sizeof(completion));
+    SecureZeroMemory(&candidate, sizeof(candidate));
+    SecureZeroMemory(&envelope, sizeof(envelope));
+    SecureZeroMemory(launch_digest, sizeof(launch_digest));
+    SecureZeroMemory(launch_path, sizeof(launch_path));
+    SecureZeroMemory(completed_path, sizeof(completed_path));
+    SecureZeroMemory(parent_path, sizeof(parent_path));
+    SecureZeroMemory(denied_path, sizeof(denied_path));
+    SecureZeroMemory(replacement_path, sizeof(replacement_path));
+    SecureZeroMemory(launch_sha256, sizeof(launch_sha256));
+    return ok;
+}
+
+static int test_isolated_supervisor_runtime_startup(void) {
+    STARTUPINFOW startup;
+    PROCESS_INFORMATION process;
+    HANDLE restricted_token = NULL;
+    wchar_t command_line[32768];
+    wchar_t runtime_directory[32768];
+    wchar_t *environment = NULL;
+    DWORD exit_code = 1;
+    int written;
+    int ok = 0;
+    memset(&startup, 0, sizeof(startup));
+    memset(&process, 0, sizeof(process));
+    startup.cb = sizeof(startup);
+    written = _snwprintf_s(
+        command_line,
+        sizeof(command_line) / sizeof(command_line[0]),
+        _TRUNCATE,
+        L"\"%ls\" -I -B -S -P -c \"import sys\"",
+        F3_BROKER_RUNTIME_PATH
+    );
+    if (written <= 0
+        || !parent_directory(
+            F3_BROKER_RUNTIME_PATH,
+            runtime_directory,
+            sizeof(runtime_directory) / sizeof(runtime_directory[0])
+        )
+        || (environment = sanitized_environment(
+            L"factor-v3-formal-native-broker-runtime-test/v1"
+        )) == NULL
+        || !create_test_supervisor_compatibility_token(&restricted_token)
+        || !CreateProcessAsUserW(
+            restricted_token,
+            F3_BROKER_RUNTIME_PATH,
+            command_line,
+            NULL,
+            NULL,
+            FALSE,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            environment,
+            runtime_directory,
+            &startup,
+            &process
+        )) {
+        goto cleanup;
+    }
+    if (WaitForSingleObject(process.hProcess, 30000) != WAIT_OBJECT_0
+        || !GetExitCodeProcess(process.hProcess, &exit_code)) {
+        goto cleanup;
+    }
+    if (exit_code != 0) {
+        SetLastError(exit_code);
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (process.hThread != NULL) {
+        CloseHandle(process.hThread);
+    }
+    if (process.hProcess != NULL) {
+        CloseHandle(process.hProcess);
+    }
+    if (restricted_token != NULL) {
+        CloseHandle(restricted_token);
+    }
+    if (environment != NULL) {
+        SecureZeroMemory(environment, 32768 * sizeof(wchar_t));
+        HeapFree(GetProcessHeap(), 0, environment);
+    }
+    SecureZeroMemory(command_line, sizeof(command_line));
+    SecureZeroMemory(runtime_directory, sizeof(runtime_directory));
+    return ok;
+}
+#endif
+
 int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
     STARTUPINFOEXW startup;
     PROCESS_INFORMATION process;
@@ -4003,6 +5742,10 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
     HeldFile candidate_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile launch_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile credential = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile supervisor_completed_file = {
+        INVALID_HANDLE_VALUE, 0, 0, {0}
+    };
+    ProtectedCompletionNamespace completion_namespace;
     ProductionCandidate candidate;
     SignedEnvelope envelope;
     unsigned char *candidate_raw = NULL;
@@ -4011,13 +5754,21 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
     DWORD launch_size = 0;
     unsigned char candidate_digest[32];
     unsigned char launch_digest[32];
+    unsigned char supervisor_completed_digest[32];
     wchar_t launch_path[32768];
     wchar_t command_line[32768];
     wchar_t runtime_directory[32768];
     wchar_t *environment = NULL;
     unsigned char completed_frame[1024];
     DWORD completed_frame_size = 0;
+    char native_terminal[1024];
+    int native_terminal_size = 0;
+    wchar_t supervisor_completed_path[32768];
+    wchar_t native_completed_path[32768];
     char authorization_sha256[65];
+    char candidate_sha256[65];
+    char observed_supervisor_completed_sha256[65];
+    char native_completed_receipt_sha256[65];
     char claim_sha256[65];
     char supervisor_completed_sha256[65];
     char worker_terminal_sha256[65];
@@ -4037,8 +5788,23 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
     memset(&pipe_security, 0, sizeof(pipe_security));
     memset(&candidate, 0, sizeof(candidate));
     memset(&envelope, 0, sizeof(envelope));
+    memset(&completion_namespace, 0, sizeof(completion_namespace));
+    initialize_held_directory_chain(&completion_namespace.chain);
     memset(launch_path, 0, sizeof(launch_path));
+    memset(supervisor_completed_path, 0, sizeof(supervisor_completed_path));
+    memset(native_completed_path, 0, sizeof(native_completed_path));
     memset(authorization_sha256, 0, sizeof(authorization_sha256));
+    memset(candidate_sha256, 0, sizeof(candidate_sha256));
+    memset(
+        observed_supervisor_completed_sha256,
+        0,
+        sizeof(observed_supervisor_completed_sha256)
+    );
+    memset(
+        native_completed_receipt_sha256,
+        0,
+        sizeof(native_completed_receipt_sha256)
+    );
     memset(claim_sha256, 0, sizeof(claim_sha256));
     memset(supervisor_completed_sha256, 0, sizeof(supervisor_completed_sha256));
     memset(worker_terminal_sha256, 0, sizeof(worker_terminal_sha256));
@@ -4113,7 +5879,14 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
     F3_PRODUCTION_LAUNCH_STAGE(2);
     action = candidate.action == ACTION_RUN ? "run" : "resume";
     digest_to_ascii(launch_digest, authorization_sha256);
-    if (!production_supervisor_command_line(
+    digest_to_ascii(candidate_digest, candidate_sha256);
+    if (!hold_protected_completion_namespace(
+            candidate.execution_ledger_root,
+            authorization_sha256,
+            native_completed_path,
+            &completion_namespace
+        )
+        || !production_supervisor_command_line(
             launch_path,
             command_line,
             sizeof(command_line) / sizeof(command_line[0])
@@ -4148,6 +5921,10 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
     }
 #endif
     if (!restricted_token_ready
+        || !restricted_token_cannot_mutate_completion_namespace(
+            restricted_token,
+            &completion_namespace.chain
+        )
         || !CreatePipe(
             &child_input,
             &parent_input,
@@ -4413,15 +6190,83 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
         || !held_unchanged(&launch_file, NULL)
         || !held_unchanged(&candidate_file, NULL)
         || !held_unchanged(&source, F3_BROKER_SOURCE_SHA256)
-        || !held_unchanged(&runtime, F3_BROKER_RUNTIME_SHA256)
+        || !held_unchanged(&runtime, F3_BROKER_RUNTIME_SHA256)) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(92);
+    if (!expected_ledger_path(
+            candidate.execution_ledger_root,
+            "completed",
+            authorization_sha256,
+            supervisor_completed_path,
+            32768
+        )
+        || !open_held_file(
+            supervisor_completed_path,
+            F3_MAX_AUTHORIZATION_BYTES,
+            &supervisor_completed_file
+        )
+        || !hash_held_file(
+            &supervisor_completed_file,
+            supervisor_completed_digest
+        )) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(93);
+    digest_to_ascii(
+        supervisor_completed_digest,
+        observed_supervisor_completed_sha256
+    );
+    if (strcmp(
+            observed_supervisor_completed_sha256,
+            supervisor_completed_sha256
+        ) != 0
+        || !write_persistent_cng_completion(
+            &completion_namespace,
+            native_completed_path,
+            authorization_sha256,
+            candidate_sha256,
+            claim_sha256,
+            supervisor_completed_sha256,
+            worker_terminal_sha256,
+            native_completed_receipt_sha256
+        )) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(94);
+    if (!verify_persistent_cng_completion(candidate_path)
+        || !held_unchanged(&supervisor_completed_file, NULL)
+        || !held_directory_chain_unchanged(
+            &completion_namespace.chain
+        )) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(95);
+    native_terminal_size = snprintf(
+        native_terminal,
+        sizeof(native_terminal),
+        "COMPLETED factor-v3-formal-native-broker/v2\n"
+        "launch_authorization_sha256=%s\n"
+        "claim_sha256=%s\n"
+        "supervisor_completed_sha256=%s\n"
+        "worker_terminal_sha256=%s\n"
+        "native_completed_receipt_sha256=%s\n",
+        authorization_sha256,
+        claim_sha256,
+        supervisor_completed_sha256,
+        worker_terminal_sha256,
+        native_completed_receipt_sha256
+    );
+    if (native_terminal_size <= 0
+        || (size_t)native_terminal_size >= sizeof(native_terminal)
         || !WriteFile(
             GetStdHandle(STD_OUTPUT_HANDLE),
-            completed_frame,
-            completed_frame_size,
+            native_terminal,
+            (DWORD)native_terminal_size,
             &written,
             NULL
         )
-        || written != completed_frame_size
+        || written != (DWORD)native_terminal_size
         || !FlushFileBuffers(GetStdHandle(STD_OUTPUT_HANDLE))) {
         goto cleanup;
     }
@@ -4479,19 +6324,44 @@ cleanup:
         HeapFree(GetProcessHeap(), 0, candidate_raw);
     }
     close_held(&credential);
+    close_held(&supervisor_completed_file);
     close_held(&launch_file);
     close_held(&candidate_file);
     close_held(&source);
     close_held(&runtime);
+    close_held_directory_chain(&completion_namespace.chain);
     SecureZeroMemory(&candidate, sizeof(candidate));
     SecureZeroMemory(&envelope, sizeof(envelope));
+    SecureZeroMemory(
+        &completion_namespace,
+        sizeof(completion_namespace)
+    );
     SecureZeroMemory(candidate_digest, sizeof(candidate_digest));
     SecureZeroMemory(launch_digest, sizeof(launch_digest));
+    SecureZeroMemory(
+        supervisor_completed_digest,
+        sizeof(supervisor_completed_digest)
+    );
     SecureZeroMemory(launch_path, sizeof(launch_path));
     SecureZeroMemory(command_line, sizeof(command_line));
     SecureZeroMemory(runtime_directory, sizeof(runtime_directory));
     SecureZeroMemory(completed_frame, sizeof(completed_frame));
+    SecureZeroMemory(native_terminal, sizeof(native_terminal));
+    SecureZeroMemory(
+        supervisor_completed_path,
+        sizeof(supervisor_completed_path)
+    );
+    SecureZeroMemory(native_completed_path, sizeof(native_completed_path));
     SecureZeroMemory(authorization_sha256, sizeof(authorization_sha256));
+    SecureZeroMemory(candidate_sha256, sizeof(candidate_sha256));
+    SecureZeroMemory(
+        observed_supervisor_completed_sha256,
+        sizeof(observed_supervisor_completed_sha256)
+    );
+    SecureZeroMemory(
+        native_completed_receipt_sha256,
+        sizeof(native_completed_receipt_sha256)
+    );
     SecureZeroMemory(claim_sha256, sizeof(claim_sha256));
     SecureZeroMemory(
         supervisor_completed_sha256,
@@ -5596,8 +7466,12 @@ int wmain(int argc, wchar_t **argv) {
         if (!f3_broker_launch_production_supervisor(argv[2])) {
             fwprintf(
                 stderr,
-                L"native broker production supervisor launch rejected stage=%d error=%lu\n",
+                L"native broker production supervisor launch rejected stage=%d pipe_stage=%d pipe_error=%lu atomic_error=%lu atomic_ntstatus=0x%08lx error=%lu\n",
                 f3_test_production_launch_stage,
+                f3_test_pipe_stage,
+                f3_test_pipe_error,
+                f3_test_atomic_write_error,
+                (unsigned long)f3_test_atomic_write_ntstatus,
                 GetLastError()
             );
             return 38;
@@ -5620,6 +7494,96 @@ int wmain(int argc, wchar_t **argv) {
         if (!denied) {
             fwprintf(stderr, L"native broker worker token ACL rejected\n");
             return 39;
+        }
+        return 0;
+    }
+    if (
+        argc == 3
+        && wcscmp(
+            argv[1],
+            L"--test-protected-completion-namespace"
+        ) == 0
+    ) {
+        if (!test_protected_completion_namespace(argv[2])) {
+            fwprintf(
+                stderr,
+                L"native broker protected completion namespace rejected stage=%d launch_stage=%d atomic_error=%lu atomic_ntstatus=0x%08lx error=%lu\n",
+                f3_test_completion_namespace_stage,
+                f3_test_production_launch_stage,
+                f3_test_atomic_write_error,
+                (unsigned long)f3_test_atomic_write_ntstatus,
+                GetLastError()
+            );
+            return 44;
+        }
+        return 0;
+    }
+    if (
+        argc == 2
+        && wcscmp(
+            argv[1],
+            L"--test-isolated-supervisor-runtime-startup"
+        ) == 0
+    ) {
+        if (!test_isolated_supervisor_runtime_startup()) {
+            fwprintf(
+                stderr,
+                L"native broker isolated supervisor runtime startup rejected error=%lu\n",
+                GetLastError()
+            );
+            return 45;
+        }
+        return 0;
+    }
+    if (
+        argc == 2
+        && wcscmp(
+            argv[1],
+            L"--test-create-persistent-cng-key"
+        ) == 0
+    ) {
+        if (!create_persistent_test_cng_key()) {
+            fwprintf(stderr, L"native broker persistent CNG key creation rejected\n");
+            return 40;
+        }
+        return 0;
+    }
+    if (
+        argc == 3
+        && wcscmp(
+            argv[1],
+            L"--test-verify-persistent-cng-completion"
+        ) == 0
+    ) {
+        if (!verify_persistent_cng_completion(argv[2])) {
+            fwprintf(stderr, L"native broker persistent CNG receipt rejected\n");
+            return 41;
+        }
+        return 0;
+    }
+    if (
+        argc == 2
+        && wcscmp(
+            argv[1],
+            L"--test-persistent-cng-key-present"
+        ) == 0
+    ) {
+        if (!persistent_test_cng_key_present()) {
+            fwprintf(stderr, L"native broker persistent CNG key missing\n");
+            return 42;
+        }
+        return 0;
+    }
+    if (
+        argc == 2
+        && wcscmp(
+            argv[1],
+            L"--test-delete-persistent-cng-key"
+        ) == 0
+    ) {
+        if (!delete_persistent_test_cng_key()) {
+            fwprintf(stderr, L"native broker persistent CNG key cleanup rejected\n");
+            return 43;
         }
         return 0;
     }
