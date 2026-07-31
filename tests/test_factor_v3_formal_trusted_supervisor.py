@@ -811,9 +811,13 @@ def test_resume_status_claim_has_exact_canonical_keyset() -> None:
         "authorization_id_sha256": "1" * 64,
         "authorization_nonce_sha256": "2" * 64,
         "bootstrap_execution_authorization_sha256": "3" * 64,
+        "launch_authorization_schema": (
+            "factor-v3-formal-supervisor-launch-authorization/v2"
+        ),
         "launch_authorization_sha256": "4" * 64,
+        "launch_authorization_signature_sha256": "5" * 64,
         "replay_scope": "factor-v3-formal-bootstrap-execution/v1",
-        "schema": "factor-v3-formal-supervisor-execution-claim/v1",
+        "schema": "factor-v3-formal-supervisor-execution-claim/v2",
         "status": "claimed",
     }
     raw = _canonical_bytes(claim)

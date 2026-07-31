@@ -997,10 +997,13 @@ def test_persistent_completion_signs_only_after_held_terminal_lineage_and_cleans
     assert '"worker_terminals"' in lineage
     assert "open_held_file" in lineage
     assert "read_candidate" in lineage
-    assert "factor-v3-formal-supervisor-execution-claim/v1" in lineage
+    assert "factor-v3-formal-supervisor-execution-claim/v2" in lineage
     assert "factor-v3-formal-supervisor-execution-completed/v2" in lineage
     assert '"status"' in lineage
     assert '"launch_authorization_sha256"' in lineage
+    assert '"launch_authorization_schema"' in lineage
+    assert '"launch_authorization_signature_sha256"' in lineage
+    assert "launch_envelope->signature" in lineage
     assert '"claim_sha256"' in lineage
     assert '"worker_terminal_bytes"' in lineage
     assert '"worker_terminal_schema"' in lineage
@@ -1008,6 +1011,20 @@ def test_persistent_completion_signs_only_after_held_terminal_lineage_and_cleans
     assert "held_unchanged" in lineage
     assert "worker_terminal_file" in launch
     assert "delete_failed_persistent_completion" in launch
+
+
+def test_native_resume_claim_v2_binds_original_schema_and_signature_hash() -> None:
+    source = BROKER_SOURCE.read_text(encoding="utf-8")
+    validator = source[
+        source.index("static int validate_resume_status"):
+        source.index("static int validate_resume_lineage")
+    ]
+
+    assert "factor-v3-formal-supervisor-execution-claim/v2" in validator
+    assert '"launch_authorization_schema"' in validator
+    assert '"launch_authorization_signature_sha256"' in validator
+    assert "original->signature" in validator
+    assert "json_top_has_exact_keys" in validator
 
 
 def test_persistent_completion_is_canonical_json_and_verifier_is_public_only() -> None:
