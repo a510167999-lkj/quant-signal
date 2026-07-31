@@ -662,6 +662,26 @@ def test_native_manifest_uses_fixed_cng_identity_and_no_private_key_file_slot() 
     assert "NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG" not in source
 
 
+def test_production_worker_token_uses_one_fixed_restricted_sid_and_cannot_open_secret() -> None:
+    source = BROKER_SOURCE.read_text(encoding="utf-8")
+    manifest = BROKER_MANIFEST.read_text(encoding="utf-8")
+    token = source[
+        source.index("static int create_production_restricted_token"):
+        source.index("static int read_exact_pipe_frame")
+    ]
+
+    assert "F3_BROKER_WORKER_SID" in manifest
+    assert "F3_BROKER_WORKER_SID" in token
+    assert "TokenRestrictedSids" in token
+    assert "restricted->GroupCount != 1" in token
+    assert "EqualSid" in token
+    assert "restricted_token_cannot_read_path" in source
+    assert source.index("restricted_token_cannot_read_path") < source.index(
+        "F3_BROKER_CREDENTIAL_SLOT_PATH",
+        source.index("f3_broker_launch_production_supervisor"),
+    )
+
+
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
 def test_interactive_process_is_rejected_as_formal_service_identity(
     tmp_path: Path,
