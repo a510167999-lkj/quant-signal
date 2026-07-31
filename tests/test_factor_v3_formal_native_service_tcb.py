@@ -1004,6 +1004,10 @@ def test_persistent_completion_signs_only_after_held_terminal_lineage_and_cleans
     assert '"launch_authorization_schema"' in lineage
     assert '"launch_authorization_signature_sha256"' in lineage
     assert "launch_envelope->signature" in lineage
+    assert "validate_resume_transition_before_signing" in lineage
+    assert '"resume_of_authorization_sha256"' in lineage
+    assert '"resume_transition_sha256"' in lineage
+    assert "resume_transition_file" in lineage
     assert '"claim_sha256"' in lineage
     assert '"worker_terminal_bytes"' in lineage
     assert '"worker_terminal_schema"' in lineage
@@ -1019,12 +1023,31 @@ def test_native_resume_claim_v2_binds_original_schema_and_signature_hash() -> No
         source.index("static int validate_resume_status"):
         source.index("static int validate_resume_lineage")
     ]
+    lineage = source[
+        source.index("static int validate_resume_lineage"):
+        source.index("int f3_broker_validate_production_candidate")
+    ]
 
     assert "factor-v3-formal-supervisor-execution-claim/v2" in validator
     assert '"launch_authorization_schema"' in validator
     assert '"launch_authorization_signature_sha256"' in validator
     assert "original->signature" in validator
     assert "json_top_has_exact_keys" in validator
+    assert '"resume_of_action"' in lineage
+    assert '"resume_of_launch_authorization_schema"' in lineage
+    assert '"resume_of_launch_authorization_signature_sha256"' in lineage
+    assert "original.signature" in lineage
+
+    transition = source[
+        source.index("static int validate_resume_transition_before_signing"):
+        source.index("static int validate_completion_lineage_before_signing")
+    ]
+    assert "factor-v3-formal-supervisor-resume-transition/v1" in transition
+    assert "json_top_has_exact_keys" in transition
+    assert '"resumed_authorizations"' in transition
+    assert '"original_claim_sha256"' in transition
+    assert '"resume_claim_sha256"' in transition
+    assert '"resume_launch_authorization_signature_sha256"' in transition
 
 
 def test_persistent_completion_is_canonical_json_and_verifier_is_public_only() -> None:

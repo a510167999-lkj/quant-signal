@@ -440,6 +440,8 @@ def test_external_loader_run_claims_before_credential_and_resumes_without_leak(
         "resume_transition_sha256",
         "schema",
         "status",
+        "worker_terminal_bytes",
+        "worker_terminal_schema",
         "worker_terminal_sha256",
     }
     assert completed["schema"] == "factor-v3-formal-supervisor-execution-completed/v2"

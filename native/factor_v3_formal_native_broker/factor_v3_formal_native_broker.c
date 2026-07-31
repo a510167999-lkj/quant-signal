@@ -3692,17 +3692,34 @@ static int validate_resume_status(
         "authorization_id_sha256",
         "authorization_nonce_sha256",
         "bootstrap_execution_authorization_sha256",
+        "launch_authorization_schema",
         "launch_authorization_sha256",
+        "launch_authorization_signature_sha256",
         "replay_scope",
         "schema",
         "status",
     };
     SignedEnvelope status_view;
+    unsigned char signature_digest[32];
+    char signature_sha256[65];
+    int ok;
     memset(&status_view, 0, sizeof(status_view));
+    memset(signature_digest, 0, sizeof(signature_digest));
+    memset(signature_sha256, 0, sizeof(signature_sha256));
     status_view.payload = status;
     status_view.payload_size = status_size;
-    return status != NULL
-        && status_size > 0
+    if (status == NULL
+        || original == NULL
+        || original_sha256 == NULL
+        || !hash_memory(
+            original->signature,
+            (DWORD)sizeof(original->signature),
+            signature_digest
+        )) {
+        return 0;
+    }
+    digest_to_ascii(signature_digest, signature_sha256);
+    ok = status_size > 0
         && json_top_has_exact_keys(
             status,
             status_size,
@@ -3713,8 +3730,8 @@ static int validate_resume_status(
             status,
             status_size,
             "schema",
-            "factor-v3-formal-supervisor-execution-claim/v1",
-            strlen("factor-v3-formal-supervisor-execution-claim/v1")
+            "factor-v3-formal-supervisor-execution-claim/v2",
+            strlen("factor-v3-formal-supervisor-execution-claim/v2")
         )
         && json_top_string_matches(
             status,
@@ -3735,6 +3752,19 @@ static int validate_resume_status(
             status_size,
             "launch_authorization_sha256",
             original_sha256,
+            64
+        )
+        && json_top_strings_equal(
+            &status_view,
+            "launch_authorization_schema",
+            original,
+            "schema"
+        )
+        && json_top_string_matches(
+            status,
+            status_size,
+            "launch_authorization_signature_sha256",
+            signature_sha256,
             64
         )
         && json_top_strings_equal(
@@ -3761,6 +3791,9 @@ static int validate_resume_status(
             original,
             "replay_scope"
         );
+    SecureZeroMemory(signature_digest, sizeof(signature_digest));
+    SecureZeroMemory(signature_sha256, sizeof(signature_sha256));
+    return ok;
 }
 
 static int validate_resume_lineage(
@@ -3770,6 +3803,7 @@ static int validate_resume_lineage(
     HeldFile original_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile status_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     unsigned char original_digest[32];
+    unsigned char original_signature_digest[32];
     unsigned char status_digest[32];
     unsigned char *original_raw = NULL;
     unsigned char *status_raw = NULL;
@@ -3781,15 +3815,26 @@ static int validate_resume_lineage(
     wchar_t expected_status_path[32768];
     wchar_t completed_path[32768];
     char original_sha256[65];
+    char original_signature_sha256[65];
     char status_sha256[65];
     DWORD completed_attributes;
     int ok = 0;
     memset(&original, 0, sizeof(original));
+    memset(
+        original_signature_digest,
+        0,
+        sizeof(original_signature_digest)
+    );
     memset(original_path, 0, sizeof(original_path));
     memset(status_path, 0, sizeof(status_path));
     memset(expected_status_path, 0, sizeof(expected_status_path));
     memset(completed_path, 0, sizeof(completed_path));
     memset(original_sha256, 0, sizeof(original_sha256));
+    memset(
+        original_signature_sha256,
+        0,
+        sizeof(original_signature_sha256)
+    );
     memset(status_sha256, 0, sizeof(status_sha256));
 #ifdef F3_BROKER_TESTING
     f3_test_production_validation_stage = 41;
@@ -3815,10 +3860,19 @@ static int validate_resume_lineage(
         )
         || !read_candidate(&original_file, &original_raw, &original_size)
         || !parse_signed_envelope(original_raw, original_size, &original)
-        || !validate_original_launch_payload(&original, candidate)) {
+        || !validate_original_launch_payload(&original, candidate)
+        || !hash_memory(
+            original.signature,
+            (DWORD)sizeof(original.signature),
+            original_signature_digest
+        )) {
         goto cleanup;
     }
     digest_to_ascii(original_digest, original_sha256);
+    digest_to_ascii(
+        original_signature_digest,
+        original_signature_sha256
+    );
 #ifdef F3_BROKER_TESTING
     f3_test_production_validation_stage = 42;
 #endif
@@ -3827,6 +3881,27 @@ static int validate_resume_lineage(
             current->payload_size,
             "resume_of_authorization_sha256",
             original_sha256,
+            64
+        )
+        || !json_top_string_matches(
+            current->payload,
+            current->payload_size,
+            "resume_of_action",
+            "run",
+            strlen("run")
+        )
+        || !json_top_string_matches(
+            current->payload,
+            current->payload_size,
+            "resume_of_launch_authorization_schema",
+            "factor-v3-formal-supervisor-launch-authorization/v2",
+            strlen("factor-v3-formal-supervisor-launch-authorization/v2")
+        )
+        || !json_top_string_matches(
+            current->payload,
+            current->payload_size,
+            "resume_of_launch_authorization_signature_sha256",
+            original_signature_sha256,
             64
         )
         || !json_top_strings_equal(
@@ -3953,6 +4028,10 @@ cleanup:
     close_held(&status_file);
     close_held(&original_file);
     SecureZeroMemory(original_digest, sizeof(original_digest));
+    SecureZeroMemory(
+        original_signature_digest,
+        sizeof(original_signature_digest)
+    );
     SecureZeroMemory(status_digest, sizeof(status_digest));
     SecureZeroMemory(&original, sizeof(original));
     SecureZeroMemory(original_path, sizeof(original_path));
@@ -3960,6 +4039,10 @@ cleanup:
     SecureZeroMemory(expected_status_path, sizeof(expected_status_path));
     SecureZeroMemory(completed_path, sizeof(completed_path));
     SecureZeroMemory(original_sha256, sizeof(original_sha256));
+    SecureZeroMemory(
+        original_signature_sha256,
+        sizeof(original_signature_sha256)
+    );
     SecureZeroMemory(status_sha256, sizeof(status_sha256));
     return ok;
 }
@@ -5307,6 +5390,302 @@ static int open_persistent_cng_signing_key(
     return persistent_cng_key_matches_public_pin(*key);
 }
 
+static int validate_resume_transition_before_signing(
+    const ProductionCandidate *candidate,
+    const SignedEnvelope *launch_envelope,
+    const char launch_authorization_sha256[65],
+    const char claim_sha256[65],
+    const unsigned char *completed_raw,
+    DWORD completed_size,
+    HeldFile *transition_file
+) {
+    static const char *const transition_keys[] = {
+        "original_action",
+        "original_authorization_id_sha256",
+        "original_authorization_nonce_sha256",
+        "original_bootstrap_execution_authorization_sha256",
+        "original_claim_sha256",
+        "original_launch_authorization_schema",
+        "original_launch_authorization_sha256",
+        "original_launch_authorization_signature_sha256",
+        "original_replay_scope",
+        "resume_action",
+        "resume_authorization_id_sha256",
+        "resume_authorization_nonce_sha256",
+        "resume_bootstrap_execution_authorization_sha256",
+        "resume_claim_sha256",
+        "resume_launch_authorization_schema",
+        "resume_launch_authorization_sha256",
+        "resume_launch_authorization_signature_sha256",
+        "resume_replay_scope",
+        "schema",
+        "status",
+    };
+    SignedEnvelope completed_view;
+    SignedEnvelope transition_view;
+    unsigned char digest[32];
+    unsigned char *transition_raw = NULL;
+    DWORD transition_size = 0;
+    char original_sha256[65];
+    char expected_transition_sha256[65];
+    char observed_sha256[65];
+    char launch_signature_sha256[65];
+    wchar_t transition_path[32768];
+    int ok = 0;
+    memset(&completed_view, 0, sizeof(completed_view));
+    memset(&transition_view, 0, sizeof(transition_view));
+    memset(digest, 0, sizeof(digest));
+    memset(original_sha256, 0, sizeof(original_sha256));
+    memset(
+        expected_transition_sha256,
+        0,
+        sizeof(expected_transition_sha256)
+    );
+    memset(observed_sha256, 0, sizeof(observed_sha256));
+    memset(launch_signature_sha256, 0, sizeof(launch_signature_sha256));
+    memset(transition_path, 0, sizeof(transition_path));
+    if (candidate == NULL
+        || launch_envelope == NULL
+        || launch_authorization_sha256 == NULL
+        || claim_sha256 == NULL
+        || completed_raw == NULL
+        || completed_size == 0
+        || transition_file == NULL
+        || transition_file->handle != INVALID_HANDLE_VALUE) {
+        goto cleanup;
+    }
+    if (candidate->action == ACTION_RUN) {
+        ok = json_top_is_null(
+                completed_raw,
+                completed_size,
+                "resume_of_authorization_sha256"
+            )
+            && json_top_is_null(
+                completed_raw,
+                completed_size,
+                "resume_transition_sha256"
+            );
+        goto cleanup;
+    }
+    if (candidate->action != ACTION_RESUME
+        || !json_top_copy_sha256(
+            completed_raw,
+            completed_size,
+            "resume_of_authorization_sha256",
+            original_sha256
+        )
+        || !json_top_copy_sha256(
+            completed_raw,
+            completed_size,
+            "resume_transition_sha256",
+            expected_transition_sha256
+        )
+        || !hash_memory(
+            launch_envelope->signature,
+            (DWORD)sizeof(launch_envelope->signature),
+            digest
+        )) {
+        goto cleanup;
+    }
+    completed_view.payload = completed_raw;
+    completed_view.payload_size = completed_size;
+    digest_to_ascii(digest, launch_signature_sha256);
+    if (!json_top_strings_equal(
+            &completed_view,
+            "resume_of_authorization_sha256",
+            launch_envelope,
+            "resume_of_authorization_sha256"
+        )
+        || !expected_ledger_path(
+            candidate->execution_ledger_root,
+            "resumed_authorizations",
+            original_sha256,
+            transition_path,
+            sizeof(transition_path) / sizeof(transition_path[0])
+        )
+        || !open_held_file(
+            transition_path,
+            F3_MAX_AUTHORIZATION_BYTES,
+            transition_file
+        )
+        || !hash_held_file(transition_file, digest)) {
+        goto cleanup;
+    }
+    digest_to_ascii(digest, observed_sha256);
+    if (strcmp(observed_sha256, expected_transition_sha256) != 0
+        || !read_candidate(
+            transition_file,
+            &transition_raw,
+            &transition_size
+        )) {
+        goto cleanup;
+    }
+    transition_view.payload = transition_raw;
+    transition_view.payload_size = transition_size;
+    if (!json_top_has_exact_keys(
+            transition_raw,
+            transition_size,
+            transition_keys,
+            sizeof(transition_keys) / sizeof(transition_keys[0])
+        )
+        || !json_top_string_matches(
+            transition_raw,
+            transition_size,
+            "schema",
+            "factor-v3-formal-supervisor-resume-transition/v1",
+            strlen("factor-v3-formal-supervisor-resume-transition/v1")
+        )
+        || !json_top_string_matches(
+            transition_raw,
+            transition_size,
+            "status",
+            "resumed",
+            strlen("resumed")
+        )
+        || !json_top_strings_equal(
+            &transition_view,
+            "original_action",
+            launch_envelope,
+            "resume_of_action"
+        )
+        || !json_top_strings_equal(
+            &transition_view,
+            "original_authorization_id_sha256",
+            launch_envelope,
+            "resume_of_authorization_id_sha256"
+        )
+        || !json_top_strings_equal(
+            &transition_view,
+            "original_authorization_nonce_sha256",
+            launch_envelope,
+            "resume_of_authorization_nonce_sha256"
+        )
+        || !json_top_strings_equal(
+            &transition_view,
+            "original_bootstrap_execution_authorization_sha256",
+            launch_envelope,
+            "resume_of_bootstrap_execution_authorization_sha256"
+        )
+        || !json_top_strings_equal(
+            &transition_view,
+            "original_claim_sha256",
+            launch_envelope,
+            "resume_status_sha256"
+        )
+        || !json_top_strings_equal(
+            &transition_view,
+            "original_launch_authorization_schema",
+            launch_envelope,
+            "resume_of_launch_authorization_schema"
+        )
+        || !json_top_strings_equal(
+            &transition_view,
+            "original_launch_authorization_sha256",
+            launch_envelope,
+            "resume_of_authorization_sha256"
+        )
+        || !json_top_strings_equal(
+            &transition_view,
+            "original_launch_authorization_signature_sha256",
+            launch_envelope,
+            "resume_of_launch_authorization_signature_sha256"
+        )
+        || !json_top_strings_equal(
+            &transition_view,
+            "original_replay_scope",
+            launch_envelope,
+            "resume_of_replay_scope"
+        )
+        || !json_top_strings_equal(
+            &transition_view,
+            "resume_action",
+            launch_envelope,
+            "action"
+        )
+        || !json_top_strings_equal(
+            &transition_view,
+            "resume_authorization_id_sha256",
+            launch_envelope,
+            "authorization_id_sha256"
+        )
+        || !json_top_strings_equal(
+            &transition_view,
+            "resume_authorization_nonce_sha256",
+            launch_envelope,
+            "authorization_nonce_sha256"
+        )
+        || !json_top_strings_equal(
+            &transition_view,
+            "resume_bootstrap_execution_authorization_sha256",
+            launch_envelope,
+            "bootstrap_execution_authorization_sha256"
+        )
+        || !json_top_string_matches(
+            transition_raw,
+            transition_size,
+            "resume_claim_sha256",
+            claim_sha256,
+            64
+        )
+        || !json_top_strings_equal(
+            &transition_view,
+            "resume_launch_authorization_schema",
+            launch_envelope,
+            "schema"
+        )
+        || !json_top_string_matches(
+            transition_raw,
+            transition_size,
+            "resume_launch_authorization_sha256",
+            launch_authorization_sha256,
+            64
+        )
+        || !json_top_string_matches(
+            transition_raw,
+            transition_size,
+            "resume_launch_authorization_signature_sha256",
+            launch_signature_sha256,
+            64
+        )
+        || !json_top_strings_equal(
+            &transition_view,
+            "resume_replay_scope",
+            launch_envelope,
+            "replay_scope"
+        )
+        || !held_unchanged(transition_file, NULL)) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (transition_raw != NULL) {
+        SecureZeroMemory(
+            transition_raw,
+            (SIZE_T)transition_size + 1
+        );
+        HeapFree(GetProcessHeap(), 0, transition_raw);
+    }
+    if (!ok) {
+        close_held(transition_file);
+    }
+    SecureZeroMemory(&completed_view, sizeof(completed_view));
+    SecureZeroMemory(&transition_view, sizeof(transition_view));
+    SecureZeroMemory(digest, sizeof(digest));
+    SecureZeroMemory(original_sha256, sizeof(original_sha256));
+    SecureZeroMemory(
+        expected_transition_sha256,
+        sizeof(expected_transition_sha256)
+    );
+    SecureZeroMemory(observed_sha256, sizeof(observed_sha256));
+    SecureZeroMemory(
+        launch_signature_sha256,
+        sizeof(launch_signature_sha256)
+    );
+    SecureZeroMemory(transition_path, sizeof(transition_path));
+    return ok;
+}
+
 static int validate_completion_lineage_before_signing(
     const ProductionCandidate *candidate,
     const SignedEnvelope *launch_envelope,
@@ -5317,14 +5696,17 @@ static int validate_completion_lineage_before_signing(
     DWORD *worker_terminal_bytes,
     HeldFile *claim_file,
     HeldFile *completed_file,
-    HeldFile *worker_terminal_file
+    HeldFile *worker_terminal_file,
+    HeldFile *resume_transition_file
 ) {
     static const char *const claim_keys[] = {
         "action",
         "authorization_id_sha256",
         "authorization_nonce_sha256",
         "bootstrap_execution_authorization_sha256",
+        "launch_authorization_schema",
         "launch_authorization_sha256",
+        "launch_authorization_signature_sha256",
         "replay_scope",
         "schema",
         "status",
@@ -5333,6 +5715,8 @@ static int validate_completion_lineage_before_signing(
         "artifact_manifest_sha256",
         "claim_sha256",
         "launch_authorization_sha256",
+        "resume_of_authorization_sha256",
+        "resume_transition_sha256",
         "schema",
         "status",
         "worker_terminal_bytes",
@@ -5379,9 +5763,11 @@ static int validate_completion_lineage_before_signing(
         || claim_file == NULL
         || completed_file == NULL
         || worker_terminal_file == NULL
+        || resume_transition_file == NULL
         || claim_file->handle != INVALID_HANDLE_VALUE
         || completed_file->handle != INVALID_HANDLE_VALUE
         || worker_terminal_file->handle != INVALID_HANDLE_VALUE
+        || resume_transition_file->handle != INVALID_HANDLE_VALUE
         || !expected_ledger_path(
             candidate->execution_ledger_root,
             "claims",
@@ -5399,9 +5785,15 @@ static int validate_completion_lineage_before_signing(
     }
     digest_to_ascii(digest, observed_sha256);
     if (strcmp(observed_sha256, claim_sha256) != 0
-        || !read_candidate(claim_file, &claim_raw, &claim_size)) {
+        || !read_candidate(claim_file, &claim_raw, &claim_size)
+        || !hash_memory(
+            launch_envelope->signature,
+            (DWORD)sizeof(launch_envelope->signature),
+            digest
+        )) {
         goto cleanup;
     }
+    digest_to_ascii(digest, observed_sha256);
     claim_view.payload = claim_raw;
     claim_view.payload_size = claim_size;
     if (!json_top_has_exact_keys(
@@ -5414,8 +5806,8 @@ static int validate_completion_lineage_before_signing(
             claim_raw,
             claim_size,
             "schema",
-            "factor-v3-formal-supervisor-execution-claim/v1",
-            strlen("factor-v3-formal-supervisor-execution-claim/v1")
+            "factor-v3-formal-supervisor-execution-claim/v2",
+            strlen("factor-v3-formal-supervisor-execution-claim/v2")
         )
         || !json_top_string_matches(
             claim_raw,
@@ -5429,6 +5821,19 @@ static int validate_completion_lineage_before_signing(
             claim_size,
             "launch_authorization_sha256",
             launch_authorization_sha256,
+            64
+        )
+        || !json_top_strings_equal(
+            &claim_view,
+            "launch_authorization_schema",
+            launch_envelope,
+            "schema"
+        )
+        || !json_top_string_matches(
+            claim_raw,
+            claim_size,
+            "launch_authorization_signature_sha256",
+            observed_sha256,
             64
         )
         || !json_top_strings_equal(
@@ -5544,6 +5949,15 @@ static int validate_completion_lineage_before_signing(
             completed_size,
             "artifact_manifest_sha256"
         )
+        || !validate_resume_transition_before_signing(
+            candidate,
+            launch_envelope,
+            launch_authorization_sha256,
+            claim_sha256,
+            completed_raw,
+            completed_size,
+            resume_transition_file
+        )
         || !expected_ledger_path(
             candidate->execution_ledger_root,
             "worker_terminals",
@@ -5640,7 +6054,11 @@ static int validate_completion_lineage_before_signing(
         )
         || !held_unchanged(claim_file, NULL)
         || !held_unchanged(completed_file, NULL)
-        || !held_unchanged(worker_terminal_file, NULL)) {
+        || !held_unchanged(worker_terminal_file, NULL)
+        || (
+            candidate->action == ACTION_RESUME
+            && !held_unchanged(resume_transition_file, NULL)
+        )) {
         goto cleanup;
     }
     *worker_terminal_bytes = completed_worker_terminal_bytes;
@@ -5667,6 +6085,7 @@ cleanup:
             *worker_terminal_bytes = 0;
         }
         close_held(worker_terminal_file);
+        close_held(resume_transition_file);
         close_held(completed_file);
         close_held(claim_file);
     }
@@ -5956,6 +6375,9 @@ static int verify_persistent_cng_completion(
     HeldFile claim_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile completed_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile worker_terminal_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile resume_transition_file = {
+        INVALID_HANDLE_VALUE, 0, 0, {0}
+    };
     ProductionCandidate candidate;
     SignedEnvelope launch_envelope;
     ByteSlice payload;
@@ -6202,12 +6624,17 @@ static int verify_persistent_cng_completion(
             &observed_worker_terminal_bytes,
             &claim_file,
             &completed_file,
-            &worker_terminal_file
+            &worker_terminal_file,
+            &resume_transition_file
         )
         || observed_worker_terminal_bytes != receipt_worker_terminal_bytes
         || !held_unchanged(&receipt_file, NULL)
         || !held_unchanged(&launch_file, NULL)
-        || !held_unchanged(&candidate_file, NULL)) {
+        || !held_unchanged(&candidate_file, NULL)
+        || (
+            candidate.action == ACTION_RESUME
+            && !held_unchanged(&resume_transition_file, NULL)
+        )) {
         goto cleanup;
     }
     ok = 1;
@@ -6235,6 +6662,7 @@ cleanup:
         SecureZeroMemory(candidate_raw, (SIZE_T)candidate_size + 1);
         HeapFree(GetProcessHeap(), 0, candidate_raw);
     }
+    close_held(&resume_transition_file);
     close_held(&worker_terminal_file);
     close_held(&completed_file);
     close_held(&claim_file);
@@ -7068,6 +7496,9 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
     HeldFile worker_terminal_file = {
         INVALID_HANDLE_VALUE, 0, 0, {0}
     };
+    HeldFile resume_transition_file = {
+        INVALID_HANDLE_VALUE, 0, 0, {0}
+    };
     ProtectedCompletionNamespace completion_namespace;
     ProductionCandidate candidate;
     SignedEnvelope envelope;
@@ -7520,7 +7951,8 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
             &worker_terminal_bytes,
             &claim_file,
             &supervisor_completed_file,
-            &worker_terminal_file
+            &worker_terminal_file,
+            &resume_transition_file
         )) {
         goto cleanup;
     }
@@ -7544,6 +7976,10 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
         || !held_unchanged(&claim_file, NULL)
         || !held_unchanged(&supervisor_completed_file, NULL)
         || !held_unchanged(&worker_terminal_file, NULL)
+        || (
+            candidate.action == ACTION_RESUME
+            && !held_unchanged(&resume_transition_file, NULL)
+        )
         || !held_directory_chain_unchanged(
             &completion_namespace.chain
         )) {
@@ -7638,6 +8074,7 @@ cleanup:
         );
     }
     close_held(&credential);
+    close_held(&resume_transition_file);
     close_held(&worker_terminal_file);
     close_held(&claim_file);
     close_held(&supervisor_completed_file);

@@ -787,6 +787,8 @@ def test_completed_v2_has_exact_keyset_types_and_terminal_binding(
         "artifact_manifest_sha256",
         "claim_sha256",
         "launch_authorization_sha256",
+        "resume_of_authorization_sha256",
+        "resume_transition_sha256",
         "schema",
         "status",
         "worker_terminal_bytes",
@@ -797,6 +799,8 @@ def test_completed_v2_has_exact_keyset_types_and_terminal_binding(
         "factor-v3-formal-supervisor-execution-completed/v2"
     )
     assert completed["status"] == "completed"
+    assert completed["resume_of_authorization_sha256"] is None
+    assert completed["resume_transition_sha256"] is None
     assert completed["worker_terminal_bytes"] == len(writes[0])
     assert completed["worker_terminal_schema"] == (
         "factor-v3-formal-bootstrap-worker-terminal/v2"
