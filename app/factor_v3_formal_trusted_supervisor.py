@@ -946,8 +946,8 @@ class _HeldLedgerFile:
         create_file.restype = wintypes.HANDLE
         handle = create_file(
             str(candidate),
-            0x80000000 | 0x40000000,
-            0x00000001,
+            0x80000000 | 0x40000000 | 0x00010000,
+            0x00000001 | 0x00000002 | 0x00000004,
             None,
             1,
             0x00200000 | 0x08000000,
@@ -977,9 +977,116 @@ class _HeldLedgerFile:
             self._stream.flush()
             os.fsync(self._stream.fileno())
             self.postverify()
+            self._seal_committed_handle()
         except BaseException:
-            self.close()
+            try:
+                self._discard_precommit()
+            finally:
+                self.close()
             raise
+
+    @staticmethod
+    def _reopen(
+        stream: Any,
+        *,
+        desired_access: int,
+        share_mode: int,
+        mode: str,
+    ) -> Any:
+        kernel32 = _kernel32()
+        reopen_file = kernel32.ReOpenFile
+        reopen_file.argtypes = (
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        )
+        reopen_file.restype = wintypes.HANDLE
+        handle = reopen_file(
+            wintypes.HANDLE(msvcrt.get_osfhandle(stream.fileno())),
+            desired_access,
+            share_mode,
+            0x00200000 | 0x08000000,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle in (None, invalid):
+            raise FormalSupervisorError("execution ledger handle transition rejected")
+        try:
+            descriptor = msvcrt.open_osfhandle(
+                int(handle),
+                (os.O_RDWR if "+" in mode else os.O_RDONLY)
+                | getattr(os, "O_BINARY", 0),
+            )
+        except BaseException:
+            kernel32.CloseHandle(handle)
+            raise
+        return os.fdopen(descriptor, mode)
+
+    def _seal_committed_handle(self) -> None:
+        intermediate = self._reopen(
+            self._stream,
+            desired_access=0x80000000,
+            share_mode=0x00000001 | 0x00000002 | 0x00000004,
+            mode="rb",
+        )
+        self._stream.close()
+        self._stream = intermediate
+        final_stream = None
+        try:
+            final_stream = self._reopen(
+                intermediate,
+                desired_access=0x80000000 | 0x40000000,
+                share_mode=0x00000001,
+                mode="r+b",
+            )
+            self._stream = final_stream
+            self.postverify()
+        except BaseException:
+            if final_stream is not None:
+                final_stream.close()
+            self._stream = intermediate
+            raise
+        intermediate.close()
+
+    def _discard_precommit(self) -> None:
+        class _FileDispositionInfo(ctypes.Structure):
+            _fields_ = [("DeleteFile", wintypes.BOOL)]
+
+        kernel32 = _kernel32()
+        set_information = kernel32.SetFileInformationByHandle
+        set_information.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        )
+        set_information.restype = wintypes.BOOL
+        disposition = _FileDispositionInfo(True)
+        if set_information(
+            wintypes.HANDLE(msvcrt.get_osfhandle(self._stream.fileno())),
+            4,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        ):
+            return
+        delete_stream = self._reopen(
+            self._stream,
+            desired_access=0x80000000 | 0x00010000,
+            share_mode=0x00000001 | 0x00000002 | 0x00000004,
+            mode="rb",
+        )
+        try:
+            if not set_information(
+                wintypes.HANDLE(msvcrt.get_osfhandle(delete_stream.fileno())),
+                4,
+                ctypes.byref(disposition),
+                ctypes.sizeof(disposition),
+            ):
+                raise FormalSupervisorError(
+                    "execution ledger partial cleanup rejected"
+                )
+        finally:
+            delete_stream.close()
 
     def postverify(self) -> None:
         self._chain.postverify()
@@ -999,7 +1106,9 @@ class _HeldLedgerFile:
             raise FormalSupervisorError("execution ledger terminal write rejected")
 
     def close(self) -> None:
-        self._stream.close()
+        if self._stream is not None:
+            self._stream.close()
+            self._stream = None
         self._chain.close()
 
 
@@ -1646,6 +1755,20 @@ def completed_path_for_authorization(root: Path, authorization_sha256: str) -> P
     return root / "completed" / "sha256" / authorization_sha256[:2] / f"{authorization_sha256}.json"
 
 
+def worker_terminal_path_for_authorization(
+    root: Path,
+    authorization_sha256: str,
+) -> Path:
+    _require_sha256(authorization_sha256, label="launch authorization SHA")
+    return (
+        root
+        / "worker_terminals"
+        / "sha256"
+        / authorization_sha256[:2]
+        / f"{authorization_sha256}.json"
+    )
+
+
 def _ledger_path(root: Path, category: str, identity_sha256: str) -> Path:
     _require_sha256(identity_sha256, label="ledger identity")
     return root / category / "sha256" / identity_sha256[:2] / f"{identity_sha256}.json"
@@ -2260,23 +2383,22 @@ def _validate_resume_status(
         max_bytes=_MAX_AUTHORIZATION_BYTES,
     )
     stack.callback(held.close)
-    status = _strict_canonical_json(held.raw, label="resume status")
+    status = _validated_claim_status(held.raw)
     if (
-        set(status) != _CLAIM_FIELDS
-        or status.get("schema") != CLAIM_SCHEMA
-        or status.get("status") != "claimed"
-        or status.get("action") != payload["resume_of_action"]
-        or status.get("launch_authorization_sha256") != payload["resume_of_authorization_sha256"]
-        or status.get("launch_authorization_schema")
+        status["action"] != payload["resume_of_action"]
+        or status["launch_authorization_sha256"]
+        != payload["resume_of_authorization_sha256"]
+        or status["launch_authorization_schema"]
         != payload["resume_of_launch_authorization_schema"]
-        or status.get("launch_authorization_signature_sha256")
+        or status["launch_authorization_signature_sha256"]
         != payload["resume_of_launch_authorization_signature_sha256"]
-        or status.get("authorization_id_sha256") != payload["resume_of_authorization_id_sha256"]
-        or status.get("authorization_nonce_sha256")
+        or status["authorization_id_sha256"]
+        != payload["resume_of_authorization_id_sha256"]
+        or status["authorization_nonce_sha256"]
         != payload["resume_of_authorization_nonce_sha256"]
-        or status.get("bootstrap_execution_authorization_sha256")
+        or status["bootstrap_execution_authorization_sha256"]
         != payload["resume_of_bootstrap_execution_authorization_sha256"]
-        or status.get("replay_scope") != payload["resume_of_replay_scope"]
+        or status["replay_scope"] != payload["resume_of_replay_scope"]
     ):
         raise FormalSupervisorError("resume status rejected")
     nonce_key = hashlib.sha256(
@@ -2314,6 +2436,29 @@ def _validate_resume_status(
         stack.callback(tuple_handle.close)
         if tuple_handle.raw != held.raw:
             raise FormalSupervisorError("resume replay tuple rejected")
+
+
+def _validated_claim_status(raw: bytes) -> dict[str, Any]:
+    status = _strict_canonical_json(raw, label="resume status")
+    if (
+        set(status) != _CLAIM_FIELDS
+        or any(type(status[field]) is not str for field in _CLAIM_FIELDS)
+        or status["schema"] != CLAIM_SCHEMA
+        or status["status"] != "claimed"
+        or status["action"] != "run"
+        or status["launch_authorization_schema"] != LAUNCH_AUTHORIZATION_SCHEMA
+        or status["replay_scope"] != EXECUTION_REPLAY_SCOPE
+    ):
+        raise FormalSupervisorError("resume status rejected")
+    for field in (
+        "authorization_id_sha256",
+        "authorization_nonce_sha256",
+        "bootstrap_execution_authorization_sha256",
+        "launch_authorization_sha256",
+        "launch_authorization_signature_sha256",
+    ):
+        _require_sha256(status[field], label="resume status")
+    return status
 
 
 def _reject_completed_resume(payload: Mapping[str, Any]) -> None:
@@ -2769,6 +2914,20 @@ def _supervise_with_pins(
             payload=payload,
             authorization_sha256=authorization_sha256,
         )
+        (
+            worker_terminal_handle,
+            worker_terminal_path,
+            worker_terminal_sha256,
+        ) = _ledger_write_once(
+            ledger_chain,
+            stack=stack,
+            category="worker_terminals",
+            authorization_sha256=authorization_sha256,
+            raw=stdout,
+            replay_label="worker terminal",
+        )
+        ledger_handles.append(worker_terminal_handle)
+        worker_terminal_bytes = len(stdout)
         artifact_manifest_sha256, artifact_handles = _validate_artifacts(
             frame["artifacts"],
             roots=(
@@ -2808,7 +2967,9 @@ def _supervise_with_pins(
                 "resume_transition_sha256": resume_transition_sha256,
                 "schema": COMPLETED_SCHEMA,
                 "status": "completed",
-                "worker_terminal_sha256": hashlib.sha256(stdout).hexdigest(),
+                "worker_terminal_bytes": worker_terminal_bytes,
+                "worker_terminal_schema": WORKER_TERMINAL_SCHEMA,
+                "worker_terminal_sha256": worker_terminal_sha256,
             }
         )
         completed_handle, completed_path, completed_sha256 = _ledger_write_once(
@@ -2837,7 +2998,10 @@ def _supervise_with_pins(
             "completed_sha256": completed_sha256,
             "launch_authorization_sha256": authorization_sha256,
             "status": "completed",
-            "worker_terminal_sha256": hashlib.sha256(stdout).hexdigest(),
+            "worker_terminal_bytes": worker_terminal_bytes,
+            "worker_terminal_path": str(worker_terminal_path),
+            "worker_terminal_schema": WORKER_TERMINAL_SCHEMA,
+            "worker_terminal_sha256": worker_terminal_sha256,
         }
 
 

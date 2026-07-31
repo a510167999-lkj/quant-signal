@@ -938,7 +938,7 @@ def test_production_completion_uses_persistent_cng_and_has_independent_verifier(
         source.index("#ifdef F3_BROKER_TESTING", completion_start)
     ]
 
-    assert "factor-v3-formal-native-broker-completed/v3" in source
+    assert "factor-v3-formal-native-broker-completed/v4" in source
     assert "NCryptOpenKey" in completion
     assert "NCryptVerifySignature" in completion
     assert "BCRYPT_RSAFULLPRIVATE_BLOB" in completion
@@ -994,15 +994,19 @@ def test_persistent_completion_signs_only_after_held_terminal_lineage_and_cleans
     )
     assert '"claims"' in lineage
     assert '"completed"' in lineage
+    assert '"worker_terminals"' in lineage
     assert "open_held_file" in lineage
     assert "read_candidate" in lineage
     assert "factor-v3-formal-supervisor-execution-claim/v1" in lineage
-    assert "factor-v3-formal-supervisor-execution-completed/v1" in lineage
+    assert "factor-v3-formal-supervisor-execution-completed/v2" in lineage
     assert '"status"' in lineage
     assert '"launch_authorization_sha256"' in lineage
     assert '"claim_sha256"' in lineage
+    assert '"worker_terminal_bytes"' in lineage
+    assert '"worker_terminal_schema"' in lineage
     assert '"worker_terminal_sha256"' in lineage
     assert "held_unchanged" in lineage
+    assert "worker_terminal_file" in launch
     assert "delete_failed_persistent_completion" in launch
 
 
@@ -1024,7 +1028,7 @@ def test_persistent_completion_is_canonical_json_and_verifier_is_public_only() -
     ]
     manifest = BROKER_MANIFEST.read_text(encoding="utf-8")
 
-    assert "factor-v3-formal-native-broker-completed/v3" in source
+    assert "factor-v3-formal-native-broker-completed/v4" in source
     assert '\\"payload\\":' in writer
     assert '\\"signature_hex\\":\\"' in writer
     assert '\\"completion_key_id\\":' in writer
@@ -1041,6 +1045,29 @@ def test_persistent_completion_is_canonical_json_and_verifier_is_public_only() -
     assert "F3_BROKER_COMPLETION_KEY_ID" in manifest
     assert "F3_BROKER_COMPLETION_KEY_VERSION" in manifest
     assert 'L"--verify-completion"' in source
+
+
+def test_native_resume_status_requires_exact_original_run_claim() -> None:
+    source = BROKER_SOURCE.read_text(encoding="utf-8")
+    validator = source[
+        source.index("static int validate_resume_status"):
+        source.index("static int validate_resume_lineage")
+    ]
+
+    assert "static const char *const status_keys[]" in validator
+    assert "json_top_has_exact_keys" in validator
+    assert validator.index("json_top_has_exact_keys") < validator.index(
+        "json_top_string_matches"
+    )
+    assert '"action"' in validator
+    assert '"authorization_id_sha256"' in validator
+    assert '"authorization_nonce_sha256"' in validator
+    assert '"bootstrap_execution_authorization_sha256"' in validator
+    assert '"launch_authorization_sha256"' in validator
+    assert '"replay_scope"' in validator
+    assert '"schema"' in validator
+    assert '"status"' in validator
+    assert '"run"' in validator
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
@@ -1648,7 +1675,7 @@ def test_native_broker_launches_rendered_supervisor_and_synthetic_worker_e2e(
         assert receipt_raw == _canonical_bytes(receipt_value)
         assert set(receipt_value) == {"payload", "signature_hex"}
         assert receipt_value["payload"]["schema"] == (
-            "factor-v3-formal-native-broker-completed/v3"
+            "factor-v3-formal-native-broker-completed/v4"
         )
         assert receipt_value["payload"]["completion_key_id"] == (
             "factor-v3-formal-native-completion"
@@ -1657,6 +1684,28 @@ def test_native_broker_launches_rendered_supervisor_and_synthetic_worker_e2e(
         assert re.fullmatch(
             r"[0-9a-f]{64}",
             receipt_value["payload"]["completion_public_blob_sha256"],
+        )
+        worker_terminal_path = (
+            Path(fields["execution_ledger_root"])
+            / "worker_terminals"
+            / "sha256"
+            / launch_sha256[:2]
+            / f"{launch_sha256}.json"
+        )
+        worker_terminal_raw = worker_terminal_path.read_bytes()
+        assert worker_terminal_raw.endswith(b"\n")
+        assert worker_terminal_raw[:-1].find(b"\n") == -1
+        assert receipt_value["payload"]["worker_terminal_bytes"] == len(
+            worker_terminal_raw
+        )
+        assert receipt_value["payload"]["worker_terminal_schema"] == (
+            "factor-v3-formal-bootstrap-worker-terminal/v2"
+        )
+        assert receipt_value["payload"]["worker_terminal_sha256"] == (
+            hashlib.sha256(worker_terminal_raw).hexdigest()
+        )
+        assert json.loads(worker_terminal_raw)["schema"] == (
+            receipt_value["payload"]["worker_terminal_schema"]
         )
         receipt = bytearray(receipt_raw)
         signature_offset = receipt.index(b'"signature_hex":"') + len(

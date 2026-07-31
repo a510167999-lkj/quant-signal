@@ -3109,6 +3109,35 @@ static int json_top_copy_sha256(
     return 1;
 }
 
+static int json_top_uint32(
+    const unsigned char *payload,
+    size_t payload_size,
+    const char *name,
+    DWORD *output
+) {
+    ByteSlice value;
+    size_t index;
+    uint64_t observed = 0;
+    if (output == NULL
+        || !json_top_field(payload, payload_size, name, &value)
+        || value.length == 0
+        || (value.length > 1 && value.value[0] == '0')) {
+        return 0;
+    }
+    for (index = 0; index < value.length; ++index) {
+        unsigned char character = (unsigned char)value.value[index];
+        if (character < '0' || character > '9') {
+            return 0;
+        }
+        observed = observed * 10 + (uint64_t)(character - '0');
+        if (observed > UINT_MAX) {
+            return 0;
+        }
+    }
+    *output = (DWORD)observed;
+    return 1;
+}
+
 static int hex_value(char value) {
     if (value >= '0' && value <= '9') {
         return value - '0';
@@ -3658,12 +3687,28 @@ static int validate_resume_status(
     const SignedEnvelope *original,
     const char original_sha256[65]
 ) {
+    static const char *const status_keys[] = {
+        "action",
+        "authorization_id_sha256",
+        "authorization_nonce_sha256",
+        "bootstrap_execution_authorization_sha256",
+        "launch_authorization_sha256",
+        "replay_scope",
+        "schema",
+        "status",
+    };
     SignedEnvelope status_view;
     memset(&status_view, 0, sizeof(status_view));
     status_view.payload = status;
     status_view.payload_size = status_size;
     return status != NULL
         && status_size > 0
+        && json_top_has_exact_keys(
+            status,
+            status_size,
+            status_keys,
+            sizeof(status_keys) / sizeof(status_keys[0])
+        )
         && json_top_string_matches(
             status,
             status_size,
@@ -4591,7 +4636,7 @@ cleanup:
 }
 
 #define F3_PERSISTENT_COMPLETION_SCHEMA \
-    "factor-v3-formal-native-broker-completed/v3"
+    "factor-v3-formal-native-broker-completed/v4"
 
 static int atomic_write_persistent_completion(
     ProtectedCompletionNamespace *completion,
@@ -5269,8 +5314,10 @@ static int validate_completion_lineage_before_signing(
     const char claim_sha256[65],
     const char supervisor_completed_sha256[65],
     const char worker_terminal_sha256[65],
+    DWORD *worker_terminal_bytes,
     HeldFile *claim_file,
-    HeldFile *completed_file
+    HeldFile *completed_file,
+    HeldFile *worker_terminal_file
 ) {
     static const char *const claim_keys[] = {
         "action",
@@ -5288,29 +5335,53 @@ static int validate_completion_lineage_before_signing(
         "launch_authorization_sha256",
         "schema",
         "status",
+        "worker_terminal_bytes",
+        "worker_terminal_schema",
         "worker_terminal_sha256",
     };
+    static const char *const worker_terminal_keys[] = {
+        "artifacts",
+        "authorization_nonce_sha256",
+        "bootstrap_execution_authorization_sha256",
+        "launch_action",
+        "launch_authorization_sha256",
+        "result",
+        "schema",
+        "status",
+        "stdlib_inventory_root_sha256",
+        "worker_action",
+    };
     SignedEnvelope claim_view;
+    SignedEnvelope worker_terminal_view;
     unsigned char *claim_raw = NULL;
     unsigned char *completed_raw = NULL;
+    unsigned char *worker_terminal_raw = NULL;
     DWORD claim_size = 0;
     DWORD completed_size = 0;
+    DWORD worker_terminal_size = 0;
+    DWORD completed_worker_terminal_bytes = 0;
     unsigned char digest[32];
     char observed_sha256[65];
     wchar_t claim_path[32768];
     wchar_t completed_path[32768];
+    wchar_t worker_terminal_path[32768];
     int ok = 0;
     memset(&claim_view, 0, sizeof(claim_view));
+    memset(&worker_terminal_view, 0, sizeof(worker_terminal_view));
     memset(digest, 0, sizeof(digest));
     memset(observed_sha256, 0, sizeof(observed_sha256));
     memset(claim_path, 0, sizeof(claim_path));
     memset(completed_path, 0, sizeof(completed_path));
+    memset(worker_terminal_path, 0, sizeof(worker_terminal_path));
     if (candidate == NULL
         || launch_envelope == NULL
+        || worker_terminal_bytes == NULL
         || claim_file == NULL
         || completed_file == NULL
+        || worker_terminal_file == NULL
         || claim_file->handle != INVALID_HANDLE_VALUE
         || completed_file->handle != INVALID_HANDLE_VALUE
+        || worker_terminal_file->handle != INVALID_HANDLE_VALUE
         || !expected_ledger_path(
             candidate->execution_ledger_root,
             "claims",
@@ -5422,8 +5493,8 @@ static int validate_completion_lineage_before_signing(
             completed_raw,
             completed_size,
             "schema",
-            "factor-v3-formal-supervisor-execution-completed/v1",
-            strlen("factor-v3-formal-supervisor-execution-completed/v1")
+            "factor-v3-formal-supervisor-execution-completed/v2",
+            strlen("factor-v3-formal-supervisor-execution-completed/v2")
         )
         || !json_top_string_matches(
             completed_raw,
@@ -5449,6 +5520,21 @@ static int validate_completion_lineage_before_signing(
         || !json_top_string_matches(
             completed_raw,
             completed_size,
+            "worker_terminal_schema",
+            "factor-v3-formal-bootstrap-worker-terminal/v2",
+            strlen("factor-v3-formal-bootstrap-worker-terminal/v2")
+        )
+        || !json_top_uint32(
+            completed_raw,
+            completed_size,
+            "worker_terminal_bytes",
+            &completed_worker_terminal_bytes
+        )
+        || completed_worker_terminal_bytes == 0
+        || completed_worker_terminal_bytes > 1024 * 1024
+        || !json_top_string_matches(
+            completed_raw,
+            completed_size,
             "worker_terminal_sha256",
             worker_terminal_sha256,
             64
@@ -5458,13 +5544,116 @@ static int validate_completion_lineage_before_signing(
             completed_size,
             "artifact_manifest_sha256"
         )
-        || !held_unchanged(claim_file, NULL)
-        || !held_unchanged(completed_file, NULL)) {
+        || !expected_ledger_path(
+            candidate->execution_ledger_root,
+            "worker_terminals",
+            launch_authorization_sha256,
+            worker_terminal_path,
+            sizeof(worker_terminal_path) / sizeof(worker_terminal_path[0])
+        )
+        || !open_held_file(
+            worker_terminal_path,
+            1024 * 1024,
+            worker_terminal_file
+        )
+        || worker_terminal_file->size_high != 0
+        || worker_terminal_file->size_low != completed_worker_terminal_bytes
+        || !hash_held_file(worker_terminal_file, digest)) {
         goto cleanup;
     }
+    digest_to_ascii(digest, observed_sha256);
+    if (strcmp(observed_sha256, worker_terminal_sha256) != 0
+        || !read_candidate(
+            worker_terminal_file,
+            &worker_terminal_raw,
+            &worker_terminal_size
+        )
+        || worker_terminal_size != completed_worker_terminal_bytes
+        || worker_terminal_size < 2
+        || worker_terminal_raw[worker_terminal_size - 1] != '\n'
+        || memchr(
+            worker_terminal_raw,
+            '\n',
+            worker_terminal_size - 1
+        ) != NULL) {
+        goto cleanup;
+    }
+    worker_terminal_view.payload = worker_terminal_raw;
+    worker_terminal_view.payload_size = worker_terminal_size - 1;
+    if (!json_top_has_exact_keys(
+            worker_terminal_raw,
+            worker_terminal_size - 1,
+            worker_terminal_keys,
+            sizeof(worker_terminal_keys) / sizeof(worker_terminal_keys[0])
+        )
+        || !json_top_string_matches(
+            worker_terminal_raw,
+            worker_terminal_size - 1,
+            "schema",
+            "factor-v3-formal-bootstrap-worker-terminal/v2",
+            strlen("factor-v3-formal-bootstrap-worker-terminal/v2")
+        )
+        || !json_top_string_matches(
+            worker_terminal_raw,
+            worker_terminal_size - 1,
+            "status",
+            "completed",
+            strlen("completed")
+        )
+        || !json_top_string_matches(
+            worker_terminal_raw,
+            worker_terminal_size - 1,
+            "launch_authorization_sha256",
+            launch_authorization_sha256,
+            64
+        )
+        || !json_top_string_matches(
+            worker_terminal_raw,
+            worker_terminal_size - 1,
+            "worker_action",
+            "run",
+            strlen("run")
+        )
+        || !json_top_strings_equal(
+            &worker_terminal_view,
+            "launch_action",
+            launch_envelope,
+            "action"
+        )
+        || !json_top_strings_equal(
+            &worker_terminal_view,
+            "authorization_nonce_sha256",
+            launch_envelope,
+            "bootstrap_authorization_nonce_sha256"
+        )
+        || !json_top_strings_equal(
+            &worker_terminal_view,
+            "bootstrap_execution_authorization_sha256",
+            launch_envelope,
+            "bootstrap_execution_authorization_sha256"
+        )
+        || !json_top_strings_equal(
+            &worker_terminal_view,
+            "stdlib_inventory_root_sha256",
+            launch_envelope,
+            "stdlib_inventory_root_sha256"
+        )
+        || !held_unchanged(claim_file, NULL)
+        || !held_unchanged(completed_file, NULL)
+        || !held_unchanged(worker_terminal_file, NULL)) {
+        goto cleanup;
+    }
+    *worker_terminal_bytes = completed_worker_terminal_bytes;
     ok = 1;
 
 cleanup:
+    if (worker_terminal_raw != NULL) {
+        SecureZeroMemory(
+            worker_terminal_raw,
+            (SIZE_T)worker_terminal_size + 1
+        );
+        HeapFree(GetProcessHeap(), 0, worker_terminal_raw);
+    }
     if (completed_raw != NULL) {
         SecureZeroMemory(completed_raw, (SIZE_T)completed_size + 1);
         HeapFree(GetProcessHeap(), 0, completed_raw);
@@ -5474,14 +5663,23 @@ cleanup:
         HeapFree(GetProcessHeap(), 0, claim_raw);
     }
     if (!ok) {
+        if (worker_terminal_bytes != NULL) {
+            *worker_terminal_bytes = 0;
+        }
+        close_held(worker_terminal_file);
         close_held(completed_file);
         close_held(claim_file);
     }
     SecureZeroMemory(&claim_view, sizeof(claim_view));
+    SecureZeroMemory(
+        &worker_terminal_view,
+        sizeof(worker_terminal_view)
+    );
     SecureZeroMemory(digest, sizeof(digest));
     SecureZeroMemory(observed_sha256, sizeof(observed_sha256));
     SecureZeroMemory(claim_path, sizeof(claim_path));
     SecureZeroMemory(completed_path, sizeof(completed_path));
+    SecureZeroMemory(worker_terminal_path, sizeof(worker_terminal_path));
     return ok;
 }
 
@@ -5531,6 +5729,7 @@ static int write_persistent_cng_completion(
     const char claim_sha256[65],
     const char supervisor_completed_sha256[65],
     const char worker_terminal_sha256[65],
+    DWORD worker_terminal_bytes,
     char completed_receipt_sha256[65]
 ) {
     BCRYPT_PKCS1_PADDING_INFO padding = {BCRYPT_SHA256_ALGORITHM};
@@ -5561,6 +5760,9 @@ static int write_persistent_cng_completion(
         "\"signature_algorithm\":\"RSA-PKCS1-SHA256\","
         "\"status\":\"completed\","
         "\"supervisor_completed_sha256\":\"%s\","
+        "\"worker_terminal_bytes\":%lu,"
+        "\"worker_terminal_schema\":"
+        "\"factor-v3-formal-bootstrap-worker-terminal/v2\","
         "\"worker_terminal_sha256\":\"%s\""
         "}",
         candidate_sha256,
@@ -5570,12 +5772,15 @@ static int write_persistent_cng_completion(
         F3_BROKER_COMPLETION_PUBLIC_BLOB_SHA256,
         launch_authorization_sha256,
         supervisor_completed_sha256,
+        (unsigned long)worker_terminal_bytes,
         worker_terminal_sha256
     );
     if (payload_length <= 0
         || (size_t)payload_length >= sizeof(payload)
         || completion == NULL
         || completed_path == NULL
+        || worker_terminal_bytes == 0
+        || worker_terminal_bytes > 1024 * 1024
         || !hash_completion_signature_payload(
             (const unsigned char *)payload,
             (DWORD)payload_length,
@@ -5738,6 +5943,8 @@ static int verify_persistent_cng_completion(
         "signature_algorithm",
         "status",
         "supervisor_completed_sha256",
+        "worker_terminal_bytes",
+        "worker_terminal_schema",
         "worker_terminal_sha256",
     };
     BCRYPT_PKCS1_PADDING_INFO padding = {BCRYPT_SHA256_ALGORITHM};
@@ -5748,6 +5955,7 @@ static int verify_persistent_cng_completion(
     HeldFile receipt_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile claim_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile completed_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile worker_terminal_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     ProductionCandidate candidate;
     SignedEnvelope launch_envelope;
     ByteSlice payload;
@@ -5770,6 +5978,8 @@ static int verify_persistent_cng_completion(
     char claim_sha256[65];
     char supervisor_sha256[65];
     char worker_sha256[65];
+    DWORD receipt_worker_terminal_bytes = 0;
+    DWORD observed_worker_terminal_bytes = 0;
     size_t json_size;
     int ok = 0;
     memset(&candidate, 0, sizeof(candidate));
@@ -5943,6 +6153,19 @@ static int verify_persistent_cng_completion(
             "worker_terminal_sha256",
             worker_sha256
         )
+        || !json_top_uint32(
+            (const unsigned char *)payload.value,
+            payload.length,
+            "worker_terminal_bytes",
+            &receipt_worker_terminal_bytes
+        )
+        || !json_top_string_matches(
+            (const unsigned char *)payload.value,
+            payload.length,
+            "worker_terminal_schema",
+            "factor-v3-formal-bootstrap-worker-terminal/v2",
+            strlen("factor-v3-formal-bootstrap-worker-terminal/v2")
+        )
         || signature_value.length < 4
         || signature_value.value[0] != '"'
         || signature_value.value[signature_value.length - 1] != '"'
@@ -5976,9 +6199,12 @@ static int verify_persistent_cng_completion(
             claim_sha256,
             supervisor_sha256,
             worker_sha256,
+            &observed_worker_terminal_bytes,
             &claim_file,
-            &completed_file
+            &completed_file,
+            &worker_terminal_file
         )
+        || observed_worker_terminal_bytes != receipt_worker_terminal_bytes
         || !held_unchanged(&receipt_file, NULL)
         || !held_unchanged(&launch_file, NULL)
         || !held_unchanged(&candidate_file, NULL)) {
@@ -6009,6 +6235,7 @@ cleanup:
         SecureZeroMemory(candidate_raw, (SIZE_T)candidate_size + 1);
         HeapFree(GetProcessHeap(), 0, candidate_raw);
     }
+    close_held(&worker_terminal_file);
     close_held(&completed_file);
     close_held(&claim_file);
     close_held(&receipt_file);
@@ -6838,6 +7065,9 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
     HeldFile supervisor_completed_file = {
         INVALID_HANDLE_VALUE, 0, 0, {0}
     };
+    HeldFile worker_terminal_file = {
+        INVALID_HANDLE_VALUE, 0, 0, {0}
+    };
     ProtectedCompletionNamespace completion_namespace;
     ProductionCandidate candidate;
     SignedEnvelope envelope;
@@ -6866,6 +7096,7 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
     DWORD response_size = 0;
     DWORD written = 0;
     DWORD child_exit = 1;
+    DWORD worker_terminal_bytes = 0;
     BOOL process_in_job = FALSE;
     int attributes_initialized = 0;
     int child_created = 0;
@@ -7286,8 +7517,10 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
             claim_sha256,
             supervisor_completed_sha256,
             worker_terminal_sha256,
+            &worker_terminal_bytes,
             &claim_file,
-            &supervisor_completed_file
+            &supervisor_completed_file,
+            &worker_terminal_file
         )) {
         goto cleanup;
     }
@@ -7300,6 +7533,7 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
             claim_sha256,
             supervisor_completed_sha256,
             worker_terminal_sha256,
+            worker_terminal_bytes,
             native_completed_receipt_sha256
         )) {
         goto cleanup;
@@ -7309,6 +7543,7 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
     if (!verify_persistent_cng_completion(candidate_path)
         || !held_unchanged(&claim_file, NULL)
         || !held_unchanged(&supervisor_completed_file, NULL)
+        || !held_unchanged(&worker_terminal_file, NULL)
         || !held_directory_chain_unchanged(
             &completion_namespace.chain
         )) {
@@ -7403,6 +7638,7 @@ cleanup:
         );
     }
     close_held(&credential);
+    close_held(&worker_terminal_file);
     close_held(&claim_file);
     close_held(&supervisor_completed_file);
     close_held(&launch_file);

@@ -827,6 +827,10 @@ def test_resume_status_claim_has_exact_canonical_keyset() -> None:
         supervisor._validated_claim_status(
             _canonical_bytes({**claim, "status": 1})
         )
+    with pytest.raises(supervisor.FormalSupervisorError, match="resume status"):
+        supervisor._validated_claim_status(
+            _canonical_bytes({**claim, "action": "resume"})
+        )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
