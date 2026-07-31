@@ -1344,21 +1344,38 @@ def test_native_production_resume_verifies_original_run_and_claim_lineage(
     )
     status_path.parent.mkdir(parents=True)
     status_path.write_bytes(status_raw)
+    original_outer = json.loads(original_launch.read_bytes())
+    original_payload = original_outer["payload"]
+    original_signature_sha256 = hashlib.sha256(
+        base64.b64decode(
+            original_outer["signature_base64"],
+            validate=True,
+        )
+    ).hexdigest()
     resume = dict(original)
     resume.update(
         {
             "action": "resume",
-            "resume_of_authorization_id_sha256": original[
+            "resume_of_action": original_payload["action"],
+            "resume_of_authorization_id_sha256": original_payload[
                 "authorization_id_sha256"
             ],
-            "resume_of_authorization_nonce_sha256": original[
+            "resume_of_authorization_nonce_sha256": original_payload[
                 "authorization_nonce_sha256"
             ],
             "resume_of_authorization_sha256": original_sha256,
-            "resume_of_bootstrap_execution_authorization_sha256": original[
-                "bootstrap_execution_authorization_sha256"
+            "resume_of_bootstrap_execution_authorization_sha256": (
+                original_payload[
+                    "bootstrap_execution_authorization_sha256"
+                ]
+            ),
+            "resume_of_launch_authorization_schema": original_payload[
+                "schema"
             ],
-            "resume_of_replay_scope": original["replay_scope"],
+            "resume_of_launch_authorization_signature_sha256": (
+                original_signature_sha256
+            ),
+            "resume_of_replay_scope": original_payload["replay_scope"],
             "resume_status_path": str(status_path),
             "resume_status_sha256": hashlib.sha256(status_raw).hexdigest(),
         }
