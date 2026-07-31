@@ -590,6 +590,28 @@ def _build_native_supervisor_e2e_fixture(
     launch_authorization = Path(
         str(launch_publication["launch_authorization_path"])
     )
+    launch_sha256 = _file_sha256(launch_authorization)
+    native_completed_root = ledger_root / "native_completed"
+    native_completed_sha_root = native_completed_root / "sha256"
+    native_completed_parent = native_completed_sha_root / launch_sha256[:2]
+    native_completed_root.mkdir()
+    _replace_acl(
+        native_completed_root,
+        builtin_users_rights=None,
+        grant_current_user=True,
+    )
+    native_completed_sha_root.mkdir()
+    native_completed_parent.mkdir()
+    _replace_acl(
+        native_completed_sha_root,
+        builtin_users_rights=None,
+        grant_current_user=True,
+    )
+    _replace_acl(
+        native_completed_parent,
+        builtin_users_rights=None,
+        grant_current_user=True,
+    )
     payload = json.loads(launch_authorization.read_bytes())["payload"]
     loader_path = Path(str(payload["supervisor_loader_path"]))
     loader_sha256 = str(payload["supervisor_loader_sha256"])
@@ -700,18 +722,46 @@ def test_production_worker_token_uses_one_fixed_restricted_sid_and_cannot_open_s
 
 def test_production_completion_uses_persistent_cng_and_has_independent_verifier() -> None:
     source = BROKER_SOURCE.read_text(encoding="utf-8")
+    completion_start = source.index(
+        "static int open_persistent_cng_signing_key"
+    )
     completion = source[
-        source.index("static int write_persistent_cng_completion"):
-        source.index("int f3_broker_launch_production_supervisor")
+        completion_start:
+        source.index("#ifdef F3_BROKER_TESTING", completion_start)
     ]
 
-    assert "factor-v3-formal-native-broker-completed/v2" in completion
+    assert "factor-v3-formal-native-broker-completed/v2" in source
     assert "NCryptOpenKey" in completion
     assert "NCryptVerifySignature" in completion
     assert "BCRYPT_RSAFULLPRIVATE_BLOB" in completion
     assert "NCryptDeleteKey" not in completion
     assert "verify_persistent_cng_completion" in source
     assert '--test-verify-persistent-cng-completion' in source
+
+
+def test_production_completion_preholds_protected_namespace_and_writes_relative_to_handle() -> None:
+    source = BROKER_SOURCE.read_text(encoding="utf-8")
+    launch = source[
+        source.index("int f3_broker_launch_production_supervisor"):
+        source.index(
+            "#ifdef F3_BROKER_TESTING\nstatic int test_protected_file_chain"
+        )
+    ]
+    atomic = source[
+        source.index("static int atomic_write_persistent_completion"):
+        source.index("static int open_persistent_cng_signing_key")
+    ]
+
+    assert "hold_protected_completion_namespace" in source
+    assert launch.index("hold_protected_completion_namespace") < launch.index(
+        "CreateProcessAsUserW"
+    )
+    assert "held_directory_chain_unchanged" in launch
+    assert "NtCreateFile" in atomic
+    assert "RootDirectory" in atomic
+    assert "SetFileInformationByHandle" in atomic
+    assert "MoveFileExW" not in atomic
+    assert '--test-protected-completion-namespace' in source
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
@@ -1219,6 +1269,20 @@ def test_native_broker_launches_rendered_supervisor_and_synthetic_worker_e2e(
             "utf-8",
             errors="replace",
         )
+        namespace_check = subprocess.run(
+            [
+                str(native),
+                "--test-protected-completion-namespace",
+                str(candidate),
+            ],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        assert namespace_check.returncode == 0, namespace_check.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
 
         completed = subprocess.run(
             [
@@ -1258,6 +1322,38 @@ def test_native_broker_launches_rendered_supervisor_and_synthetic_worker_e2e(
             "utf-8",
             errors="replace",
         )
+        from app import factor_v3_formal_native_broker as broker
+
+        fields = broker._validated_candidate(candidate)
+        launch_path = Path(fields["launch_authorization_path"])
+        launch_sha256 = _file_sha256(launch_path)
+        receipt_path = (
+            Path(fields["execution_ledger_root"])
+            / "native_completed"
+            / "sha256"
+            / launch_sha256[:2]
+            / f"{launch_sha256}.json"
+        )
+        receipt = bytearray(receipt_path.read_bytes())
+        signature_offset = receipt.index(b"signature_hex=") + len(
+            b"signature_hex="
+        )
+        receipt[signature_offset] = (
+            ord("0") if receipt[signature_offset] != ord("0") else ord("1")
+        )
+        receipt_path.write_bytes(receipt)
+        tampered = subprocess.run(
+            [
+                str(native),
+                "--test-verify-persistent-cng-completion",
+                str(candidate),
+            ],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        assert tampered.returncode != 0
+        assert tampered.stdout == b""
         present = subprocess.run(
             [str(native), "--test-persistent-cng-key-present"],
             check=False,
