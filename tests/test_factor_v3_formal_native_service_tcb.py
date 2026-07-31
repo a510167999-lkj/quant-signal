@@ -943,6 +943,37 @@ def test_persistent_completion_signs_only_after_held_terminal_lineage_and_cleans
     assert "delete_failed_persistent_completion" in launch
 
 
+def test_persistent_completion_is_canonical_json_and_verifier_is_public_only() -> None:
+    source = BROKER_SOURCE.read_text(encoding="utf-8")
+    writer = source[
+        source.index("static int write_persistent_cng_completion"):
+        source.index("static int hex_signature")
+    ]
+    verifier = source[
+        source.index("static int verify_persistent_cng_completion"):
+        source.index("#ifdef F3_BROKER_TESTING", source.index(
+            "static int verify_persistent_cng_completion"
+        ))
+    ]
+    manifest = BROKER_MANIFEST.read_text(encoding="utf-8")
+
+    assert "factor-v3-formal-native-broker-completed/v3" in source
+    assert '{"payload":' in writer
+    assert '"signature_hex":"' in writer
+    assert '"completion_key_id":' in writer
+    assert '"completion_key_version":' in writer
+    assert '"completion_public_blob_sha256":' in writer
+    assert "BCRYPT_RSAPUBLIC_BLOB" in verifier
+    assert "BCryptImportKeyPair" in verifier
+    assert "NCryptOpenKey" not in verifier
+    assert "open_persistent_cng_signing_key" not in verifier
+    assert "F3_BROKER_COMPLETION_PUBLIC_BLOB_HEX" in manifest
+    assert "F3_BROKER_COMPLETION_PUBLIC_BLOB_SHA256" in manifest
+    assert "F3_BROKER_COMPLETION_KEY_ID" in manifest
+    assert "F3_BROKER_COMPLETION_KEY_VERSION" in manifest
+    assert 'L"--verify-completion"' in source
+
+
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
 def test_interactive_process_is_rejected_as_formal_service_identity(
     tmp_path: Path,
