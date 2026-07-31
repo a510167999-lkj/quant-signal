@@ -634,6 +634,12 @@ def test_real_chain_fixture_uses_trusted_dispatch_and_buffers_binding(
     ledger_entries: list[Mapping[str, object]] = []
 
     class Context:
+        def acquire_preflight_terminal_guard(self, **_kwargs: object) -> object:
+            raise AssertionError("verify must not acquire a preflight guard")
+
+        def preflight_terminal_guard_descriptor(self) -> object:
+            raise AssertionError("verify must not request a preflight guard descriptor")
+
         def validate_action_config(self, candidate: object) -> None:
             if candidate is not config:
                 raise RuntimeError("untrusted config")
