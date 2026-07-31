@@ -41,7 +41,7 @@ class FormalBootstrapRenderError(RuntimeError):
 
 
 CONFIG_SCHEMA = "factor-v3-formal-bootstrap-render-config/v1"
-RUNTIME_TEMPLATE_SHA256 = "53917efa5966ceafc286be86b5d58223c49f1157f25ec2c8fdd2a008dd9cde19"
+RUNTIME_TEMPLATE_SHA256 = "cd6ef96fbf3385edf06651b4b4d6d66ca12ec1132c53b7932464b644a9015a56"
 AUTHORIZATION_SCHEMA = "factor-v3-formal-bootstrap-execution-authorization/v2"
 PUBLICATION_RECEIPT_SCHEMA = "factor-v3-formal-bootstrap-publication-receipt/v1"
 COMPLETION_SCHEMA = PUBLICATION_COMPLETION_SCHEMA

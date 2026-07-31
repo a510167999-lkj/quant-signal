@@ -1099,6 +1099,7 @@ class _TrustedBootstrapContext:
         self._preflight_terminal_guard_descriptor = _preflight_terminal_guard_descriptor(
             action_config
         )
+        self._preflight_terminal_guard_provider: Any | None = None
 
     def validate_action_config(self, candidate: Any) -> None:
         if (
@@ -1120,7 +1121,34 @@ class _TrustedBootstrapContext:
     ) -> Any:
         if descriptor is not self._preflight_terminal_guard_descriptor:
             raise _BootstrapError("external native preflight terminal guard descriptor rejected")
-        raise _BootstrapError("external native preflight terminal guard unavailable")
+        provider = self._preflight_terminal_guard_provider
+        if provider is None:
+            raise _BootstrapError("external native preflight terminal guard unavailable")
+        expected_identity = descriptor["provider_identity"]
+        acquire = getattr(
+            provider,
+            "acquire_preflight_terminal_guard",
+            None,
+        )
+        if (
+            isinstance(provider, Mapping)
+            or getattr(provider, "provider_identity", None)
+            != expected_identity
+            or not callable(acquire)
+        ):
+            raise _BootstrapError("external native preflight terminal guard rejected")
+        try:
+            return acquire(
+                descriptor,
+                lambda value: self._terminal_guard_emit_json(
+                    provider,
+                    value,
+                ),
+            )
+        except BaseException as exc:
+            raise _BootstrapError(
+                "external native preflight terminal guard acquisition rejected"
+            ) from exc
 
     def verified_ledger_entry(self, module_name: str) -> Mapping[str, object]:
         if type(module_name) is not str or module_name not in self._source_registry:
@@ -1159,7 +1187,7 @@ class _TrustedBootstrapContext:
         ):
             raise _BootstrapError("verified module assertion rejected")
 
-    def emit_json(self, value: Any) -> None:
+    def _buffer_json(self, value: Any) -> None:
         if self._output is not None:
             raise _BootstrapError("trusted output already emitted")
         _reject_credential_shape(value)
@@ -1167,6 +1195,27 @@ class _TrustedBootstrapContext:
         if not raw or len(raw) > _MAX_OUTPUT_BYTES:
             raise _BootstrapError("trusted output rejected")
         self._output = raw + b"\n"
+
+    def _terminal_guard_emit_json(
+        self,
+        provider: Any,
+        value: Any,
+    ) -> None:
+        if (
+            self._preflight_terminal_guard_descriptor is None
+            or provider is not self._preflight_terminal_guard_provider
+        ):
+            raise _BootstrapError(
+                "external native preflight terminal guard output rejected"
+            )
+        self._buffer_json(value)
+
+    def emit_json(self, value: Any) -> None:
+        if self._preflight_terminal_guard_descriptor is not None:
+            raise _BootstrapError(
+                "protected action requires terminal guard output"
+            )
+        self._buffer_json(value)
 
     def postverify(self) -> None:
         if self._postverified:

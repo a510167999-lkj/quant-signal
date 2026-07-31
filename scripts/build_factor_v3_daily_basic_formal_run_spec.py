@@ -92,6 +92,7 @@ FORMAL_REVIEW_SOURCE_RELATIVE_PATHS = (
     "app/factor_v3_daily_basic_runner.py",
     "app/factor_v3_feature_history_frozen_source_attestation.py",
     "app/factor_v3_feature_history_runner.py",
+    "app/factor_v3_formal_control_contract.py",
     "app/jiaoch_credential_slots.py",
     "app/jiaoch_daily_basic_collection_set.py",
     "app/jiaoch_daily_basic_exact_set_authority.py",
@@ -1552,19 +1553,6 @@ _TRUSTED_CONTEXT_METHODS = (
     "validate_action_config",
     "verified_ledger_entry",
 )
-_PREFLIGHT_TERMINAL_GUARD_FIELDS = frozenset(
-    {
-        "acquire_before",
-        "action",
-        "atomic_terminal_operation",
-        "hold_until",
-        "parent_path",
-        "provider_identity",
-        "run_root",
-        "schema",
-        "write_policy",
-    }
-)
 _VERIFIED_LEDGER_ENTRY_FIELDS = frozenset(
     {
         "absolute_path",
@@ -1586,6 +1574,10 @@ _SHIM_MODULE_NAME = "scripts.run_factor_v3_daily_basic_formal"
 _SHIM_RELATIVE_PATH = "scripts/run_factor_v3_daily_basic_formal.py"
 _RUNNER_MODULE_NAME = "app.factor_v3_daily_basic_runner"
 _RUNNER_RELATIVE_PATH = "app/factor_v3_daily_basic_runner.py"
+_CONTROL_CONTRACT_MODULE_NAME = "app.factor_v3_formal_control_contract"
+_CONTROL_CONTRACT_RELATIVE_PATH = (
+    "app/factor_v3_formal_control_contract.py"
+)
 
 
 def _trusted_context_method(context: Any, name: str) -> Any:
@@ -1828,23 +1820,36 @@ def _validated_preflight_terminal_guard(
         raise FormalRunSpecError(
             "formal preflight terminal guard descriptor rejected"
         ) from exc
-    expected = {
-        "acquire_before": "planned-run-root-initial-snapshot",
-        "action": action,
-        "atomic_terminal_operation": (
-            "planned-run-root-postverify-and-success-buffer"
-        ),
-        "hold_until": "supervisor-terminal-output-flush",
-        "parent_path": str(PLANNED_RUN_ROOT.parent),
-        "provider_identity": "external-win32-native-supervisor/v1",
-        "run_root": str(PLANNED_RUN_ROOT),
-        "schema": "factor-v3-formal-preflight-terminal-guard/v1",
-        "write_policy": "deny-create-delete-rename-replace",
-    }
+    try:
+        control_contract = importlib.import_module(
+            _CONTROL_CONTRACT_MODULE_NAME
+        )
+        _validated_verified_ledger_entry(
+            context,
+            module_name=_CONTROL_CONTRACT_MODULE_NAME,
+            relative_path=_CONTROL_CONTRACT_RELATIVE_PATH,
+            assert_loaded=True,
+        )
+        request = getattr(
+            control_contract,
+            "preflight_terminal_guard_request",
+            None,
+        )
+        if not callable(request):
+            raise TypeError("guard request factory unavailable")
+        expected = request(
+            action=action,
+            run_root=str(PLANNED_RUN_ROOT),
+        )
+    except BaseException as exc:
+        raise FormalRunSpecError(
+            "formal preflight terminal guard contract rejected"
+        ) from exc
     if (
         not isinstance(descriptor, Mapping)
         or isinstance(descriptor, dict)
-        or set(descriptor) != _PREFLIGHT_TERMINAL_GUARD_FIELDS
+        or expected is None
+        or set(descriptor) != set(expected)
         or dict(descriptor) != expected
     ):
         raise FormalRunSpecError(
