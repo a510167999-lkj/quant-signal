@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -557,6 +558,16 @@ def _build_native_supervisor_e2e_fixture(root: Path) -> tuple[Path, Path, bytes]
     credential = (root / "points-primary.token").resolve()
     secret = f"fixture-native-secret-{uuid.uuid4()}".encode("ascii")
     credential.write_bytes(secret)
+    _replace_acl(
+        credential,
+        builtin_users_rights=None,
+        grant_current_user=True,
+    )
+    _replace_acl(
+        ledger_root,
+        builtin_users_rights="M",
+        grant_current_user=True,
+    )
     private_key, _public_der = _execution_test_key(root)
     launch_publication = (
         formal_control._build_factor_v3_formal_supervisor_launch_authorization_with_trust(
@@ -620,6 +631,8 @@ def _build_native_supervisor_e2e_fixture(root: Path) -> tuple[Path, Path, bytes]
                 '#define F3_BROKER_SERVICE_NAME L"DisposableFixtureService"',
                 '#define F3_BROKER_SERVICE_SID L"S-1-5-18"',
                 '#define F3_BROKER_RESTRICTING_SID L"S-1-5-4"',
+                '#define F3_BROKER_WORKER_SID L"S-1-5-32-545"',
+                "#define F3_BROKER_TESTING_SUPERVISOR_TOKEN_COMPATIBILITY 1",
                 '#define F3_BROKER_EXECUTION_PUBLIC_MODULUS_HEX "'
                 + modulus.to_bytes(384, "big").hex()
                 + '"',
@@ -1151,30 +1164,64 @@ def test_restricted_child_gets_credential_only_after_bound_ready_and_broker_comp
 def test_native_broker_launches_rendered_supervisor_and_synthetic_worker_e2e(
     tmp_path: Path,
 ) -> None:
-    native, candidate, secret = _build_native_supervisor_e2e_fixture(tmp_path)
+    del tmp_path
+    root = Path(
+        tempfile.mkdtemp(
+            prefix="quant-signal-lkj-native-supervisor-e2e-",
+            dir=Path(os.environ["ProgramData"]),
+        )
+    )
+    try:
+        native, candidate, secret = _build_native_supervisor_e2e_fixture(root)
+        credential = root / "points-primary.token"
+        token_check = subprocess.run(
+            [
+                str(native),
+                "--test-fixed-worker-token-denies-secret",
+                str(credential),
+            ],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        assert token_check.returncode == 0, token_check.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
 
-    completed = subprocess.run(
-        [
-            str(native),
-            "--test-production-supervisor-launch",
-            str(candidate),
-        ],
-        check=False,
-        capture_output=True,
-        timeout=180,
-    )
+        completed = subprocess.run(
+            [
+                str(native),
+                "--test-production-supervisor-launch",
+                str(candidate),
+            ],
+            check=False,
+            capture_output=True,
+            timeout=180,
+        )
 
-    assert completed.returncode == 0, completed.stderr.decode(
-        "utf-8",
-        errors="replace",
-    )
-    assert completed.stderr == b""
-    assert completed.stdout.startswith(
-        b"COMPLETED factor-v3-formal-native-broker-supervisor/v1\n"
-    )
-    assert b"launch_authorization_sha256=" in completed.stdout
-    assert b"claim_sha256=" in completed.stdout
-    assert b"supervisor_completed_sha256=" in completed.stdout
-    assert b"worker_terminal_sha256=" in completed.stdout
-    assert secret not in completed.stdout
-    assert secret not in completed.stderr
+        assert completed.returncode == 0, completed.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
+        assert completed.stderr == b""
+        assert completed.stdout.startswith(
+            b"COMPLETED factor-v3-formal-native-broker-supervisor/v1\n"
+        )
+        assert b"launch_authorization_sha256=" in completed.stdout
+        assert b"claim_sha256=" in completed.stdout
+        assert b"supervisor_completed_sha256=" in completed.stdout
+        assert b"worker_terminal_sha256=" in completed.stdout
+        assert secret not in completed.stdout
+        assert secret not in completed.stderr
+    finally:
+        _grant_cleanup_access(root)
+        def remove_readonly(
+            function: object,
+            path: str,
+            _error: object,
+        ) -> None:
+            os.chmod(path, stat.S_IWRITE)
+            function(path)
+
+        shutil.rmtree(root, onerror=remove_readonly)

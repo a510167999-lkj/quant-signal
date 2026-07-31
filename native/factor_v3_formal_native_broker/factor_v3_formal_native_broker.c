@@ -25,6 +25,9 @@
 #ifndef F3_BROKER_RESTRICTING_SID
 #define F3_BROKER_RESTRICTING_SID L""
 #endif
+#ifndef F3_BROKER_WORKER_SID
+#define F3_BROKER_WORKER_SID L""
+#endif
 #ifndef F3_BROKER_HANDOFF_ORIGINAL_SCHEMA
 #define F3_BROKER_HANDOFF_ORIGINAL_SCHEMA ""
 #endif
@@ -50,6 +53,9 @@
 #ifdef F3_BROKER_TESTING
 #ifndef F3_BROKER_DISPOSABLE_TEST_MANIFEST
 #define F3_BROKER_DISPOSABLE_TEST_MANIFEST 0
+#endif
+#ifndef F3_BROKER_TESTING_SUPERVISOR_TOKEN_COMPATIBILITY
+#define F3_BROKER_TESTING_SUPERVISOR_TOKEN_COMPATIBILITY 0
 #endif
 #if F3_BROKER_DISPOSABLE_TEST_MANIFEST != 1
 #error F3_BROKER_TESTING requires a disposable test manifest
@@ -3583,15 +3589,157 @@ static int production_supervisor_command_line(
 static int create_production_restricted_token(HANDLE *restricted_token) {
     HANDLE primary = NULL;
     PSID disabled_sid = NULL;
+    PSID worker_sid = NULL;
     SID_AND_ATTRIBUTES disabled;
+    SID_AND_ATTRIBUTES restricting;
+    TOKEN_GROUPS *restricted = NULL;
+    DWORD restricted_size = 0;
     int ok = 0;
     memset(&disabled, 0, sizeof(disabled));
+    memset(&restricting, 0, sizeof(restricting));
     if (restricted_token == NULL
-        || F3_BROKER_RESTRICTING_SID[0] == L'\0') {
+        || F3_BROKER_RESTRICTING_SID[0] == L'\0'
+        || F3_BROKER_WORKER_SID[0] == L'\0'
+        || wcscmp(
+            F3_BROKER_RESTRICTING_SID,
+            F3_BROKER_WORKER_SID
+        ) == 0) {
         return 0;
     }
     *restricted_token = NULL;
     if (!OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
+            &primary
+        )
+        || !ConvertStringSidToSidW(
+            F3_BROKER_RESTRICTING_SID,
+            &disabled_sid
+        )
+        || !ConvertStringSidToSidW(
+            F3_BROKER_WORKER_SID,
+            &worker_sid
+        )) {
+        goto cleanup;
+    }
+    disabled.Sid = disabled_sid;
+    restricting.Sid = worker_sid;
+    if (!CreateRestrictedToken(
+            primary,
+            DISABLE_MAX_PRIVILEGE,
+            1,
+            &disabled,
+            0,
+            NULL,
+            1,
+            &restricting,
+            restricted_token
+        )) {
+        goto cleanup;
+    }
+    SetLastError(ERROR_SUCCESS);
+    if (GetTokenInformation(
+            *restricted_token,
+            TokenRestrictedSids,
+            NULL,
+            0,
+            &restricted_size
+        )
+        || GetLastError() != ERROR_INSUFFICIENT_BUFFER
+        || restricted_size < sizeof(TOKEN_GROUPS)) {
+        goto cleanup;
+    }
+    restricted = (TOKEN_GROUPS *)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        restricted_size
+    );
+    if (restricted == NULL
+        || !GetTokenInformation(
+            *restricted_token,
+            TokenRestrictedSids,
+            restricted,
+            restricted_size,
+            &restricted_size
+        )
+        || restricted->GroupCount != 1
+        || !EqualSid(restricted->Groups[0].Sid, worker_sid)) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (restricted != NULL) {
+        SecureZeroMemory(restricted, restricted_size);
+        HeapFree(GetProcessHeap(), 0, restricted);
+    }
+    if (!ok && restricted_token != NULL && *restricted_token != NULL) {
+        CloseHandle(*restricted_token);
+        *restricted_token = NULL;
+    }
+    if (primary != NULL) {
+        CloseHandle(primary);
+    }
+    if (disabled_sid != NULL) {
+        LocalFree(disabled_sid);
+    }
+    if (worker_sid != NULL) {
+        LocalFree(worker_sid);
+    }
+    return ok;
+}
+
+static int restricted_token_cannot_read_path(
+    HANDLE restricted_token,
+    const wchar_t *path
+) {
+    HANDLE opened = INVALID_HANDLE_VALUE;
+    DWORD open_error = ERROR_SUCCESS;
+    int impersonating = 0;
+    int ok = 0;
+    if (restricted_token == NULL
+        || path == NULL
+        || !ImpersonateLoggedOnUser(restricted_token)) {
+        goto cleanup;
+    }
+    impersonating = 1;
+    opened = CreateFileW(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+        NULL
+    );
+    open_error = GetLastError();
+    if (opened != INVALID_HANDLE_VALUE) {
+        goto cleanup;
+    }
+    ok = open_error == ERROR_ACCESS_DENIED;
+
+cleanup:
+    if (opened != INVALID_HANDLE_VALUE) {
+        CloseHandle(opened);
+    }
+    if (impersonating && !RevertToSelf()) {
+        ok = 0;
+    }
+    return ok;
+}
+
+#ifdef F3_BROKER_TESTING
+static int create_test_supervisor_compatibility_token(
+    HANDLE *restricted_token
+) {
+    HANDLE primary = NULL;
+    PSID disabled_sid = NULL;
+    SID_AND_ATTRIBUTES disabled;
+    int ok = 0;
+    memset(&disabled, 0, sizeof(disabled));
+    if (restricted_token == NULL
+        || F3_BROKER_RESTRICTING_SID[0] == L'\0'
+        || !OpenProcessToken(
             GetCurrentProcess(),
             TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
             &primary
@@ -3631,6 +3779,7 @@ cleanup:
     }
     return ok;
 }
+#endif
 
 static int read_exact_pipe_frame(
     HANDLE pipe,
@@ -3879,6 +4028,7 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
     BOOL process_in_job = FALSE;
     int attributes_initialized = 0;
     int child_created = 0;
+    int restricted_token_ready = 0;
     int ok = 0;
     const char *action = NULL;
     memset(&startup, 0, sizeof(startup));
@@ -3978,8 +4128,26 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
     environment = sanitized_environment(
         L"factor-v3-formal-native-broker-supervisor/v1"
     );
-    if (environment == NULL
-        || !create_production_restricted_token(&restricted_token)
+    if (environment == NULL) {
+        goto cleanup;
+    }
+#ifdef F3_BROKER_TESTING
+    if (F3_BROKER_TESTING_SUPERVISOR_TOKEN_COMPATIBILITY == 1) {
+        restricted_token_ready = create_test_supervisor_compatibility_token(
+            &restricted_token
+        );
+    } else {
+#endif
+        restricted_token_ready =
+            create_production_restricted_token(&restricted_token)
+            && restricted_token_cannot_read_path(
+                restricted_token,
+                F3_BROKER_CREDENTIAL_SLOT_PATH
+            );
+#ifdef F3_BROKER_TESTING
+    }
+#endif
+    if (!restricted_token_ready
         || !CreatePipe(
             &child_input,
             &parent_input,
@@ -5433,6 +5601,25 @@ int wmain(int argc, wchar_t **argv) {
                 GetLastError()
             );
             return 38;
+        }
+        return 0;
+    }
+    if (
+        argc == 3
+        && wcscmp(
+            argv[1],
+            L"--test-fixed-worker-token-denies-secret"
+        ) == 0
+    ) {
+        HANDLE worker_token = NULL;
+        int denied = create_production_restricted_token(&worker_token)
+            && restricted_token_cannot_read_path(worker_token, argv[2]);
+        if (worker_token != NULL) {
+            CloseHandle(worker_token);
+        }
+        if (!denied) {
+            fwprintf(stderr, L"native broker worker token ACL rejected\n");
+            return 39;
         }
         return 0;
     }
