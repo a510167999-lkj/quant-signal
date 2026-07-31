@@ -49,6 +49,10 @@ def _immutable_tree_metadata(root: Path) -> dict[str, dict[str, object]]:
             "size": metadata.st_size,
             "type": "directory" if path.is_dir() else "file",
         }
+        if path.is_file():
+            snapshot[path.relative_to(root).as_posix()]["sha256"] = hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
     return snapshot
 
 
