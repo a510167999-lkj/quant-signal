@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import errno
 import json
 import os
@@ -141,6 +141,7 @@ def _authorization_payload(
     stdlib_root_sha256 = renderer.stdlib_policy_root_sha256(stdlib_policy)
     config["_test_stdlib_inventory_root_sha256"] = stdlib_root_sha256
     config["_test_stdlib_pycache_prefix"] = str(pycache_prefix)
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
     return {
         "action": config["action"],
         "authorization_id_sha256": _sha256(
@@ -159,7 +160,9 @@ def _authorization_payload(
         "expected_commit": config["expected_commit"],
         "execution_authorization_key_id": (f"sha256:{execution_key_sha256}"),
         "execution_authorization_key_role": ("factor-v3-bootstrap-execution-authorization"),
-        "expires_at_utc": "2026-07-31T00:00:00+00:00",
+        "expires_at_utc": (now_utc + timedelta(minutes=30)).isoformat(
+            timespec="seconds"
+        ),
         "feature_attestation_sha256": review_payload["feature_attestation_sha256"],
         "formal_input_root_path": config["formal_input_root"],
         "formal_input_root_sha256": config["formal_input_root_sha256"],
@@ -167,8 +170,8 @@ def _authorization_payload(
         "formal_runner_sha256": review_payload["formal_runner_sha256"],
         "git_executable_path": config["git_executable_path"],
         "git_executable_sha256": config["git_executable_sha256"],
-        "issued_at_utc": "2026-07-30T12:00:00+00:00",
-        "not_before_utc": "2026-07-30T12:00:00+00:00",
+        "issued_at_utc": now_utc.isoformat(timespec="seconds"),
+        "not_before_utc": now_utc.isoformat(timespec="seconds"),
         "project_id": "quant-signal-lkj",
         "python_executable_path": config["python_executable_path"],
         "python_executable_sha256": config["python_executable_sha256"],
@@ -484,6 +487,11 @@ def _run_as_synthetic_supervisor(
                 b"synthetic-supervisor-launch-envelope"
             ),
             "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL": ("factor-v3-formal-supervisor-worker/v2"),
+            "FACTOR_V3_FORMAL_PREFLIGHT_TERMINAL_GUARD_BINDING": (
+                _sha256(b"synthetic-native-guard-binding")
+                if selected_action in {"build-spec", "preflight"}
+                else "none"
+            ),
         }
     )
     if include_stdlib_prelock:

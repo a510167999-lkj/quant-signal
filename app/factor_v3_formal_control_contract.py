@@ -22,6 +22,10 @@ PUBLICATION_COMPLETION_SCHEMA = "factor-v3-formal-bootstrap-publication-completi
 STDLIB_POLICY_SCHEMA = "factor-v3-formal-stdlib-policy/v2"
 EXECUTION_REPLAY_SCOPE = "factor-v3-formal-bootstrap-execution/v1"
 STDLIB_ROOT_ENVIRONMENT = "FACTOR_V3_FORMAL_STDLIB_INVENTORY_ROOT_SHA256"
+PREFLIGHT_TERMINAL_GUARD_BINDING_ENVIRONMENT = "FACTOR_V3_FORMAL_PREFLIGHT_TERMINAL_GUARD_BINDING"
+PREFLIGHT_TERMINAL_GUARD_SCHEMA = "factor-v3-formal-preflight-terminal-guard/v1"
+PREFLIGHT_TERMINAL_GUARD_PROVIDER_IDENTITY = "external-win32-native-supervisor/v1"
+PREFLIGHT_TERMINAL_GUARD_ACTIONS = ("build-spec", "preflight")
 WORKER_ACTION_BY_LAUNCH_ACTION = {
     "build-spec": "build-spec",
     "preflight": "preflight",
@@ -41,6 +45,7 @@ FIXED_ENVIRONMENT = [
     "FACTOR_V3_FORMAL_LAUNCH_ACTION",
     "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256",
     "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL",
+    PREFLIGHT_TERMINAL_GUARD_BINDING_ENVIRONMENT,
     STDLIB_ROOT_ENVIRONMENT,
 ]
 WORKER_TERMINAL_FIELDS = [
@@ -122,11 +127,44 @@ def worker_protocol_descriptor() -> dict[str, Any]:
     }
 
 
+def preflight_terminal_guard_contract() -> dict[str, Any]:
+    return {
+        "acquire_before": "planned-run-root-initial-snapshot",
+        "atomic_terminal_operation": ("planned-run-root-postverify-and-success-buffer"),
+        "hold_until": "supervisor-terminal-output-flush",
+        "protected_actions": list(PREFLIGHT_TERMINAL_GUARD_ACTIONS),
+        "protected_path_field": "run_root",
+        "provider_identity": PREFLIGHT_TERMINAL_GUARD_PROVIDER_IDENTITY,
+        "schema": PREFLIGHT_TERMINAL_GUARD_SCHEMA,
+        "worker_binding_environment": (PREFLIGHT_TERMINAL_GUARD_BINDING_ENVIRONMENT),
+        "write_policy": "deny-create-delete-rename-replace",
+    }
+
+
+def preflight_terminal_guard_request(
+    *,
+    action: str,
+    run_root: str,
+) -> dict[str, Any] | None:
+    if action not in WORKER_ACTION_BY_LAUNCH_ACTION.values():
+        raise FormalControlContractError("preflight terminal guard action rejected")
+    if action not in PREFLIGHT_TERMINAL_GUARD_ACTIONS:
+        return None
+    protected_root = Path(_absolute_path(run_root))
+    return {
+        **preflight_terminal_guard_contract(),
+        "action": action,
+        "parent_path": str(protected_root.parent),
+        "run_root": str(protected_root),
+    }
+
+
 def control_contract_descriptor() -> dict[str, Any]:
     return {
         "completion_schema": PUBLICATION_COMPLETION_SCHEMA,
         "environment_policy": worker_environment_policy(),
         "execution_replay_scope": EXECUTION_REPLAY_SCOPE,
+        "preflight_terminal_guard": preflight_terminal_guard_contract(),
         "stdlib_policy_schema": STDLIB_POLICY_SCHEMA,
         "stdlib_root_environment": STDLIB_ROOT_ENVIRONMENT,
         "worker_action_by_launch_action": dict(WORKER_ACTION_BY_LAUNCH_ACTION),

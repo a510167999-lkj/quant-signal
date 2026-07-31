@@ -1249,15 +1249,18 @@ def _same_file_identity(
 
 
 def _planned_run_root_sidecars(parent: Path) -> list[Path]:
-    sidecar_prefixes = (
-        f"{PLANNED_RUN_ROOT.name}.",
-        f".{PLANNED_RUN_ROOT.name}.",
+    sidecar_prefixes = tuple(
+        value.casefold()
+        for value in (
+            f"{PLANNED_RUN_ROOT.name}.",
+            f".{PLANNED_RUN_ROOT.name}.",
+        )
     )
     try:
         return [
             child
             for child in parent.iterdir()
-            if child.name.startswith(sidecar_prefixes)
+            if child.name.casefold().startswith(sidecar_prefixes)
         ]
     except OSError as exc:
         raise FormalRunSpecError(
@@ -1541,11 +1544,26 @@ _TRUSTED_ACTION_CONFIG_FIELDS = frozenset(
     }
 )
 _TRUSTED_CONTEXT_METHODS = (
+    "acquire_preflight_terminal_guard",
     "assert_verified_module",
     "emit_json",
     "postverify",
+    "preflight_terminal_guard_descriptor",
     "validate_action_config",
     "verified_ledger_entry",
+)
+_PREFLIGHT_TERMINAL_GUARD_FIELDS = frozenset(
+    {
+        "acquire_before",
+        "action",
+        "atomic_terminal_operation",
+        "hold_until",
+        "parent_path",
+        "provider_identity",
+        "run_root",
+        "schema",
+        "write_policy",
+    }
 )
 _VERIFIED_LEDGER_ENTRY_FIELDS = frozenset(
     {
@@ -1796,6 +1814,109 @@ def _emit_trusted_json(context: Any, value: Any) -> None:
         ) from exc
 
 
+def _validated_preflight_terminal_guard(
+    context: Any,
+    *,
+    action: str,
+) -> Any:
+    try:
+        descriptor = _trusted_context_method(
+            context,
+            "preflight_terminal_guard_descriptor",
+        )()
+    except BaseException as exc:
+        raise FormalRunSpecError(
+            "formal preflight terminal guard descriptor rejected"
+        ) from exc
+    expected = {
+        "acquire_before": "planned-run-root-initial-snapshot",
+        "action": action,
+        "atomic_terminal_operation": (
+            "planned-run-root-postverify-and-success-buffer"
+        ),
+        "hold_until": "supervisor-terminal-output-flush",
+        "parent_path": str(PLANNED_RUN_ROOT.parent),
+        "provider_identity": "external-win32-native-supervisor/v1",
+        "run_root": str(PLANNED_RUN_ROOT),
+        "schema": "factor-v3-formal-preflight-terminal-guard/v1",
+        "write_policy": "deny-create-delete-rename-replace",
+    }
+    if (
+        not isinstance(descriptor, Mapping)
+        or isinstance(descriptor, dict)
+        or set(descriptor) != _PREFLIGHT_TERMINAL_GUARD_FIELDS
+        or dict(descriptor) != expected
+    ):
+        raise FormalRunSpecError(
+            "formal preflight terminal guard descriptor rejected"
+        )
+    try:
+        guard = _trusted_context_method(
+            context,
+            "acquire_preflight_terminal_guard",
+        )(descriptor)
+    except BaseException as exc:
+        raise FormalRunSpecError(
+            "formal preflight terminal guard acquisition rejected"
+        ) from exc
+    if (
+        isinstance(guard, Mapping)
+        or getattr(guard, "descriptor", None) is not descriptor
+        or not callable(getattr(guard, "__enter__", None))
+        or not callable(getattr(guard, "__exit__", None))
+        or not callable(getattr(guard, "bind_initial_snapshot", None))
+        or not callable(
+            getattr(guard, "terminal_postverify_and_emit", None)
+        )
+    ):
+        raise FormalRunSpecError(
+            "formal preflight terminal guard rejected"
+        )
+    return guard
+
+
+def _guarded_preflight_or_build(
+    context: Any,
+    runner: Any,
+    source_manifest: list[dict[str, Any]],
+    *,
+    action: str,
+) -> None:
+    guard = _validated_preflight_terminal_guard(
+        context,
+        action=action,
+    )
+    try:
+        with guard as entered:
+            if entered is not guard:
+                raise FormalRunSpecError(
+                    "formal preflight terminal guard rejected"
+                )
+            snapshot = _planned_run_root_snapshot()
+            guard.bind_initial_snapshot(snapshot)
+            candidate, content = build_and_verify_candidate(runner)
+            published = action == "build-spec"
+            if published:
+                publish_candidate(content)
+            result = safe_summary(
+                candidate,
+                content,
+                published=published,
+            )
+            _postverify_verified_module_ledger(
+                context,
+                source_manifest,
+            )
+            _assert_no_credential_shape(result)
+            guard.terminal_postverify_and_emit(snapshot, result)
+    except FormalRunSpecError:
+        raise
+    except BaseException as exc:
+        raise FormalRunSpecError(
+            "formal preflight terminal guard rejected"
+        ) from exc
+
+
 def trusted_dispatch(
     context: Any,
     frozen_action_config: Any,
@@ -1823,18 +1944,14 @@ def trusted_dispatch(
         )
     runner = _load_runner(context)
     action = config["action"]
-    planned_run_root_snapshot = None
     if action in {"build-spec", "preflight"}:
-        planned_run_root_snapshot = _planned_run_root_snapshot()
-        candidate, content = build_and_verify_candidate(runner)
-        published = action == "build-spec"
-        if published:
-            publish_candidate(content)
-        result = safe_summary(
-            candidate,
-            content,
-            published=published,
+        _guarded_preflight_or_build(
+            context,
+            runner,
+            source_manifest,
+            action=action,
         )
+        return 0
     elif action == "run":
         try:
             result = runner.run_factor_v3_daily_basic_collection(
@@ -1856,10 +1973,6 @@ def trusted_dispatch(
                 "formal daily-basic verification rejected"
             ) from exc
     _postverify_verified_module_ledger(context, source_manifest)
-    if planned_run_root_snapshot is not None:
-        _postverify_planned_run_root(
-            planned_run_root_snapshot
-        )
     _emit_trusted_json(context, result)
     return 0
 

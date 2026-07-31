@@ -1181,6 +1181,8 @@ def test_formal_dispatch_requires_exact_trusted_context_api() -> None:
     )
     source = (
         inspect.getsource(formal.trusted_dispatch)
+        + inspect.getsource(formal._guarded_preflight_or_build)
+        + inspect.getsource(formal._validated_preflight_terminal_guard)
         + inspect.getsource(formal._emit_trusted_json)
     )
     assert "_validated_trusted_action_config" in source

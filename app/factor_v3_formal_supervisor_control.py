@@ -841,6 +841,16 @@ def _launch_payload(
     )
     if action not in contract.WORKER_ACTION_BY_LAUNCH_ACTION:
         raise FormalSupervisorControlError("launch action rejected")
+    terminal_guard_request = contract.preflight_terminal_guard_request(
+        action=contract.WORKER_ACTION_BY_LAUNCH_ACTION[action],
+        run_root=str(config["run_root"]),
+    )
+    if (
+        action in {"build-spec", "preflight"}
+    ) != (terminal_guard_request is not None):
+        raise FormalSupervisorControlError(
+            "preflight terminal guard request rejected"
+        )
     if now_utc.tzinfo != timezone.utc or now_utc.microsecond != 0:
         raise FormalSupervisorControlError("launch time rejected")
     launch_id = _sha256(

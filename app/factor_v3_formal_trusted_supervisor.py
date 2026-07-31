@@ -29,7 +29,7 @@ class FormalSupervisorError(RuntimeError):
 
 _EMBEDDED_CONTROL_CONTRACT_SOURCE: bytes | None = None
 _CONTROL_CONTRACT_SOURCE_NAME = "factor_v3_formal_control_contract.py"
-_CONTROL_CONTRACT_SOURCE_SHA256 = "eed9dc9fe938d476b2ff054cf586feff46e14d7325a96cf421cd668de1b86cff"
+_CONTROL_CONTRACT_SOURCE_SHA256 = "161518d9188e166255abf04637a668626bd56c5f35e6d94996c47198b1623721"
 
 
 def _fixed_control_contract_source() -> bytes:
@@ -68,6 +68,8 @@ def _load_fixed_control_contract() -> dict[str, Any]:
         raise FormalSupervisorError("fixed control contract rejected") from exc
     required = {
         "EXECUTION_REPLAY_SCOPE",
+        "PREFLIGHT_TERMINAL_GUARD_BINDING_ENVIRONMENT",
+        "PREFLIGHT_TERMINAL_GUARD_PROVIDER_IDENTITY",
         "PUBLICATION_COMPLETION_SCHEMA",
         "STDLIB_POLICY_SCHEMA",
         "STDLIB_ROOT_ENVIRONMENT",
@@ -77,6 +79,7 @@ def _load_fixed_control_contract() -> dict[str, Any]:
         "WORKER_TERMINAL_SCHEMA",
         "control_contract_descriptor_sha256",
         "exact_worker_argv",
+        "preflight_terminal_guard_request",
         "validate_stdlib_policy",
         "worker_environment_policy",
         "worker_protocol_descriptor",
@@ -88,6 +91,12 @@ def _load_fixed_control_contract() -> dict[str, Any]:
 
 _CONTROL_CONTRACT = _load_fixed_control_contract()
 EXECUTION_REPLAY_SCOPE = _CONTROL_CONTRACT["EXECUTION_REPLAY_SCOPE"]
+PREFLIGHT_TERMINAL_GUARD_BINDING_ENVIRONMENT = _CONTROL_CONTRACT[
+    "PREFLIGHT_TERMINAL_GUARD_BINDING_ENVIRONMENT"
+]
+PREFLIGHT_TERMINAL_GUARD_PROVIDER_IDENTITY = _CONTROL_CONTRACT[
+    "PREFLIGHT_TERMINAL_GUARD_PROVIDER_IDENTITY"
+]
 PUBLICATION_COMPLETION_SCHEMA = _CONTROL_CONTRACT["PUBLICATION_COMPLETION_SCHEMA"]
 STDLIB_POLICY_SCHEMA = _CONTROL_CONTRACT["STDLIB_POLICY_SCHEMA"]
 STDLIB_ROOT_ENVIRONMENT = _CONTROL_CONTRACT["STDLIB_ROOT_ENVIRONMENT"]
@@ -97,6 +106,7 @@ WORKER_TERMINAL_FIELDS = _CONTROL_CONTRACT["WORKER_TERMINAL_FIELDS"]
 WORKER_TERMINAL_SCHEMA = _CONTROL_CONTRACT["WORKER_TERMINAL_SCHEMA"]
 control_contract_descriptor_sha256 = _CONTROL_CONTRACT["control_contract_descriptor_sha256"]
 exact_worker_argv = _CONTROL_CONTRACT["exact_worker_argv"]
+preflight_terminal_guard_request = _CONTROL_CONTRACT["preflight_terminal_guard_request"]
 validate_stdlib_policy = _CONTROL_CONTRACT["validate_stdlib_policy"]
 worker_environment_policy = _CONTROL_CONTRACT["worker_environment_policy"]
 worker_protocol_descriptor = _CONTROL_CONTRACT["worker_protocol_descriptor"]
@@ -1339,8 +1349,7 @@ def _validate_launch_payload(
                 )
             )
             or payload.get("resume_of_action") != "run"
-            or payload.get("resume_of_launch_authorization_schema")
-            != LAUNCH_AUTHORIZATION_SCHEMA
+            or payload.get("resume_of_launch_authorization_schema") != LAUNCH_AUTHORIZATION_SCHEMA
             or payload.get("resume_of_replay_scope") != EXECUTION_REPLAY_SCOPE
             or payload["authorization_id_sha256"] != payload["resume_of_authorization_id_sha256"]
             or payload["authorization_nonce_sha256"]
@@ -1425,6 +1434,7 @@ def _worker_environment(
     credential_value: str | None,
     launch_authorization_sha256: str,
     snapshot: Mapping[str, str],
+    terminal_guard_binding: str | None,
 ) -> tuple[dict[str, str], tuple[str, ...]]:
     environment = _public_environment(snapshot)
     secret_names = tuple(
@@ -1444,6 +1454,9 @@ def _worker_environment(
             "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256": launch_authorization_sha256,
             "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL": WORKER_PROTOCOL,
             STDLIB_ROOT_ENVIRONMENT: str(payload["stdlib_inventory_root_sha256"]),
+            PREFLIGHT_TERMINAL_GUARD_BINDING_ENVIRONMENT: (
+                "none" if terminal_guard_binding is None else terminal_guard_binding
+            ),
         }
     )
     allowed_names = (
@@ -1454,6 +1467,15 @@ def _worker_environment(
     if not set(environment).issubset(allowed_names):
         raise FormalSupervisorError("worker environment rejected")
     return environment, secret_names
+
+
+@contextmanager
+def _acquire_external_native_preflight_terminal_guard(
+    request: Mapping[str, Any],
+) -> Iterator[Any]:
+    del request
+    raise FormalSupervisorError("external native preflight terminal guard unavailable")
+    yield
 
 
 def _held_run_credential(
@@ -2527,9 +2549,7 @@ def _supervise_with_pins(
                     "original_replay_scope": payload["resume_of_replay_scope"],
                     "resume_action": payload["action"],
                     "resume_authorization_id_sha256": payload["authorization_id_sha256"],
-                    "resume_authorization_nonce_sha256": payload[
-                        "authorization_nonce_sha256"
-                    ],
+                    "resume_authorization_nonce_sha256": payload["authorization_nonce_sha256"],
                     "resume_bootstrap_execution_authorization_sha256": payload[
                         "bootstrap_execution_authorization_sha256"
                     ],
@@ -2592,11 +2612,42 @@ def _supervise_with_pins(
             payload,
             stack=stack,
         )
+        terminal_guard_request = preflight_terminal_guard_request(
+            action=str(payload["worker_action"]),
+            run_root=str(payload["run_root"]),
+        )
+        terminal_guard = None
+        terminal_guard_binding = None
+        if terminal_guard_request is not None:
+            terminal_guard = stack.enter_context(
+                _acquire_external_native_preflight_terminal_guard(
+                    terminal_guard_request,
+                )
+            )
+            if (
+                getattr(terminal_guard, "provider_identity", None)
+                != PREFLIGHT_TERMINAL_GUARD_PROVIDER_IDENTITY
+                or not callable(getattr(terminal_guard, "worker_binding", None))
+                or not callable(
+                    getattr(
+                        terminal_guard,
+                        "postverify_after_terminal_output",
+                        None,
+                    )
+                )
+            ):
+                raise FormalSupervisorError("external native preflight terminal guard rejected")
+            terminal_guard_binding = terminal_guard.worker_binding()
+            if _SHA256_RE.fullmatch(str(terminal_guard_binding)) is None:
+                raise FormalSupervisorError(
+                    "external native preflight terminal guard binding rejected"
+                )
         worker_environment, _secret_names = _worker_environment(
             payload,
             credential_value=credential_value,
             launch_authorization_sha256=authorization_sha256,
             snapshot=environment_snapshot,
+            terminal_guard_binding=terminal_guard_binding,
         )
         credential_values = () if credential_value is None else (credential_value,)
         returncode, stdout, stderr = _run_worker(
@@ -2655,9 +2706,7 @@ def _supervise_with_pins(
                 "artifact_manifest_sha256": artifact_manifest_sha256,
                 "claim_sha256": claim_sha256,
                 "launch_authorization_sha256": authorization_sha256,
-                "resume_of_authorization_sha256": payload[
-                    "resume_of_authorization_sha256"
-                ],
+                "resume_of_authorization_sha256": payload["resume_of_authorization_sha256"],
                 "resume_transition_sha256": resume_transition_sha256,
                 "schema": COMPLETED_SCHEMA,
                 "status": "completed",
@@ -2678,6 +2727,8 @@ def _supervise_with_pins(
         ledger_chain.postverify()
         _reject_completed_resume(payload)
         _write_all(1, stdout, writer=output_writer)
+        if terminal_guard is not None:
+            terminal_guard.postverify_after_terminal_output()
         for handle in terminal_handles:
             handle.postverify()
         ledger_chain.postverify()

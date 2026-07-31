@@ -663,6 +663,7 @@ def test_preflight_supervisor_environment_is_nonsecret_and_action_exact() -> Non
         "FACTOR_V3_FORMAL_LAUNCH_ACTION": "preflight",
         "FACTOR_V3_FORMAL_LAUNCH_AUTHORIZATION_SHA256": "1" * 64,
         "FACTOR_V3_FORMAL_LAUNCH_PROTOCOL": SUPERVISOR_PROTOCOL,
+        "FACTOR_V3_FORMAL_PREFLIGHT_TERMINAL_GUARD_BINDING": "3" * 64,
         "FACTOR_V3_FORMAL_STDLIB_INVENTORY_ROOT_SHA256": "2" * 64,
         "SYSTEMROOT": r"C:\Windows",
     }
@@ -673,7 +674,33 @@ def test_preflight_supervisor_environment_is_nonsecret_and_action_exact() -> Non
     )
 
     assert validated["FACTOR_V3_FORMAL_LAUNCH_ACTION"] == "preflight"
+    assert (
+        validated["FACTOR_V3_FORMAL_PREFLIGHT_TERMINAL_GUARD_BINDING"]
+        == "3" * 64
+    )
     assert "JIAOCH_TOKEN" not in validated
+
+
+def test_preflight_worker_fails_closed_without_external_native_guard(
+    tmp_path: Path,
+) -> None:
+    (
+        config,
+        _payload,
+        authorization_path,
+        trusted_public_der,
+    ) = _authorized_fixture(tmp_path, action="preflight")
+    rendered = _render_authorized(authorization_path, trusted_public_der)
+
+    completed = _run_as_synthetic_supervisor(
+        rendered,
+        config,
+        tmp_path,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "factor-v3 formal bootstrap rejected\n"
 
 
 def test_worker_rejects_missing_stdlib_prelock_proof(

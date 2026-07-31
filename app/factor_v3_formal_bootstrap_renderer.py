@@ -29,6 +29,7 @@ from app.factor_v3_formal_control_contract import (
     canonical_stdlib_policy,
     control_contract_descriptor,
     control_contract_descriptor_sha256,
+    preflight_terminal_guard_request,
     stdlib_policy_root_sha256,
     validate_stdlib_policy,
     worker_protocol_descriptor,
@@ -40,7 +41,7 @@ class FormalBootstrapRenderError(RuntimeError):
 
 
 CONFIG_SCHEMA = "factor-v3-formal-bootstrap-render-config/v1"
-RUNTIME_TEMPLATE_SHA256 = "f29cab288d895b62866ec74fd3a869db0ba3f10c16868fcbc139235d1244ce7c"
+RUNTIME_TEMPLATE_SHA256 = "53917efa5966ceafc286be86b5d58223c49f1157f25ec2c8fdd2a008dd9cde19"
 AUTHORIZATION_SCHEMA = "factor-v3-formal-bootstrap-execution-authorization/v2"
 PUBLICATION_RECEIPT_SCHEMA = "factor-v3-formal-bootstrap-publication-receipt/v1"
 COMPLETION_SCHEMA = PUBLICATION_COMPLETION_SCHEMA
@@ -1174,6 +1175,12 @@ def _validated_execution_authorization(
         raise FormalBootstrapRenderError("stdlib policy rejected")
     if payload.get("supervisor_protocol") != _supervisor_protocol_descriptor():
         raise FormalBootstrapRenderError("supervisor protocol rejected")
+    terminal_guard_request = preflight_terminal_guard_request(
+        action=str(payload["action"]),
+        run_root=str(payload["run_root"]),
+    )
+    if (payload["action"] in {"build-spec", "preflight"}) != (terminal_guard_request is not None):
+        raise FormalBootstrapRenderError("preflight terminal guard request rejected")
     _verify_rsa3072_signature(
         _canonical_bytes(payload),
         _decoded_signature(outer.get("signature_base64"), label="authorization"),

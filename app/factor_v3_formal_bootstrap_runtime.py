@@ -498,6 +498,14 @@ def _validated_supervisor_environment(
         is None
     ):
         raise _BootstrapError("supervisor environment rejected")
+    guard_contract = descriptor["preflight_terminal_guard"]
+    guard_binding_name = guard_contract["worker_binding_environment"]
+    guard_binding = canonical.get(guard_binding_name)
+    if worker_action in guard_contract["protected_actions"]:
+        if _SHA256_RE.fullmatch(str(guard_binding)) is None:
+            raise _BootstrapError("external native preflight terminal guard binding rejected")
+    elif guard_binding != "none":
+        raise _BootstrapError("external native preflight terminal guard binding rejected")
     return canonical
 
 
@@ -897,6 +905,24 @@ class _FrozenActionConfig(Mapping[str, str]):
         return len(self._values)
 
 
+def _preflight_terminal_guard_descriptor(
+    action_config: _FrozenActionConfig,
+) -> Mapping[str, Any] | None:
+    guard_contract = _control_contract()["preflight_terminal_guard"]
+    action = action_config["action"]
+    if action not in guard_contract["protected_actions"]:
+        return None
+    run_root = Path(action_config["run_root"])
+    return MappingProxyType(
+        {
+            **guard_contract,
+            "action": action,
+            "parent_path": str(run_root.parent),
+            "run_root": str(run_root),
+        }
+    )
+
+
 class _VerifiedSourceLoader(importlib.abc.Loader):
     def __init__(
         self,
@@ -1070,6 +1096,9 @@ class _TrustedBootstrapContext:
         self._stderr_sink = stderr_sink
         self._output: bytes | None = None
         self._postverified = False
+        self._preflight_terminal_guard_descriptor = _preflight_terminal_guard_descriptor(
+            action_config
+        )
 
     def validate_action_config(self, candidate: Any) -> None:
         if (
@@ -1078,6 +1107,20 @@ class _TrustedBootstrapContext:
             != self._action_config_sha256
         ):
             raise _BootstrapError("frozen action configuration rejected")
+
+    def preflight_terminal_guard_descriptor(self) -> Mapping[str, Any]:
+        descriptor = self._preflight_terminal_guard_descriptor
+        if descriptor is None:
+            raise _BootstrapError("external native preflight terminal guard is not required")
+        return descriptor
+
+    def acquire_preflight_terminal_guard(
+        self,
+        descriptor: Any,
+    ) -> Any:
+        if descriptor is not self._preflight_terminal_guard_descriptor:
+            raise _BootstrapError("external native preflight terminal guard descriptor rejected")
+        raise _BootstrapError("external native preflight terminal guard unavailable")
 
     def verified_ledger_entry(self, module_name: str) -> Mapping[str, object]:
         if type(module_name) is not str or module_name not in self._source_registry:
@@ -2287,6 +2330,8 @@ def _trusted_run() -> bytes:
         dict(os.environ),
         worker_action=str(config["action"]),
     )
+    if config["action"] in _control_contract()["preflight_terminal_guard"]["protected_actions"]:
+        raise _BootstrapError("external native preflight terminal guard unavailable")
     if (
         supervisor_environment[_control_contract()["stdlib_root_environment"]]
         != config["stdlib_policy_root_sha256"]

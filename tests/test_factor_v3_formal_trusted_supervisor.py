@@ -692,6 +692,32 @@ def test_preflight_launch_payload_is_first_class_and_has_no_credential(
     assert validated["credential_slot_id"] is None
 
 
+def test_preflight_supervisor_fails_closed_before_worker_without_native_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pins, _payload, authorization_path, environment, writes = _fixture(
+        tmp_path,
+        action="preflight",
+        worker_action="preflight",
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_run_worker",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("worker must not start without native guard")
+        ),
+    )
+
+    with pytest.raises(
+        supervisor.FormalSupervisorError,
+        match="external native preflight terminal guard unavailable",
+    ):
+        _run_fixture(pins, authorization_path, environment, writes)
+
+    assert writes == []
+
+
 def test_unrendered_template_has_no_production_entrypoint() -> None:
     with pytest.raises(supervisor.FormalSupervisorError, match="fixed production"):
         supervisor.supervise_factor_v3_formal_execution(Path("unused.json"))
