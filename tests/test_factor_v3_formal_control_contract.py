@@ -51,10 +51,49 @@ def test_shared_contract_is_the_only_v2_protocol_definition() -> None:
         "verify": "verify",
     }
     assert contract.ACTION_SECRET_ENVIRONMENT["preflight"] == []
+    assert contract.PREFLIGHT_TERMINAL_GUARD_BINDING_ENVIRONMENT in (
+        contract.FIXED_ENVIRONMENT
+    )
+    guard_contract = contract.preflight_terminal_guard_contract()
+    assert guard_contract == {
+        "acquire_before": "planned-run-root-initial-snapshot",
+        "atomic_terminal_operation": (
+            "planned-run-root-postverify-and-success-buffer"
+        ),
+        "hold_until": "supervisor-terminal-output-flush",
+        "protected_actions": ["build-spec", "preflight"],
+        "protected_path_field": "run_root",
+        "provider_identity": "external-win32-native-supervisor/v1",
+        "schema": "factor-v3-formal-preflight-terminal-guard/v1",
+        "worker_binding_environment": (
+            "FACTOR_V3_FORMAL_PREFLIGHT_TERMINAL_GUARD_BINDING"
+        ),
+        "write_policy": "deny-create-delete-rename-replace",
+    }
+    request = contract.preflight_terminal_guard_request(
+        action="preflight",
+        run_root=str((Path.cwd() / "planned-run").resolve()),
+    )
+    assert request == {
+        **guard_contract,
+        "action": "preflight",
+        "parent_path": str((Path.cwd() / "planned-run").resolve().parent),
+        "run_root": str((Path.cwd() / "planned-run").resolve()),
+    }
+    assert (
+        contract.preflight_terminal_guard_request(
+            action="verify",
+            run_root=str((Path.cwd() / "planned-run").resolve()),
+        )
+        is None
+    )
     expected = contract.worker_protocol_descriptor()
     assert renderer._supervisor_protocol_descriptor() == expected
     assert runtime._supervisor_protocol_descriptor() == expected
     assert supervisor._fresh_environment_policy() == contract.worker_environment_policy()
+    assert contract.control_contract_descriptor()["preflight_terminal_guard"] == (
+        guard_contract
+    )
 
     copied_literals = {
         contract.WORKER_PROTOCOL,
@@ -684,6 +723,24 @@ def test_runtime_uses_manifest_finder_without_general_path_or_sourceless_loader(
     trusted_run = inspect.getsource(runtime._trusted_run)
     assert "importlib.machinery.PathFinder" not in trusted_run
     assert "sys.pycache_prefix = " not in trusted_run
+
+
+def test_preflight_terminal_guard_is_consumed_across_the_trusted_closure() -> None:
+    runtime_context = inspect.getsource(runtime._TrustedBootstrapContext)
+    runtime_run = inspect.getsource(runtime._trusted_run)
+    supervisor_run = inspect.getsource(supervisor._supervise_with_pins)
+    control_payload = inspect.getsource(supervisor_control._launch_payload)
+
+    assert "acquire_preflight_terminal_guard" in runtime_context
+    assert "external native preflight terminal guard unavailable" in runtime_run
+    assert "_acquire_external_native_preflight_terminal_guard" in supervisor_run
+    assert supervisor_run.index(
+        "_acquire_external_native_preflight_terminal_guard"
+    ) < supervisor_run.index("_run_worker")
+    assert supervisor_run.index("_write_all") < supervisor_run.rindex(
+        "terminal_guard"
+    )
+    assert "preflight_terminal_guard_request" in control_payload
 
 
 def test_resume_replay_tuple_rejects_a_completed_original_authorization(

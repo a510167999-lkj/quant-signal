@@ -13,7 +13,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -181,6 +181,12 @@ class _TrustedBootstrapContext:
         self.asserted_modules: list[tuple[str, str, str]] = []
         self.buffered: list[object] = []
         self.postverify_calls = 0
+        self.guard_events: list[str] = []
+        self.guard_terminal_attack: Callable[[], None] | None = None
+        self.guard_descriptor_overrides: dict[str, object] = {}
+        self.guard_initial_snapshot_override: object | None = None
+        self._guard_descriptor: Mapping[str, object] | None = None
+        self.guard = _SyntheticNativePreflightTerminalGuard(self)
 
     def validate_action_config(self, candidate: object) -> None:
         if candidate is not self._config:
@@ -224,6 +230,85 @@ class _TrustedBootstrapContext:
 
     def postverify(self) -> None:
         self.postverify_calls += 1
+
+    def preflight_terminal_guard_descriptor(self) -> Mapping[str, object]:
+        if self._guard_descriptor is not None:
+            return self._guard_descriptor
+        descriptor: dict[str, object] = {
+            "acquire_before": "planned-run-root-initial-snapshot",
+            "action": self._config["action"],
+            "atomic_terminal_operation": (
+                "planned-run-root-postverify-and-success-buffer"
+            ),
+            "hold_until": "supervisor-terminal-output-flush",
+            "parent_path": str(formal.PLANNED_RUN_ROOT.parent),
+            "provider_identity": "external-win32-native-supervisor/v1",
+            "run_root": str(formal.PLANNED_RUN_ROOT),
+            "schema": "factor-v3-formal-preflight-terminal-guard/v1",
+            "write_policy": "deny-create-delete-rename-replace",
+        }
+        descriptor.update(self.guard_descriptor_overrides)
+        self._guard_descriptor = MappingProxyType(descriptor)
+        return self._guard_descriptor
+
+    def acquire_preflight_terminal_guard(
+        self,
+        descriptor: object,
+    ) -> object:
+        if descriptor is not self.guard.descriptor:
+            raise RuntimeError("terminal guard descriptor identity rejected")
+        self.guard_events.append("acquire")
+        return self.guard
+
+
+class _SyntheticNativePreflightTerminalGuard:
+    def __init__(self, context: _TrustedBootstrapContext) -> None:
+        self.context = context
+        self.active = False
+
+    @property
+    def descriptor(self) -> Mapping[str, object]:
+        return self.context.preflight_terminal_guard_descriptor()
+
+    def __enter__(self) -> _SyntheticNativePreflightTerminalGuard:
+        self.active = True
+        self.context.guard_events.append("enter")
+        return self
+
+    def __exit__(
+        self,
+        exc_type: object,
+        exc: object,
+        traceback: object,
+    ) -> None:
+        del exc_type, exc, traceback
+        self.context.guard_events.append("release")
+        self.active = False
+
+    def bind_initial_snapshot(self, snapshot: object) -> None:
+        expected = self.context.guard_initial_snapshot_override
+        if expected is not None and snapshot is not expected:
+            raise RuntimeError("terminal guard initial identity rejected")
+        self.context.guard_events.append("bind-initial")
+
+    def attempt_namespace_mutation(self, mutation: Callable[[], None]) -> None:
+        if self.active:
+            raise formal.FormalRunSpecError(
+                "external native preflight terminal guard denied mutation"
+            )
+        mutation()
+
+    def terminal_postverify_and_emit(
+        self,
+        snapshot: object,
+        value: object,
+    ) -> None:
+        self.context.guard_events.append("terminal-atomic")
+        attack = self.context.guard_terminal_attack
+        if attack is not None:
+            self.attempt_namespace_mutation(attack)
+        formal._postverify_planned_run_root(snapshot)
+        self.context.emit_json(value)
 
 
 def _frozen_action_config(action: str = "build-spec") -> _FrozenActionConfig:
@@ -1100,6 +1185,9 @@ def test_formal_dispatch_requires_exact_trusted_context_api() -> None:
     )
     assert "_validated_trusted_action_config" in source
     assert "_postverify_verified_module_ledger" in source
+    assert "acquire_preflight_terminal_guard" in source
+    assert "preflight_terminal_guard_descriptor" in source
+    assert "terminal_postverify_and_emit" in source
     assert "emit_json" in source
     assert "print(" not in source
     assert "runner.main" not in source
@@ -1150,6 +1238,13 @@ def test_success_output_is_buffered_until_external_terminal_postverify(
     assert formal.trusted_dispatch(context, config) == 0
 
     assert events == ["ledger", "run-root-terminal", "emit"]
+    assert context.guard_events == [
+        "acquire",
+        "enter",
+        "bind-initial",
+        "terminal-atomic",
+        "release",
+    ]
     assert len(context.buffered) == 1
     assert context.postverify_calls == 0
     assert capsys.readouterr() == ("", "")
@@ -1202,6 +1297,13 @@ def test_preflight_dispatch_never_publishes_runs_or_verifies(
         "ledger",
         "run-root-terminal-verified",
     ]
+    assert context.guard_events == [
+        "acquire",
+        "enter",
+        "bind-initial",
+        "terminal-atomic",
+        "release",
+    ]
     assert runner.validate_calls
     assert context.buffered == [
         formal.safe_summary(
@@ -1244,6 +1346,254 @@ def test_preflight_rejects_sidecar_created_after_initial_check(
         tmp_path,
         mutation=mutate,
     )
+
+
+def test_preflight_rejects_case_variant_win32_sidecar(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "planned-parent"
+    parent.mkdir()
+    run_root = parent / "planned-run"
+    run_root.mkdir()
+    run_root.with_name("PLANNED-RUN.stdout.log").write_bytes(b"")
+    monkeypatch.setattr(formal, "PLANNED_RUN_ROOT", run_root)
+
+    with pytest.raises(formal.FormalRunSpecError, match="sidecar"):
+        formal.verify_planned_run_root()
+
+
+def test_preflight_rejects_missing_external_native_terminal_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _frozen_action_config("preflight")
+    context = _TrustedBootstrapContext(config)
+    context.acquire_preflight_terminal_guard = None  # type: ignore[method-assign]
+    runner = _FakeRunner(_candidate())
+    monkeypatch.setattr(formal, "_load_runner", lambda _context: runner)
+    monkeypatch.setattr(formal, "_planned_run_root_snapshot", object)
+    monkeypatch.setattr(
+        formal,
+        "_postverify_planned_run_root",
+        lambda _snapshot: None,
+    )
+    monkeypatch.setattr(
+        formal,
+        "_postverify_verified_module_ledger",
+        lambda _context, _manifest: None,
+    )
+
+    with pytest.raises(
+        formal.FormalRunSpecError,
+        match="trusted bootstrap context",
+    ):
+        formal.trusted_dispatch(context, config)
+
+    assert context.buffered == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("provider_identity", "python-fake-guard/v1"),
+        ("run_root", r"E:\hostile\other-run-root"),
+        ("parent_path", r"E:\hostile"),
+        ("hold_until", "worker-buffer-only"),
+    ),
+)
+def test_preflight_rejects_untrusted_or_misbound_terminal_guard_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+) -> None:
+    config = _frozen_action_config("preflight")
+    context = _TrustedBootstrapContext(config)
+    context.guard_descriptor_overrides[field] = value
+    runner = _FakeRunner(_candidate())
+    monkeypatch.setattr(formal, "_load_runner", lambda _context: runner)
+    monkeypatch.setattr(formal, "_planned_run_root_snapshot", object)
+    monkeypatch.setattr(
+        formal,
+        "_postverify_planned_run_root",
+        lambda _snapshot: None,
+    )
+    monkeypatch.setattr(
+        formal,
+        "_postverify_verified_module_ledger",
+        lambda _context, _manifest: None,
+    )
+
+    with pytest.raises(formal.FormalRunSpecError, match="terminal guard"):
+        formal.trusted_dispatch(context, config)
+
+    assert context.buffered == []
+
+
+def test_preflight_rejects_terminal_guard_initial_identity_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _frozen_action_config("preflight")
+    context = _TrustedBootstrapContext(config)
+    context.guard_initial_snapshot_override = object()
+    runner = _FakeRunner(_candidate())
+    monkeypatch.setattr(formal, "_load_runner", lambda _context: runner)
+    monkeypatch.setattr(formal, "_planned_run_root_snapshot", object)
+    monkeypatch.setattr(
+        formal,
+        "_postverify_planned_run_root",
+        lambda _snapshot: None,
+    )
+    monkeypatch.setattr(
+        formal,
+        "_postverify_verified_module_ledger",
+        lambda _context, _manifest: None,
+    )
+
+    with pytest.raises(formal.FormalRunSpecError, match="terminal guard"):
+        formal.trusted_dispatch(context, config)
+
+    assert context.buffered == []
+
+
+def _assert_preflight_guard_rejects_transient_namespace_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    mutation: Callable[[Path, Path], None],
+    create_run_root: bool = True,
+) -> None:
+    parent = tmp_path / "planned-parent"
+    parent.mkdir()
+    run_root = parent / "planned-run"
+    if create_run_root:
+        run_root.mkdir()
+    monkeypatch.setattr(formal, "PLANNED_RUN_ROOT", run_root)
+    config = _frozen_action_config("preflight")
+    context = _TrustedBootstrapContext(config)
+    runner = _FakeRunner(_candidate())
+    original_build = formal.build_and_verify_candidate
+
+    def raced_build(candidate_runner: object) -> tuple[dict[str, object], bytes]:
+        candidate, content = original_build(candidate_runner)
+        context.guard.attempt_namespace_mutation(
+            lambda: mutation(parent, run_root)
+        )
+        return candidate, content
+
+    monkeypatch.setattr(formal, "_load_runner", lambda _context: runner)
+    monkeypatch.setattr(formal, "build_and_verify_candidate", raced_build)
+    stable_snapshot = object()
+    monkeypatch.setattr(
+        formal,
+        "_planned_run_root_snapshot",
+        lambda: stable_snapshot,
+    )
+    monkeypatch.setattr(
+        formal,
+        "_postverify_planned_run_root",
+        lambda snapshot: (
+            None
+            if snapshot is stable_snapshot
+            else (_ for _ in ()).throw(AssertionError("unexpected snapshot"))
+        ),
+    )
+    monkeypatch.setattr(
+        formal,
+        "_postverify_verified_module_ledger",
+        lambda _context, _manifest: None,
+    )
+
+    with pytest.raises(formal.FormalRunSpecError, match="guard"):
+        formal.trusted_dispatch(context, config)
+
+    assert context.buffered == []
+
+
+def test_preflight_guard_rejects_transient_file_and_sidecar_create_delete(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def mutate(parent: Path, run_root: Path) -> None:
+        transient = run_root / "transient.json"
+        transient.write_bytes(b"{}")
+        transient.unlink()
+        sidecar = parent / f".{run_root.name}.TRANSIENT"
+        sidecar.write_bytes(b"")
+        sidecar.unlink()
+
+    _assert_preflight_guard_rejects_transient_namespace_mutation(
+        monkeypatch,
+        tmp_path,
+        mutation=mutate,
+    )
+
+
+def test_preflight_guard_rejects_transient_run_root_aba(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def mutate(_parent: Path, run_root: Path) -> None:
+        run_root.rmdir()
+        run_root.mkdir()
+
+    _assert_preflight_guard_rejects_transient_namespace_mutation(
+        monkeypatch,
+        tmp_path,
+        mutation=mutate,
+    )
+
+
+def test_preflight_guard_rejects_transient_parent_aba(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def mutate(parent: Path, _run_root: Path) -> None:
+        parent.rmdir()
+        parent.mkdir()
+
+    _assert_preflight_guard_rejects_transient_namespace_mutation(
+        monkeypatch,
+        tmp_path,
+        mutation=mutate,
+        create_run_root=False,
+    )
+
+
+def test_preflight_guard_rejects_final_check_to_success_emit_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "planned-parent"
+    parent.mkdir()
+    run_root = parent / "planned-run"
+    run_root.mkdir()
+    monkeypatch.setattr(formal, "PLANNED_RUN_ROOT", run_root)
+    config = _frozen_action_config("preflight")
+    context = _TrustedBootstrapContext(config)
+    runner = _FakeRunner(_candidate())
+    original_emit = formal._emit_trusted_json
+
+    def attack() -> None:
+        (run_root / "after-terminal-before-emit.json").write_bytes(b"{}")
+
+    def raced_emit(candidate_context: object, value: object) -> None:
+        attack()
+        original_emit(candidate_context, value)
+
+    context.guard_terminal_attack = attack
+    monkeypatch.setattr(formal, "_load_runner", lambda _context: runner)
+    monkeypatch.setattr(formal, "_emit_trusted_json", raced_emit)
+    monkeypatch.setattr(
+        formal,
+        "_postverify_verified_module_ledger",
+        lambda _context, _manifest: None,
+    )
+
+    with pytest.raises(formal.FormalRunSpecError, match="guard"):
+        formal.trusted_dispatch(context, config)
+
+    assert context.buffered == []
+    assert list(run_root.iterdir()) == []
 
 
 def test_preflight_rejects_empty_run_root_replaced_after_initial_check(
