@@ -613,8 +613,12 @@ def test_planned_run_root_must_be_absent_or_strictly_empty_without_sidecars(
     monkeypatch.setattr(formal, "PLANNED_RUN_ROOT", run_root)
 
     formal.verify_planned_run_root()
+    absent_snapshot = formal._planned_run_root_snapshot()
+    formal._postverify_planned_run_root(absent_snapshot)
     run_root.mkdir()
     formal.verify_planned_run_root()
+    empty_snapshot = formal._planned_run_root_snapshot()
+    formal._postverify_planned_run_root(empty_snapshot)
 
     (run_root / "state.json").write_text("{}", encoding="utf-8")
     with pytest.raises(formal.FormalRunSpecError, match="not empty"):
@@ -1117,7 +1121,21 @@ def test_success_output_is_buffered_until_external_terminal_postverify(
 
     context.emit_json = emit_json
     monkeypatch.setattr(formal, "_load_runner", lambda _context: runner)
-    monkeypatch.setattr(formal, "verify_planned_run_root", lambda: None)
+    planned_snapshot = object()
+    monkeypatch.setattr(
+        formal,
+        "_planned_run_root_snapshot",
+        lambda: planned_snapshot,
+    )
+    monkeypatch.setattr(
+        formal,
+        "_postverify_planned_run_root",
+        lambda snapshot: (
+            events.append("run-root-terminal")
+            if snapshot is planned_snapshot
+            else (_ for _ in ()).throw(AssertionError("unexpected snapshot"))
+        ),
+    )
     monkeypatch.setattr(
         formal,
         "publish_candidate",
@@ -1131,7 +1149,7 @@ def test_success_output_is_buffered_until_external_terminal_postverify(
 
     assert formal.trusted_dispatch(context, config) == 0
 
-    assert events == ["ledger", "emit"]
+    assert events == ["ledger", "run-root-terminal", "emit"]
     assert len(context.buffered) == 1
     assert context.postverify_calls == 0
     assert capsys.readouterr() == ("", "")
@@ -1144,11 +1162,25 @@ def test_preflight_dispatch_never_publishes_runs_or_verifies(
     context = _TrustedBootstrapContext(config)
     runner = _FakeRunner(_candidate())
     events: list[str] = []
+    planned_snapshot = object()
     monkeypatch.setattr(formal, "_load_runner", lambda _context: runner)
+
+    def postverify_planned_run_root(snapshot: object) -> None:
+        assert snapshot is planned_snapshot
+        events.append("run-root-terminal-verified")
+
     monkeypatch.setattr(
         formal,
-        "verify_planned_run_root",
-        lambda: events.append("run-root-readonly-verified"),
+        "_planned_run_root_snapshot",
+        lambda: (
+            events.append("run-root-readonly-snapshotted")
+            or planned_snapshot
+        ),
+    )
+    monkeypatch.setattr(
+        formal,
+        "_postverify_planned_run_root",
+        postverify_planned_run_root,
     )
     monkeypatch.setattr(
         formal,
@@ -1165,7 +1197,11 @@ def test_preflight_dispatch_never_publishes_runs_or_verifies(
 
     assert formal.trusted_dispatch(context, config) == 0
 
-    assert events == ["run-root-readonly-verified", "ledger"]
+    assert events == [
+        "run-root-readonly-snapshotted",
+        "ledger",
+        "run-root-terminal-verified",
+    ]
     assert runner.validate_calls
     assert context.buffered == [
         formal.safe_summary(
@@ -1272,7 +1308,18 @@ def test_failed_terminal_ledger_proof_emits_no_success(
     context = _TrustedBootstrapContext(config)
     runner = _FakeRunner(_candidate())
     monkeypatch.setattr(formal, "_load_runner", lambda _context: runner)
-    monkeypatch.setattr(formal, "verify_planned_run_root", lambda: None)
+    monkeypatch.setattr(
+        formal,
+        "_planned_run_root_snapshot",
+        object,
+    )
+    monkeypatch.setattr(
+        formal,
+        "_postverify_planned_run_root",
+        lambda _snapshot: (_ for _ in ()).throw(
+            AssertionError("run-root proof must follow the ledger proof")
+        ),
+    )
     monkeypatch.setattr(
         formal,
         "publish_candidate",

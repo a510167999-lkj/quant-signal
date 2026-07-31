@@ -1235,33 +1235,124 @@ def verify_formal_worktree(
     }
 
 
-def verify_planned_run_root() -> None:
-    parent = PLANNED_RUN_ROOT.parent
-    if not parent.is_dir() or _is_reparse(parent):
-        raise FormalRunSpecError("planned run-root parent rejected")
+_PlannedRunRootSnapshot = tuple[os.stat_result, os.stat_result | None]
+
+
+def _same_file_identity(
+    before: os.stat_result,
+    after: os.stat_result,
+) -> bool:
+    return (
+        stat.S_IFMT(before.st_mode) == stat.S_IFMT(after.st_mode)
+        and os.path.samestat(before, after)
+    )
+
+
+def _planned_run_root_sidecars(parent: Path) -> list[Path]:
     sidecar_prefixes = (
         f"{PLANNED_RUN_ROOT.name}.",
         f".{PLANNED_RUN_ROOT.name}.",
     )
     try:
-        sidecars = [
-            child for child in parent.iterdir() if child.name.startswith(sidecar_prefixes)
+        return [
+            child
+            for child in parent.iterdir()
+            if child.name.startswith(sidecar_prefixes)
         ]
     except OSError as exc:
-        raise FormalRunSpecError("planned run-root parent unavailable") from exc
-    if sidecars:
-        raise FormalRunSpecError("planned run-root sidecar exists")
-    if not PLANNED_RUN_ROOT.exists():
-        if _is_reparse(PLANNED_RUN_ROOT):
-            raise FormalRunSpecError("planned run-root rejected")
-        return
-    if not PLANNED_RUN_ROOT.is_dir() or _is_reparse(PLANNED_RUN_ROOT):
-        raise FormalRunSpecError("planned run-root rejected")
+        raise FormalRunSpecError(
+            "planned run-root parent unavailable"
+        ) from exc
+
+
+def _planned_run_root_snapshot() -> _PlannedRunRootSnapshot:
+    parent = PLANNED_RUN_ROOT.parent
     try:
-        if next(PLANNED_RUN_ROOT.iterdir(), None) is not None:
-            raise FormalRunSpecError("planned run-root is not empty")
+        parent_before = parent.lstat()
     except OSError as exc:
-        raise FormalRunSpecError("planned run-root unavailable") from exc
+        raise FormalRunSpecError(
+            "planned run-root parent rejected"
+        ) from exc
+    if (
+        not stat.S_ISDIR(parent_before.st_mode)
+        or _is_reparse(parent)
+    ):
+        raise FormalRunSpecError("planned run-root parent rejected")
+    if _planned_run_root_sidecars(parent):
+        raise FormalRunSpecError("planned run-root sidecar exists")
+
+    try:
+        root_before = PLANNED_RUN_ROOT.lstat()
+    except FileNotFoundError:
+        root_before = None
+    except OSError as exc:
+        raise FormalRunSpecError(
+            "planned run-root unavailable"
+        ) from exc
+
+    root_after: os.stat_result | None = None
+    if root_before is None:
+        if os.path.lexists(PLANNED_RUN_ROOT):
+            raise FormalRunSpecError("planned run-root rejected")
+    else:
+        if (
+            not stat.S_ISDIR(root_before.st_mode)
+            or _is_reparse(PLANNED_RUN_ROOT)
+        ):
+            raise FormalRunSpecError("planned run-root rejected")
+        try:
+            if next(PLANNED_RUN_ROOT.iterdir(), None) is not None:
+                raise FormalRunSpecError(
+                    "planned run-root is not empty"
+                )
+            root_after = PLANNED_RUN_ROOT.lstat()
+        except OSError as exc:
+            raise FormalRunSpecError(
+                "planned run-root unavailable"
+            ) from exc
+        if (
+            not _same_file_identity(root_before, root_after)
+            or _is_reparse(PLANNED_RUN_ROOT)
+        ):
+            raise FormalRunSpecError("planned run-root drifted")
+
+    if _planned_run_root_sidecars(parent):
+        raise FormalRunSpecError("planned run-root sidecar exists")
+    try:
+        parent_after = parent.lstat()
+    except OSError as exc:
+        raise FormalRunSpecError(
+            "planned run-root parent unavailable"
+        ) from exc
+    if (
+        not _same_file_identity(parent_before, parent_after)
+        or _is_reparse(parent)
+    ):
+        raise FormalRunSpecError("planned run-root parent drifted")
+    if root_before is None and os.path.lexists(PLANNED_RUN_ROOT):
+        raise FormalRunSpecError("planned run-root drifted")
+    return parent_after, root_after
+
+
+def verify_planned_run_root() -> None:
+    _planned_run_root_snapshot()
+
+
+def _postverify_planned_run_root(
+    snapshot: _PlannedRunRootSnapshot,
+) -> None:
+    parent_before, root_before = snapshot
+    parent_after, root_after = _planned_run_root_snapshot()
+    if (
+        not _same_file_identity(parent_before, parent_after)
+        or (root_before is None) != (root_after is None)
+        or (
+            root_before is not None
+            and root_after is not None
+            and not _same_file_identity(root_before, root_after)
+        )
+    ):
+        raise FormalRunSpecError("planned run-root drifted")
 
 
 def _assert_no_credential_shape(value: Any) -> None:
@@ -1732,8 +1823,9 @@ def trusted_dispatch(
         )
     runner = _load_runner(context)
     action = config["action"]
+    planned_run_root_snapshot = None
     if action in {"build-spec", "preflight"}:
-        verify_planned_run_root()
+        planned_run_root_snapshot = _planned_run_root_snapshot()
         candidate, content = build_and_verify_candidate(runner)
         published = action == "build-spec"
         if published:
@@ -1764,6 +1856,10 @@ def trusted_dispatch(
                 "formal daily-basic verification rejected"
             ) from exc
     _postverify_verified_module_ledger(context, source_manifest)
+    if planned_run_root_snapshot is not None:
+        _postverify_planned_run_root(
+            planned_run_root_snapshot
+        )
     _emit_trusted_json(context, result)
     return 0
 
