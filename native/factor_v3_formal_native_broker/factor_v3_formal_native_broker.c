@@ -3129,9 +3129,12 @@ static int json_top_uint32(
         if (character < '0' || character > '9') {
             return 0;
         }
-        observed = observed * 10 + (uint64_t)(character - '0');
-        if (observed > UINT_MAX) {
-            return 0;
+        {
+            uint64_t digit = (uint64_t)(character - '0');
+            if (observed > ((uint64_t)UINT_MAX - digit) / 10) {
+                return 0;
+            }
+            observed = observed * 10 + digit;
         }
     }
     *output = (DWORD)observed;

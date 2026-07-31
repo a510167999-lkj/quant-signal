@@ -865,6 +865,26 @@ def test_held_ledger_file_removes_precommit_partial_file(
     assert not path.exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_held_ledger_file_keeps_original_delete_lease_until_close(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    path = parent / "committed.json"
+    raw = _canonical_bytes({"schema": "test-ledger/v1"})
+
+    held = supervisor._HeldLedgerFile(path, raw, replay_label="test ledger")
+    try:
+        with pytest.raises(PermissionError):
+            path.read_bytes()
+        held.postverify()
+    finally:
+        held.close()
+
+    assert path.read_bytes() == raw
+
+
 def test_native_credential_handle_is_requested_only_after_claim_and_not_reopened(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1587,6 +1607,22 @@ def test_original_and_resume_share_one_atomic_worker_and_terminal_lease(
         original_sha256,
     )
     assert claim_path.is_file()
+    claim_sha256 = _sha256(
+        _canonical_bytes(
+            {
+                "action": "run",
+                "authorization_id_sha256": payload["authorization_id_sha256"],
+                "authorization_nonce_sha256": payload["authorization_nonce_sha256"],
+                "bootstrap_execution_authorization_sha256": payload[
+                    "bootstrap_execution_authorization_sha256"
+                ],
+                "launch_authorization_sha256": original_sha256,
+                "replay_scope": payload["replay_scope"],
+                "schema": "factor-v3-formal-supervisor-execution-claim/v1",
+                "status": "claimed",
+            }
+        )
+    )
     payload.update(
         {
             "action": "resume",
@@ -1603,7 +1639,7 @@ def test_original_and_resume_share_one_atomic_worker_and_terminal_lease(
             ),
             "resume_of_replay_scope": payload["replay_scope"],
             "resume_status_path": str(claim_path),
-            "resume_status_sha256": _file_sha256(claim_path),
+            "resume_status_sha256": claim_sha256,
         }
     )
     resume_path = _rewrite_authorization(

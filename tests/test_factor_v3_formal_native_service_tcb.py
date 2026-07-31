@@ -1110,6 +1110,19 @@ def test_native_resume_status_requires_exact_original_run_claim() -> None:
     assert '"run"' in validator
 
 
+def test_native_uint32_parser_checks_bounds_before_multiply_add() -> None:
+    source = BROKER_SOURCE.read_text(encoding="utf-8")
+    parser = source[
+        source.index("static int json_top_uint32"):
+        source.index("static int hex_value")
+    ]
+
+    guard = "observed > ((uint64_t)UINT_MAX - digit) / 10"
+    update = "observed = observed * 10 + digit"
+    assert guard in parser
+    assert parser.index(guard) < parser.index(update)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
 def test_interactive_process_is_rejected_as_formal_service_identity(
     tmp_path: Path,

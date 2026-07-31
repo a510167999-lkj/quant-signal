@@ -947,7 +947,7 @@ class _HeldLedgerFile:
         handle = create_file(
             str(candidate),
             0x80000000 | 0x40000000 | 0x00010000,
-            0x00000001 | 0x00000002 | 0x00000004,
+            0x00000001,
             None,
             1,
             0x00200000 | 0x08000000,
@@ -977,76 +977,12 @@ class _HeldLedgerFile:
             self._stream.flush()
             os.fsync(self._stream.fileno())
             self.postverify()
-            self._seal_committed_handle()
         except BaseException:
             try:
                 self._discard_precommit()
             finally:
                 self.close()
             raise
-
-    @staticmethod
-    def _reopen(
-        stream: Any,
-        *,
-        desired_access: int,
-        share_mode: int,
-        mode: str,
-    ) -> Any:
-        kernel32 = _kernel32()
-        reopen_file = kernel32.ReOpenFile
-        reopen_file.argtypes = (
-            wintypes.HANDLE,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.DWORD,
-        )
-        reopen_file.restype = wintypes.HANDLE
-        handle = reopen_file(
-            wintypes.HANDLE(msvcrt.get_osfhandle(stream.fileno())),
-            desired_access,
-            share_mode,
-            0x00200000 | 0x08000000,
-        )
-        invalid = ctypes.c_void_p(-1).value
-        if handle in (None, invalid):
-            raise FormalSupervisorError("execution ledger handle transition rejected")
-        try:
-            descriptor = msvcrt.open_osfhandle(
-                int(handle),
-                (os.O_RDWR if "+" in mode else os.O_RDONLY)
-                | getattr(os, "O_BINARY", 0),
-            )
-        except BaseException:
-            kernel32.CloseHandle(handle)
-            raise
-        return os.fdopen(descriptor, mode)
-
-    def _seal_committed_handle(self) -> None:
-        intermediate = self._reopen(
-            self._stream,
-            desired_access=0x80000000,
-            share_mode=0x00000001 | 0x00000002 | 0x00000004,
-            mode="rb",
-        )
-        self._stream.close()
-        self._stream = intermediate
-        final_stream = None
-        try:
-            final_stream = self._reopen(
-                intermediate,
-                desired_access=0x80000000 | 0x40000000,
-                share_mode=0x00000001,
-                mode="r+b",
-            )
-            self._stream = final_stream
-            self.postverify()
-        except BaseException:
-            if final_stream is not None:
-                final_stream.close()
-            self._stream = intermediate
-            raise
-        intermediate.close()
 
     def _discard_precommit(self) -> None:
         class _FileDispositionInfo(ctypes.Structure):
@@ -1062,31 +998,13 @@ class _HeldLedgerFile:
         )
         set_information.restype = wintypes.BOOL
         disposition = _FileDispositionInfo(True)
-        if set_information(
+        if not set_information(
             wintypes.HANDLE(msvcrt.get_osfhandle(self._stream.fileno())),
             4,
             ctypes.byref(disposition),
             ctypes.sizeof(disposition),
         ):
-            return
-        delete_stream = self._reopen(
-            self._stream,
-            desired_access=0x80000000 | 0x00010000,
-            share_mode=0x00000001 | 0x00000002 | 0x00000004,
-            mode="rb",
-        )
-        try:
-            if not set_information(
-                wintypes.HANDLE(msvcrt.get_osfhandle(delete_stream.fileno())),
-                4,
-                ctypes.byref(disposition),
-                ctypes.sizeof(disposition),
-            ):
-                raise FormalSupervisorError(
-                    "execution ledger partial cleanup rejected"
-                )
-        finally:
-            delete_stream.close()
+            raise FormalSupervisorError("execution ledger partial cleanup rejected")
 
     def postverify(self) -> None:
         self._chain.postverify()
