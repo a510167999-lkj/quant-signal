@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import uuid
@@ -64,6 +65,28 @@ def _run_sidecars(root: Path) -> tuple[str, ...]:
             )
         )
     )
+
+
+def test_immutable_tree_metadata_detects_same_size_rewrite_with_restored_mtime(
+    tmp_path: Path,
+) -> None:
+    root = (tmp_path / "run").resolve()
+    root.mkdir()
+    artifact = root / "artifact.bin"
+    artifact.write_bytes(b"original")
+    original = artifact.stat()
+    before = _immutable_tree_metadata(root)
+
+    artifact.write_bytes(b"tampered")
+    os.utime(
+        artifact,
+        ns=(original.st_atime_ns, original.st_mtime_ns),
+    )
+    after = _immutable_tree_metadata(root)
+
+    assert before["artifact.bin"]["sha256"] == hashlib.sha256(b"original").hexdigest()
+    assert after["artifact.bin"]["sha256"] == hashlib.sha256(b"tampered").hexdigest()
+    assert before != after
 
 
 def _daily_authority_code(session: str) -> str:
