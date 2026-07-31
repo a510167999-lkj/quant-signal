@@ -168,10 +168,12 @@ typedef struct F3_FILE_RENAME_INFORMATION {
 } F3_FILE_RENAME_INFORMATION;
 
 #define F3_OBJ_CASE_INSENSITIVE 0x00000040UL
+#define F3_FILE_OPEN 0x00000001UL
 #define F3_FILE_CREATE 0x00000002UL
 #define F3_FILE_WRITE_THROUGH 0x00000002UL
 #define F3_FILE_SYNCHRONOUS_IO_NONALERT 0x00000020UL
 #define F3_FILE_NON_DIRECTORY_FILE 0x00000040UL
+#define F3_FILE_OPEN_REPARSE_POINT 0x00200000UL
 #define F3_FILE_RENAME_INFORMATION_CLASS 10UL
 
 static int strict_windows_candidate_path(const wchar_t *path);
@@ -3007,6 +3009,77 @@ static int json_top_is_null(
         && memcmp(value.value, "null", 4) == 0;
 }
 
+static int json_top_has_exact_keys(
+    const unsigned char *payload,
+    size_t payload_size,
+    const char *const *names,
+    size_t count
+) {
+    size_t cursor = 1;
+    size_t field = 0;
+    if (payload == NULL
+        || names == NULL
+        || count == 0
+        || payload_size < 2
+        || payload[0] != '{'
+        || payload[payload_size - 1] != '}') {
+        return 0;
+    }
+    while (field < count) {
+        size_t key_start;
+        size_t key_end;
+        size_t key_length;
+        size_t expected_length = strlen(names[field]);
+        if (cursor >= payload_size - 1 || payload[cursor] != '"') {
+            return 0;
+        }
+        key_start = cursor + 1;
+        if (!json_skip_string(payload, payload_size, &cursor)) {
+            return 0;
+        }
+        key_end = cursor - 1;
+        key_length = key_end - key_start;
+        if (key_length != expected_length
+            || memcmp(payload + key_start, names[field], key_length) != 0
+            || cursor >= payload_size
+            || payload[cursor++] != ':'
+            || !json_skip_value(payload, payload_size, &cursor, 0)) {
+            return 0;
+        }
+        ++field;
+        if (field == count) {
+            return cursor == payload_size - 1 && payload[cursor] == '}';
+        }
+        if (cursor >= payload_size || payload[cursor++] != ',') {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static int json_top_has_sha256(
+    const unsigned char *payload,
+    size_t payload_size,
+    const char *name
+) {
+    ByteSlice value;
+    size_t index;
+    if (!json_top_field(payload, payload_size, name, &value)
+        || value.length != 66
+        || value.value[0] != '"'
+        || value.value[65] != '"') {
+        return 0;
+    }
+    for (index = 1; index < 65; ++index) {
+        unsigned char character = (unsigned char)value.value[index];
+        if (!((character >= '0' && character <= '9')
+                || (character >= 'a' && character <= 'f'))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int hex_value(char value) {
     if (value >= '0' && value <= '9') {
         return value - '0';
@@ -4800,6 +4873,123 @@ cleanup:
     return ok;
 }
 
+static int delete_failed_persistent_completion(
+    ProtectedCompletionNamespace *completion,
+    const char expected_sha256[65]
+) {
+    FILE_ATTRIBUTE_TAG_INFO tag;
+    FILE_DISPOSITION_INFO disposition = {TRUE};
+    F3_UNICODE_STRING name;
+    F3_OBJECT_ATTRIBUTES object_attributes;
+    F3_IO_STATUS_BLOCK io_status;
+    F3_NT_CREATE_FILE nt_create_file;
+    HMODULE ntdll;
+    HeldFile file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    BY_HANDLE_FILE_INFORMATION information;
+    unsigned char digest[32];
+    char observed_sha256[65];
+    HANDLE parent_handle;
+    int ok = 0;
+    memset(&tag, 0, sizeof(tag));
+    memset(&name, 0, sizeof(name));
+    memset(&object_attributes, 0, sizeof(object_attributes));
+    memset(&io_status, 0, sizeof(io_status));
+    memset(&information, 0, sizeof(information));
+    memset(digest, 0, sizeof(digest));
+    memset(observed_sha256, 0, sizeof(observed_sha256));
+    if (completion == NULL
+        || completion->chain.count == 0
+        || expected_sha256 == NULL
+        || strlen(expected_sha256) != 64
+        || !held_directory_chain_unchanged(&completion->chain)) {
+        goto cleanup;
+    }
+    parent_handle = completion->chain.entries[
+        completion->chain.count - 1
+    ].handle;
+    ntdll = GetModuleHandleW(L"ntdll.dll");
+    nt_create_file = ntdll == NULL
+        ? NULL
+        : (F3_NT_CREATE_FILE)(void *)GetProcAddress(
+            ntdll,
+            "NtCreateFile"
+        );
+    if (parent_handle == INVALID_HANDLE_VALUE
+        || nt_create_file == NULL
+        || wcslen(completion->final_name) > USHRT_MAX / sizeof(wchar_t)) {
+        goto cleanup;
+    }
+    name.Length = (USHORT)(
+        wcslen(completion->final_name) * sizeof(wchar_t)
+    );
+    name.MaximumLength = name.Length;
+    name.Buffer = completion->final_name;
+    object_attributes.Length = sizeof(object_attributes);
+    object_attributes.RootDirectory = parent_handle;
+    object_attributes.ObjectName = &name;
+    object_attributes.Attributes = F3_OBJ_CASE_INSENSITIVE;
+    if (nt_create_file(
+            &file.handle,
+            GENERIC_READ | DELETE | SYNCHRONIZE,
+            &object_attributes,
+            &io_status,
+            NULL,
+            FILE_ATTRIBUTE_NORMAL,
+            0,
+            F3_FILE_OPEN,
+            F3_FILE_NON_DIRECTORY_FILE
+                | F3_FILE_SYNCHRONOUS_IO_NONALERT
+                | F3_FILE_OPEN_REPARSE_POINT,
+            NULL,
+            0
+        ) < 0
+        || file.handle == INVALID_HANDLE_VALUE
+        || !GetFileInformationByHandle(file.handle, &information)
+        || !GetFileInformationByHandleEx(
+            file.handle,
+            FileAttributeTagInfo,
+            &tag,
+            sizeof(tag)
+        )
+        || information.nNumberOfLinks != 1
+        || information.nFileSizeHigh != 0
+        || (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+        || (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || !held_file_allows_only_trusted_mutation(file.handle)) {
+        goto cleanup;
+    }
+    file.size_high = information.nFileSizeHigh;
+    file.size_low = information.nFileSizeLow;
+    if (!hash_held_file(&file, digest)) {
+        goto cleanup;
+    }
+    digest_to_ascii(digest, observed_sha256);
+    if (strcmp(observed_sha256, expected_sha256) != 0
+        || !SetFileInformationByHandle(
+            file.handle,
+            FileDispositionInfo,
+            &disposition,
+            sizeof(disposition)
+        )) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    close_held(&file);
+    if (ok && !held_directory_chain_unchanged(&completion->chain)) {
+        ok = 0;
+    }
+    SecureZeroMemory(&tag, sizeof(tag));
+    SecureZeroMemory(&name, sizeof(name));
+    SecureZeroMemory(&object_attributes, sizeof(object_attributes));
+    SecureZeroMemory(&io_status, sizeof(io_status));
+    SecureZeroMemory(&information, sizeof(information));
+    SecureZeroMemory(digest, sizeof(digest));
+    SecureZeroMemory(observed_sha256, sizeof(observed_sha256));
+    return ok;
+}
+
 static int open_persistent_cng_signing_key(
     NCRYPT_PROV_HANDLE *provider,
     NCRYPT_KEY_HANDLE *key
@@ -4845,6 +5035,229 @@ static int open_persistent_cng_signing_key(
         return 0;
     }
     return 1;
+}
+
+static int validate_completion_lineage_before_signing(
+    const ProductionCandidate *candidate,
+    const SignedEnvelope *launch_envelope,
+    const char launch_authorization_sha256[65],
+    const char claim_sha256[65],
+    const char supervisor_completed_sha256[65],
+    const char worker_terminal_sha256[65],
+    HeldFile *claim_file,
+    HeldFile *completed_file
+) {
+    static const char *const claim_keys[] = {
+        "action",
+        "authorization_id_sha256",
+        "authorization_nonce_sha256",
+        "bootstrap_execution_authorization_sha256",
+        "launch_authorization_sha256",
+        "replay_scope",
+        "schema",
+        "status",
+    };
+    static const char *const completed_keys[] = {
+        "artifact_manifest_sha256",
+        "claim_sha256",
+        "launch_authorization_sha256",
+        "schema",
+        "status",
+        "worker_terminal_sha256",
+    };
+    SignedEnvelope claim_view;
+    unsigned char *claim_raw = NULL;
+    unsigned char *completed_raw = NULL;
+    DWORD claim_size = 0;
+    DWORD completed_size = 0;
+    unsigned char digest[32];
+    char observed_sha256[65];
+    wchar_t claim_path[32768];
+    wchar_t completed_path[32768];
+    int ok = 0;
+    memset(&claim_view, 0, sizeof(claim_view));
+    memset(digest, 0, sizeof(digest));
+    memset(observed_sha256, 0, sizeof(observed_sha256));
+    memset(claim_path, 0, sizeof(claim_path));
+    memset(completed_path, 0, sizeof(completed_path));
+    if (candidate == NULL
+        || launch_envelope == NULL
+        || claim_file == NULL
+        || completed_file == NULL
+        || claim_file->handle != INVALID_HANDLE_VALUE
+        || completed_file->handle != INVALID_HANDLE_VALUE
+        || !expected_ledger_path(
+            candidate->execution_ledger_root,
+            "claims",
+            launch_authorization_sha256,
+            claim_path,
+            sizeof(claim_path) / sizeof(claim_path[0])
+        )
+        || !open_held_file(
+            claim_path,
+            F3_MAX_AUTHORIZATION_BYTES,
+            claim_file
+        )
+        || !hash_held_file(claim_file, digest)) {
+        goto cleanup;
+    }
+    digest_to_ascii(digest, observed_sha256);
+    if (strcmp(observed_sha256, claim_sha256) != 0
+        || !read_candidate(claim_file, &claim_raw, &claim_size)) {
+        goto cleanup;
+    }
+    claim_view.payload = claim_raw;
+    claim_view.payload_size = claim_size;
+    if (!json_top_has_exact_keys(
+            claim_raw,
+            claim_size,
+            claim_keys,
+            sizeof(claim_keys) / sizeof(claim_keys[0])
+        )
+        || !json_top_string_matches(
+            claim_raw,
+            claim_size,
+            "schema",
+            "factor-v3-formal-supervisor-execution-claim/v1",
+            strlen("factor-v3-formal-supervisor-execution-claim/v1")
+        )
+        || !json_top_string_matches(
+            claim_raw,
+            claim_size,
+            "status",
+            "claimed",
+            strlen("claimed")
+        )
+        || !json_top_string_matches(
+            claim_raw,
+            claim_size,
+            "launch_authorization_sha256",
+            launch_authorization_sha256,
+            64
+        )
+        || !json_top_strings_equal(
+            &claim_view,
+            "action",
+            launch_envelope,
+            "action"
+        )
+        || !json_top_strings_equal(
+            &claim_view,
+            "authorization_id_sha256",
+            launch_envelope,
+            "authorization_id_sha256"
+        )
+        || !json_top_strings_equal(
+            &claim_view,
+            "authorization_nonce_sha256",
+            launch_envelope,
+            "authorization_nonce_sha256"
+        )
+        || !json_top_strings_equal(
+            &claim_view,
+            "bootstrap_execution_authorization_sha256",
+            launch_envelope,
+            "bootstrap_execution_authorization_sha256"
+        )
+        || !json_top_strings_equal(
+            &claim_view,
+            "replay_scope",
+            launch_envelope,
+            "replay_scope"
+        )
+        || !expected_ledger_path(
+            candidate->execution_ledger_root,
+            "completed",
+            launch_authorization_sha256,
+            completed_path,
+            sizeof(completed_path) / sizeof(completed_path[0])
+        )
+        || !open_held_file(
+            completed_path,
+            F3_MAX_AUTHORIZATION_BYTES,
+            completed_file
+        )
+        || !hash_held_file(completed_file, digest)) {
+        goto cleanup;
+    }
+    digest_to_ascii(digest, observed_sha256);
+    if (strcmp(observed_sha256, supervisor_completed_sha256) != 0
+        || !read_candidate(
+            completed_file,
+            &completed_raw,
+            &completed_size
+        )
+        || !json_top_has_exact_keys(
+            completed_raw,
+            completed_size,
+            completed_keys,
+            sizeof(completed_keys) / sizeof(completed_keys[0])
+        )
+        || !json_top_string_matches(
+            completed_raw,
+            completed_size,
+            "schema",
+            "factor-v3-formal-supervisor-execution-completed/v1",
+            strlen("factor-v3-formal-supervisor-execution-completed/v1")
+        )
+        || !json_top_string_matches(
+            completed_raw,
+            completed_size,
+            "status",
+            "completed",
+            strlen("completed")
+        )
+        || !json_top_string_matches(
+            completed_raw,
+            completed_size,
+            "launch_authorization_sha256",
+            launch_authorization_sha256,
+            64
+        )
+        || !json_top_string_matches(
+            completed_raw,
+            completed_size,
+            "claim_sha256",
+            claim_sha256,
+            64
+        )
+        || !json_top_string_matches(
+            completed_raw,
+            completed_size,
+            "worker_terminal_sha256",
+            worker_terminal_sha256,
+            64
+        )
+        || !json_top_has_sha256(
+            completed_raw,
+            completed_size,
+            "artifact_manifest_sha256"
+        )
+        || !held_unchanged(claim_file, NULL)
+        || !held_unchanged(completed_file, NULL)) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (completed_raw != NULL) {
+        SecureZeroMemory(completed_raw, (SIZE_T)completed_size + 1);
+        HeapFree(GetProcessHeap(), 0, completed_raw);
+    }
+    if (claim_raw != NULL) {
+        SecureZeroMemory(claim_raw, (SIZE_T)claim_size + 1);
+        HeapFree(GetProcessHeap(), 0, claim_raw);
+    }
+    if (!ok) {
+        close_held(completed_file);
+        close_held(claim_file);
+    }
+    SecureZeroMemory(&claim_view, sizeof(claim_view));
+    SecureZeroMemory(digest, sizeof(digest));
+    SecureZeroMemory(observed_sha256, sizeof(observed_sha256));
+    SecureZeroMemory(claim_path, sizeof(claim_path));
+    SecureZeroMemory(completed_path, sizeof(completed_path));
+    return ok;
 }
 
 static int write_persistent_cng_completion(
@@ -5742,6 +6155,7 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
     HeldFile candidate_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile launch_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile credential = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile claim_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
     HeldFile supervisor_completed_file = {
         INVALID_HANDLE_VALUE, 0, 0, {0}
     };
@@ -5754,7 +6168,6 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
     DWORD launch_size = 0;
     unsigned char candidate_digest[32];
     unsigned char launch_digest[32];
-    unsigned char supervisor_completed_digest[32];
     wchar_t launch_path[32768];
     wchar_t command_line[32768];
     wchar_t runtime_directory[32768];
@@ -5763,11 +6176,9 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
     DWORD completed_frame_size = 0;
     char native_terminal[1024];
     int native_terminal_size = 0;
-    wchar_t supervisor_completed_path[32768];
     wchar_t native_completed_path[32768];
     char authorization_sha256[65];
     char candidate_sha256[65];
-    char observed_supervisor_completed_sha256[65];
     char native_completed_receipt_sha256[65];
     char claim_sha256[65];
     char supervisor_completed_sha256[65];
@@ -5780,6 +6191,7 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
     int attributes_initialized = 0;
     int child_created = 0;
     int restricted_token_ready = 0;
+    int native_completion_published = 0;
     int ok = 0;
     const char *action = NULL;
     memset(&startup, 0, sizeof(startup));
@@ -5791,15 +6203,9 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
     memset(&completion_namespace, 0, sizeof(completion_namespace));
     initialize_held_directory_chain(&completion_namespace.chain);
     memset(launch_path, 0, sizeof(launch_path));
-    memset(supervisor_completed_path, 0, sizeof(supervisor_completed_path));
     memset(native_completed_path, 0, sizeof(native_completed_path));
     memset(authorization_sha256, 0, sizeof(authorization_sha256));
     memset(candidate_sha256, 0, sizeof(candidate_sha256));
-    memset(
-        observed_supervisor_completed_sha256,
-        0,
-        sizeof(observed_supervisor_completed_sha256)
-    );
     memset(
         native_completed_receipt_sha256,
         0,
@@ -6194,34 +6600,20 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
         goto cleanup;
     }
     F3_PRODUCTION_LAUNCH_STAGE(92);
-    if (!expected_ledger_path(
-            candidate.execution_ledger_root,
-            "completed",
+    if (!validate_completion_lineage_before_signing(
+            &candidate,
+            &envelope,
             authorization_sha256,
-            supervisor_completed_path,
-            32768
-        )
-        || !open_held_file(
-            supervisor_completed_path,
-            F3_MAX_AUTHORIZATION_BYTES,
+            claim_sha256,
+            supervisor_completed_sha256,
+            worker_terminal_sha256,
+            &claim_file,
             &supervisor_completed_file
-        )
-        || !hash_held_file(
-            &supervisor_completed_file,
-            supervisor_completed_digest
         )) {
         goto cleanup;
     }
     F3_PRODUCTION_LAUNCH_STAGE(93);
-    digest_to_ascii(
-        supervisor_completed_digest,
-        observed_supervisor_completed_sha256
-    );
-    if (strcmp(
-            observed_supervisor_completed_sha256,
-            supervisor_completed_sha256
-        ) != 0
-        || !write_persistent_cng_completion(
+    if (!write_persistent_cng_completion(
             &completion_namespace,
             native_completed_path,
             authorization_sha256,
@@ -6233,8 +6625,10 @@ int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
         )) {
         goto cleanup;
     }
+    native_completion_published = 1;
     F3_PRODUCTION_LAUNCH_STAGE(94);
     if (!verify_persistent_cng_completion(candidate_path)
+        || !held_unchanged(&claim_file, NULL)
         || !held_unchanged(&supervisor_completed_file, NULL)
         || !held_directory_chain_unchanged(
             &completion_namespace.chain
@@ -6323,7 +6717,14 @@ cleanup:
         SecureZeroMemory(candidate_raw, (SIZE_T)candidate_size + 1);
         HeapFree(GetProcessHeap(), 0, candidate_raw);
     }
+    if (!ok && native_completion_published) {
+        delete_failed_persistent_completion(
+            &completion_namespace,
+            native_completed_receipt_sha256
+        );
+    }
     close_held(&credential);
+    close_held(&claim_file);
     close_held(&supervisor_completed_file);
     close_held(&launch_file);
     close_held(&candidate_file);
@@ -6338,26 +6739,14 @@ cleanup:
     );
     SecureZeroMemory(candidate_digest, sizeof(candidate_digest));
     SecureZeroMemory(launch_digest, sizeof(launch_digest));
-    SecureZeroMemory(
-        supervisor_completed_digest,
-        sizeof(supervisor_completed_digest)
-    );
     SecureZeroMemory(launch_path, sizeof(launch_path));
     SecureZeroMemory(command_line, sizeof(command_line));
     SecureZeroMemory(runtime_directory, sizeof(runtime_directory));
     SecureZeroMemory(completed_frame, sizeof(completed_frame));
     SecureZeroMemory(native_terminal, sizeof(native_terminal));
-    SecureZeroMemory(
-        supervisor_completed_path,
-        sizeof(supervisor_completed_path)
-    );
     SecureZeroMemory(native_completed_path, sizeof(native_completed_path));
     SecureZeroMemory(authorization_sha256, sizeof(authorization_sha256));
     SecureZeroMemory(candidate_sha256, sizeof(candidate_sha256));
-    SecureZeroMemory(
-        observed_supervisor_completed_sha256,
-        sizeof(observed_supervisor_completed_sha256)
-    );
     SecureZeroMemory(
         native_completed_receipt_sha256,
         sizeof(native_completed_receipt_sha256)
