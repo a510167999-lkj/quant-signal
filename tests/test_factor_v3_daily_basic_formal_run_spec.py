@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from copy import deepcopy
 from datetime import date, timedelta
 import hashlib
@@ -236,6 +236,45 @@ def _frozen_action_config(action: str = "build-spec") -> _FrozenActionConfig:
             "run_spec_path": str(formal.SPEC_OUTPUT_ROOT / "planned.json"),
         }
     )
+
+
+def _assert_preflight_rejects_postcheck_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    mutation: Callable[[Path, Path], None],
+    create_run_root: bool = True,
+) -> None:
+    parent = tmp_path / "planned-parent"
+    parent.mkdir()
+    run_root = parent / "planned-run"
+    if create_run_root:
+        run_root.mkdir()
+    monkeypatch.setattr(formal, "PLANNED_RUN_ROOT", run_root)
+    config = _frozen_action_config("preflight")
+    context = _TrustedBootstrapContext(config)
+    runner = _FakeRunner(_candidate())
+    events: list[str] = []
+    original_build = formal.build_and_verify_candidate
+
+    def raced_build(candidate_runner: object) -> tuple[dict[str, object], bytes]:
+        candidate, content = original_build(candidate_runner)
+        mutation(parent, run_root)
+        return candidate, content
+
+    monkeypatch.setattr(formal, "_load_runner", lambda _context: runner)
+    monkeypatch.setattr(formal, "build_and_verify_candidate", raced_build)
+    monkeypatch.setattr(
+        formal,
+        "_postverify_verified_module_ledger",
+        lambda _context, _manifest: events.append("ledger"),
+    )
+
+    with pytest.raises(formal.FormalRunSpecError, match="planned run-root"):
+        formal.trusted_dispatch(context, config)
+
+    assert events == ["ledger"]
+    assert context.buffered == []
 
 
 def _required_existing_package_initializers(
@@ -1135,6 +1174,94 @@ def test_preflight_dispatch_never_publishes_runs_or_verifies(
             published=False,
         )
     ]
+
+
+def test_preflight_rejects_run_root_file_created_after_initial_check(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def mutate(_parent: Path, run_root: Path) -> None:
+        (run_root / "hostile-after-check.json").write_text(
+            "{}",
+            encoding="utf-8",
+        )
+
+    _assert_preflight_rejects_postcheck_mutation(
+        monkeypatch,
+        tmp_path,
+        mutation=mutate,
+    )
+
+
+def test_preflight_rejects_sidecar_created_after_initial_check(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def mutate(_parent: Path, run_root: Path) -> None:
+        run_root.with_name(f"{run_root.name}.stdout.log").write_text(
+            "",
+            encoding="utf-8",
+        )
+
+    _assert_preflight_rejects_postcheck_mutation(
+        monkeypatch,
+        tmp_path,
+        mutation=mutate,
+    )
+
+
+def test_preflight_rejects_empty_run_root_replaced_after_initial_check(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def mutate(_parent: Path, run_root: Path) -> None:
+        run_root.rmdir()
+        run_root.mkdir()
+
+    _assert_preflight_rejects_postcheck_mutation(
+        monkeypatch,
+        tmp_path,
+        mutation=mutate,
+    )
+
+
+def test_preflight_rejects_empty_parent_replaced_after_initial_check(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def mutate(parent: Path, _run_root: Path) -> None:
+        parent.rmdir()
+        parent.mkdir()
+
+    _assert_preflight_rejects_postcheck_mutation(
+        monkeypatch,
+        tmp_path,
+        mutation=mutate,
+        create_run_root=False,
+    )
+
+
+def test_preflight_rejects_run_root_reparse_after_initial_check(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    original_is_reparse = formal._is_reparse
+
+    def mutate(_parent: Path, run_root: Path) -> None:
+        monkeypatch.setattr(
+            formal,
+            "_is_reparse",
+            lambda path: (
+                Path(path) == run_root
+                or original_is_reparse(Path(path))
+            ),
+        )
+
+    _assert_preflight_rejects_postcheck_mutation(
+        monkeypatch,
+        tmp_path,
+        mutation=mutate,
+    )
 
 
 def test_failed_terminal_ledger_proof_emits_no_success(
