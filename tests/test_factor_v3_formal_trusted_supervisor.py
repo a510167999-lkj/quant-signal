@@ -753,6 +753,106 @@ def test_supervisor_executes_exact_worker_and_publishes_one_terminal_frame(
     assert Path(result["completed_path"]).is_file()
 
 
+def test_supervisor_persists_exact_worker_terminal_before_completed_v2(
+    tmp_path: Path,
+) -> None:
+    pins, payload, authorization_path, environment, writes = _fixture(tmp_path)
+
+    result = _run_fixture(pins, authorization_path, environment, writes)
+
+    authorization_sha256 = _file_sha256(authorization_path)
+    terminal_path = supervisor.worker_terminal_path_for_authorization(
+        Path(str(payload["execution_ledger_root"])),
+        authorization_sha256,
+    )
+    assert result["worker_terminal_path"] == str(terminal_path)
+    assert terminal_path.read_bytes() == writes[0]
+    assert result["worker_terminal_sha256"] == hashlib.sha256(writes[0]).hexdigest()
+    assert result["worker_terminal_bytes"] == len(writes[0])
+    assert result["worker_terminal_schema"] == (
+        "factor-v3-formal-bootstrap-worker-terminal/v2"
+    )
+    assert terminal_path.stat().st_mtime_ns <= Path(result["completed_path"]).stat().st_mtime_ns
+
+
+def test_completed_v2_has_exact_keyset_types_and_terminal_binding(
+    tmp_path: Path,
+) -> None:
+    pins, payload, authorization_path, environment, writes = _fixture(tmp_path)
+
+    result = _run_fixture(pins, authorization_path, environment, writes)
+
+    completed = json.loads(Path(result["completed_path"]).read_bytes())
+    assert set(completed) == {
+        "artifact_manifest_sha256",
+        "claim_sha256",
+        "launch_authorization_sha256",
+        "schema",
+        "status",
+        "worker_terminal_bytes",
+        "worker_terminal_schema",
+        "worker_terminal_sha256",
+    }
+    assert completed["schema"] == (
+        "factor-v3-formal-supervisor-execution-completed/v2"
+    )
+    assert completed["status"] == "completed"
+    assert completed["worker_terminal_bytes"] == len(writes[0])
+    assert completed["worker_terminal_schema"] == (
+        "factor-v3-formal-bootstrap-worker-terminal/v2"
+    )
+    assert completed["worker_terminal_sha256"] == hashlib.sha256(writes[0]).hexdigest()
+    assert Path(result["completed_path"]).read_bytes() == _canonical_bytes(completed)
+
+
+def test_resume_status_claim_has_exact_canonical_keyset() -> None:
+    claim = {
+        "action": "run",
+        "authorization_id_sha256": "1" * 64,
+        "authorization_nonce_sha256": "2" * 64,
+        "bootstrap_execution_authorization_sha256": "3" * 64,
+        "launch_authorization_sha256": "4" * 64,
+        "replay_scope": "factor-v3-formal-bootstrap-execution/v1",
+        "schema": "factor-v3-formal-supervisor-execution-claim/v1",
+        "status": "claimed",
+    }
+    raw = _canonical_bytes(claim)
+
+    assert supervisor._validated_claim_status(raw) == claim
+    with pytest.raises(supervisor.FormalSupervisorError, match="resume status"):
+        supervisor._validated_claim_status(
+            _canonical_bytes({**claim, "unexpected": "value"})
+        )
+    with pytest.raises(supervisor.FormalSupervisorError, match="resume status"):
+        supervisor._validated_claim_status(
+            _canonical_bytes({**claim, "status": 1})
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_held_ledger_file_removes_precommit_partial_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    path = parent / "partial.json"
+
+    def fail_fsync(_descriptor: int) -> None:
+        raise OSError("injected fsync failure")
+
+    monkeypatch.setattr(supervisor.os, "fsync", fail_fsync)
+
+    with pytest.raises(OSError, match="injected fsync"):
+        supervisor._HeldLedgerFile(
+            path,
+            b'{"status":"partial"}',
+            replay_label="partial test",
+        )
+
+    assert not path.exists()
+
+
 def test_native_credential_handle_is_requested_only_after_claim_and_not_reopened(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
