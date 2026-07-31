@@ -1616,9 +1616,13 @@ def test_original_and_resume_share_one_atomic_worker_and_terminal_lease(
                 "bootstrap_execution_authorization_sha256": payload[
                     "bootstrap_execution_authorization_sha256"
                 ],
+                "launch_authorization_schema": supervisor.LAUNCH_AUTHORIZATION_SCHEMA,
                 "launch_authorization_sha256": original_sha256,
+                "launch_authorization_signature_sha256": (
+                    original_signature_sha256
+                ),
                 "replay_scope": payload["replay_scope"],
-                "schema": "factor-v3-formal-supervisor-execution-claim/v1",
+                "schema": supervisor.CLAIM_SCHEMA,
                 "status": "claimed",
             }
         )
