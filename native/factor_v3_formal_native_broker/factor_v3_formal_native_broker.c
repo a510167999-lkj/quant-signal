@@ -137,6 +137,12 @@ typedef struct SignedEnvelope {
 
 #ifdef F3_BROKER_TESTING
 static int f3_test_production_validation_stage = 0;
+static int f3_test_production_launch_stage = 0;
+#define F3_PRODUCTION_LAUNCH_STAGE(value) \
+    do { f3_test_production_launch_stage = (value); } while (0)
+#else
+#define F3_PRODUCTION_LAUNCH_STAGE(value) \
+    do { (void)(value); } while (0)
 #endif
 
 static void close_held(HeldFile *held) {
@@ -1652,7 +1658,6 @@ cleanup:
     return ok;
 }
 
-#ifdef F3_BROKER_TESTING
 static int append_environment_entry(
     wchar_t *block,
     size_t capacity,
@@ -1801,6 +1806,7 @@ static int append_quoted_argument(
     );
 }
 
+#ifdef F3_BROKER_TESTING
 static int quoted_command_line(
     const wchar_t *executable,
     const wchar_t *argument,
@@ -1832,7 +1838,9 @@ static int quoted_command_line(
     output[offset] = L'\0';
     return 1;
 }
+#endif
 
+#ifdef F3_BROKER_TESTING
 static int launch_test_child(
     const wchar_t *output_path,
     int close_job_after_child_ready,
@@ -2817,7 +2825,11 @@ static int validate_current_launch_payload(
 ) {
     const char *action = candidate->action == ACTION_RUN ? "run" : "resume";
     char credential[32768 * 3];
+    char runtime[32768 * 3];
+    char source[32768 * 3];
     size_t credential_length = 0;
+    size_t runtime_length = 0;
+    size_t source_length = 0;
     if (envelope == NULL
         || candidate == NULL
         || !wide_path_to_utf8(
@@ -2825,6 +2837,18 @@ static int validate_current_launch_payload(
             credential,
             sizeof(credential),
             &credential_length
+        )
+        || !wide_path_to_utf8(
+            F3_BROKER_RUNTIME_PATH,
+            runtime,
+            sizeof(runtime),
+            &runtime_length
+        )
+        || !wide_path_to_utf8(
+            F3_BROKER_SOURCE_PATH,
+            source,
+            sizeof(source),
+            &source_length
         )
         || !json_top_string_matches(
             envelope->payload,
@@ -2882,11 +2906,29 @@ static int validate_current_launch_payload(
             F3_CREDENTIAL_SLOT_ID,
             strlen(F3_CREDENTIAL_SLOT_ID)
         )
+        || !json_top_string_matches(
+            envelope->payload,
+            envelope->payload_size,
+            "python_executable_path",
+            runtime,
+            runtime_length
+        )
+        || !json_top_string_matches(
+            envelope->payload,
+            envelope->payload_size,
+            "supervisor_loader_path",
+            source,
+            source_length
+        )
         || !verify_execution_signature(envelope)) {
         SecureZeroMemory(credential, sizeof(credential));
+        SecureZeroMemory(runtime, sizeof(runtime));
+        SecureZeroMemory(source, sizeof(source));
         return 0;
     }
     SecureZeroMemory(credential, sizeof(credential));
+    SecureZeroMemory(runtime, sizeof(runtime));
+    SecureZeroMemory(source, sizeof(source));
     if (candidate->action == ACTION_RUN) {
         return json_top_is_null(
                 envelope->payload,
@@ -3494,6 +3536,801 @@ static int validate_candidate_only(const wchar_t *candidate_path) {
     close_held(&candidate);
     close_held(&source);
     close_held(&runtime);
+    return ok;
+}
+
+static int production_supervisor_command_line(
+    const wchar_t *authorization_path,
+    wchar_t *output,
+    size_t capacity
+) {
+    const wchar_t *arguments[] = {
+        F3_BROKER_RUNTIME_PATH,
+        L"-I",
+        L"-B",
+        L"-S",
+        L"-P",
+        F3_BROKER_SOURCE_PATH,
+        authorization_path,
+        L"--native-broker-v1",
+    };
+    size_t offset = 0;
+    size_t index;
+    for (index = 0; index < sizeof(arguments) / sizeof(arguments[0]); ++index) {
+        if ((index != 0
+                && !append_command_character(
+                    output,
+                    capacity,
+                    &offset,
+                    L' '
+                ))
+            || !append_quoted_argument(
+                arguments[index],
+                output,
+                capacity,
+                &offset
+            )) {
+            return 0;
+        }
+    }
+    if (offset >= capacity) {
+        return 0;
+    }
+    output[offset] = L'\0';
+    return 1;
+}
+
+static int create_production_restricted_token(HANDLE *restricted_token) {
+    HANDLE primary = NULL;
+    PSID disabled_sid = NULL;
+    SID_AND_ATTRIBUTES disabled;
+    int ok = 0;
+    memset(&disabled, 0, sizeof(disabled));
+    if (restricted_token == NULL
+        || F3_BROKER_RESTRICTING_SID[0] == L'\0') {
+        return 0;
+    }
+    *restricted_token = NULL;
+    if (!OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
+            &primary
+        )
+        || !ConvertStringSidToSidW(
+            F3_BROKER_RESTRICTING_SID,
+            &disabled_sid
+        )) {
+        goto cleanup;
+    }
+    disabled.Sid = disabled_sid;
+    if (!CreateRestrictedToken(
+            primary,
+            DISABLE_MAX_PRIVILEGE,
+            1,
+            &disabled,
+            0,
+            NULL,
+            0,
+            NULL,
+            restricted_token
+        )) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (!ok && restricted_token != NULL && *restricted_token != NULL) {
+        CloseHandle(*restricted_token);
+        *restricted_token = NULL;
+    }
+    if (primary != NULL) {
+        CloseHandle(primary);
+    }
+    if (disabled_sid != NULL) {
+        LocalFree(disabled_sid);
+    }
+    return ok;
+}
+
+static int read_exact_pipe_frame(
+    HANDLE pipe,
+    HANDLE process,
+    unsigned char *output,
+    DWORD expected_size,
+    DWORD timeout_ms
+) {
+    DWORD total = 0;
+    DWORD available = 0;
+    DWORD count = 0;
+    DWORD elapsed = 0;
+    DWORD exit_code = STILL_ACTIVE;
+    if (pipe == INVALID_HANDLE_VALUE
+        || process == NULL
+        || output == NULL
+        || expected_size == 0) {
+        return 0;
+    }
+    while (total < expected_size && elapsed < timeout_ms) {
+        if (!PeekNamedPipe(pipe, NULL, 0, NULL, &available, NULL)) {
+            return 0;
+        }
+        if (available == 0) {
+            if (!GetExitCodeProcess(process, &exit_code)
+                || exit_code != STILL_ACTIVE) {
+                return 0;
+            }
+            Sleep(10);
+            elapsed += 10;
+            continue;
+        }
+        if (available > expected_size - total) {
+            return 0;
+        }
+        if (!ReadFile(
+                pipe,
+                output + total,
+                available,
+                &count,
+                NULL
+            )
+            || count == 0) {
+            return 0;
+        }
+        total += count;
+    }
+    if (total != expected_size
+        || !PeekNamedPipe(pipe, NULL, 0, NULL, &available, NULL)
+        || available != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static int read_production_ready(
+    HANDLE pipe,
+    HANDLE process,
+    const char authorization_sha256[65],
+    const char *action
+) {
+    unsigned char frame[512];
+    char expected[512];
+    int length = snprintf(
+        expected,
+        sizeof(expected),
+        "READY factor-v3-formal-native-broker-supervisor/v1\n"
+        "launch_authorization_sha256=%s\n"
+        "action=%s\n",
+        authorization_sha256,
+        action
+    );
+    int ok = length > 0
+        && (size_t)length < sizeof(expected)
+        && read_exact_pipe_frame(
+            pipe,
+            process,
+            frame,
+            (DWORD)length,
+            120000
+        )
+        && memcmp(frame, expected, (size_t)length) == 0;
+    SecureZeroMemory(frame, sizeof(frame));
+    SecureZeroMemory(expected, sizeof(expected));
+    return ok;
+}
+
+static int exact_hash_field(
+    const unsigned char *frame,
+    size_t frame_size,
+    size_t *offset,
+    const char *label,
+    char output[65]
+) {
+    size_t label_size = strlen(label);
+    size_t index;
+    if (*offset + label_size + 65 > frame_size
+        || memcmp(frame + *offset, label, label_size) != 0) {
+        return 0;
+    }
+    *offset += label_size;
+    for (index = 0; index < 64; ++index) {
+        unsigned char value = frame[*offset + index];
+        if (!((value >= '0' && value <= '9')
+                || (value >= 'a' && value <= 'f'))) {
+            return 0;
+        }
+        output[index] = (char)value;
+    }
+    output[64] = '\0';
+    *offset += 64;
+    if (frame[*offset] != '\n') {
+        SecureZeroMemory(output, 65);
+        return 0;
+    }
+    ++*offset;
+    return 1;
+}
+
+static int read_production_completed(
+    HANDLE pipe,
+    HANDLE process,
+    const char authorization_sha256[65],
+    unsigned char *frame,
+    DWORD *frame_size,
+    char claim_sha256[65],
+    char supervisor_completed_sha256[65],
+    char worker_terminal_sha256[65]
+) {
+    static const char prefix[] =
+        "COMPLETED factor-v3-formal-native-broker-supervisor/v1\n";
+    static const char launch_label[] = "launch_authorization_sha256=";
+    static const char claim_label[] = "claim_sha256=";
+    static const char supervisor_label[] = "supervisor_completed_sha256=";
+    static const char worker_label[] = "worker_terminal_sha256=";
+    DWORD expected_size = (DWORD)(
+        sizeof(prefix) - 1
+        + sizeof(launch_label) - 1 + 65
+        + sizeof(claim_label) - 1 + 65
+        + sizeof(supervisor_label) - 1 + 65
+        + sizeof(worker_label) - 1 + 65
+    );
+    char launch_sha256[65];
+    size_t offset = 0;
+    int ok = expected_size <= 1024
+        && read_exact_pipe_frame(
+            pipe,
+            process,
+            frame,
+            expected_size,
+            180000
+        )
+        && memcmp(frame, prefix, sizeof(prefix) - 1) == 0;
+    if (!ok) {
+        goto cleanup;
+    }
+    offset = sizeof(prefix) - 1;
+    ok = exact_hash_field(
+            frame,
+            expected_size,
+            &offset,
+            launch_label,
+            launch_sha256
+        )
+        && strcmp(launch_sha256, authorization_sha256) == 0
+        && exact_hash_field(
+            frame,
+            expected_size,
+            &offset,
+            claim_label,
+            claim_sha256
+        )
+        && exact_hash_field(
+            frame,
+            expected_size,
+            &offset,
+            supervisor_label,
+            supervisor_completed_sha256
+        )
+        && exact_hash_field(
+            frame,
+            expected_size,
+            &offset,
+            worker_label,
+            worker_terminal_sha256
+        )
+        && offset == expected_size;
+    if (ok) {
+        *frame_size = expected_size;
+    }
+
+cleanup:
+    SecureZeroMemory(launch_sha256, sizeof(launch_sha256));
+    if (!ok) {
+        SecureZeroMemory(frame, 1024);
+        SecureZeroMemory(claim_sha256, 65);
+        SecureZeroMemory(supervisor_completed_sha256, 65);
+        SecureZeroMemory(worker_terminal_sha256, 65);
+    }
+    return ok;
+}
+
+int f3_broker_launch_production_supervisor(const wchar_t *candidate_path) {
+    STARTUPINFOEXW startup;
+    PROCESS_INFORMATION process;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+    SECURITY_ATTRIBUTES pipe_security;
+    PPROC_THREAD_ATTRIBUTE_LIST attributes = NULL;
+    SIZE_T attributes_size = 0;
+    HANDLE inherited_handles[3];
+    HANDLE job = NULL;
+    HANDLE restricted_token = NULL;
+    HANDLE child_input = INVALID_HANDLE_VALUE;
+    HANDLE parent_input = INVALID_HANDLE_VALUE;
+    HANDLE parent_output = INVALID_HANDLE_VALUE;
+    HANDLE child_output = INVALID_HANDLE_VALUE;
+    HANDLE null_error = INVALID_HANDLE_VALUE;
+    HANDLE remote_credential = NULL;
+    HeldFile runtime = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile source = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile candidate_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile launch_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile credential = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    ProductionCandidate candidate;
+    SignedEnvelope envelope;
+    unsigned char *candidate_raw = NULL;
+    unsigned char *launch_raw = NULL;
+    DWORD candidate_size = 0;
+    DWORD launch_size = 0;
+    unsigned char candidate_digest[32];
+    unsigned char launch_digest[32];
+    wchar_t launch_path[32768];
+    wchar_t command_line[32768];
+    wchar_t runtime_directory[32768];
+    wchar_t *environment = NULL;
+    unsigned char completed_frame[1024];
+    DWORD completed_frame_size = 0;
+    char authorization_sha256[65];
+    char claim_sha256[65];
+    char supervisor_completed_sha256[65];
+    char worker_terminal_sha256[65];
+    char response[128];
+    DWORD response_size = 0;
+    DWORD written = 0;
+    DWORD child_exit = 1;
+    BOOL process_in_job = FALSE;
+    int attributes_initialized = 0;
+    int child_created = 0;
+    int ok = 0;
+    const char *action = NULL;
+    memset(&startup, 0, sizeof(startup));
+    memset(&process, 0, sizeof(process));
+    memset(&limits, 0, sizeof(limits));
+    memset(&pipe_security, 0, sizeof(pipe_security));
+    memset(&candidate, 0, sizeof(candidate));
+    memset(&envelope, 0, sizeof(envelope));
+    memset(launch_path, 0, sizeof(launch_path));
+    memset(authorization_sha256, 0, sizeof(authorization_sha256));
+    memset(claim_sha256, 0, sizeof(claim_sha256));
+    memset(supervisor_completed_sha256, 0, sizeof(supervisor_completed_sha256));
+    memset(worker_terminal_sha256, 0, sizeof(worker_terminal_sha256));
+    pipe_security.nLength = sizeof(pipe_security);
+    pipe_security.bInheritHandle = TRUE;
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    F3_PRODUCTION_LAUNCH_STAGE(1);
+    if (!f3_broker_validate_production_candidate(candidate_path)) {
+#ifdef F3_BROKER_TESTING
+        f3_test_production_launch_stage =
+            100 + f3_test_production_validation_stage;
+#endif
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(11);
+    if (!open_held_file(
+            F3_BROKER_RUNTIME_PATH,
+            F3_MAX_MANIFEST_FILE_BYTES,
+            &runtime
+        )
+        || !verify_held_hash(&runtime, F3_BROKER_RUNTIME_SHA256)
+        || !open_held_file(
+            F3_BROKER_SOURCE_PATH,
+            F3_MAX_MANIFEST_FILE_BYTES,
+            &source
+        )
+        || !verify_held_hash(&source, F3_BROKER_SOURCE_SHA256)
+        || !open_held_file(
+            candidate_path,
+            F3_MAX_CANDIDATE_BYTES,
+            &candidate_file
+        )
+        || !hash_held_file(&candidate_file, candidate_digest)
+        || !filename_matches_candidate_digest(
+            candidate_path,
+            candidate_digest
+        )
+        || !read_candidate(
+            &candidate_file,
+            &candidate_raw,
+            &candidate_size
+        )
+        || !parse_production_candidate(
+            candidate_raw,
+            candidate_size,
+            &candidate
+        )
+        || !byte_slice_to_wide(
+            candidate.launch_authorization_path,
+            launch_path,
+            sizeof(launch_path) / sizeof(launch_path[0])
+        )
+        || !open_held_file(
+            launch_path,
+            F3_MAX_AUTHORIZATION_BYTES,
+            &launch_file
+        )
+        || !hash_held_file(&launch_file, launch_digest)
+        || !filename_matches_digest_suffix(
+            launch_path,
+            launch_digest,
+            L".json"
+        )
+        || !read_candidate(&launch_file, &launch_raw, &launch_size)
+        || !parse_signed_envelope(launch_raw, launch_size, &envelope)
+        || !validate_current_launch_payload(&envelope, &candidate)
+        || (candidate.action == ACTION_RESUME
+            && !validate_resume_lineage(&candidate, &envelope))) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(2);
+    action = candidate.action == ACTION_RUN ? "run" : "resume";
+    digest_to_ascii(launch_digest, authorization_sha256);
+    if (!production_supervisor_command_line(
+            launch_path,
+            command_line,
+            sizeof(command_line) / sizeof(command_line[0])
+        )
+        || !parent_directory(
+            F3_BROKER_RUNTIME_PATH,
+            runtime_directory,
+            sizeof(runtime_directory) / sizeof(runtime_directory[0])
+        )) {
+        goto cleanup;
+    }
+    environment = sanitized_environment(
+        L"factor-v3-formal-native-broker-supervisor/v1"
+    );
+    if (environment == NULL
+        || !create_production_restricted_token(&restricted_token)
+        || !CreatePipe(
+            &child_input,
+            &parent_input,
+            &pipe_security,
+            0
+        )
+        || !CreatePipe(
+            &parent_output,
+            &child_output,
+            &pipe_security,
+            0
+        )
+        || !SetHandleInformation(
+            parent_input,
+            HANDLE_FLAG_INHERIT,
+            0
+        )
+        || !SetHandleInformation(
+            parent_output,
+            HANDLE_FLAG_INHERIT,
+            0
+        )) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(3);
+    null_error = CreateFileW(
+        L"NUL",
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        &pipe_security,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+    if (null_error == INVALID_HANDLE_VALUE) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(4);
+    startup.StartupInfo.hStdInput = child_input;
+    startup.StartupInfo.hStdOutput = child_output;
+#ifdef F3_BROKER_TESTING
+    startup.StartupInfo.hStdError = child_output;
+#else
+    startup.StartupInfo.hStdError = null_error;
+#endif
+    inherited_handles[0] = child_input;
+    inherited_handles[1] = child_output;
+    inherited_handles[2] = null_error;
+    job = CreateJobObjectW(NULL, NULL);
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (job == NULL
+        || !SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &limits,
+            sizeof(limits)
+        )) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(5);
+    InitializeProcThreadAttributeList(NULL, 2, 0, &attributes_size);
+    attributes = (PPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        attributes_size
+    );
+    if (attributes_size == 0
+        || attributes == NULL
+        || !InitializeProcThreadAttributeList(
+            attributes,
+            2,
+            0,
+            &attributes_size
+        )) {
+        goto cleanup;
+    }
+    attributes_initialized = 1;
+    if (!UpdateProcThreadAttribute(
+            attributes,
+            0,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST,
+            &job,
+            sizeof(job),
+            NULL,
+            NULL
+        )
+        || !UpdateProcThreadAttribute(
+            attributes,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            inherited_handles,
+            sizeof(inherited_handles),
+            NULL,
+            NULL
+        )) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(6);
+    startup.lpAttributeList = attributes;
+    if (!CreateProcessAsUserW(
+            restricted_token,
+            F3_BROKER_RUNTIME_PATH,
+            command_line,
+            NULL,
+            NULL,
+            TRUE,
+            CREATE_SUSPENDED
+                | CREATE_UNICODE_ENVIRONMENT
+                | CREATE_NO_WINDOW
+                | EXTENDED_STARTUPINFO_PRESENT,
+            environment,
+            runtime_directory,
+            &startup.StartupInfo,
+            &process
+        )
+        || !IsProcessInJob(process.hProcess, job, &process_in_job)
+        || !process_in_job) {
+        if (process.hProcess != NULL) {
+            TerminateProcess(process.hProcess, 90);
+        }
+        goto cleanup;
+    }
+    child_created = 1;
+    F3_PRODUCTION_LAUNCH_STAGE(7);
+    CloseHandle(child_input);
+    child_input = INVALID_HANDLE_VALUE;
+    CloseHandle(child_output);
+    child_output = INVALID_HANDLE_VALUE;
+    CloseHandle(null_error);
+    null_error = INVALID_HANDLE_VALUE;
+    if (ResumeThread(process.hThread) == (DWORD)-1) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(71);
+    if (!read_production_ready(
+            parent_output,
+            process.hProcess,
+            authorization_sha256,
+            action
+        )) {
+        DWORD diagnostic_exit = STILL_ACTIVE;
+        WaitForSingleObject(process.hProcess, 1000);
+        if (GetExitCodeProcess(process.hProcess, &diagnostic_exit)
+            && diagnostic_exit != STILL_ACTIVE) {
+            SetLastError(diagnostic_exit);
+        }
+#ifdef F3_BROKER_TESTING
+        {
+            DWORD diagnostic_available = 0;
+            DWORD diagnostic_read = 0;
+            unsigned char diagnostic[4096];
+            if (PeekNamedPipe(
+                    parent_output,
+                    NULL,
+                    0,
+                    NULL,
+                    &diagnostic_available,
+                    NULL
+                )
+                && diagnostic_available > 0
+                && diagnostic_available <= sizeof(diagnostic)
+                && ReadFile(
+                    parent_output,
+                    diagnostic,
+                    diagnostic_available,
+                    &diagnostic_read,
+                    NULL
+                )
+                && diagnostic_read > 0) {
+                fwrite(diagnostic, 1, diagnostic_read, stderr);
+            }
+            SecureZeroMemory(diagnostic, sizeof(diagnostic));
+        }
+#endif
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(72);
+    if (!open_held_file(
+            F3_BROKER_CREDENTIAL_SLOT_PATH,
+            F3_MAX_SECRET_SLOT_BYTES,
+            &credential
+        )
+        || !DuplicateHandle(
+            GetCurrentProcess(),
+            credential.handle,
+            process.hProcess,
+            &remote_credential,
+            GENERIC_READ,
+            FALSE,
+            0
+        )) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(8);
+    response_size = (DWORD)snprintf(
+        response,
+        sizeof(response),
+        "HANDLE=%llx\n",
+        (unsigned long long)(uintptr_t)remote_credential
+    );
+    if (response_size == 0
+        || response_size >= sizeof(response)
+        || !WriteFile(
+            parent_input,
+            response,
+            response_size,
+            &written,
+            NULL
+        )
+        || written != response_size
+        || !FlushFileBuffers(parent_input)) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(9);
+    CloseHandle(parent_input);
+    parent_input = INVALID_HANDLE_VALUE;
+    if (!read_production_completed(
+            parent_output,
+            process.hProcess,
+            authorization_sha256,
+            completed_frame,
+            &completed_frame_size,
+            claim_sha256,
+            supervisor_completed_sha256,
+            worker_terminal_sha256
+        )) {
+#ifdef F3_BROKER_TESTING
+        {
+            DWORD diagnostic_available = 0;
+            DWORD diagnostic_read = 0;
+            unsigned char diagnostic[4096];
+            WaitForSingleObject(process.hProcess, 1000);
+            if (PeekNamedPipe(
+                    parent_output,
+                    NULL,
+                    0,
+                    NULL,
+                    &diagnostic_available,
+                    NULL
+                )
+                && diagnostic_available > 0
+                && diagnostic_available <= sizeof(diagnostic)
+                && ReadFile(
+                    parent_output,
+                    diagnostic,
+                    diagnostic_available,
+                    &diagnostic_read,
+                    NULL
+                )
+                && diagnostic_read > 0) {
+                fwrite(diagnostic, 1, diagnostic_read, stderr);
+            }
+            SecureZeroMemory(diagnostic, sizeof(diagnostic));
+        }
+#endif
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(91);
+    if (WaitForSingleObject(process.hProcess, 30000) != WAIT_OBJECT_0
+        || !GetExitCodeProcess(process.hProcess, &child_exit)
+        || child_exit != 0
+        || !held_unchanged(&credential, NULL)
+        || !held_unchanged(&launch_file, NULL)
+        || !held_unchanged(&candidate_file, NULL)
+        || !held_unchanged(&source, F3_BROKER_SOURCE_SHA256)
+        || !held_unchanged(&runtime, F3_BROKER_RUNTIME_SHA256)
+        || !WriteFile(
+            GetStdHandle(STD_OUTPUT_HANDLE),
+            completed_frame,
+            completed_frame_size,
+            &written,
+            NULL
+        )
+        || written != completed_frame_size
+        || !FlushFileBuffers(GetStdHandle(STD_OUTPUT_HANDLE))) {
+        goto cleanup;
+    }
+    F3_PRODUCTION_LAUNCH_STAGE(10);
+    ok = 1;
+
+cleanup:
+    if (!ok && child_created && process.hProcess != NULL) {
+        TerminateProcess(process.hProcess, 97);
+        WaitForSingleObject(process.hProcess, 5000);
+    }
+    if (process.hThread != NULL) {
+        CloseHandle(process.hThread);
+    }
+    if (process.hProcess != NULL) {
+        CloseHandle(process.hProcess);
+    }
+    if (child_input != INVALID_HANDLE_VALUE) {
+        CloseHandle(child_input);
+    }
+    if (parent_input != INVALID_HANDLE_VALUE) {
+        CloseHandle(parent_input);
+    }
+    if (parent_output != INVALID_HANDLE_VALUE) {
+        CloseHandle(parent_output);
+    }
+    if (child_output != INVALID_HANDLE_VALUE) {
+        CloseHandle(child_output);
+    }
+    if (null_error != INVALID_HANDLE_VALUE) {
+        CloseHandle(null_error);
+    }
+    if (restricted_token != NULL) {
+        CloseHandle(restricted_token);
+    }
+    if (job != NULL) {
+        CloseHandle(job);
+    }
+    if (attributes_initialized) {
+        DeleteProcThreadAttributeList(attributes);
+    }
+    if (attributes != NULL) {
+        HeapFree(GetProcessHeap(), 0, attributes);
+    }
+    if (environment != NULL) {
+        SecureZeroMemory(environment, 32768 * sizeof(wchar_t));
+        HeapFree(GetProcessHeap(), 0, environment);
+    }
+    if (launch_raw != NULL) {
+        SecureZeroMemory(launch_raw, (SIZE_T)launch_size + 1);
+        HeapFree(GetProcessHeap(), 0, launch_raw);
+    }
+    if (candidate_raw != NULL) {
+        SecureZeroMemory(candidate_raw, (SIZE_T)candidate_size + 1);
+        HeapFree(GetProcessHeap(), 0, candidate_raw);
+    }
+    close_held(&credential);
+    close_held(&launch_file);
+    close_held(&candidate_file);
+    close_held(&source);
+    close_held(&runtime);
+    SecureZeroMemory(&candidate, sizeof(candidate));
+    SecureZeroMemory(&envelope, sizeof(envelope));
+    SecureZeroMemory(candidate_digest, sizeof(candidate_digest));
+    SecureZeroMemory(launch_digest, sizeof(launch_digest));
+    SecureZeroMemory(launch_path, sizeof(launch_path));
+    SecureZeroMemory(command_line, sizeof(command_line));
+    SecureZeroMemory(runtime_directory, sizeof(runtime_directory));
+    SecureZeroMemory(completed_frame, sizeof(completed_frame));
+    SecureZeroMemory(authorization_sha256, sizeof(authorization_sha256));
+    SecureZeroMemory(claim_sha256, sizeof(claim_sha256));
+    SecureZeroMemory(
+        supervisor_completed_sha256,
+        sizeof(supervisor_completed_sha256)
+    );
+    SecureZeroMemory(worker_terminal_sha256, sizeof(worker_terminal_sha256));
+    SecureZeroMemory(response, sizeof(response));
     return ok;
 }
 
@@ -4581,6 +5418,24 @@ int wmain(int argc, wchar_t **argv) {
         }
         return 0;
     }
+    if (
+        argc == 3
+        && wcscmp(
+            argv[1],
+            L"--test-production-supervisor-launch"
+        ) == 0
+    ) {
+        if (!f3_broker_launch_production_supervisor(argv[2])) {
+            fwprintf(
+                stderr,
+                L"native broker production supervisor launch rejected stage=%d error=%lu\n",
+                f3_test_production_launch_stage,
+                GetLastError()
+            );
+            return 38;
+        }
+        return 0;
+    }
     if (argc == 4 && wcscmp(argv[1], L"--test-launch") == 0) {
         if (!test_launch(argv[2], argv[3], 0, 0)) {
             fwprintf(stderr, L"native broker test boundary rejected\n");
@@ -4630,10 +5485,17 @@ int wmain(int argc, wchar_t **argv) {
             fwprintf(stderr, L"native broker production candidate rejected\n");
             return 37;
         }
+        if (!f3_broker_launch_production_supervisor(argv[2])) {
+            close_held_directory_chain(&credential_chain);
+            close_held_directory_chain(&source_chain);
+            close_held_directory_chain(&runtime_chain);
+            fwprintf(stderr, L"native broker production supervisor launch rejected\n");
+            return 38;
+        }
         close_held_directory_chain(&credential_chain);
         close_held_directory_chain(&source_chain);
         close_held_directory_chain(&runtime_chain);
-        fwprintf(stderr, L"native broker credential handoff is unimplemented\n");
+        return 0;
 #else
         fwprintf(stderr, L"native broker production boundary is unprovisioned\n");
 #endif

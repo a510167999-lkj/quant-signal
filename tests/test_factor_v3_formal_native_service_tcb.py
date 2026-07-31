@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -15,9 +15,14 @@ import uuid
 import pytest
 
 from app import factor_v3_formal_trusted_supervisor as formal_supervisor
+from app import factor_v3_formal_bootstrap_renderer as formal_bootstrap_renderer
 from app import factor_v3_formal_supervisor_control as formal_control
+from tests.test_factor_v3_formal_bootstrap_authorization import (
+    _authorized_fixture,
+    _execution_test_key,
+    _write_completion_authorization,
+)
 from tests.test_factor_v3_formal_trusted_supervisor import (
-    _cas_write,
     _canonical_bytes,
     _file_sha256,
     _fixture,
@@ -413,7 +418,7 @@ def _build_production_validation_fixture(
     )
     public_der = base64.b64decode(pins.execution_public_key_spki_der_base64)
     modulus, exponent = formal_supervisor._parse_rsa3072_spki(public_der)
-    source = REPO_ROOT / "app" / "factor_v3_formal_supervisor_loader_runtime.py"
+    source = Path(str(payload["supervisor_loader_path"]))
     credential = Path(str(payload["credential_path"]))
     manifest = root / "production_validation_manifest.h"
     manifest.write_text(
@@ -473,76 +478,109 @@ def _build_native_supervisor_e2e_fixture(root: Path) -> tuple[Path, Path, bytes]
     from app import factor_v3_formal_native_broker as broker
 
     now = datetime.now(timezone.utc).replace(microsecond=0)
-    pins, payload, _launch, _environment, _writes = _fixture(
+    def current_validity(payload: dict[str, object]) -> None:
+        base_python = Path(sys._base_executable).resolve()
+        payload["issued_at_utc"] = now.isoformat(timespec="seconds")
+        payload["not_before_utc"] = now.isoformat(timespec="seconds")
+        payload["expires_at_utc"] = (now + timedelta(minutes=30)).isoformat(
+            timespec="seconds"
+        )
+        payload["python_executable_path"] = str(base_python)
+        payload["python_executable_sha256"] = hashlib.sha256(
+            base_python.read_bytes()
+        ).hexdigest()
+        claim_path = Path(str(payload["bootstrap_claim_path"]))
+        claim = json.loads(claim_path.read_bytes())
+        claim["python_executable_path"] = str(base_python)
+        claim["python_executable_sha256"] = payload[
+            "python_executable_sha256"
+        ]
+        claim_raw = _canonical_bytes(claim)
+        claim_sha256 = hashlib.sha256(claim_raw).hexdigest()
+        updated_claim_path = (
+            claim_path.parent.parent
+            / claim_sha256[:2]
+            / f"{claim_sha256}.json"
+        )
+        updated_claim_path.parent.mkdir(parents=True)
+        updated_claim_path.write_bytes(claim_raw)
+        payload["bootstrap_claim_path"] = str(updated_claim_path.resolve())
+        payload["bootstrap_claim_sha256"] = claim_sha256
+
+    config, _payload, authorization_path, trusted_public_der = (
+        _authorized_fixture(
+            root,
+            action="run",
+            mutate_payload=current_validity,
+        )
+    )
+    source_app = REPO_ROOT / "app"
+    reviewed_app = Path(str(config["repo_root"])) / "app"
+    for name in (
+        "factor_v3_formal_control_contract.py",
+        "factor_v3_formal_supervisor_loader_runtime.py",
+        "factor_v3_formal_trusted_supervisor.py",
+    ):
+        shutil.copyfile(source_app / name, reviewed_app / name)
+    exclude_path = Path(str(config["repo_root"])) / ".git" / "info" / "exclude"
+    with exclude_path.open("a", encoding="utf-8", newline="\n") as stream:
+        for name in (
+            "factor_v3_formal_control_contract.py",
+            "factor_v3_formal_supervisor_loader_runtime.py",
+            "factor_v3_formal_trusted_supervisor.py",
+        ):
+            stream.write(f"/app/{name}\n")
+    completion_payload = (
+        formal_bootstrap_renderer._plan_factor_v3_formal_bootstrap_publication_with_test_trust(
+            authorization_path=authorization_path,
+            trusted_public_key_spki_der=trusted_public_der,
+        )
+    )
+    completion_authorization_path = _write_completion_authorization(
         root,
-        now_utc=now,
+        completion_payload,
     )
-    bootstrap_root = Path(str(payload["bootstrap_output_root"]))
-    supervisor_raw = formal_supervisor._render_supervisor_with_test_pins(pins)
-    supervisor_path, supervisor_sha256 = _cas_write(
-        bootstrap_root,
-        "supervisors",
-        supervisor_raw,
-        ".py",
+    bootstrap_publication = (
+        formal_bootstrap_renderer._publish_factor_v3_formal_bootstrap_with_test_trust(
+            authorization_path=authorization_path,
+            completion_authorization_path=completion_authorization_path,
+            trusted_public_key_spki_der=trusted_public_der,
+        )
     )
-    public_der = base64.b64decode(pins.execution_public_key_spki_der_base64)
-    stdlib_policy = json.loads(
-        Path(str(payload["stdlib_policy_path"])).read_bytes()
+    publication = formal_control._publish_with_trust(
+        authorization_path=authorization_path,
+        completion_marker_path=bootstrap_publication["completion_marker_path"],
+        trusted_public_key_spki_der=trusted_public_der,
     )
-    loader_raw = formal_control._loader_source(
-        artifact_path=supervisor_path,
-        artifact_sha256=supervisor_sha256,
-        public_der=public_der,
-        stdlib_policy=stdlib_policy,
-        template_raw=formal_control.SUPERVISOR_EXTERNAL_LOADER_TEMPLATE.encode(
-            "utf-8"
-        ),
+    ledger_root = (root / "execution-ledger").resolve()
+    ledger_root.mkdir()
+    credential = (root / "points-primary.token").resolve()
+    secret = f"fixture-native-secret-{uuid.uuid4()}".encode("ascii")
+    credential.write_bytes(secret)
+    private_key, _public_der = _execution_test_key(root)
+    launch_publication = (
+        formal_control._build_factor_v3_formal_supervisor_launch_authorization_with_trust(
+            authorization_path=authorization_path,
+            completion_marker_path=bootstrap_publication["completion_marker_path"],
+            publication_receipt_path=publication[
+                "supervisor_publication_receipt_path"
+            ],
+            private_key_path=private_key,
+            trusted_public_key_spki_der=trusted_public_der,
+            verify_reviewed_sources=False,
+            action="run",
+            execution_ledger_root=ledger_root,
+            credential_path=credential,
+            now_utc=now,
+        )
     )
-    loader_path, loader_sha256 = _cas_write(
-        bootstrap_root,
-        "supervisor_loaders",
-        loader_raw,
-        ".py",
+    launch_authorization = Path(
+        str(launch_publication["launch_authorization_path"])
     )
-    receipt = json.loads(
-        Path(str(payload["supervisor_publication_receipt_path"])).read_bytes()
-    )
-    receipt.update(
-        {
-            "executed_supervisor_bytes": len(supervisor_raw),
-            "executed_supervisor_relative_path": supervisor_path.relative_to(
-                bootstrap_root
-            ).as_posix(),
-            "executed_supervisor_sha256": supervisor_sha256,
-            "supervisor_loader_bytes": len(loader_raw),
-            "supervisor_loader_relative_path": loader_path.relative_to(
-                bootstrap_root
-            ).as_posix(),
-            "supervisor_loader_sha256": loader_sha256,
-        }
-    )
-    receipt_path, receipt_sha256 = _cas_write(
-        bootstrap_root,
-        "supervisor_publication_receipts",
-        _canonical_bytes(receipt),
-        ".json",
-    )
-    payload.update(
-        {
-            "executed_supervisor_path": str(supervisor_path),
-            "executed_supervisor_sha256": supervisor_sha256,
-            "supervisor_loader_bytes": len(loader_raw),
-            "supervisor_loader_path": str(loader_path),
-            "supervisor_loader_sha256": loader_sha256,
-            "supervisor_publication_receipt_path": str(receipt_path),
-            "supervisor_publication_receipt_sha256": receipt_sha256,
-        }
-    )
-    launch_authorization = _rewrite_authorization(
-        root,
-        payload,
-        root / "execution-key" / "execution-private.pem",
-    )
+    payload = json.loads(launch_authorization.read_bytes())["payload"]
+    loader_path = Path(str(payload["supervisor_loader_path"]))
+    loader_sha256 = str(payload["supervisor_loader_sha256"])
+    runtime = Path(str(payload["python_executable_path"]))
     candidate = broker.build_factor_v3_formal_native_broker_candidate(
         action="run",
         authorization_path=payload["bootstrap_execution_authorization_path"],
@@ -555,9 +593,9 @@ def _build_native_supervisor_e2e_fixture(root: Path) -> tuple[Path, Path, bytes]
         candidate_output_root=root / "native-candidates",
         candidate=candidate,
     )
-    modulus, exponent = formal_supervisor._parse_rsa3072_spki(public_der)
-    runtime = Path(str(payload["python_executable_path"]))
-    credential = Path(str(payload["credential_path"]))
+    modulus, exponent = formal_supervisor._parse_rsa3072_spki(
+        trusted_public_der
+    )
     manifest = root / "native_supervisor_e2e_manifest.h"
     manifest.write_text(
         "\n".join(
@@ -566,7 +604,9 @@ def _build_native_supervisor_e2e_fixture(root: Path) -> tuple[Path, Path, bytes]
                 '#define F3_BROKER_RUNTIME_SHA256 L"'
                 + hashlib.sha256(runtime.read_bytes()).hexdigest()
                 + '"',
-                '#define F3_BROKER_SOURCE_PATH L"' + _c_wide(loader_path) + '"',
+                '#define F3_BROKER_SOURCE_PATH L"'
+                + str(loader_path.resolve()).replace("\\", "\\\\")
+                + '"',
                 f'#define F3_BROKER_SOURCE_SHA256 L"{loader_sha256}"',
                 '#define F3_BROKER_CREDENTIAL_SLOT_PATH L"'
                 + _c_wide(credential)
@@ -601,7 +641,7 @@ def _build_native_supervisor_e2e_fixture(root: Path) -> tuple[Path, Path, bytes]
         ],
         libraries=["-lncrypt"],
     )
-    return native, Path(publication["candidate_path"]), credential.read_bytes()
+    return native, Path(publication["candidate_path"]), secret
 
 
 def test_native_manifest_uses_fixed_cng_identity_and_no_private_key_file_slot() -> None:
@@ -677,7 +717,7 @@ def test_protected_file_chain_validates_and_holds_all_ancestor_namespaces(
     assert protected.stderr == ""
 
 
-def test_production_launch_checks_service_and_fixed_namespace_chains_before_fail_closed() -> None:
+def test_production_launch_checks_service_and_fixed_namespace_chains_before_handoff() -> None:
     source = BROKER_SOURCE.read_text(encoding="utf-8")
     launch = source.index('wcscmp(argv[1], L"--launch")')
     service_check = source.index(
@@ -685,11 +725,16 @@ def test_production_launch_checks_service_and_fixed_namespace_chains_before_fail
         launch,
     )
     namespace_check = source.index("hold_production_namespace_chains", launch)
-    fail_closed = source.index(
-        "native broker credential handoff is unimplemented",
+    candidate_check = source.index(
+        "f3_broker_validate_production_candidate",
         launch,
     )
-    assert launch < service_check < namespace_check < fail_closed
+    handoff = source.index(
+        "f3_broker_launch_production_supervisor",
+        candidate_check,
+    )
+    assert launch < service_check < namespace_check < candidate_check < handoff
+    assert "native broker credential handoff is unimplemented" not in source
     production_check = source[
         source.index("hold_production_namespace_chains"):launch
     ]
