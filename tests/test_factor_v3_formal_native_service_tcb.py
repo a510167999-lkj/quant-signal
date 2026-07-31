@@ -475,7 +475,9 @@ def _build_production_validation_fixture(
     )
 
 
-def _build_native_supervisor_e2e_fixture(root: Path) -> tuple[Path, Path, bytes]:
+def _build_native_supervisor_e2e_fixture(
+    root: Path,
+) -> tuple[Path, Path, bytes, str]:
     from app import factor_v3_formal_native_broker as broker
 
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -607,6 +609,7 @@ def _build_native_supervisor_e2e_fixture(root: Path) -> tuple[Path, Path, bytes]
     modulus, exponent = formal_supervisor._parse_rsa3072_spki(
         trusted_public_der
     )
+    key_name = f"quant-signal-lkj-disposable-test-{uuid.uuid4()}"
     manifest = root / "native_supervisor_e2e_manifest.h"
     manifest.write_text(
         "\n".join(
@@ -626,7 +629,7 @@ def _build_native_supervisor_e2e_fixture(root: Path) -> tuple[Path, Path, bytes]
                     '#define F3_BROKER_CNG_PROVIDER '
                     'L"Microsoft Software Key Storage Provider"'
                 ),
-                '#define F3_BROKER_CNG_KEY_NAME L"unused-disposable-test-key"',
+                f'#define F3_BROKER_CNG_KEY_NAME L"{key_name}"',
                 "#define F3_BROKER_CNG_ALGORITHM NCRYPT_RSA_ALGORITHM",
                 '#define F3_BROKER_SERVICE_NAME L"DisposableFixtureService"',
                 '#define F3_BROKER_SERVICE_SID L"S-1-5-18"',
@@ -654,7 +657,7 @@ def _build_native_supervisor_e2e_fixture(root: Path) -> tuple[Path, Path, bytes]
         ],
         libraries=["-lncrypt"],
     )
-    return native, Path(publication["candidate_path"]), secret
+    return native, Path(publication["candidate_path"]), secret, key_name
 
 
 def test_native_manifest_uses_fixed_cng_identity_and_no_private_key_file_slot() -> None:
@@ -693,6 +696,22 @@ def test_production_worker_token_uses_one_fixed_restricted_sid_and_cannot_open_s
         "F3_BROKER_CREDENTIAL_SLOT_PATH",
         source.index("f3_broker_launch_production_supervisor"),
     )
+
+
+def test_production_completion_uses_persistent_cng_and_has_independent_verifier() -> None:
+    source = BROKER_SOURCE.read_text(encoding="utf-8")
+    completion = source[
+        source.index("static int write_persistent_cng_completion"):
+        source.index("int f3_broker_launch_production_supervisor")
+    ]
+
+    assert "factor-v3-formal-native-broker-completed/v2" in completion
+    assert "NCryptOpenKey" in completion
+    assert "NCryptVerifySignature" in completion
+    assert "BCRYPT_RSAFULLPRIVATE_BLOB" in completion
+    assert "NCryptDeleteKey" not in completion
+    assert "verify_persistent_cng_completion" in source
+    assert '--test-verify-persistent-cng-completion' in source
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
@@ -1172,7 +1191,19 @@ def test_native_broker_launches_rendered_supervisor_and_synthetic_worker_e2e(
         )
     )
     try:
-        native, candidate, secret = _build_native_supervisor_e2e_fixture(root)
+        native, candidate, secret, key_name = (
+            _build_native_supervisor_e2e_fixture(root)
+        )
+        created_key = subprocess.run(
+            [str(native), "--test-create-persistent-cng-key"],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        assert created_key.returncode == 0, created_key.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
         credential = root / "points-primary.token"
         token_check = subprocess.run(
             [
@@ -1206,15 +1237,48 @@ def test_native_broker_launches_rendered_supervisor_and_synthetic_worker_e2e(
         )
         assert completed.stderr == b""
         assert completed.stdout.startswith(
-            b"COMPLETED factor-v3-formal-native-broker-supervisor/v1\n"
+            b"COMPLETED factor-v3-formal-native-broker/v2\n"
         )
         assert b"launch_authorization_sha256=" in completed.stdout
         assert b"claim_sha256=" in completed.stdout
         assert b"supervisor_completed_sha256=" in completed.stdout
         assert b"worker_terminal_sha256=" in completed.stdout
+        assert b"native_completed_receipt_sha256=" in completed.stdout
+        verified = subprocess.run(
+            [
+                str(native),
+                "--test-verify-persistent-cng-completion",
+                str(candidate),
+            ],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        assert verified.returncode == 0, verified.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
+        present = subprocess.run(
+            [str(native), "--test-persistent-cng-key-present"],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        assert present.returncode == 0, present.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
+        assert key_name.encode("utf-8") not in completed.stdout
         assert secret not in completed.stdout
         assert secret not in completed.stderr
     finally:
+        if "native" in locals() and native.exists():
+            subprocess.run(
+                [str(native), "--test-delete-persistent-cng-key"],
+                check=False,
+                capture_output=True,
+                timeout=30,
+            )
         _grant_cleanup_access(root)
         def remove_readonly(
             function: object,
