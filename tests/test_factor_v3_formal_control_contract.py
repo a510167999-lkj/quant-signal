@@ -110,6 +110,44 @@ def test_shared_contract_is_the_only_v2_protocol_definition() -> None:
         assert copied_literals.isdisjoint(literals)
 
 
+def test_runtime_context_uses_exact_shared_guard_request_and_rejects_plain_emit(
+    tmp_path: Path,
+) -> None:
+    run_root = (tmp_path / "planned-run").resolve()
+    action_config = runtime._FrozenActionConfig(
+        {
+            "action": "preflight",
+            "formal_input_root_sha256": "1" * 64,
+            "formal_output_root": str((tmp_path / "formal-output").resolve()),
+            "run_root": str(run_root),
+            "run_spec_path": str((tmp_path / "run-spec.json").resolve()),
+        }
+    )
+    descriptor = runtime._preflight_terminal_guard_descriptor(
+        action_config
+    )
+    assert descriptor is not None
+    assert dict(descriptor) == contract.preflight_terminal_guard_request(
+        action="preflight",
+        run_root=str(run_root),
+    )
+    context = object.__new__(runtime._TrustedBootstrapContext)
+    context._preflight_terminal_guard_descriptor = descriptor
+    context._preflight_terminal_guard_provider = object()
+    context._output = None
+
+    with pytest.raises(
+        runtime._BootstrapError,
+        match="terminal guard output",
+    ):
+        runtime._TrustedBootstrapContext.emit_json(
+            context,
+            {"status": "must-not-use-plain-emit"},
+        )
+
+    assert context._output is None
+
+
 def test_supervisor_import_cannot_execute_dirty_shared_contract_before_pins(
     tmp_path: Path,
 ) -> None:

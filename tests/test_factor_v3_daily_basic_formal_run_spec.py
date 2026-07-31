@@ -17,6 +17,7 @@ from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
+from app import factor_v3_formal_bootstrap_runtime as bootstrap_runtime
 from scripts import build_factor_v3_daily_basic_formal_run_spec as formal
 from scripts import run_factor_v3_daily_basic_formal as formal_shim
 
@@ -186,6 +187,7 @@ class _TrustedBootstrapContext:
         self.guard_descriptor_overrides: dict[str, object] = {}
         self.guard_initial_snapshot_override: object | None = None
         self._guard_descriptor: Mapping[str, object] | None = None
+        self._runtime_guard_context: object | None = None
         self.guard = _SyntheticNativePreflightTerminalGuard(self)
 
     def validate_action_config(self, candidate: object) -> None:
@@ -234,19 +236,31 @@ class _TrustedBootstrapContext:
     def preflight_terminal_guard_descriptor(self) -> Mapping[str, object]:
         if self._guard_descriptor is not None:
             return self._guard_descriptor
-        descriptor: dict[str, object] = {
-            "acquire_before": "planned-run-root-initial-snapshot",
-            "action": self._config["action"],
-            "atomic_terminal_operation": (
-                "planned-run-root-postverify-and-success-buffer"
-            ),
-            "hold_until": "supervisor-terminal-output-flush",
-            "parent_path": str(formal.PLANNED_RUN_ROOT.parent),
-            "provider_identity": "external-win32-native-supervisor/v1",
-            "run_root": str(formal.PLANNED_RUN_ROOT),
-            "schema": "factor-v3-formal-preflight-terminal-guard/v1",
-            "write_policy": "deny-create-delete-rename-replace",
-        }
+        runtime_action_config = bootstrap_runtime._FrozenActionConfig(
+            {
+                "action": self._config["action"],
+                "formal_input_root_sha256": self._config[
+                    "formal_input_root"
+                ],
+                "formal_output_root": self._config["formal_output_root"],
+                "run_root": self._config["run_root"],
+                "run_spec_path": self._config["run_spec_path"],
+            }
+        )
+        runtime_context = object.__new__(
+            bootstrap_runtime._TrustedBootstrapContext
+        )
+        runtime_context._preflight_terminal_guard_descriptor = (  # type: ignore[attr-defined]
+            bootstrap_runtime._preflight_terminal_guard_descriptor(
+                runtime_action_config
+            )
+        )
+        descriptor = dict(
+            bootstrap_runtime._TrustedBootstrapContext.preflight_terminal_guard_descriptor(
+                runtime_context
+            )
+        )
+        self._runtime_guard_context = runtime_context
         descriptor.update(self.guard_descriptor_overrides)
         self._guard_descriptor = MappingProxyType(descriptor)
         return self._guard_descriptor
@@ -1313,6 +1327,60 @@ def test_preflight_dispatch_never_publishes_runs_or_verifies(
             runner.validate_calls[0],
             published=False,
         )
+    ]
+
+
+def test_runtime_context_descriptor_enters_builder_guard_acquisition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _frozen_action_config("preflight")
+    context = _TrustedBootstrapContext(config)
+    runner = _FakeRunner(_candidate())
+    snapshot = object()
+    monkeypatch.setattr(formal, "_load_runner", lambda _context: runner)
+    monkeypatch.setattr(
+        formal,
+        "_planned_run_root_snapshot",
+        lambda: snapshot,
+    )
+    monkeypatch.setattr(
+        formal,
+        "_postverify_planned_run_root",
+        lambda candidate: (
+            None
+            if candidate is snapshot
+            else (_ for _ in ()).throw(AssertionError("unexpected snapshot"))
+        ),
+    )
+    monkeypatch.setattr(
+        formal,
+        "_postverify_verified_module_ledger",
+        lambda _context, _manifest: None,
+    )
+
+    descriptor = context.preflight_terminal_guard_descriptor()
+    assert set(descriptor) == {
+        "acquire_before",
+        "action",
+        "atomic_terminal_operation",
+        "hold_until",
+        "parent_path",
+        "protected_actions",
+        "protected_path_field",
+        "provider_identity",
+        "run_root",
+        "schema",
+        "worker_binding_environment",
+        "write_policy",
+    }
+    assert context._runtime_guard_context is not None
+    assert formal.trusted_dispatch(context, config) == 0
+    assert context.guard_events == [
+        "acquire",
+        "enter",
+        "bind-initial",
+        "terminal-atomic",
+        "release",
     ]
 
 
