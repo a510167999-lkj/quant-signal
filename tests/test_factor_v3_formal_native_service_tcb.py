@@ -910,6 +910,39 @@ def test_production_completion_preholds_protected_namespace_and_writes_relative_
     assert '--test-protected-completion-namespace' in source
 
 
+def test_persistent_completion_signs_only_after_held_terminal_lineage_and_cleans_failed_publication() -> None:
+    source = BROKER_SOURCE.read_text(encoding="utf-8")
+    launch = source[
+        source.index("int f3_broker_launch_production_supervisor"):
+        source.index(
+            "#ifdef F3_BROKER_TESTING\nstatic int test_protected_file_chain"
+        )
+    ]
+    lineage = source[
+        source.index("static int validate_completion_lineage_before_signing"):
+        source.index("static int write_persistent_cng_completion")
+    ]
+
+    assert launch.index("read_production_completed") < launch.index(
+        "validate_completion_lineage_before_signing"
+    )
+    assert launch.index("validate_completion_lineage_before_signing") < (
+        launch.index("write_persistent_cng_completion")
+    )
+    assert '"claims"' in lineage
+    assert '"completed"' in lineage
+    assert "open_held_file" in lineage
+    assert "read_candidate" in lineage
+    assert "factor-v3-formal-supervisor-execution-claim/v1" in lineage
+    assert "factor-v3-formal-supervisor-execution-completed/v1" in lineage
+    assert '"status"' in lineage
+    assert '"launch_authorization_sha256"' in lineage
+    assert '"claim_sha256"' in lineage
+    assert '"worker_terminal_sha256"' in lineage
+    assert "held_unchanged" in lineage
+    assert "delete_failed_persistent_completion" in launch
+
+
 @pytest.mark.skipif(os.name != "nt", reason="native broker is Windows-only")
 def test_interactive_process_is_rejected_as_formal_service_identity(
     tmp_path: Path,
