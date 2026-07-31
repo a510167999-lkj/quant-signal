@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -824,6 +825,68 @@ def _build_native_supervisor_e2e_fixture(
         ],
         libraries=["-lncrypt"],
     )
+    try:
+        created = subprocess.run(
+            [str(native), "--test-create-persistent-cng-key"],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        assert created.returncode == 0, created.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
+        exported = subprocess.run(
+            [str(native), "--test-export-persistent-cng-public"],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        assert exported.returncode == 0, exported.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
+        public_fields = dict(
+            line.split("=", 1)
+            for line in exported.stdout.decode("ascii").splitlines()
+        )
+        public_blob_hex = public_fields["public_blob_hex"]
+        public_blob_sha256 = public_fields["public_blob_sha256"]
+        assert re.fullmatch(r"[0-9a-f]+", public_blob_hex)
+        assert re.fullmatch(r"[0-9a-f]{64}", public_blob_sha256)
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8")
+            + "\n".join(
+                (
+                    '#define F3_BROKER_COMPLETION_KEY_ID '
+                    '"factor-v3-formal-native-completion"',
+                    '#define F3_BROKER_COMPLETION_KEY_VERSION "v1"',
+                    '#define F3_BROKER_COMPLETION_PUBLIC_BLOB_HEX '
+                    f'"{public_blob_hex}"',
+                    '#define F3_BROKER_COMPLETION_PUBLIC_BLOB_SHA256 '
+                    f'"{public_blob_sha256}"',
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        _compile_source(
+            source=BROKER_SOURCE,
+            output=native,
+            includes=[root, BROKER_ROOT],
+            definitions=[
+                '-DF3_BROKER_MANIFEST_HEADER="native_supervisor_e2e_manifest.h"',
+            ],
+            libraries=["-lncrypt"],
+        )
+    except BaseException:
+        subprocess.run(
+            [str(native), "--test-delete-persistent-cng-key"],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        raise
     return native, Path(publication["candidate_path"]), secret, key_name
 
 
@@ -875,7 +938,7 @@ def test_production_completion_uses_persistent_cng_and_has_independent_verifier(
         source.index("#ifdef F3_BROKER_TESTING", completion_start)
     ]
 
-    assert "factor-v3-formal-native-broker-completed/v2" in source
+    assert "factor-v3-formal-native-broker-completed/v3" in source
     assert "NCryptOpenKey" in completion
     assert "NCryptVerifySignature" in completion
     assert "BCRYPT_RSAFULLPRIVATE_BLOB" in completion
@@ -951,20 +1014,26 @@ def test_persistent_completion_is_canonical_json_and_verifier_is_public_only() -
     ]
     verifier = source[
         source.index("static int verify_persistent_cng_completion"):
-        source.index("#ifdef F3_BROKER_TESTING", source.index(
+        source.index("#if 0", source.index(
             "static int verify_persistent_cng_completion"
         ))
+    ]
+    public_import = source[
+        source.index("static int import_completion_public_key"):
+        source.index("static int persistent_cng_key_matches_public_pin")
     ]
     manifest = BROKER_MANIFEST.read_text(encoding="utf-8")
 
     assert "factor-v3-formal-native-broker-completed/v3" in source
-    assert '{"payload":' in writer
-    assert '"signature_hex":"' in writer
-    assert '"completion_key_id":' in writer
-    assert '"completion_key_version":' in writer
-    assert '"completion_public_blob_sha256":' in writer
-    assert "BCRYPT_RSAPUBLIC_BLOB" in verifier
-    assert "BCryptImportKeyPair" in verifier
+    assert '\\"payload\\":' in writer
+    assert '\\"signature_hex\\":\\"' in writer
+    assert '\\"completion_key_id\\":' in writer
+    assert '\\"completion_key_version\\":' in writer
+    assert '\\"completion_public_blob_sha256\\":' in writer
+    assert "hash_completion_signature_payload" in writer
+    assert "import_completion_public_key" in verifier
+    assert "BCRYPT_RSAPUBLIC_BLOB" in public_import
+    assert "BCryptImportKeyPair" in public_import
     assert "NCryptOpenKey" not in verifier
     assert "open_persistent_cng_signing_key" not in verifier
     assert "F3_BROKER_COMPLETION_PUBLIC_BLOB_HEX" in manifest
@@ -1454,16 +1523,6 @@ def test_native_broker_launches_rendered_supervisor_and_synthetic_worker_e2e(
         native, candidate, secret, key_name = (
             _build_native_supervisor_e2e_fixture(root)
         )
-        created_key = subprocess.run(
-            [str(native), "--test-create-persistent-cng-key"],
-            check=False,
-            capture_output=True,
-            timeout=30,
-        )
-        assert created_key.returncode == 0, created_key.stderr.decode(
-            "utf-8",
-            errors="replace",
-        )
         credential = root / "points-primary.token"
         token_check = subprocess.run(
             [
@@ -1542,6 +1601,36 @@ def test_native_broker_launches_rendered_supervisor_and_synthetic_worker_e2e(
             "utf-8",
             errors="replace",
         )
+        present = subprocess.run(
+            [str(native), "--test-persistent-cng-key-present"],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        assert present.returncode == 0, present.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
+        deleted = subprocess.run(
+            [str(native), "--test-delete-persistent-cng-key"],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        assert deleted.returncode == 0, deleted.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
+        public_only = subprocess.run(
+            [str(native), "--verify-completion", str(candidate)],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        assert public_only.returncode == 0, public_only.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
         from app import factor_v3_formal_native_broker as broker
 
         fields = broker._validated_candidate(candidate.read_bytes())
@@ -1554,9 +1643,24 @@ def test_native_broker_launches_rendered_supervisor_and_synthetic_worker_e2e(
             / launch_sha256[:2]
             / f"{launch_sha256}.json"
         )
-        receipt = bytearray(receipt_path.read_bytes())
-        signature_offset = receipt.index(b"signature_hex=") + len(
-            b"signature_hex="
+        receipt_raw = receipt_path.read_bytes()
+        receipt_value = json.loads(receipt_raw)
+        assert receipt_raw == _canonical_bytes(receipt_value)
+        assert set(receipt_value) == {"payload", "signature_hex"}
+        assert receipt_value["payload"]["schema"] == (
+            "factor-v3-formal-native-broker-completed/v3"
+        )
+        assert receipt_value["payload"]["completion_key_id"] == (
+            "factor-v3-formal-native-completion"
+        )
+        assert receipt_value["payload"]["completion_key_version"] == "v1"
+        assert re.fullmatch(
+            r"[0-9a-f]{64}",
+            receipt_value["payload"]["completion_public_blob_sha256"],
+        )
+        receipt = bytearray(receipt_raw)
+        signature_offset = receipt.index(b'"signature_hex":"') + len(
+            b'"signature_hex":"'
         )
         receipt[signature_offset] = (
             ord("0") if receipt[signature_offset] != ord("0") else ord("1")
@@ -1565,7 +1669,7 @@ def test_native_broker_launches_rendered_supervisor_and_synthetic_worker_e2e(
         tampered = subprocess.run(
             [
                 str(native),
-                "--test-verify-persistent-cng-completion",
+                "--verify-completion",
                 str(candidate),
             ],
             check=False,
@@ -1574,16 +1678,6 @@ def test_native_broker_launches_rendered_supervisor_and_synthetic_worker_e2e(
         )
         assert tampered.returncode != 0
         assert tampered.stdout == b""
-        present = subprocess.run(
-            [str(native), "--test-persistent-cng-key-present"],
-            check=False,
-            capture_output=True,
-            timeout=30,
-        )
-        assert present.returncode == 0, present.stderr.decode(
-            "utf-8",
-            errors="replace",
-        )
         assert key_name.encode("utf-8") not in completed.stdout
         assert secret not in completed.stdout
         assert secret not in completed.stderr

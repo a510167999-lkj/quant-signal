@@ -49,6 +49,18 @@
 #ifndef F3_BROKER_EXECUTION_PUBLIC_EXPONENT
 #define F3_BROKER_EXECUTION_PUBLIC_EXPONENT 0u
 #endif
+#ifndef F3_BROKER_COMPLETION_KEY_ID
+#define F3_BROKER_COMPLETION_KEY_ID ""
+#endif
+#ifndef F3_BROKER_COMPLETION_KEY_VERSION
+#define F3_BROKER_COMPLETION_KEY_VERSION ""
+#endif
+#ifndef F3_BROKER_COMPLETION_PUBLIC_BLOB_HEX
+#define F3_BROKER_COMPLETION_PUBLIC_BLOB_HEX ""
+#endif
+#ifndef F3_BROKER_COMPLETION_PUBLIC_BLOB_SHA256
+#define F3_BROKER_COMPLETION_PUBLIC_BLOB_SHA256 ""
+#endif
 
 #ifdef F3_BROKER_TESTING
 #ifndef F3_BROKER_DISPOSABLE_TEST_MANIFEST
@@ -3080,6 +3092,23 @@ static int json_top_has_sha256(
     return 1;
 }
 
+static int json_top_copy_sha256(
+    const unsigned char *payload,
+    size_t payload_size,
+    const char *name,
+    char output[65]
+) {
+    ByteSlice value;
+    if (output == NULL
+        || !json_top_has_sha256(payload, payload_size, name)
+        || !json_top_field(payload, payload_size, name, &value)) {
+        return 0;
+    }
+    memcpy(output, value.value + 1, 64);
+    output[64] = '\0';
+    return 1;
+}
+
 static int hex_value(char value) {
     if (value >= '0' && value <= '9') {
         return value - '0';
@@ -4562,7 +4591,7 @@ cleanup:
 }
 
 #define F3_PERSISTENT_COMPLETION_SCHEMA \
-    "factor-v3-formal-native-broker-completed/v2"
+    "factor-v3-formal-native-broker-completed/v3"
 
 static int atomic_write_persistent_completion(
     ProtectedCompletionNamespace *completion,
@@ -4990,6 +5019,202 @@ cleanup:
     return ok;
 }
 
+static int fixed_completion_token(const char *value) {
+    size_t index;
+    size_t length;
+    if (value == NULL || value[0] == '\0') {
+        return 0;
+    }
+    length = strlen(value);
+    if (length > 128) {
+        return 0;
+    }
+    for (index = 0; index < length; ++index) {
+        unsigned char character = (unsigned char)value[index];
+        if (!((character >= 'a' && character <= 'z')
+                || (character >= 'A' && character <= 'Z')
+                || (character >= '0' && character <= '9')
+                || character == '-'
+                || character == '.'
+                || character == '_'
+                || character == '/')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int manifest_completion_public_blob(
+    unsigned char **blob,
+    DWORD *blob_size
+) {
+    const char *hex = F3_BROKER_COMPLETION_PUBLIC_BLOB_HEX;
+    size_t hex_size = strlen(hex);
+    unsigned char *decoded = NULL;
+    BCRYPT_RSAKEY_BLOB *header;
+    unsigned char digest[32];
+    char observed_sha256[65];
+    size_t index;
+    int ok = 0;
+    memset(digest, 0, sizeof(digest));
+    memset(observed_sha256, 0, sizeof(observed_sha256));
+    if (blob == NULL
+        || blob_size == NULL
+        || !fixed_completion_token(F3_BROKER_COMPLETION_KEY_ID)
+        || !fixed_completion_token(F3_BROKER_COMPLETION_KEY_VERSION)
+        || strlen(F3_BROKER_COMPLETION_PUBLIC_BLOB_SHA256) != 64
+        || hex_size == 0
+        || hex_size % 2 != 0
+        || hex_size / 2 > UINT_MAX
+        || hex_size / 2 < sizeof(BCRYPT_RSAKEY_BLOB)) {
+        goto cleanup;
+    }
+    decoded = (unsigned char *)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        hex_size / 2
+    );
+    if (decoded == NULL) {
+        goto cleanup;
+    }
+    for (index = 0; index < hex_size; index += 2) {
+        int high = hex_value(hex[index]);
+        int low = hex_value(hex[index + 1]);
+        if (high < 0 || low < 0) {
+            goto cleanup;
+        }
+        decoded[index / 2] = (unsigned char)((high << 4) | low);
+    }
+    header = (BCRYPT_RSAKEY_BLOB *)decoded;
+    if (header->Magic != BCRYPT_RSAPUBLIC_MAGIC
+        || header->BitLength != F3_EXECUTION_RSA_BITS
+        || header->cbPrime1 != 0
+        || header->cbPrime2 != 0
+        || header->cbPublicExp == 0
+        || header->cbModulus != F3_EXECUTION_RSA_BITS / 8
+        || sizeof(BCRYPT_RSAKEY_BLOB)
+            + (size_t)header->cbPublicExp
+            + (size_t)header->cbModulus
+            != hex_size / 2
+        || !hash_memory(
+            decoded,
+            (DWORD)(hex_size / 2),
+            digest
+        )) {
+        goto cleanup;
+    }
+    digest_to_ascii(digest, observed_sha256);
+    if (strcmp(
+            observed_sha256,
+            F3_BROKER_COMPLETION_PUBLIC_BLOB_SHA256
+        ) != 0) {
+        goto cleanup;
+    }
+    *blob = decoded;
+    *blob_size = (DWORD)(hex_size / 2);
+    decoded = NULL;
+    ok = 1;
+
+cleanup:
+    if (decoded != NULL) {
+        SecureZeroMemory(decoded, hex_size / 2);
+        HeapFree(GetProcessHeap(), 0, decoded);
+    }
+    SecureZeroMemory(digest, sizeof(digest));
+    SecureZeroMemory(observed_sha256, sizeof(observed_sha256));
+    return ok;
+}
+
+static int import_completion_public_key(
+    BCRYPT_ALG_HANDLE *algorithm,
+    BCRYPT_KEY_HANDLE *key
+) {
+    unsigned char *blob = NULL;
+    DWORD blob_size = 0;
+    int ok = algorithm != NULL
+        && key != NULL
+        && manifest_completion_public_blob(&blob, &blob_size)
+        && BCryptOpenAlgorithmProvider(
+            algorithm,
+            BCRYPT_RSA_ALGORITHM,
+            NULL,
+            0
+        ) >= 0
+        && BCryptImportKeyPair(
+            *algorithm,
+            NULL,
+            BCRYPT_RSAPUBLIC_BLOB,
+            key,
+            blob,
+            blob_size,
+            0
+        ) >= 0;
+    if (blob != NULL) {
+        SecureZeroMemory(blob, blob_size);
+        HeapFree(GetProcessHeap(), 0, blob);
+    }
+    if (!ok) {
+        if (key != NULL && *key != NULL) {
+            BCryptDestroyKey(*key);
+            *key = NULL;
+        }
+        if (algorithm != NULL && *algorithm != NULL) {
+            BCryptCloseAlgorithmProvider(*algorithm, 0);
+            *algorithm = NULL;
+        }
+    }
+    return ok;
+}
+
+static int persistent_cng_key_matches_public_pin(NCRYPT_KEY_HANDLE key) {
+    unsigned char *expected = NULL;
+    unsigned char *observed = NULL;
+    DWORD expected_size = 0;
+    DWORD observed_size = 0;
+    int ok = key != 0
+        && manifest_completion_public_blob(&expected, &expected_size)
+        && NCryptExportKey(
+            key,
+            0,
+            BCRYPT_RSAPUBLIC_BLOB,
+            NULL,
+            NULL,
+            0,
+            &observed_size,
+            0
+        ) == ERROR_SUCCESS
+        && observed_size == expected_size;
+    if (ok) {
+        observed = (unsigned char *)HeapAlloc(
+            GetProcessHeap(),
+            HEAP_ZERO_MEMORY,
+            observed_size
+        );
+        ok = observed != NULL
+            && NCryptExportKey(
+                key,
+                0,
+                BCRYPT_RSAPUBLIC_BLOB,
+                NULL,
+                observed,
+                observed_size,
+                &observed_size,
+                0
+            ) == ERROR_SUCCESS
+            && observed_size == expected_size
+            && memcmp(observed, expected, expected_size) == 0;
+    }
+    if (observed != NULL) {
+        SecureZeroMemory(observed, observed_size);
+        HeapFree(GetProcessHeap(), 0, observed);
+    }
+    if (expected != NULL) {
+        SecureZeroMemory(expected, expected_size);
+        HeapFree(GetProcessHeap(), 0, expected);
+    }
+    return ok;
+}
+
 static int open_persistent_cng_signing_key(
     NCRYPT_PROV_HANDLE *provider,
     NCRYPT_KEY_HANDLE *key
@@ -5034,7 +5259,7 @@ static int open_persistent_cng_signing_key(
         ) == ERROR_SUCCESS) {
         return 0;
     }
-    return 1;
+    return persistent_cng_key_matches_public_pin(*key);
 }
 
 static int validate_completion_lineage_before_signing(
@@ -5260,6 +5485,44 @@ cleanup:
     return ok;
 }
 
+static int hash_completion_signature_payload(
+    const unsigned char *payload,
+    DWORD payload_size,
+    unsigned char digest[32]
+) {
+    static const unsigned char domain[] =
+        "factor-v3-formal-native-broker-completion-signature/v1";
+    unsigned char *input = NULL;
+    size_t domain_size = sizeof(domain) - 1;
+    size_t input_size;
+    int ok = 0;
+    if (payload == NULL
+        || payload_size == 0
+        || digest == NULL
+        || (size_t)payload_size > SIZE_MAX - domain_size - 1) {
+        return 0;
+    }
+    input_size = domain_size + 1 + (size_t)payload_size;
+    if (input_size > UINT_MAX) {
+        return 0;
+    }
+    input = (unsigned char *)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        input_size
+    );
+    if (input == NULL) {
+        return 0;
+    }
+    memcpy(input, domain, domain_size);
+    input[domain_size] = '\0';
+    memcpy(input + domain_size + 1, payload, payload_size);
+    ok = hash_memory(input, (DWORD)input_size, digest);
+    SecureZeroMemory(input, input_size);
+    HeapFree(GetProcessHeap(), 0, input);
+    return ok;
+}
+
 static int write_persistent_cng_completion(
     ProtectedCompletionNamespace *completion,
     const wchar_t *completed_path,
@@ -5277,37 +5540,45 @@ static int write_persistent_cng_completion(
     unsigned char receipt_digest[32];
     unsigned char *signature = NULL;
     DWORD signature_size = 0;
-    char unsigned_receipt[1024];
+    char payload[2048];
     unsigned char *receipt = NULL;
     size_t receipt_capacity = 0;
     size_t offset = 0;
     size_t index;
-    int unsigned_length;
+    int payload_length;
     int ok = 0;
-    unsigned_length = snprintf(
-        unsigned_receipt,
-        sizeof(unsigned_receipt),
-        "schema=" F3_PERSISTENT_COMPLETION_SCHEMA "\n"
-        "status=completed\n"
-        "launch_authorization_sha256=%s\n"
-        "candidate_sha256=%s\n"
-        "claim_sha256=%s\n"
-        "supervisor_completed_sha256=%s\n"
-        "worker_terminal_sha256=%s\n"
-        "signature_algorithm=RSA-PKCS1-SHA256\n",
-        launch_authorization_sha256,
+    payload_length = snprintf(
+        payload,
+        sizeof(payload),
+        "{"
+        "\"candidate_sha256\":\"%s\","
+        "\"claim_sha256\":\"%s\","
+        "\"completion_key_id\":\"%s\","
+        "\"completion_key_version\":\"%s\","
+        "\"completion_public_blob_sha256\":\"%s\","
+        "\"launch_authorization_sha256\":\"%s\","
+        "\"schema\":\"" F3_PERSISTENT_COMPLETION_SCHEMA "\","
+        "\"signature_algorithm\":\"RSA-PKCS1-SHA256\","
+        "\"status\":\"completed\","
+        "\"supervisor_completed_sha256\":\"%s\","
+        "\"worker_terminal_sha256\":\"%s\""
+        "}",
         candidate_sha256,
         claim_sha256,
+        F3_BROKER_COMPLETION_KEY_ID,
+        F3_BROKER_COMPLETION_KEY_VERSION,
+        F3_BROKER_COMPLETION_PUBLIC_BLOB_SHA256,
+        launch_authorization_sha256,
         supervisor_completed_sha256,
         worker_terminal_sha256
     );
-    if (unsigned_length <= 0
-        || (size_t)unsigned_length >= sizeof(unsigned_receipt)
+    if (payload_length <= 0
+        || (size_t)payload_length >= sizeof(payload)
         || completion == NULL
         || completed_path == NULL
-        || !hash_memory(
-            (const unsigned char *)unsigned_receipt,
-            (DWORD)unsigned_length,
+        || !hash_completion_signature_payload(
+            (const unsigned char *)payload,
+            (DWORD)payload_length,
             unsigned_digest
         )) {
         goto cleanup;
@@ -5335,8 +5606,9 @@ static int write_persistent_cng_completion(
         goto cleanup;
     }
     F3_PRODUCTION_LAUNCH_STAGE(933);
-    receipt_capacity = (size_t)unsigned_length
-        + strlen("signature_hex=\n")
+    receipt_capacity = strlen("{\"payload\":")
+        + (size_t)payload_length
+        + strlen(",\"signature_hex\":\"\"}")
         + (size_t)signature_size * 2
         + 1;
     receipt = (unsigned char *)HeapAlloc(
@@ -5347,16 +5619,23 @@ static int write_persistent_cng_completion(
     if (receipt == NULL) {
         goto cleanup;
     }
-    memcpy(receipt, unsigned_receipt, (size_t)unsigned_length);
-    offset = (size_t)unsigned_length;
-    memcpy(receipt + offset, "signature_hex=", strlen("signature_hex="));
-    offset += strlen("signature_hex=");
+    memcpy(receipt, "{\"payload\":", strlen("{\"payload\":"));
+    offset = strlen("{\"payload\":");
+    memcpy(receipt + offset, payload, (size_t)payload_length);
+    offset += (size_t)payload_length;
+    memcpy(
+        receipt + offset,
+        ",\"signature_hex\":\"",
+        strlen(",\"signature_hex\":\"")
+    );
+    offset += strlen(",\"signature_hex\":\"");
     for (index = 0; index < signature_size; ++index) {
         static const char digits[] = "0123456789abcdef";
         receipt[offset++] = (unsigned char)digits[signature[index] >> 4];
         receipt[offset++] = (unsigned char)digits[signature[index] & 15];
     }
-    receipt[offset++] = '\n';
+    memcpy(receipt + offset, "\"}", strlen("\"}"));
+    offset += strlen("\"}");
     if (offset > UINT_MAX
         || !hash_memory(receipt, (DWORD)offset, receipt_digest)
         || !atomic_write_persistent_completion(
@@ -5388,7 +5667,7 @@ cleanup:
     }
     SecureZeroMemory(unsigned_digest, sizeof(unsigned_digest));
     SecureZeroMemory(receipt_digest, sizeof(receipt_digest));
-    SecureZeroMemory(unsigned_receipt, sizeof(unsigned_receipt));
+    SecureZeroMemory(payload, sizeof(payload));
     if (!ok) {
         SecureZeroMemory(completed_receipt_sha256, 65);
     }
@@ -5442,6 +5721,318 @@ static int hex_signature(
 }
 
 static int verify_persistent_cng_completion(
+    const wchar_t *candidate_path
+) {
+    static const char *const envelope_keys[] = {
+        "payload",
+        "signature_hex",
+    };
+    static const char *const payload_keys[] = {
+        "candidate_sha256",
+        "claim_sha256",
+        "completion_key_id",
+        "completion_key_version",
+        "completion_public_blob_sha256",
+        "launch_authorization_sha256",
+        "schema",
+        "signature_algorithm",
+        "status",
+        "supervisor_completed_sha256",
+        "worker_terminal_sha256",
+    };
+    BCRYPT_PKCS1_PADDING_INFO padding = {BCRYPT_SHA256_ALGORITHM};
+    BCRYPT_ALG_HANDLE algorithm = NULL;
+    BCRYPT_KEY_HANDLE key = NULL;
+    HeldFile candidate_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile launch_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile receipt_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile claim_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    HeldFile completed_file = {INVALID_HANDLE_VALUE, 0, 0, {0}};
+    ProductionCandidate candidate;
+    SignedEnvelope launch_envelope;
+    ByteSlice payload;
+    ByteSlice signature_value;
+    unsigned char *candidate_raw = NULL;
+    unsigned char *launch_raw = NULL;
+    unsigned char *receipt_raw = NULL;
+    unsigned char *signature = NULL;
+    DWORD candidate_size = 0;
+    DWORD launch_size = 0;
+    DWORD receipt_size = 0;
+    DWORD signature_size = 0;
+    unsigned char candidate_digest[32];
+    unsigned char launch_digest[32];
+    unsigned char payload_digest[32];
+    wchar_t launch_path[32768];
+    wchar_t receipt_path[32768];
+    char candidate_sha256[65];
+    char launch_sha256[65];
+    char claim_sha256[65];
+    char supervisor_sha256[65];
+    char worker_sha256[65];
+    size_t json_size;
+    int ok = 0;
+    memset(&candidate, 0, sizeof(candidate));
+    memset(&launch_envelope, 0, sizeof(launch_envelope));
+    memset(&payload, 0, sizeof(payload));
+    memset(&signature_value, 0, sizeof(signature_value));
+    memset(candidate_digest, 0, sizeof(candidate_digest));
+    memset(launch_digest, 0, sizeof(launch_digest));
+    memset(payload_digest, 0, sizeof(payload_digest));
+    memset(launch_path, 0, sizeof(launch_path));
+    memset(receipt_path, 0, sizeof(receipt_path));
+    memset(candidate_sha256, 0, sizeof(candidate_sha256));
+    memset(launch_sha256, 0, sizeof(launch_sha256));
+    memset(claim_sha256, 0, sizeof(claim_sha256));
+    memset(supervisor_sha256, 0, sizeof(supervisor_sha256));
+    memset(worker_sha256, 0, sizeof(worker_sha256));
+    if (!open_held_file(
+            candidate_path,
+            F3_MAX_CANDIDATE_BYTES,
+            &candidate_file
+        )
+        || !hash_held_file(&candidate_file, candidate_digest)
+        || !filename_matches_candidate_digest(
+            candidate_path,
+            candidate_digest
+        )
+        || !read_candidate(&candidate_file, &candidate_raw, &candidate_size)
+        || !parse_production_candidate(
+            candidate_raw,
+            candidate_size,
+            &candidate
+        )
+        || !byte_slice_to_wide(
+            candidate.launch_authorization_path,
+            launch_path,
+            sizeof(launch_path) / sizeof(launch_path[0])
+        )
+        || !open_held_file(
+            launch_path,
+            F3_MAX_AUTHORIZATION_BYTES,
+            &launch_file
+        )
+        || !hash_held_file(&launch_file, launch_digest)
+        || !filename_matches_digest_suffix(
+            launch_path,
+            launch_digest,
+            L".json"
+        )
+        || !read_candidate(&launch_file, &launch_raw, &launch_size)
+        || !parse_signed_envelope(
+            launch_raw,
+            launch_size,
+            &launch_envelope
+        )
+        || !validate_current_launch_payload(
+            &launch_envelope,
+            &candidate
+        )) {
+        goto cleanup;
+    }
+    digest_to_ascii(candidate_digest, candidate_sha256);
+    digest_to_ascii(launch_digest, launch_sha256);
+    if (!expected_ledger_path(
+            candidate.execution_ledger_root,
+            "native_completed",
+            launch_sha256,
+            receipt_path,
+            sizeof(receipt_path) / sizeof(receipt_path[0])
+        )
+        || !open_held_file(receipt_path, 16 * 1024, &receipt_file)
+        || !read_candidate(&receipt_file, &receipt_raw, &receipt_size)
+        || receipt_size < 2) {
+        goto cleanup;
+    }
+    json_size = (size_t)receipt_size;
+    if (!json_top_has_exact_keys(
+            receipt_raw,
+            json_size,
+            envelope_keys,
+            sizeof(envelope_keys) / sizeof(envelope_keys[0])
+        )
+        || !json_top_field(
+            receipt_raw,
+            json_size,
+            "payload",
+            &payload
+        )
+        || !json_top_field(
+            receipt_raw,
+            json_size,
+            "signature_hex",
+            &signature_value
+        )
+        || !json_top_has_exact_keys(
+            (const unsigned char *)payload.value,
+            payload.length,
+            payload_keys,
+            sizeof(payload_keys) / sizeof(payload_keys[0])
+        )
+        || !json_top_string_matches(
+            (const unsigned char *)payload.value,
+            payload.length,
+            "candidate_sha256",
+            candidate_sha256,
+            64
+        )
+        || !json_top_string_matches(
+            (const unsigned char *)payload.value,
+            payload.length,
+            "launch_authorization_sha256",
+            launch_sha256,
+            64
+        )
+        || !json_top_string_matches(
+            (const unsigned char *)payload.value,
+            payload.length,
+            "completion_key_id",
+            F3_BROKER_COMPLETION_KEY_ID,
+            strlen(F3_BROKER_COMPLETION_KEY_ID)
+        )
+        || !json_top_string_matches(
+            (const unsigned char *)payload.value,
+            payload.length,
+            "completion_key_version",
+            F3_BROKER_COMPLETION_KEY_VERSION,
+            strlen(F3_BROKER_COMPLETION_KEY_VERSION)
+        )
+        || !json_top_string_matches(
+            (const unsigned char *)payload.value,
+            payload.length,
+            "completion_public_blob_sha256",
+            F3_BROKER_COMPLETION_PUBLIC_BLOB_SHA256,
+            64
+        )
+        || !json_top_string_matches(
+            (const unsigned char *)payload.value,
+            payload.length,
+            "schema",
+            F3_PERSISTENT_COMPLETION_SCHEMA,
+            strlen(F3_PERSISTENT_COMPLETION_SCHEMA)
+        )
+        || !json_top_string_matches(
+            (const unsigned char *)payload.value,
+            payload.length,
+            "signature_algorithm",
+            "RSA-PKCS1-SHA256",
+            strlen("RSA-PKCS1-SHA256")
+        )
+        || !json_top_string_matches(
+            (const unsigned char *)payload.value,
+            payload.length,
+            "status",
+            "completed",
+            strlen("completed")
+        )
+        || !json_top_copy_sha256(
+            (const unsigned char *)payload.value,
+            payload.length,
+            "claim_sha256",
+            claim_sha256
+        )
+        || !json_top_copy_sha256(
+            (const unsigned char *)payload.value,
+            payload.length,
+            "supervisor_completed_sha256",
+            supervisor_sha256
+        )
+        || !json_top_copy_sha256(
+            (const unsigned char *)payload.value,
+            payload.length,
+            "worker_terminal_sha256",
+            worker_sha256
+        )
+        || signature_value.length < 4
+        || signature_value.value[0] != '"'
+        || signature_value.value[signature_value.length - 1] != '"'
+        || !hex_signature(
+            (const unsigned char *)signature_value.value + 1,
+            signature_value.length - 2,
+            &signature,
+            &signature_size
+        )
+        || signature_size != F3_EXECUTION_RSA_BITS / 8
+        || payload.length > UINT_MAX
+        || !hash_completion_signature_payload(
+            (const unsigned char *)payload.value,
+            (DWORD)payload.length,
+            payload_digest
+        )
+        || !import_completion_public_key(&algorithm, &key)
+        || BCryptVerifySignature(
+            key,
+            &padding,
+            payload_digest,
+            sizeof(payload_digest),
+            signature,
+            signature_size,
+            BCRYPT_PAD_PKCS1
+        ) < 0
+        || !validate_completion_lineage_before_signing(
+            &candidate,
+            &launch_envelope,
+            launch_sha256,
+            claim_sha256,
+            supervisor_sha256,
+            worker_sha256,
+            &claim_file,
+            &completed_file
+        )
+        || !held_unchanged(&receipt_file, NULL)
+        || !held_unchanged(&launch_file, NULL)
+        || !held_unchanged(&candidate_file, NULL)) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (signature != NULL) {
+        SecureZeroMemory(signature, signature_size);
+        HeapFree(GetProcessHeap(), 0, signature);
+    }
+    if (key != NULL) {
+        BCryptDestroyKey(key);
+    }
+    if (algorithm != NULL) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+    }
+    if (receipt_raw != NULL) {
+        SecureZeroMemory(receipt_raw, (SIZE_T)receipt_size + 1);
+        HeapFree(GetProcessHeap(), 0, receipt_raw);
+    }
+    if (launch_raw != NULL) {
+        SecureZeroMemory(launch_raw, (SIZE_T)launch_size + 1);
+        HeapFree(GetProcessHeap(), 0, launch_raw);
+    }
+    if (candidate_raw != NULL) {
+        SecureZeroMemory(candidate_raw, (SIZE_T)candidate_size + 1);
+        HeapFree(GetProcessHeap(), 0, candidate_raw);
+    }
+    close_held(&completed_file);
+    close_held(&claim_file);
+    close_held(&receipt_file);
+    close_held(&launch_file);
+    close_held(&candidate_file);
+    SecureZeroMemory(&candidate, sizeof(candidate));
+    SecureZeroMemory(&launch_envelope, sizeof(launch_envelope));
+    SecureZeroMemory(&payload, sizeof(payload));
+    SecureZeroMemory(&signature_value, sizeof(signature_value));
+    SecureZeroMemory(candidate_digest, sizeof(candidate_digest));
+    SecureZeroMemory(launch_digest, sizeof(launch_digest));
+    SecureZeroMemory(payload_digest, sizeof(payload_digest));
+    SecureZeroMemory(launch_path, sizeof(launch_path));
+    SecureZeroMemory(receipt_path, sizeof(receipt_path));
+    SecureZeroMemory(candidate_sha256, sizeof(candidate_sha256));
+    SecureZeroMemory(launch_sha256, sizeof(launch_sha256));
+    SecureZeroMemory(claim_sha256, sizeof(claim_sha256));
+    SecureZeroMemory(supervisor_sha256, sizeof(supervisor_sha256));
+    SecureZeroMemory(worker_sha256, sizeof(worker_sha256));
+    return ok;
+}
+
+#if 0
+static int legacy_verify_persistent_cng_completion(
     const wchar_t *candidate_path
 ) {
     static const char schema[] =
@@ -5741,11 +6332,12 @@ cleanup:
     return ok;
 }
 
+#endif
 #ifdef F3_BROKER_TESTING
 static int create_persistent_test_cng_key(void) {
     NCRYPT_PROV_HANDLE provider = 0;
     NCRYPT_KEY_HANDLE key = 0;
-    DWORD bits = F3_RSA_BITS;
+    DWORD bits = F3_EXECUTION_RSA_BITS;
     DWORD export_policy = 0;
     int ok = 0;
     if (wcsncmp(
@@ -5789,6 +6381,93 @@ cleanup:
     if (provider != 0) {
         NCryptFreeObject(provider);
     }
+    return ok;
+}
+
+static int export_persistent_test_cng_public(void) {
+    NCRYPT_PROV_HANDLE provider = 0;
+    NCRYPT_KEY_HANDLE key = 0;
+    unsigned char *blob = NULL;
+    DWORD blob_size = 0;
+    unsigned char digest[32];
+    char sha256[65];
+    size_t index;
+    int ok = 0;
+    memset(digest, 0, sizeof(digest));
+    memset(sha256, 0, sizeof(sha256));
+    if (wcsncmp(
+            F3_BROKER_CNG_KEY_NAME,
+            F3_DISPOSABLE_KEY_PREFIX,
+            wcslen(F3_DISPOSABLE_KEY_PREFIX)
+        ) != 0
+        || f3_broker_open_cng_provider(&provider) != ERROR_SUCCESS
+        || NCryptOpenKey(
+            provider,
+            &key,
+            F3_BROKER_CNG_KEY_NAME,
+            0,
+            0
+        ) != ERROR_SUCCESS
+        || NCryptExportKey(
+            key,
+            0,
+            BCRYPT_RSAPUBLIC_BLOB,
+            NULL,
+            NULL,
+            0,
+            &blob_size,
+            0
+        ) != ERROR_SUCCESS
+        || blob_size == 0) {
+        goto cleanup;
+    }
+    blob = (unsigned char *)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        blob_size
+    );
+    if (blob == NULL
+        || NCryptExportKey(
+            key,
+            0,
+            BCRYPT_RSAPUBLIC_BLOB,
+            NULL,
+            blob,
+            blob_size,
+            &blob_size,
+            0
+        ) != ERROR_SUCCESS
+        || !hash_memory(blob, blob_size, digest)) {
+        goto cleanup;
+    }
+    digest_to_ascii(digest, sha256);
+    if (fputs("public_blob_hex=", stdout) < 0) {
+        goto cleanup;
+    }
+    for (index = 0; index < blob_size; ++index) {
+        if (fprintf(stdout, "%02x", blob[index]) < 0) {
+            goto cleanup;
+        }
+    }
+    if (fprintf(stdout, "\npublic_blob_sha256=%s\n", sha256) < 0
+        || fflush(stdout) != 0) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (blob != NULL) {
+        SecureZeroMemory(blob, blob_size);
+        HeapFree(GetProcessHeap(), 0, blob);
+    }
+    if (key != 0) {
+        NCryptFreeObject(key);
+    }
+    if (provider != 0) {
+        NCryptFreeObject(provider);
+    }
+    SecureZeroMemory(digest, sizeof(digest));
+    SecureZeroMemory(sha256, sizeof(sha256));
     return ok;
 }
 
@@ -7938,6 +8617,19 @@ int wmain(int argc, wchar_t **argv) {
         return 0;
     }
     if (
+        argc == 2
+        && wcscmp(
+            argv[1],
+            L"--test-export-persistent-cng-public"
+        ) == 0
+    ) {
+        if (!export_persistent_test_cng_public()) {
+            fwprintf(stderr, L"native broker persistent CNG public export rejected\n");
+            return 46;
+        }
+        return 0;
+    }
+    if (
         argc == 3
         && wcscmp(
             argv[1],
@@ -8001,6 +8693,16 @@ int wmain(int argc, wchar_t **argv) {
         return 0;
     }
 #endif
+    if (
+        argc == 3
+        && wcscmp(argv[1], L"--verify-completion") == 0
+    ) {
+        if (!verify_persistent_cng_completion(argv[2])) {
+            fwprintf(stderr, L"native broker completion verification rejected\n");
+            return 47;
+        }
+        return 0;
+    }
     if (argc == 3 && wcscmp(argv[1], L"--launch") == 0) {
 #if F3_BROKER_PRODUCTION_HANDOFF_READY
         HeldDirectoryChain runtime_chain;
