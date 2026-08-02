@@ -43,6 +43,7 @@ def evaluate_market_regime(data_provider, disclaimer: str) -> Dict[str, Any]:
                     "score": payload["score"],
                     "last_close": payload["last_close"],
                     "as_of": payload["as_of"],
+                    "market_data_source": payload.get("source") or "unknown",
                     "ma20": payload["indicators"].get("ma20"),
                     "ma60": payload["indicators"].get("ma60"),
                     "return_20d_pct": payload["indicators"].get("return_20d_pct"),
@@ -101,4 +102,3 @@ def evaluate_market_regime(data_provider, disclaimer: str) -> Dict[str, Any]:
         "proxies": proxies,
         "errors": errors,
     }
-

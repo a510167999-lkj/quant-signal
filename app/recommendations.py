@@ -115,10 +115,30 @@ RECOMMENDATION_STATUS_DEVELOPMENT = "research_development_candidate"
 EVIDENCE_SCOPE_DEVELOPMENT_ONLY = "development_only"
 
 
+def _jiaoch_source_observed(value: Any) -> bool:
+    return str(value or "").strip().lower().startswith("jiaoch")
+
+
+def _market_source_observations(item: Dict[str, Any]) -> set[str]:
+    """Collect every market-data provenance carried by a recommendation."""
+    observations = {
+        str(item.get("market_data_source") or "unknown").strip() or "unknown",
+        str(item.get("market_snapshot_source") or "unknown").strip() or "unknown",
+    }
+    l1_quote = item.get("l1_quote")
+    if isinstance(l1_quote, dict) and l1_quote:
+        observations.add(
+            str(l1_quote.get("source") or "unknown").strip() or "unknown"
+        )
+    return observations
+
+
 def _jiaoch_market_source_observed(item: Dict[str, Any]) -> bool:
-    """Require an explicit Jiaoch provenance before live publication."""
-    source = str(item.get("market_data_source") or "").strip().lower()
-    return source.startswith("jiaoch")
+    """Require explicit Jiaoch provenance for every market input."""
+    return all(
+        _jiaoch_source_observed(source)
+        for source in _market_source_observations(item)
+    )
 
 
 def _recommendation_key(item: Dict[str, Any]) -> str:
@@ -452,6 +472,7 @@ def _price_action_context(result: Dict[str, Any], candidate: Dict[str, Any]) -> 
 def _proxy_return_context(data_provider) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
     returns_20d = []
     returns_60d = []
+    market_data_sources: set[str] = set()
     errors = []
     proxies = [
         {"symbol": "510300", "market": "etf", "name": "沪深300ETF"},
@@ -459,7 +480,13 @@ def _proxy_return_context(data_provider) -> tuple[Dict[str, Any], List[Dict[str,
     ]
     for proxy in proxies:
         try:
-            frame, _source = data_provider.history(proxy["symbol"], proxy["market"], lookback_days=180, adjust="qfq")
+            frame, source = data_provider.history(
+                proxy["symbol"],
+                proxy["market"],
+                lookback_days=180,
+                adjust="qfq",
+            )
+            market_data_sources.add(str(source or "unknown").strip() or "unknown")
             frame = add_indicators(frame)
             latest = frame.iloc[-1]
             returns_20d.append(_num(latest.get("return_20d")) * 100)
@@ -471,6 +498,7 @@ def _proxy_return_context(data_provider) -> tuple[Dict[str, Any], List[Dict[str,
         "proxy_return_20d_max_pct": round(max(returns_20d), 2) if returns_20d else None,
         "proxy_return_60d_avg_pct": round(_avg(returns_60d), 2) if returns_60d else None,
         "proxy_return_60d_max_pct": round(max(returns_60d), 2) if returns_60d else None,
+        "market_data_sources": sorted(market_data_sources),
     }
     return context, errors
 
@@ -791,6 +819,7 @@ def _compact_analysis(
         "name": result.get("name") or candidate.get("name"),
         "as_of": result["as_of"],
         "market_data_source": result.get("source") or "unknown",
+        "market_snapshot_source": candidate.get("market_snapshot_source") or "unknown",
         "action": result["action"],
         "action_label": result["action_label"],
         "score": result["score"],
@@ -1244,17 +1273,35 @@ class RecommendationService:
         stored_market_source_gate = payload.get("market_source_gate")
         if not isinstance(stored_market_source_gate, dict):
             stored_market_source_gate = {}
-        observed_market_sources = sorted(
-            {
-                str(item.get("market_data_source") or "unknown")
-                for item in item_values
-                if isinstance(item, dict)
-            }
-        )
+        observed_market_sources_set: set[str] = set()
+        for item in item_values:
+            if isinstance(item, dict):
+                observed_market_sources_set.update(_market_source_observations(item))
+        summary_payload = payload.get("summary")
+        if isinstance(summary_payload, dict):
+            proxy_payload = summary_payload.get("relative_strength_proxy")
+            if isinstance(proxy_payload, dict):
+                proxy_sources = proxy_payload.get("market_data_sources")
+                if isinstance(proxy_sources, list):
+                    observed_market_sources_set.update(
+                        str(source or "unknown").strip() or "unknown"
+                        for source in proxy_sources
+                    )
+            market_payload = summary_payload.get("market_context")
+            if isinstance(market_payload, dict):
+                for proxy in market_payload.get("proxies") or []:
+                    if isinstance(proxy, dict):
+                        observed_market_sources_set.add(
+                            str(proxy.get("market_data_source") or "unknown").strip()
+                            or "unknown"
+                        )
+        observed_market_sources = sorted(observed_market_sources_set)
         market_source_gate_valid = (
             stored_market_source_gate.get("required") == "jiaoch"
             and stored_market_source_gate.get("passed") is True
             and stored_market_source_gate.get("observed") == observed_market_sources
+            and bool(observed_market_sources)
+            and all(_jiaoch_source_observed(source) for source in observed_market_sources)
             and all(_jiaoch_market_source_observed(item) for item in item_values)
         )
         publication_claimed = (
@@ -2220,14 +2267,22 @@ class RecommendationService:
         current_pool_production_eligible = bool(
             current_pool_gate.get("production_recommendation_eligible", False)
         )
-        observed_market_sources = sorted(
-            {
-                str(item.get("market_data_source") or "unknown")
-                for item in selected
-            }
-        )
-        market_source_gate_passed = all(
-            _jiaoch_market_source_observed(item) for item in selected
+        observed_market_sources_set: set[str] = set()
+        for item in selected:
+            observed_market_sources_set.update(_market_source_observations(item))
+        for source in proxy_returns.get("market_data_sources") or []:
+            observed_market_sources_set.add(
+                str(source or "unknown").strip() or "unknown"
+            )
+        for proxy in market_context.get("proxies") or []:
+            if isinstance(proxy, dict):
+                observed_market_sources_set.add(
+                    str(proxy.get("market_data_source") or "unknown").strip()
+                    or "unknown"
+                )
+        observed_market_sources = sorted(observed_market_sources_set)
+        market_source_gate_passed = bool(observed_market_sources) and all(
+            _jiaoch_source_observed(source) for source in observed_market_sources
         )
         evidence_live_proof = (
             profile_live_proof and current_pool_production_eligible

@@ -28,6 +28,7 @@ def test_universe_snapshot_uses_cache_when_akshare_import_fails(tmp_path, monkey
     items = AShareUniverseProvider(str(cache_path)).snapshot(use_cache_on_error=True)
 
     assert items[0]["symbol"] == "600001"
+    assert items[0]["market_snapshot_source"] == "unknown:legacy_cache"
 
 
 def test_select_deep_scan_candidates_adds_rank_percentiles():

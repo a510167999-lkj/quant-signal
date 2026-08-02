@@ -54,6 +54,7 @@ class AShareUniverseProvider:
                 self.cache_path,
                 {
                     "updated_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
+                    "market_snapshot_source": "akshare:stock_zh_a_spot",
                     "items": items,
                 },
             )
@@ -63,7 +64,21 @@ class AShareUniverseProvider:
                 cached = read_json(self.cache_path, {"items": []})
                 items = cached.get("items", []) if isinstance(cached, dict) else []
                 if items:
-                    return items
+                    cached_source = (
+                        cached.get("market_snapshot_source")
+                        if isinstance(cached, dict)
+                        else None
+                    )
+                    return [
+                        {
+                            **item,
+                            "market_snapshot_source": item.get(
+                                "market_snapshot_source",
+                                cached_source or "unknown:legacy_cache",
+                            ),
+                        }
+                        for item in items
+                    ]
             raise
 
     def _normalize_snapshot(self, frame: pd.DataFrame) -> List[Dict[str, Any]]:
@@ -85,6 +100,7 @@ class AShareUniverseProvider:
                     "symbol": code,
                     "market": "a",
                     "name": name,
+                    "market_snapshot_source": "akshare:stock_zh_a_spot",
                     "latest": latest,
                     "amount": amount,
                     "change_pct": change_pct,

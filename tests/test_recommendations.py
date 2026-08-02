@@ -58,7 +58,15 @@ class FakeUniverse:
         self._snapshot = snapshot
 
     def snapshot(self, use_cache_on_error=True):
-        return list(self._snapshot)
+        return [
+            {
+                **item,
+                "market_snapshot_source": item.get(
+                    "market_snapshot_source", "Jiaoch fixture"
+                ),
+            }
+            for item in self._snapshot
+        ]
 
 
 class FakeIndustry:
@@ -345,6 +353,7 @@ def complete_operation_contract_item():
         "symbol": "600519",
         "market": "a",
         "market_data_source": "Jiaoch fixture",
+        "market_snapshot_source": "Jiaoch fixture",
         "auto_order": False,
         "entry_zone": {"low": 99.0, "high": 101.0},
         "levels": {
@@ -788,10 +797,11 @@ def test_latest_accepts_snapshot_with_receipt_in_ledger(tmp_path, monkeypatch):
     ] == "a" * 64
 
 
-def test_latest_rejects_non_jiaoch_market_source(tmp_path, monkeypatch):
+@pytest.mark.parametrize("field", ["market_data_source", "market_snapshot_source"])
+def test_latest_rejects_non_jiaoch_market_source(tmp_path, monkeypatch, field):
     service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
     payload = publication_payload(["600519"])
-    payload["items"][0]["market_data_source"] = "AKShare fixture"
+    payload["items"][0][field] = "AKShare fixture"
     service._commit_publication_ledger(payload)
     write_json(service.settings.latest_recommendations_path, payload)
     monkeypatch.setattr(
@@ -814,6 +824,31 @@ def test_latest_rejects_non_jiaoch_market_source(tmp_path, monkeypatch):
         "status": "blocked",
         "reason": "market_data_source_not_jiaoch",
     }
+    assert result["market_source_gate"]["passed"] is False
+
+
+def test_latest_rejects_non_jiaoch_l1_source(tmp_path, monkeypatch):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    payload = publication_payload(["600519"])
+    payload["items"][0]["l1_quote"] = {"source": "mootdx", "price": 100.0}
+    service._commit_publication_ledger(payload)
+    write_json(service.settings.latest_recommendations_path, payload)
+    monkeypatch.setattr(
+        service,
+        "_current_pool_gate",
+        lambda moment, run_slot=None: {
+            "passed": True,
+            "production_recommendation_eligible": True,
+            "allowed_symbols": {"600519"},
+            "canonical_sha256": "a" * 64,
+            "source_as_of": "2026-07-13",
+        },
+    )
+
+    result = service.latest()
+
+    assert result["items"] == []
+    assert result["recommendation_status"] == "blocked_market_source_gate"
     assert result["market_source_gate"]["passed"] is False
 
 
