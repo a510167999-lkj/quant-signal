@@ -25,6 +25,7 @@ DEVELOPMENT_GATE_NAMES = (
     "minimum_sample",
     "signal_days_120",
     "all_rolling_12m",
+    "all_rolling_12m_stability",
     "pit_contract",
     "temporal_contract",
     "cost_slippage",
@@ -139,6 +140,7 @@ def _development_gates(
         "minimum_sample": _integer_at_least(metrics.get("selected_trade_count"), 200),
         "signal_days_120": _integer_at_least(metrics.get("signal_days"), profile.min_signal_days),
         "all_rolling_12m": _all_rolling_pass(metrics.get("rolling_12m"), profile),
+        "all_rolling_12m_stability": metrics.get("rolling_12m_stability_pass") is True,
         "pit_contract": evidence.get("pit_contract") is True,
         "temporal_contract": evidence.get("temporal_contract") is True,
         "cost_slippage": evidence.get("cost_slippage") is True,
@@ -173,6 +175,9 @@ def build_profile_evidence_receipt(
         raise ValueError("aggregate_validation must be an object")
     profile_payload = profile_to_dict(profile)
     windows = _rolling_windows(rolling_12m)
+    qualification = validation_report.get("qualification") or {}
+    if not isinstance(qualification, dict):
+        qualification = {}
     full_window = bool(aggregate.get("rolling_1y_latest_full_window"))
     signed_drawdown = aggregate.get("portfolio_max_drawdown_pct")
     metrics = {
@@ -192,6 +197,9 @@ def build_profile_evidence_receipt(
         "profit_factor": aggregate.get("trade_profit_factor"),
         "calmar": aggregate.get("calmar_latest_12m"),
         "rolling_12m": windows,
+        "rolling_12m_stability_pass": (
+            qualification.get("all_rolling_12m_stability_pass") is True
+        ),
     }
     gates = _development_gates(metrics, evidence, profile)
     development_ready = all(gates.values())
@@ -199,7 +207,7 @@ def build_profile_evidence_receipt(
     shadow = evidence.get("shadow") is True
     live_monitoring = evidence.get("live_monitoring") is True
     live_proof = development_ready and final_oos and shadow and live_monitoring and bool(
-        (validation_report.get("qualification") or {}).get("completion_pass")
+        qualification.get("completion_pass")
     )
     gates.update({"final_oos": final_oos, "shadow": shadow, "live_monitoring": live_monitoring})
     blocking_gates = [key for key, passed in gates.items() if not passed]
@@ -233,9 +241,7 @@ def build_profile_evidence_receipt(
         "status": status,
         "evidence_scope": "live_proof" if live_proof else "development_only",
         "live_proof": live_proof,
-        "completion_pass": bool(
-            (validation_report.get("qualification") or {}).get("completion_pass")
-        ),
+        "completion_pass": bool(qualification.get("completion_pass")),
         "evidence": {
             **dict(evidence),
             "pit_verified": evidence.get("pit_verified") is True,

@@ -21,6 +21,7 @@ def _metrics():
                 "calmar": 1.8,
             }
         ],
+        "rolling_12m_stability_pass": True,
     }
 
 
@@ -90,6 +91,21 @@ def test_metric_or_health_failure_is_reported_as_structured_reasons():
     assert "signal_days_below_min" in result["reasons"]
     assert "production_health_not_ok" in result["reasons"]
     assert result["auto_order"] is False
+
+
+def test_missing_authoritative_rolling_stability_claim_fails_closed():
+    metrics = _metrics()
+    metrics.pop("rolling_12m_stability_pass")
+
+    result = evaluate_recommendation_gate(
+        DEFAULT_PROFILE,
+        metrics,
+        _evidence(),
+        {"ok": True},
+    )
+
+    assert result["development_ready"] is False
+    assert "rolling_12m_stability_missing" in result["reasons"]
 
 
 def test_signed_drawdown_is_checked_by_absolute_magnitude():

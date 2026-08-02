@@ -111,6 +111,8 @@ def evaluate_recommendation_gate(
     _require_number(metrics, "calmar", reasons, minimum=profile.min_calmar)
     _require_number(metrics, "signal_days", reasons, minimum=profile.min_signal_days)
     reasons.extend(_rolling_reasons(profile, metrics.get("rolling_12m")))
+    if metrics.get("rolling_12m_stability_pass") is not True:
+        reasons.append("rolling_12m_stability_missing")
 
     for key in (
         "pit_contract",

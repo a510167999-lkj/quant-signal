@@ -1723,6 +1723,7 @@ def _profile_evidence_payload():
             "minimum_sample": True,
             "signal_days_120": True,
             "all_rolling_12m": True,
+            "all_rolling_12m_stability": True,
             "pit_contract": True,
             "temporal_contract": True,
             "cost_slippage": True,
@@ -1748,6 +1749,7 @@ def _profile_evidence_payload():
             "profit_factor": 1.6,
             "calmar": 2.0,
             "signal_days": 132,
+            "rolling_12m_stability_pass": True,
             "rolling_12m": [
                 {
                     "annualized_return_pct": 50.2,

@@ -35,7 +35,10 @@ def _report(metrics=None):
         aggregate.update(metrics)
     return {
         "aggregate_validation": aggregate,
-        "qualification": {"completion_pass": False},
+        "qualification": {
+            "completion_pass": False,
+            "all_rolling_12m_stability_pass": True,
+        },
         "dataset_sha256": "dataset-hash",
         "strategy_sha256": "strategy-hash",
         "validation_sha256": "validation-hash",
@@ -154,6 +157,27 @@ def test_receipt_qualifies_development_evidence_but_not_live_proof():
     assert receipt["blocking_gates"] == ["final_oos", "shadow", "live_monitoring"]
     assert receipt["metrics"]["calmar"] == 2.1
     assert receipt["metric_basis"]["calmar"] == "rolling_365d_return_over_same_window_drawdown"
+
+
+def test_receipt_requires_authoritative_rolling_stability_claim():
+    report = _report()
+    report["qualification"]["all_rolling_12m_stability_pass"] = False
+    receipt = build_profile_evidence_receipt(
+        profile=DEFAULT_PROFILE,
+        experiment_id="stability-unbound",
+        strategy={"capital_model": "slot-daily"},
+        validation={"final_oos_start": "2026-07-13"},
+        validation_report=report,
+        rolling_12m=_rolling_windows(),
+        evidence=_evidence(),
+        source_artifact={"path": "cache.json", "sha256": "cache-hash"},
+        report_artifact={"path": "report.json", "sha256": "report-hash"},
+        ledger_anchor={"sequence": 106, "record_hash": "ledger-hash"},
+    )
+
+    assert receipt["status"] == "incomplete"
+    assert receipt["metrics"]["rolling_12m_stability_pass"] is False
+    assert "all_rolling_12m_stability" in receipt["blocking_gates"]
 
 
 def test_receipt_verifier_checks_canonical_hash_and_source_artifacts(tmp_path):
