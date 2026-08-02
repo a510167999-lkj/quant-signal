@@ -108,6 +108,22 @@ def test_missing_authoritative_rolling_stability_claim_fails_closed():
     assert "rolling_12m_stability_missing" in result["reasons"]
 
 
+def test_rolling_return_pct_is_accepted_for_research_window_schema():
+    metrics = _metrics()
+    window = metrics["rolling_12m"][0]
+    window["return_pct"] = window.pop("annualized_return_pct")
+
+    result = evaluate_recommendation_gate(
+        DEFAULT_PROFILE,
+        metrics,
+        _evidence(),
+        {"ok": True},
+    )
+
+    assert result["development_ready"] is True
+    assert result["reasons"] == []
+
+
 def test_signed_drawdown_is_checked_by_absolute_magnitude():
     metrics = _metrics()
     metrics["max_drawdown_pct"] = -16.0

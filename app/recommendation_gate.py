@@ -57,16 +57,22 @@ def _rolling_reasons(profile: RecommendationProfile, windows: Any) -> List[str]:
             continue
         prefix = "rolling_12m_window_%d" % index
         checks = (
-            ("annualized_return_pct", profile.target_annualized_return_pct, None),
-            ("max_drawdown_pct", None, profile.max_drawdown_pct),
-            ("payoff_ratio", profile.min_payoff_ratio, None),
-            ("profit_factor", profile.min_profit_factor, None),
-            ("calmar", profile.min_calmar, None),
+            (
+                "annualized_return_pct",
+                window.get("annualized_return_pct", window.get("return_pct")),
+                profile.target_annualized_return_pct,
+                None,
+            ),
+            ("max_drawdown_pct", window.get("max_drawdown_pct"), None, profile.max_drawdown_pct),
+            ("payoff_ratio", window.get("payoff_ratio"), profile.min_payoff_ratio, None),
+            ("profit_factor", window.get("profit_factor"), profile.min_profit_factor, None),
+            ("calmar", window.get("calmar"), profile.min_calmar, None),
         )
-        for key, minimum, maximum in checks:
-            value = _number(window.get(key))
+        for key, raw_value, minimum, maximum in checks:
+            value = _number(raw_value)
             if value is None:
-                reasons.append("%s_%s_missing" % (prefix, key))
+                label = "annualized_return_pct" if key == "return_pct" else key
+                reasons.append("%s_%s_missing" % (prefix, label))
             elif minimum is not None and value < minimum:
                 reasons.append("%s_%s_below_min" % (prefix, key))
             elif maximum is not None and abs(value) > maximum:
