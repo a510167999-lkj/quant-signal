@@ -1248,8 +1248,6 @@ def _build_exact_cross_section_features(
         median_return = _deterministic_median(
             [item["value"] for item in return_inputs]
         )
-        raw_feature_inputs: dict[str, list[dict[str, Any]]] = {}
-        ranked_feature_outputs: dict[str, list[dict[str, Any]]] = {}
         for raw_name, ranked_name in zip(
             RAW_STOCK_FEATURE_NAMES,
             RANKED_STOCK_FEATURE_NAMES,
@@ -1257,26 +1255,6 @@ def _build_exact_cross_section_features(
             raw_values = group[raw_name].to_numpy(dtype=float)
             ranked_values = _deterministic_midrank(raw_values)
             group[ranked_name] = ranked_values
-            raw_feature_inputs[raw_name] = [
-                {
-                    "security_id": str(security_id),
-                    "value": float(value),
-                }
-                for security_id, value in zip(
-                    group["security_id"].astype(str),
-                    raw_values,
-                )
-            ]
-            ranked_feature_outputs[ranked_name] = [
-                {
-                    "security_id": str(security_id),
-                    "value": float(value),
-                }
-                for security_id, value in zip(
-                    group["security_id"].astype(str),
-                    ranked_values,
-                )
-            ]
         group["cross_section_above_ma20_fraction"] = float(breadth)
         group["cross_section_median_return_5d_pct"] = float(
             median_return
@@ -1288,11 +1266,29 @@ def _build_exact_cross_section_features(
             "breadth_inputs_sha256": _sha256(breadth_inputs),
             "return_5d_inputs_sha256": _sha256(return_inputs),
             "raw_feature_inputs_sha256": {
-                name: _sha256(raw_feature_inputs[name])
+                name: _sha256_canonical_sequence(
+                    {
+                        "security_id": str(security_id),
+                        "value": float(value),
+                    }
+                    for security_id, value in zip(
+                        group["security_id"].astype(str),
+                        group[name].to_numpy(dtype=float),
+                    )
+                )
                 for name in RAW_STOCK_FEATURE_NAMES
             },
             "ranked_feature_outputs_sha256": {
-                name: _sha256(ranked_feature_outputs[name])
+                name: _sha256_canonical_sequence(
+                    {
+                        "security_id": str(security_id),
+                        "value": float(value),
+                    }
+                    for security_id, value in zip(
+                        group["security_id"].astype(str),
+                        group[name].to_numpy(dtype=float),
+                    )
+                )
                 for name in RANKED_STOCK_FEATURE_NAMES
             },
             "cross_section_above_ma20_fraction": float(breadth),
