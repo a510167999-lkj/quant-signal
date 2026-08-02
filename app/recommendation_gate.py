@@ -32,6 +32,21 @@ def _require_number(
     return value
 
 
+def _require_absolute_maximum(
+    metrics: Dict[str, Any],
+    key: str,
+    reasons: List[str],
+    maximum: float,
+) -> float | None:
+    value = _number(metrics.get(key))
+    if value is None:
+        reasons.append("%s_missing" % key)
+        return None
+    if abs(value) > maximum:
+        reasons.append("%s_above_max" % key)
+    return value
+
+
 def _rolling_reasons(profile: RecommendationProfile, windows: Any) -> List[str]:
     if not isinstance(windows, list) or not windows:
         return ["rolling_12m_missing"]
@@ -54,7 +69,7 @@ def _rolling_reasons(profile: RecommendationProfile, windows: Any) -> List[str]:
                 reasons.append("%s_%s_missing" % (prefix, key))
             elif minimum is not None and value < minimum:
                 reasons.append("%s_%s_below_min" % (prefix, key))
-            elif maximum is not None and value > maximum:
+            elif maximum is not None and abs(value) > maximum:
                 reasons.append("%s_%s_above_max" % (prefix, key))
     return reasons
 
@@ -72,7 +87,12 @@ def evaluate_recommendation_gate(
     reasons: List[str] = []
 
     _require_number(metrics, "annualized_return_pct", reasons, minimum=profile.target_annualized_return_pct)
-    _require_number(metrics, "max_drawdown_pct", reasons, maximum=profile.max_drawdown_pct)
+    _require_absolute_maximum(
+        metrics,
+        "max_drawdown_pct",
+        reasons,
+        profile.max_drawdown_pct,
+    )
     _require_number(
         metrics,
         "win_rate_pct",

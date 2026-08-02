@@ -90,3 +90,20 @@ def test_metric_or_health_failure_is_reported_as_structured_reasons():
     assert "signal_days_below_min" in result["reasons"]
     assert "production_health_not_ok" in result["reasons"]
     assert result["auto_order"] is False
+
+
+def test_signed_drawdown_is_checked_by_absolute_magnitude():
+    metrics = _metrics()
+    metrics["max_drawdown_pct"] = -16.0
+    metrics["rolling_12m"][0]["max_drawdown_pct"] = -16.0
+
+    result = evaluate_recommendation_gate(
+        DEFAULT_PROFILE,
+        metrics,
+        _evidence(),
+        {"ok": True},
+    )
+
+    assert result["development_ready"] is False
+    assert "max_drawdown_pct_above_max" in result["reasons"]
+    assert "rolling_12m_window_0_max_drawdown_pct_above_max" in result["reasons"]
