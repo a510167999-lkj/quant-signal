@@ -19,21 +19,21 @@ WORKSPACE = Path(r"E:\AI workspace\quant-signal-lkj")
 RELATIVE_OUTPUT_DIR = Path(
     "data/research_runs/"
     "audited_pit_ranked_liquidity_shallow_gbdt_rolling126_oof_v1_"
-    "development_7_stream_feature_receipts_local_research_9gib"
+    "development_8_inplace_feature_input_local_research_9gib"
 )
 PARENT_FAILURE = Path(
     "data/research_runs/"
     "audited_pit_ranked_liquidity_shallow_gbdt_rolling126_oof_v1_"
-    "development_6_lifetime_release_local_research_9gib/formal_run.failure.json"
+    "development_7_stream_feature_receipts_local_research_9gib/formal_run.failure.json"
 )
 EXPECTED_PARENT_FAILURE_SHA256 = (
-    "454c2c66c891343d57b2e6bcefaa85e45437c5ce618e0907cad12875b6a6b541"
+    "44972e48d3c460f27eb57d9654a59a065275f8b30787252fd0d2ace8b55b5f8d"
 )
 EXPECTED_STRATEGY_SHA256 = (
     "53d00badc8683670ef3d6c02307697e2c3ef8ec769b9d8da072d36420cea70ac"
 )
 EXPECTED_PRODUCER_ROOT_SHA256 = (
-    "a3a62c66269209dbe3e76ada358cd5dd040ee61412440a4dee6300d2e4bc4dfa"
+    "8e335c35b01bf8662256f50effd732b58ce176018fe504c5a36b5868a5c71a18"
 )
 USER_TOTAL_MEMORY_BUDGET_BYTES = 10 * 1024**3
 RESEARCH_JOB_MEMORY_LIMIT_BYTES = 9 * 1024**3
@@ -218,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
             "-m",
             "scripts.run_shallow_gbdt_development_3_resource_capped",
         ],
-        "retry_kind": "same_frozen_hypothesis_after_streamed_feature_receipt_memory_fix_before_oof",
+        "retry_kind": "same_frozen_hypothesis_after_inplace_feature_input_memory_fix_before_oof",
         "runtime_role": "local_research",
         "parent_failure_receipt": {
             "path": str(PARENT_FAILURE).replace("\\", "/"),

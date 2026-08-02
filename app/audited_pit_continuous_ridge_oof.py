@@ -982,6 +982,7 @@ def _build_exact_cross_section_features(
     sessions: Sequence[str],
     *,
     minimum_cross_section_members: int | None = None,
+    copy_input: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     session_dates = _ordered_sessions(sessions)
     minimum = (
@@ -997,7 +998,7 @@ def _build_exact_cross_section_features(
     if missing_columns:
         raise ValueError("continuous ridge bars are missing required columns")
 
-    values = bars.copy()
+    values = bars.copy() if copy_input else bars
     values["date"] = values["date"].astype(str)
     values["ts_code"] = values["ts_code"].astype(str)
     if "source_ts_code" not in values:
@@ -6449,6 +6450,7 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
                 minimum_cross_section_members=int(
                     strategy_spec["minimum_cross_section_members"]
                 ),
+                copy_input=False,
             )
         )
         verify_feature_receipt(features, feature_receipt)
