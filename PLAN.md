@@ -201,6 +201,13 @@
 - 2026-07-24 `development_2` 在冻结提交 `efcb13fbaa9358d90d8392171af259243c3dea8b`、相同策略 SHA、producer root、development 日期和输入锚下成功启动；行情载入 2,196,925 行后，应用户为游戏立即释放内存的明确请求，真实 Python 子进程在 `stage=bars_loaded`、Private Bytes 约 4.398 GiB 时被停止。该运行没有生成 OOF、selection、统计指标或 result bundle，stdout/stderr 均为空，工作树与 producer binding 未变化，embargo/final-OOS 均未消耗，因此固定分类为 `user_requested_resource_release_before_oof`，不得用于策略判断、调参或因子筛选。外层 `Start-Process` 包装器在子进程强制终止后错误记录 `exit_code=0`，该字段不构成成功证据；无结果制品与追加中断收据共同优先。中断收据位于 `data/research_runs/audited_pit_ranked_liquidity_shallow_gbdt_rolling126_oof_v1_development_2/formal_run.interruption.json`，SHA-256 为 `6b368755c526318f91a3581d2563df94da3e40ee6578952212faee4a03770f73`。两分钟监控已删除，研究不得在用户游戏期间自动重启；恢复时仍只能重放完全相同的冻结统计假设，并须使用全新输出目录保留 `development_1/2` 原证据。
 - 2026-07-24 用户随后允许研究内存提升至最多 10 GiB。资源受限启动基础设施在提交 `6fa060c298bb67266c77d3a9a546960b25938e25` 完成：现有 Windows Job Object 守卫新增 `JOB_OBJECT_LIMIT_JOB_MEMORY`、挂起后先绑定再恢复、`KILL_ON_JOB_CLOSE`、整棵 Job 的 `ActiveProcesses` drain、峰值内存查询及异常路径整树终止；正式 launcher 固定为受 Git 跟踪的 `scripts/run_shallow_gbdt_development_3_resource_capped.py`，运行时精确绑定完整 HEAD blob、当前源码、策略 SHA、producer root、父中断收据及 frozen-v2 的 coverage/artifact/temporal/transition 输入。正式研究 Job 的内核硬上限固定为 9 GiB，另留 1 GiB 给轻量 supervisor，成功收据还要求峰值严格低于用户 10 GiB 总预算。结果只有在 exit 0、Job tree drained、资源/进度 schema 与 command hash 匹配、progress=`completed`、唯一主 artifact 的 unsigned canonical SHA 与文件名/embedded/progress 四方一致且 post-run HEAD/工作树/producer/launcher 均未漂移时，才可标为“待独立验证”；任何其他情况均为无统计解释权的技术失败。Windows 专项测试 `10 passed`，Ruff 与 diff check 通过；全量回归中 2,424 项通过，唯一吞吐基准样本因并发环境为 `2.1993 < 2.2`，随即单独复测通过。两路独立只读终审均无 P0/P1。下一次只能以全新 `development_3_resource_capped_9gib` 目录重放完全相同假设；不得改变模型、特征、公式、成本、折、阈值、选择、晋级门或触碰 embargo/final-OOS。
 
+## 2026-08-02 Factor V3 运行时与外部边界复核
+
+- 250-session feature-history frozen attestation replay 已在冻结源码工作树复核通过；733-session daily_basic exact-set authority preflight 已在项目 `.venv` 完成，顺序与边界有效。
+- 正式复核必须使用项目 `.venv`（pypdf 6.14.2）；系统 Python 的旧依赖结果不纳入证据。
+- formal native TCB 在项目 `.venv` 下 39/39 通过，但外部 Windows service/ACL/CNG handoff 尚未提供；manifest 仍为非生产状态，故不启动 733-session 采集。
+- daily_basic run root 当前仅保留锁文件；未触碰 embargo、final-OOS、materialization、production 或 VPS 推荐。上述结论不含 secrets、token、capability 或原始响应。
+
 ## Phase 3: mini-program client
 
 - 运行边界冻结：所有 PIT/研究/训练数据集物化、训练、调参、OOF/回放评估和模型包签名均在本机完成；VPS 只允许采集当日推理输入、加载最终门通过且摘要/签名匹配的冻结包、生成 0–3 只推荐和消息分发，不执行研究/训练命令，不自动下单。合格冻结包产生前保持 0 推荐。
