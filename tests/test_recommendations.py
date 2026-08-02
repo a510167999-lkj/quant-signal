@@ -344,6 +344,7 @@ def complete_operation_contract_item():
         "strategy_quality": {"passed": True},
         "symbol": "600519",
         "market": "a",
+        "market_data_source": "Jiaoch fixture",
         "auto_order": False,
         "entry_zone": {"low": 99.0, "high": 101.0},
         "levels": {
@@ -393,6 +394,11 @@ def publication_payload(symbols, prior_symbols=(), target="2026-07-13"):
         "live_proof": True,
         "auto_order": False,
         "publication_gate": {"status": "allowed", "reason": None},
+        "market_source_gate": {
+            "required": "jiaoch",
+            "passed": True,
+            "observed": ["Jiaoch fixture"],
+        },
         "profile_gate": {
             "live_proof": True,
             "evidence_receipt_sha256": "b" * 64,
@@ -780,6 +786,35 @@ def test_latest_accepts_snapshot_with_receipt_in_ledger(tmp_path, monkeypatch):
     assert validated.model_extra["current_pool_revalidation"][
         "canonical_sha256"
     ] == "a" * 64
+
+
+def test_latest_rejects_non_jiaoch_market_source(tmp_path, monkeypatch):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    payload = publication_payload(["600519"])
+    payload["items"][0]["market_data_source"] = "AKShare fixture"
+    service._commit_publication_ledger(payload)
+    write_json(service.settings.latest_recommendations_path, payload)
+    monkeypatch.setattr(
+        service,
+        "_current_pool_gate",
+        lambda moment, run_slot=None: {
+            "passed": True,
+            "production_recommendation_eligible": True,
+            "allowed_symbols": {"600519"},
+            "canonical_sha256": "a" * 64,
+            "source_as_of": "2026-07-13",
+        },
+    )
+
+    result = service.latest()
+
+    assert result["items"] == []
+    assert result["recommendation_status"] == "blocked_market_source_gate"
+    assert result["publication_gate"] == {
+        "status": "blocked",
+        "reason": "market_data_source_not_jiaoch",
+    }
+    assert result["market_source_gate"]["passed"] is False
 
 
 def test_latest_rejects_self_hashed_receipt_not_in_ledger(

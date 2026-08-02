@@ -1241,6 +1241,21 @@ class RecommendationService:
         stored_profile_gate = payload.get("profile_gate")
         if not isinstance(stored_profile_gate, dict):
             stored_profile_gate = {}
+        stored_market_source_gate = payload.get("market_source_gate")
+        if not isinstance(stored_market_source_gate, dict):
+            stored_market_source_gate = {}
+        observed_market_sources = sorted(
+            {
+                str(item.get("market_data_source") or "unknown")
+                for item in item_values
+                if isinstance(item, dict)
+            }
+        )
+        market_source_gate_valid = (
+            stored_market_source_gate.get("required") == "jiaoch"
+            and stored_market_source_gate.get("passed") is True
+            and all(_jiaoch_market_source_observed(item) for item in item_values)
+        )
         publication_claimed = (
             payload.get("recommendation_status") == "live_proven"
             and payload.get("live_proof") is True
@@ -1262,10 +1277,14 @@ class RecommendationService:
             reason = "current_pool_not_production_eligible"
         elif snapshot_contract_errors:
             reason = "snapshot_contract_invalid"
+        elif publication_claimed and not market_source_gate_valid:
+            reason = "market_data_source_not_jiaoch"
         else:
             reason = None
         if reason is None:
             payload["current_pool_revalidation"] = gate_public
+            if publication_claimed:
+                payload["market_source_gate"] = stored_market_source_gate
             if publication_claimed:
                 payload["publication_gate"] = {
                     "status": "allowed",
@@ -1279,6 +1298,8 @@ class RecommendationService:
         blocked_status = (
             "blocked_snapshot_contract"
             if reason == "snapshot_contract_invalid"
+            else "blocked_market_source_gate"
+            if reason == "market_data_source_not_jiaoch"
             else "blocked_current_pool_gate"
         )
         result_status = (
@@ -1295,6 +1316,11 @@ class RecommendationService:
                 "live_proof": False,
                 "auto_order": False,
                 "current_pool_gate": gate_public,
+                "market_source_gate": {
+                    "required": "jiaoch",
+                    "passed": market_source_gate_valid,
+                    "observed": observed_market_sources,
+                },
                 "publication_gate": {"status": "blocked", "reason": reason},
                 "selection_funnel": self._empty_selection_funnel(reason),
             }
@@ -1305,11 +1331,15 @@ class RecommendationService:
                 "stage": (
                     "snapshot_contract"
                     if reason == "snapshot_contract_invalid"
+                    else "market_source_gate"
+                    if reason == "market_data_source_not_jiaoch"
                     else "current_pool_gate"
                 ),
                 "reasons": (
                     list(snapshot_contract_errors)
                     if reason == "snapshot_contract_invalid"
+                    else [reason]
+                    if reason == "market_data_source_not_jiaoch"
                     else gate_public.get("reasons") or [reason]
                 ),
             }
@@ -1323,6 +1353,11 @@ class RecommendationService:
                 "live_proof": False,
                 "auto_order": False,
                 "current_pool_gate": gate_public,
+                "market_source_gate": {
+                    "required": "jiaoch",
+                    "passed": market_source_gate_valid,
+                    "observed": observed_market_sources,
+                },
                 "publication_gate": {"status": "blocked", "reason": reason},
                 "summary": summary,
                 "disclaimer": self.disclaimer,
