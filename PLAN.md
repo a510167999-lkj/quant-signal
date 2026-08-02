@@ -207,6 +207,7 @@
 - 正式复核必须使用项目 `.venv`（pypdf 6.14.2）；系统 Python 的旧依赖结果不纳入证据。
 - formal native TCB 在项目 `.venv` 下 39/39 通过，但外部 Windows service/ACL/CNG handoff 尚未提供；manifest 仍为非生产状态，故不启动 733-session 采集。
 - daily_basic run root 当前仅保留锁文件；未触碰 embargo、final-OOS、materialization、production 或 VPS 推荐。上述结论不含 secrets、token、capability 或原始响应。
+- 同日只读盘点发现 AI workspace 内共有 83 个 `quant-signal*` Git worktree；`quant-signal-lkj-oof-consumer` 与 `quant-signal-lkj-oof-dev4-exact-v3-lf` 有未提交 OOF 改动，均保留原状、不清理、不擅自整合；Factor V3 正式/TCB worktree 仍干净。
 
 ## Phase 3: mini-program client
 
