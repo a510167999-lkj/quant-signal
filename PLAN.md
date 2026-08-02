@@ -210,6 +210,7 @@
 - 同日只读盘点发现 AI workspace 内共有 83 个 `quant-signal*` Git worktree；`quant-signal-lkj-oof-consumer` 与 `quant-signal-lkj-oof-dev4-exact-v3-lf` 有未提交 OOF 改动，均保留原状、不清理、不擅自整合；Factor V3 正式/TCB worktree 仍干净。
 - 早期 feature-history authority/runner worktree 均干净；其分支提交已由主仓等价提交覆盖，无额外可安全 cherry-pick 的修复。主仓 `test_audited_pit_factor_v3_feature_history_authority.py` 在项目 `.venv` 下 50/50 通过。
 - 新的 `factor-v3-formal-preflight-fix` 分支（工作树干净）协议专项 63/63 通过；其余 `formal_control_contract` 仅排除 `test_actual_completion_supervisor_runtime_and_be3_dispatch_chain` 时 16/16，通过该实际 supervisor 链的单项及合并 308 项 formal 回归均在有界时间内未完成，故不作为通过证据、不整合主仓，也不替代外部 native TCB。
+- 同日只读 TCB 环境诊断显示当前会话非 Windows 管理员、SCM 无目标服务，且未形成可用 CNG handoff 证据；因此 formal 入口继续拒绝 dispatch，不能启动 733-session 采集。
 
 ## Phase 3: mini-program client
 
