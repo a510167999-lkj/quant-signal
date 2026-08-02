@@ -212,6 +212,15 @@
 - 新的 `factor-v3-formal-preflight-fix` 分支（工作树干净）协议专项 63/63 通过；其余 `formal_control_contract` 仅排除 `test_actual_completion_supervisor_runtime_and_be3_dispatch_chain` 时 16/16，通过该实际 supervisor 链的单项及合并 308 项 formal 回归均在有界时间内未完成，故不作为通过证据、不整合主仓，也不替代外部 native TCB。
 - 同日只读 TCB 环境诊断显示当前会话非 Windows 管理员、SCM 无目标服务，且未形成可用 CNG handoff 证据；因此 formal 入口继续拒绝 dispatch，不能启动 733-session 采集。
 
+### 当前目标完成矩阵（不等同于生产授权）
+
+- [x] AI workspace `quant-signal*` 项目与 worktree 盘点；主仓及关键 Factor V3 worktree 状态可审计。
+- [x] Jiaoch-only/PIT authority、250-session feature-history 冻结复核、733-session exact-set 离线预检；未消费 embargo 或 final-OOS。
+- [x] 0–3 建议、无自动交易、北交所/科创板上游保留后过滤及 profile fail-closed 门禁的代码/专项测试。
+- [ ] 外部 native TCB handoff（管理员、SCM/service SID、ACL、CNG key/provider、终端 lineage）；当前环境不具备。
+- [ ] 733-session 正式 daily_basic 采集、离线权威验证、Factor V3 materialization、真实成本回测及全滚动 12m 指标证据。
+- [ ] embargo、final-OOS、production profile 和 VPS 推荐；在上一项全部通过前保持禁止。
+
 ## Phase 3: mini-program client
 
 - 运行边界冻结：所有 PIT/研究/训练数据集物化、训练、调参、OOF/回放评估和模型包签名均在本机完成；VPS 只允许采集当日推理输入、加载最终门通过且摘要/签名匹配的冻结包、生成 0–3 只推荐和消息分发，不执行研究/训练命令，不自动下单。合格冻结包产生前保持 0 推荐。
