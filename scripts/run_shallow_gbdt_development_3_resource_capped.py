@@ -19,21 +19,21 @@ WORKSPACE = Path(r"E:\AI workspace\quant-signal-lkj")
 RELATIVE_OUTPUT_DIR = Path(
     "data/research_runs/"
     "audited_pit_ranked_liquidity_shallow_gbdt_rolling126_oof_v1_"
-    "development_3_resource_capped_9gib"
+    "development_4_streamed_receipt_9gib"
 )
-PARENT_INTERRUPTION = Path(
+PARENT_FAILURE = Path(
     "data/research_runs/"
     "audited_pit_ranked_liquidity_shallow_gbdt_rolling126_oof_v1_"
-    "development_2/formal_run.interruption.json"
+    "development_3_resource_capped_9gib/formal_run.failure.json"
 )
-EXPECTED_PARENT_INTERRUPTION_SHA256 = (
-    "6b368755c526318f91a3581d2563df94da3e40ee6578952212faee4a03770f73"
+EXPECTED_PARENT_FAILURE_SHA256 = (
+    "fe9b80b30c06cc5beaaf90d7637e672864eae9a48562700ba643972104534109"
 )
 EXPECTED_STRATEGY_SHA256 = (
     "53d00badc8683670ef3d6c02307697e2c3ef8ec769b9d8da072d36420cea70ac"
 )
 EXPECTED_PRODUCER_ROOT_SHA256 = (
-    "c02f7143bff9dae1d26cd48321a6deda718b654a9464fd3543ade4075d3d55fd"
+    "fe8793f75e3e03beab41dd9be6b801afd40449fb22630bd80613f1710f5c7fa4"
 )
 USER_TOTAL_MEMORY_BUDGET_BYTES = 10 * 1024**3
 RESEARCH_JOB_MEMORY_LIMIT_BYTES = 9 * 1024**3
@@ -140,9 +140,9 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("formal launcher does not match the expected commit")
     launcher_git_blob_sha256 = hashlib.sha256(launcher_blob).hexdigest()
 
-    parent_path = WORKSPACE / PARENT_INTERRUPTION
-    if sha256_file(parent_path) != EXPECTED_PARENT_INTERRUPTION_SHA256:
-        raise RuntimeError("parent interruption receipt drifted")
+    parent_path = WORKSPACE / PARENT_FAILURE
+    if sha256_file(parent_path) != EXPECTED_PARENT_FAILURE_SHA256:
+        raise RuntimeError("parent failure receipt drifted")
     python_executable = (WORKSPACE / ".venv/Scripts/python.exe").resolve()
     binding = producer_binding(python_executable)
     if (
@@ -218,11 +218,11 @@ def main(argv: list[str] | None = None) -> int:
             "-m",
             "scripts.run_shallow_gbdt_development_3_resource_capped",
         ],
-        "retry_kind": "same_frozen_hypothesis_after_user_interruption_before_oof",
-        "parent_interruption_receipt": {
-            "path": str(PARENT_INTERRUPTION).replace("\\", "/"),
-            "sha256": EXPECTED_PARENT_INTERRUPTION_SHA256,
-            "classification": "user_requested_resource_release_before_oof",
+        "retry_kind": "same_frozen_hypothesis_after_resource_failure_before_oof",
+        "parent_failure_receipt": {
+            "path": str(PARENT_FAILURE).replace("\\", "/"),
+            "sha256": EXPECTED_PARENT_FAILURE_SHA256,
+            "classification": "resource_capped_run_without_valid_completed_result",
             "statistical_result_available": False,
         },
         "resource_contract": {
@@ -260,8 +260,8 @@ def main(argv: list[str] | None = None) -> int:
             "-m",
             "scripts.run_shallow_gbdt_development_3_resource_capped",
         ],
-        "parent_interruption_receipt_sha256": (
-            EXPECTED_PARENT_INTERRUPTION_SHA256
+        "parent_failure_receipt_sha256": (
+            EXPECTED_PARENT_FAILURE_SHA256
         ),
         "research_job_memory_limit_bytes": RESEARCH_JOB_MEMORY_LIMIT_BYTES,
         "embargo_consumed": False,
