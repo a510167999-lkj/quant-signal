@@ -6446,7 +6446,6 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
             "bars_loaded",
             bar_row_count=len(bars),
         )
-        frames_by_symbol = _residual_frames_by_symbol(bars)
         features, feature_receipt = (
             _build_exact_cross_section_features(
                 bars,
@@ -6486,6 +6485,10 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
             raise AuditedPITDevelopmentReplayError(
                 "ranked-liquidity tail feature pool differs from cutoff"
             )
+        del feature_candidates, features
+        frames_by_symbol = _residual_frames_by_symbol(bars)
+        del bars
+        gc.collect()
         write_progress(
             "tail_cutoff_applied",
             kept_candidate_count=len(tail_candidates),
@@ -6683,7 +6686,6 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
 
     del (
         adapter,
-        bars,
         base_adapter,
         bulk_adapter,
         completed_candidates,
@@ -6691,8 +6693,6 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
         censored_positions,
         entry_receipt,
         executable_candidates,
-        feature_candidates,
-        features,
         frames_by_symbol,
         outcome_receipt,
         raw_suspension_evidence,
