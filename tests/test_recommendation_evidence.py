@@ -1,4 +1,5 @@
 import hashlib
+import json
 
 from app.recommendation_evidence import (
     build_profile_evidence_receipt,
@@ -185,3 +186,24 @@ def test_receipt_verifier_checks_canonical_hash_and_source_artifacts(tmp_path):
     tampered = dict(receipt)
     tampered["metrics"] = dict(receipt["metrics"], annualized_return_pct=999.0)
     assert verify_profile_evidence_receipt(tampered)["ok"] is False
+
+    coherently_rehashed = dict(receipt)
+    coherently_rehashed["metrics"] = dict(
+        receipt["metrics"], annualized_return_pct=10.0
+    )
+    coherently_rehashed["receipt_sha256"] = hashlib.sha256(
+        json.dumps(
+            {
+                key: value
+                for key, value in coherently_rehashed.items()
+                if key != "receipt_sha256"
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        .encode("utf-8")
+    ).hexdigest()
+    verified = verify_profile_evidence_receipt(coherently_rehashed)
+    assert verified["ok"] is False
+    assert "gates_mismatch" in verified["errors"]

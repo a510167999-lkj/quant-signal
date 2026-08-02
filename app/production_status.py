@@ -20,7 +20,10 @@ from app.recommendation_contract import (
     recommendation_publication_receipt_errors,
     recommendation_snapshot_publication_errors,
 )
-from app.recommendation_evidence import verify_profile_evidence_receipt
+from app.recommendation_evidence import (
+    DEVELOPMENT_GATE_NAMES,
+    verify_profile_evidence_receipt,
+)
 from app.storage import read_jsonl_strict, write_json
 
 
@@ -434,26 +437,7 @@ def _recommendation_profile(settings: Settings) -> dict[str, Any]:
         receipt_check = verify_profile_evidence_receipt(payload)
         if not receipt_check.get("ok"):
             raise ValueError("receipt invalid: %s" % ",".join(receipt_check.get("errors") or []))
-        required_gates = {
-            "annualized_return",
-            "max_drawdown",
-            "observed_win_rate",
-            "wilson_lower",
-            "payoff_ratio",
-            "profit_factor",
-            "calmar",
-            "minimum_sample",
-            "signal_days_120",
-            "all_rolling_12m",
-            "pit_contract",
-            "temporal_contract",
-            "cost_slippage",
-            "artifact_execution",
-            "strategy_signal_replay",
-            "outcome_replay",
-            "double_cost",
-            "regime",
-        }
+        required_gates = set(DEVELOPMENT_GATE_NAMES)
         gates = payload.get("gates")
         if not isinstance(gates, dict):
             raise ValueError("receipt gates missing")
@@ -466,7 +450,11 @@ def _recommendation_profile(settings: Settings) -> dict[str, Any]:
             "cost_slippage",
             "artifact_execution",
             "strategy_signal_replay",
+            "strategy_entry_decision",
+            "strategy_selection_replay",
             "outcome_replay",
+            "double_cost",
+            "regime",
         )
         missing = [key for key in required_evidence if evidence.get(key) is not True]
         if missing:

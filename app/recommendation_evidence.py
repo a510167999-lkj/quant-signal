@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -13,6 +14,35 @@ from app.storage import write_json
 
 RECEIPT_SCHEMA = "profile-evidence-receipt/v1"
 
+DEVELOPMENT_GATE_NAMES = (
+    "annualized_return",
+    "max_drawdown",
+    "observed_win_rate",
+    "wilson_lower",
+    "payoff_ratio",
+    "profit_factor",
+    "calmar",
+    "minimum_sample",
+    "signal_days_120",
+    "all_rolling_12m",
+    "pit_contract",
+    "temporal_contract",
+    "cost_slippage",
+    "artifact_execution",
+    "strategy_signal_replay",
+    "strategy_entry_decision",
+    "strategy_selection_replay",
+    "outcome_replay",
+    "double_cost",
+    "regime",
+)
+
+RECEIPT_GATE_NAMES = DEVELOPMENT_GATE_NAMES + (
+    "final_oos",
+    "shadow",
+    "live_monitoring",
+)
+
 
 def _canonical(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -20,6 +50,41 @@ def _canonical(value: Any) -> bytes:
 
 def _sha256(value: Any) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _at_least(value: Any, minimum: float) -> bool:
+    number = _finite_number(value)
+    return number is not None and number >= minimum
+
+
+def _at_most_abs(value: Any, maximum: float) -> bool:
+    number = _finite_number(value)
+    return number is not None and abs(number) <= maximum
+
+
+def _between(value: Any, minimum: float, maximum: float) -> bool:
+    number = _finite_number(value)
+    return number is not None and minimum <= number <= maximum
+
+
+def _integer_at_least(value: Any, minimum: int) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return number == value and number >= minimum
 
 
 def _rolling_windows(value: Any) -> List[Dict[str, Any]]:
@@ -37,20 +102,54 @@ def _all_rolling_pass(windows: Iterable[Dict[str, Any]], profile: Recommendation
     if not rows:
         return False
     for window in rows:
-        try:
-            if float(window["return_pct"]) < profile.target_annualized_return_pct:
-                return False
-            if abs(float(window["max_drawdown_pct"])) > profile.max_drawdown_pct:
-                return False
-            if float(window["payoff_ratio"]) < profile.min_payoff_ratio:
-                return False
-            if float(window["profit_factor"]) < profile.min_profit_factor:
-                return False
-            if float(window["calmar"]) < profile.min_calmar:
-                return False
-        except (KeyError, TypeError, ValueError):
+        return_pct = window.get("return_pct", window.get("annualized_return_pct"))
+        if not _at_least(return_pct, profile.target_annualized_return_pct):
+            return False
+        if not _at_most_abs(window.get("max_drawdown_pct"), profile.max_drawdown_pct):
+            return False
+        if not _at_least(window.get("payoff_ratio"), profile.min_payoff_ratio):
+            return False
+        if not _at_least(window.get("profit_factor"), profile.min_profit_factor):
+            return False
+        if not _at_least(window.get("calmar"), profile.min_calmar):
             return False
     return True
+
+
+def _development_gates(
+    metrics: Dict[str, Any], evidence: Dict[str, Any], profile: RecommendationProfile
+) -> Dict[str, bool]:
+    """Derive the development gates from receipt data in one canonical place."""
+    return {
+        "annualized_return": _at_least(
+            metrics.get("annualized_return_pct"), profile.target_annualized_return_pct
+        ),
+        "max_drawdown": _at_most_abs(
+            metrics.get("max_drawdown_pct"), profile.max_drawdown_pct
+        ),
+        "observed_win_rate": _between(
+            metrics.get("win_rate_pct"), profile.min_win_rate_pct, profile.max_win_rate_pct
+        ),
+        "wilson_lower": _at_least(
+            metrics.get("wilson_95_lower_pct"), profile.min_win_rate_wilson_lower_pct
+        ),
+        "payoff_ratio": _at_least(metrics.get("payoff_ratio"), profile.min_payoff_ratio),
+        "profit_factor": _at_least(metrics.get("profit_factor"), profile.min_profit_factor),
+        "calmar": _at_least(metrics.get("calmar"), profile.min_calmar),
+        "minimum_sample": _integer_at_least(metrics.get("selected_trade_count"), 200),
+        "signal_days_120": _integer_at_least(metrics.get("signal_days"), profile.min_signal_days),
+        "all_rolling_12m": _all_rolling_pass(metrics.get("rolling_12m"), profile),
+        "pit_contract": evidence.get("pit_contract") is True,
+        "temporal_contract": evidence.get("temporal_contract") is True,
+        "cost_slippage": evidence.get("cost_slippage") is True,
+        "artifact_execution": evidence.get("artifact_execution") is True,
+        "strategy_signal_replay": evidence.get("strategy_signal_replay") is True,
+        "strategy_entry_decision": evidence.get("strategy_entry_decision") is True,
+        "strategy_selection_replay": evidence.get("strategy_selection_replay") is True,
+        "outcome_replay": evidence.get("outcome_replay") is True,
+        "double_cost": evidence.get("double_cost") is True,
+        "regime": evidence.get("regime") is True,
+    }
 
 
 def build_profile_evidence_receipt(
@@ -94,37 +193,7 @@ def build_profile_evidence_receipt(
         "calmar": aggregate.get("calmar_latest_12m"),
         "rolling_12m": windows,
     }
-    gates = {
-        "annualized_return": metrics["annualized_return_pct"] is not None
-        and float(metrics["annualized_return_pct"]) >= profile.target_annualized_return_pct,
-        "max_drawdown": metrics["max_drawdown_pct"] is not None
-        and float(metrics["max_drawdown_pct"]) <= profile.max_drawdown_pct,
-        "observed_win_rate": metrics["win_rate_pct"] is not None
-        and profile.min_win_rate_pct <= float(metrics["win_rate_pct"]) <= profile.max_win_rate_pct,
-        "wilson_lower": metrics["wilson_95_lower_pct"] is not None
-        and float(metrics["wilson_95_lower_pct"]) >= profile.min_win_rate_wilson_lower_pct,
-        "payoff_ratio": metrics["payoff_ratio"] is not None
-        and float(metrics["payoff_ratio"]) >= profile.min_payoff_ratio,
-        "profit_factor": metrics["profit_factor"] is not None
-        and float(metrics["profit_factor"]) >= profile.min_profit_factor,
-        "calmar": metrics["calmar"] is not None and float(metrics["calmar"]) >= profile.min_calmar,
-        "minimum_sample": metrics["selected_trade_count"] is not None
-        and int(metrics["selected_trade_count"]) >= 200,
-        "signal_days_120": metrics["signal_days"] is not None
-        and int(metrics["signal_days"]) >= profile.min_signal_days,
-        "all_rolling_12m": _all_rolling_pass(windows, profile),
-        "pit_contract": evidence.get("pit_contract") is True,
-        "temporal_contract": evidence.get("temporal_contract") is True,
-        "cost_slippage": evidence.get("cost_slippage") is True,
-        "artifact_execution": evidence.get("artifact_execution") is True,
-        "strategy_signal_replay": evidence.get("strategy_signal_replay") is True,
-        "strategy_entry_decision": evidence.get("strategy_entry_decision") is True,
-        "strategy_selection_replay": evidence.get("strategy_selection_replay")
-        is True,
-        "outcome_replay": evidence.get("outcome_replay") is True,
-        "double_cost": evidence.get("double_cost") is True,
-        "regime": evidence.get("regime") is True,
-    }
+    gates = _development_gates(metrics, evidence, profile)
     development_ready = all(gates.values())
     final_oos = evidence.get("final_oos") is True
     shadow = evidence.get("shadow") is True
@@ -164,6 +233,9 @@ def build_profile_evidence_receipt(
         "status": status,
         "evidence_scope": "live_proof" if live_proof else "development_only",
         "live_proof": live_proof,
+        "completion_pass": bool(
+            (validation_report.get("qualification") or {}).get("completion_pass")
+        ),
         "evidence": {
             **dict(evidence),
             "pit_verified": evidence.get("pit_verified") is True,
@@ -215,7 +287,7 @@ def write_profile_evidence_receipt(path: str, receipt: Dict[str, Any]) -> None:
 
 
 def verify_profile_evidence_receipt(receipt: Dict[str, Any]) -> Dict[str, Any]:
-    """Verify receipt identity and any content-addressed artifacts it names."""
+    """Verify receipt identity, gate binding, and named content-addressed artifacts."""
     errors: List[str] = []
     if not isinstance(receipt, dict):
         return {"ok": False, "status": None, "errors": ["receipt_not_object"]}
@@ -224,24 +296,83 @@ def verify_profile_evidence_receipt(receipt: Dict[str, Any]) -> Dict[str, Any]:
     if stored_hash != expected_hash:
         errors.append("receipt_sha256_mismatch")
     expected_profile_hash = profile_to_dict(DEFAULT_PROFILE)["profile_hash"]
+    if receipt.get("schema_version") != RECEIPT_SCHEMA:
+        errors.append("schema_version_mismatch")
     if receipt.get("profile_id") != DEFAULT_PROFILE.profile_id:
         errors.append("profile_id_mismatch")
     if receipt.get("profile_hash") != expected_profile_hash:
         errors.append("profile_hash_mismatch")
+    if receipt.get("version") != DEFAULT_PROFILE.version:
+        errors.append("profile_version_mismatch")
+    if receipt.get("auto_order") is not False:
+        errors.append("auto_order_must_be_false")
     status = receipt.get("status")
     if status not in {"incomplete", "qualified", "live_proven"}:
         errors.append("status_invalid")
-    blocking = set(receipt.get("blocking_gates") or [])
-    if status == "qualified" and blocking - {"final_oos", "shadow", "live_monitoring"}:
-        errors.append("qualified_receipt_has_blocking_gates")
-    if status == "live_proven" and blocking:
-        errors.append("live_proven_receipt_has_blocking_gates")
-    if status == "live_proven" and receipt.get("live_proof") is not True:
+    blocking_value = receipt.get("blocking_gates")
+    if not isinstance(blocking_value, list) or any(
+        not isinstance(item, str) or not item for item in blocking_value
+    ):
+        errors.append("blocking_gates_invalid")
+        blocking_value = []
+    metrics = receipt.get("metrics")
+    evidence = receipt.get("evidence")
+    gates = receipt.get("gates")
+    if not isinstance(metrics, dict):
+        errors.append("metrics_missing")
+        metrics = {}
+    if not isinstance(evidence, dict):
+        errors.append("evidence_missing")
+        evidence = {}
+    if evidence.get("auto_order") is not False:
+        errors.append("evidence_auto_order_must_be_false")
+    if not isinstance(gates, dict):
+        errors.append("gates_missing")
+        gates = {}
+    expected_gates = _development_gates(metrics, evidence, DEFAULT_PROFILE)
+    expected_gates.update(
+        {
+            "final_oos": evidence.get("final_oos") is True,
+            "shadow": evidence.get("shadow") is True,
+            "live_monitoring": evidence.get("live_monitoring") is True,
+        }
+    )
+    if set(gates) != set(RECEIPT_GATE_NAMES) or any(
+        gates.get(name) is not expected_gates[name] for name in RECEIPT_GATE_NAMES
+    ):
+        errors.append("gates_mismatch")
+    expected_blocking = [name for name in RECEIPT_GATE_NAMES if not expected_gates[name]]
+    if blocking_value != expected_blocking:
+        errors.append("blocking_gates_mismatch")
+    development_ready = all(expected_gates[name] for name in DEVELOPMENT_GATE_NAMES)
+    live_flags = all(expected_gates[name] for name in ("final_oos", "shadow", "live_monitoring"))
+    completion_pass = receipt.get("completion_pass") is True
+    if receipt.get("live_proof") is not (status == "live_proven"):
         errors.append("live_proof_mismatch")
+    if receipt.get("evidence_scope") != (
+        "live_proof" if status == "live_proven" else "development_only"
+    ):
+        errors.append("evidence_scope_mismatch")
+    if status == "incomplete" and development_ready:
+        errors.append("incomplete_receipt_is_ready")
+    if status == "qualified" and (
+        not development_ready or (blocking_value and set(blocking_value) - {"final_oos", "shadow", "live_monitoring"})
+    ):
+        errors.append("qualified_receipt_has_blocking_gates")
+    if status == "live_proven" and (
+        not development_ready or not live_flags or not completion_pass or blocking_value
+    ):
+        errors.append("live_proven_receipt_incomplete")
     provenance = receipt.get("provenance") or {}
+    if not isinstance(provenance, dict):
+        errors.append("provenance_invalid")
+        provenance = {}
     for name in ("source_artifact", "report_artifact"):
         descriptor = provenance.get(name)
         if not descriptor:
+            continue
+        if not isinstance(descriptor, dict):
+            errors.append("%s_descriptor_invalid" % name)
             continue
         path = descriptor.get("path")
         expected = descriptor.get("sha256")
@@ -252,7 +383,11 @@ def verify_profile_evidence_receipt(receipt: Dict[str, Any]) -> Dict[str, Any]:
         if not artifact_path.exists():
             errors.append("%s_missing" % name)
             continue
-        actual = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        try:
+            actual = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        except OSError:
+            errors.append("%s_unreadable" % name)
+            continue
         if actual != expected:
             errors.append("%s_sha256_mismatch" % name)
     return {"ok": not errors, "status": status, "errors": list(dict.fromkeys(errors))}

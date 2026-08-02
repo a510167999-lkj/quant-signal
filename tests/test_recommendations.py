@@ -1702,11 +1702,16 @@ def test_generate_daily_recommendations_from_a_share_universe(tmp_path):
 def _profile_evidence_payload():
     profile = profile_to_dict(DEFAULT_PROFILE)
     payload = {
+        "schema_version": "profile-evidence-receipt/v1",
         "profile_id": profile["profile_id"],
         "version": profile["version"],
         "profile_hash": profile["profile_hash"],
         "status": "qualified",
-        "blocking_gates": [],
+        "blocking_gates": ["final_oos", "shadow", "live_monitoring"],
+        "evidence_scope": "development_only",
+        "live_proof": False,
+        "completion_pass": False,
+        "auto_order": False,
         "gates": {
             "annualized_return": True,
             "max_drawdown": True,
@@ -1723,14 +1728,21 @@ def _profile_evidence_payload():
             "cost_slippage": True,
             "artifact_execution": True,
             "strategy_signal_replay": True,
+            "strategy_entry_decision": True,
+            "strategy_selection_replay": True,
             "outcome_replay": True,
             "double_cost": True,
             "regime": True,
+            "final_oos": False,
+            "shadow": False,
+            "live_monitoring": False,
         },
         "metrics": {
             "annualized_return_pct": 52.0,
             "max_drawdown_pct": 12.0,
+            "selected_trade_count": 240,
             "win_rate_pct": 56.0,
+            "wilson_95_lower_pct": 52.1,
             "win_rate_wilson_lower_pct": 52.1,
             "payoff_ratio": 1.45,
             "profit_factor": 1.6,
@@ -1753,7 +1765,15 @@ def _profile_evidence_payload():
             "cost_slippage": True,
             "artifact_execution": True,
             "strategy_signal_replay": True,
+            "strategy_entry_decision": True,
+            "strategy_selection_replay": True,
             "outcome_replay": True,
+            "double_cost": True,
+            "regime": True,
+            "shadow": False,
+            "live_monitoring": False,
+            "live_proof": False,
+            "auto_order": False,
         },
     }
     payload["receipt_sha256"] = hashlib.sha256(
@@ -1765,12 +1785,28 @@ def _profile_evidence_payload():
 def _live_profile_evidence_payload():
     payload = _profile_evidence_payload()
     payload.pop("receipt_sha256")
-    payload.update({"status": "live_proven", "live_proof": True})
+    payload.update(
+        {
+            "status": "live_proven",
+            "evidence_scope": "live_proof",
+            "live_proof": True,
+            "completion_pass": True,
+        }
+    )
+    payload["blocking_gates"] = []
+    payload["gates"].update(
+        {
+            "final_oos": True,
+            "shadow": True,
+            "live_monitoring": True,
+        }
+    )
     payload["evidence"].update(
         {
             "final_oos": True,
             "shadow": True,
             "live_monitoring": True,
+            "live_proof": True,
         }
     )
     payload["receipt_sha256"] = hashlib.sha256(

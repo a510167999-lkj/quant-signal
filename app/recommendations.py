@@ -35,7 +35,10 @@ from app.recommendation_contract import (
     recommendation_snapshot_sha256,
     validate_publication_ledger,
 )
-from app.recommendation_evidence import verify_profile_evidence_receipt
+from app.recommendation_evidence import (
+    DEVELOPMENT_GATE_NAMES,
+    verify_profile_evidence_receipt,
+)
 from app.recommendation_gate import evaluate_recommendation_gate
 from app.recommendation_profile import (
     DEFAULT_PROFILE,
@@ -1076,26 +1079,7 @@ class RecommendationService:
         elif payload:
             reasons.append("receipt_hash_missing")
         if receipt_status in {"qualified", "live_proven"}:
-            development_gate_names = {
-                "annualized_return",
-                "max_drawdown",
-                "observed_win_rate",
-                "wilson_lower",
-                "payoff_ratio",
-                "profit_factor",
-                "calmar",
-                "minimum_sample",
-                "signal_days_120",
-                "all_rolling_12m",
-                "pit_contract",
-                "temporal_contract",
-                "cost_slippage",
-                "artifact_execution",
-                "strategy_signal_replay",
-                "outcome_replay",
-                "double_cost",
-                "regime",
-            }
+            development_gate_names = set(DEVELOPMENT_GATE_NAMES)
             receipt_gates = payload.get("gates")
             if not isinstance(receipt_gates, dict):
                 reasons.append("receipt_gates_missing")
