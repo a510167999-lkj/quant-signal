@@ -18,21 +18,21 @@ WORKSPACE = Path(r"E:\AI workspace\quant-signal-lkj")
 RELATIVE_OUTPUT_DIR = Path(
     "data/research_runs/"
     "audited_pit_ranked_liquidity_shallow_gbdt_rolling126_oof_v1_"
-    "development_9_unbounded_local_research"
+    "development_10_unbounded_completed_flag_fix_local_research"
 )
 PARENT_FAILURE = Path(
     "data/research_runs/"
     "audited_pit_ranked_liquidity_shallow_gbdt_rolling126_oof_v1_"
-    "development_8_inplace_feature_input_local_research_9gib/formal_run.failure.json"
+    "development_9_unbounded_local_research/formal_run.failure.json"
 )
 EXPECTED_PARENT_FAILURE_SHA256 = (
-    "26818f79f02ec47507b5e0817ef1193d092db18d8952cba389d4c6b522899685"
+    "21a7250c8878c1363506b748841f920e27d96141d514bba38648efaca3935cc2"
 )
 EXPECTED_STRATEGY_SHA256 = (
     "53d00badc8683670ef3d6c02307697e2c3ef8ec769b9d8da072d36420cea70ac"
 )
 EXPECTED_PRODUCER_ROOT_SHA256 = (
-    "8e335c35b01bf8662256f50effd732b58ce176018fe504c5a36b5868a5c71a18"
+    "98dbcfd7886e1f09d8544efa63a26ae730d153ac73dc0e38c047246d49bb43aa"
 )
 HEX_ARTIFACT = re.compile(r"^[0-9a-f]{64}\.json$")
 LAUNCHER_GIT_PATH = "scripts/run_shallow_gbdt_development_3_resource_capped.py"
@@ -279,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
         "parent_failure_receipt": {
             "path": str(PARENT_FAILURE).replace("\\", "/"),
             "sha256": EXPECTED_PARENT_FAILURE_SHA256,
-            "classification": "resource_capped_run_without_valid_completed_result",
+            "classification": "unbounded_run_without_valid_completed_result",
             "statistical_result_available": False,
         },
         "resource_contract": {

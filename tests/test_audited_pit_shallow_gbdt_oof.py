@@ -262,6 +262,28 @@ def test_rolling_oof_inputs_keep_only_model_columns_and_minimal_outcomes() -> No
     )
 
 
+def test_rolling_oof_inputs_normalize_omitted_completed_censor_flag() -> None:
+    sessions, features, outcomes = _fixture()
+    completed = next(outcome for outcome in outcomes if not outcome["right_censored"])
+    omitted_flag_outcomes = [
+        {key: value for key, value in outcome.items() if key != "right_censored"}
+        if outcome is completed
+        else outcome
+        for outcome in outcomes
+    ]
+
+    _, _, outcome_lookup = gbdt._rolling_oof_inputs(
+        features,
+        omitted_flag_outcomes,
+        sessions,
+        minimum_training_sessions=4,
+        training_window_sessions=4,
+        validation_sessions=2,
+    )
+
+    assert outcome_lookup[completed["candidate_key"]]["right_censored"] is False
+
+
 @pytest.mark.parametrize(
     "session_mutation",
     [

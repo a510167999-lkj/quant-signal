@@ -490,7 +490,7 @@ def _rolling_oof_inputs(
             raise ValueError(
                 "shallow GBDT rolling OOF outcomes have invalid keys"
             )
-        right_censored = raw_outcome.get("right_censored")
+        right_censored = raw_outcome.get("right_censored", False)
         if type(right_censored) is not bool:
             raise ValueError(
                 "shallow GBDT rolling OOF right_censored must be boolean"
