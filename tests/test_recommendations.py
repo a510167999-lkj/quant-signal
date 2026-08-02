@@ -35,6 +35,11 @@ class FakeProvider:
         return sample_frame("up"), "fake-provider"
 
 
+class FakeJiaochProvider(FakeProvider):
+    def history(self, symbol, market, lookback_days=360, adjust="qfq"):
+        return sample_frame("up"), "Jiaoch fixture"
+
+
 class GapProvider:
     def history(self, symbol, market, lookback_days=360, adjust="qfq"):
         frame = sample_frame("up")
@@ -976,7 +981,7 @@ def test_generation_enforces_target_trade_date_publication_cap(
         scan_max_deep=6,
         scan_result_limit=6,
     )
-    service = RecommendationService(settings, FakeProvider(), "risk")
+    service = RecommendationService(settings, FakeJiaochProvider(), "risk")
     service.industry = FakeIndustry()
     service.industry_history = FakeIndustryHistory()
     service.news = FakeNews()
@@ -1869,6 +1874,72 @@ def test_live_profile_cannot_publish_when_current_pool_is_development_only(tmp_p
     assert result["auto_order"] is False
     assert result["summary"]["auto_order"] is False
     assert all(item["auto_order"] is False for item in result["items"])
+
+
+def test_live_profile_cannot_publish_non_jiaoch_market_source(tmp_path, monkeypatch):
+    evidence_path = tmp_path / "profile-evidence.json"
+    write_json(str(evidence_path), _live_profile_evidence_payload())
+    symbols = ["%06d" % (600519 + index) for index in range(5)]
+    settings = replace(
+        make_settings(tmp_path),
+        recommendation_profile_id="primary_50_return_15_drawdown",
+        recommendation_profile_evidence_path=str(evidence_path),
+        scan_max_deep=6,
+        scan_result_limit=6,
+    )
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    service.industry = FakeIndustry()
+    service.industry_history = FakeIndustryHistory()
+    service.news = FakeNews()
+    service.announcements = FakeAnnouncement()
+    service.fund_flow = FakeFundFlow()
+    service.margin_eligibility = FakeMarginEligibility()
+    service.universe = FakeUniverse(
+        [
+            {
+                "symbol": symbol,
+                "market": "a",
+                "name": "娴嬭瘯鑲＄エ%d" % index,
+                "latest": 100,
+                "amount": 100000000,
+                "change_pct": 7.0,
+                "volume": 10000,
+            }
+            for index, symbol in enumerate(symbols)
+        ]
+    )
+    monkeypatch.setattr("app.recommendations.is_trade_day", lambda value: True)
+    monkeypatch.setattr(
+        "app.recommendations.build_production_status",
+        lambda settings: {"status": "healthy", "checks": []},
+    )
+    monkeypatch.setattr(
+        service,
+        "_current_pool_gate",
+        lambda moment, run_slot=None: {
+            "passed": True,
+            "production_recommendation_eligible": True,
+            "allowed_symbols": set(symbols),
+            "canonical_sha256": "a" * 64,
+            "source_as_of": "2026-07-13",
+        },
+    )
+    monkeypatch.setattr(
+        "app.recommendations._selection_rejection_reason",
+        lambda compact, allowed_actions, min_score: None,
+    )
+
+    result = service.generate_daily_recommendations(force=True)
+
+    assert result["profile_gate"]["live_proof"] is True
+    assert result["recommendation_status"] == "blocked_market_source_gate"
+    assert result["publication_gate"] == {
+        "status": "blocked",
+        "reason": "market_data_source_not_jiaoch",
+    }
+    assert result["market_source_gate"]["passed"] is False
+    assert result["items"] == []
+    assert result["auto_order"] is False
 
 
 def test_pre_open_run_slot_skips_l1_context(tmp_path):

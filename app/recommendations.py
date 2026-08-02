@@ -115,6 +115,12 @@ RECOMMENDATION_STATUS_DEVELOPMENT = "research_development_candidate"
 EVIDENCE_SCOPE_DEVELOPMENT_ONLY = "development_only"
 
 
+def _jiaoch_market_source_observed(item: Dict[str, Any]) -> bool:
+    """Require an explicit Jiaoch provenance before live publication."""
+    source = str(item.get("market_data_source") or "").strip().lower()
+    return source.startswith("jiaoch")
+
+
 def _recommendation_key(item: Dict[str, Any]) -> str:
     return "%s:%s" % (item.get("market", "a"), item.get("symbol", ""))
 
@@ -2178,6 +2184,15 @@ class RecommendationService:
         current_pool_production_eligible = bool(
             current_pool_gate.get("production_recommendation_eligible", False)
         )
+        observed_market_sources = sorted(
+            {
+                str(item.get("market_data_source") or "unknown")
+                for item in selected
+            }
+        )
+        market_source_gate_passed = all(
+            _jiaoch_market_source_observed(item) for item in selected
+        )
         evidence_live_proof = (
             profile_live_proof and current_pool_production_eligible
         )
@@ -2209,6 +2224,10 @@ class RecommendationService:
         elif not current_pool_production_eligible:
             final_status = "blocked_current_pool_gate"
             publication_reason = "current_pool_not_production_eligible"
+        elif not market_source_gate_passed:
+            final_live_proof = False
+            final_status = "blocked_market_source_gate"
+            publication_reason = "market_data_source_not_jiaoch"
         elif not profile_live_proof:
             final_status = "blocked_profile_gate"
             publication_reason = "profile_not_live_proven"
@@ -2302,6 +2321,11 @@ class RecommendationService:
                 "status": "allowed" if final_live_proof else "blocked",
                 "reason": publication_reason,
             },
+            "market_source_gate": {
+                "required": "jiaoch",
+                "passed": market_source_gate_passed,
+                "observed": observed_market_sources,
+            },
             "daily_publication_cap": daily_publication_cap,
             "profile_gate": profile_gate,
             "current_pool_gate": current_pool_gate_public,
@@ -2320,6 +2344,11 @@ class RecommendationService:
                 "publication_gate": {
                     "status": "allowed" if final_live_proof else "blocked",
                     "reason": publication_reason,
+                },
+                "market_source_gate": {
+                    "required": "jiaoch",
+                    "passed": market_source_gate_passed,
+                    "observed": observed_market_sources,
                 },
                 "daily_publication_cap": daily_publication_cap,
                 "profile_gate": profile_gate,
