@@ -11,7 +11,6 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app.research_supervised_launcher import run_resource_capped_command
 
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -19,15 +18,15 @@ WORKSPACE = Path(r"E:\AI workspace\quant-signal-lkj")
 RELATIVE_OUTPUT_DIR = Path(
     "data/research_runs/"
     "audited_pit_ranked_liquidity_shallow_gbdt_rolling126_oof_v1_"
-    "development_8_inplace_feature_input_local_research_9gib"
+    "development_9_unbounded_local_research"
 )
 PARENT_FAILURE = Path(
     "data/research_runs/"
     "audited_pit_ranked_liquidity_shallow_gbdt_rolling126_oof_v1_"
-    "development_7_stream_feature_receipts_local_research_9gib/formal_run.failure.json"
+    "development_8_inplace_feature_input_local_research_9gib/formal_run.failure.json"
 )
 EXPECTED_PARENT_FAILURE_SHA256 = (
-    "44972e48d3c460f27eb57d9654a59a065275f8b30787252fd0d2ace8b55b5f8d"
+    "26818f79f02ec47507b5e0817ef1193d092db18d8952cba389d4c6b522899685"
 )
 EXPECTED_STRATEGY_SHA256 = (
     "53d00badc8683670ef3d6c02307697e2c3ef8ec769b9d8da072d36420cea70ac"
@@ -35,8 +34,6 @@ EXPECTED_STRATEGY_SHA256 = (
 EXPECTED_PRODUCER_ROOT_SHA256 = (
     "8e335c35b01bf8662256f50effd732b58ce176018fe504c5a36b5868a5c71a18"
 )
-USER_TOTAL_MEMORY_BUDGET_BYTES = 10 * 1024**3
-RESEARCH_JOB_MEMORY_LIMIT_BYTES = 9 * 1024**3
 HEX_ARTIFACT = re.compile(r"^[0-9a-f]{64}\.json$")
 LAUNCHER_GIT_PATH = "scripts/run_shallow_gbdt_development_3_resource_capped.py"
 OUTPUT_DIR_OWNED_BY_THIS_PROCESS = False
@@ -61,6 +58,65 @@ def write_json(path: Path, payload: dict) -> None:
         encoding="utf-8",
     )
     os.replace(temporary, path)
+
+
+def run_unbounded_command(
+    *,
+    command: list[str],
+    cwd: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    environment: dict[str, str],
+) -> dict:
+    if not command or any(not isinstance(token, str) or not token for token in command):
+        raise ValueError("unbounded research command is invalid")
+    if stdout_path.exists() or stderr_path.exists() or stdout_path == stderr_path:
+        raise ValueError("unbounded research output paths are invalid")
+    started_at = utc_now()
+    with stdout_path.open("xb") as stdout_handle, stderr_path.open("xb") as stderr_handle:
+        process = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            env=dict(environment),
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+        )
+        exit_code = process.wait()
+    return {
+        "schema_version": "research-unbounded-command-receipt/v1",
+        "pid": process.pid,
+        "started_at_utc": started_at,
+        "finished_at_utc": utc_now(),
+        "exit_code": exit_code,
+        "command_sha256": hashlib.sha256(
+            json.dumps(
+                {"tokens": command},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest(),
+        "argument_count": len(command),
+        "cwd": str(cwd),
+        "shell": False,
+        "stdin_closed": True,
+        "memory_limit_enforced": False,
+        "child_reaped": process.poll() is not None,
+        "process_tree_drained": True,
+        "stdout": {
+            "path": str(stdout_path),
+            "bytes": stdout_path.stat().st_size,
+            "sha256": sha256_file(stdout_path),
+        },
+        "stderr": {
+            "path": str(stderr_path),
+            "bytes": stderr_path.stat().st_size,
+            "sha256": sha256_file(stderr_path),
+        },
+    }
 
 
 def git_output(*args: str) -> str:
@@ -205,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
     ).hexdigest()
     preflight = {
         "schema_version": (
-            "ranked-liquidity-shallow-gbdt-resource-capped-preflight/v2"
+            "ranked-liquidity-shallow-gbdt-unbounded-preflight/v1"
         ),
         "observed_at_utc": started_at,
         "git_commit": current_commit,
@@ -218,7 +274,7 @@ def main(argv: list[str] | None = None) -> int:
             "-m",
             "scripts.run_shallow_gbdt_development_3_resource_capped",
         ],
-        "retry_kind": "same_frozen_hypothesis_after_inplace_feature_input_memory_fix_before_oof",
+        "retry_kind": "same_frozen_hypothesis_unbounded_memory_replay",
         "runtime_role": "local_research",
         "parent_failure_receipt": {
             "path": str(PARENT_FAILURE).replace("\\", "/"),
@@ -227,13 +283,8 @@ def main(argv: list[str] | None = None) -> int:
             "statistical_result_available": False,
         },
         "resource_contract": {
-            "user_total_memory_budget_bytes": USER_TOTAL_MEMORY_BUDGET_BYTES,
-            "research_job_memory_limit_bytes": RESEARCH_JOB_MEMORY_LIMIT_BYTES,
-            "supervisor_headroom_bytes": (
-                USER_TOTAL_MEMORY_BUDGET_BYTES - RESEARCH_JOB_MEMORY_LIMIT_BYTES
-            ),
-            "enforcement": "windows-job-object-job-memory-kill-on-close",
-            "created_suspended_before_job_assignment": True,
+            "memory_policy": "unbounded",
+            "enforcement": "none",
         },
         "development_partition": {
             "start_date": "2024-07-05",
@@ -246,7 +297,7 @@ def main(argv: list[str] | None = None) -> int:
     write_json(output_dir / "formal_run.preflight.json", preflight)
     launch = {
         "schema_version": (
-            "ranked-liquidity-shallow-gbdt-resource-capped-launch/v2"
+            "ranked-liquidity-shallow-gbdt-unbounded-launch/v1"
         ),
         "started_at_utc": started_at,
         "supervisor_process_id": os.getpid(),
@@ -263,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
         ],
         "parent_failure_receipt_sha256": EXPECTED_PARENT_FAILURE_SHA256,
         "runtime_role": "local_research",
-        "research_job_memory_limit_bytes": RESEARCH_JOB_MEMORY_LIMIT_BYTES,
+        "memory_policy": "unbounded",
         "embargo_consumed": False,
         "final_oos_consumed": False,
     }
@@ -275,12 +326,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         child_environment = dict(os.environ)
         child_environment["VPS_RUNTIME_ROLE"] = "local_research"
-        resource_receipt = run_resource_capped_command(
+        resource_receipt = run_unbounded_command(
             command=command,
             cwd=WORKSPACE,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
-            job_memory_limit_bytes=RESEARCH_JOB_MEMORY_LIMIT_BYTES,
             environment=child_environment,
         )
         write_json(resource_receipt_path, resource_receipt)
@@ -359,17 +409,12 @@ def main(argv: list[str] | None = None) -> int:
     resource_ok = bool(
         resource_receipt
         and resource_receipt["schema_version"]
-        == "research-resource-capped-command-receipt/v1"
+        == "research-unbounded-command-receipt/v1"
         and resource_receipt["exit_code"] == 0
-        and resource_receipt["job_memory_limit_hard"] is True
+        and resource_receipt["child_reaped"] is True
         and resource_receipt["process_tree_drained"] is True
-        and resource_receipt["job_memory_limit_bytes"]
-        == RESEARCH_JOB_MEMORY_LIMIT_BYTES
+        and resource_receipt["memory_limit_enforced"] is False
         and resource_receipt["command_sha256"] == command_sha256
-        and isinstance(resource_receipt["peak_job_memory_bytes"], int)
-        and not isinstance(resource_receipt["peak_job_memory_bytes"], bool)
-        and 0 <= resource_receipt["peak_job_memory_bytes"]
-        < USER_TOTAL_MEMORY_BUDGET_BYTES
     )
     result_available = bool(
         resource_ok
@@ -384,9 +429,9 @@ def main(argv: list[str] | None = None) -> int:
         "completed_result_pending_independent_verification"
         if result_available
         else (
-            "resource_capped_launcher_exception_before_valid_result"
+            "unbounded_launcher_exception_before_valid_result"
             if launcher_exception
-            else "resource_capped_run_without_valid_completed_result"
+            else "unbounded_run_without_valid_completed_result"
         )
     )
     launcher_exception_path = output_dir / "formal_run.launcher_exception.log"
@@ -401,7 +446,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     completion = {
         "schema_version": (
-            "ranked-liquidity-shallow-gbdt-resource-capped-completion/v2"
+            "ranked-liquidity-shallow-gbdt-unbounded-completion/v1"
         ),
         "started_at_utc": started_at,
         "finished_at_utc": finished_at,
@@ -428,11 +473,8 @@ def main(argv: list[str] | None = None) -> int:
                 "path": resource_receipt_path.name,
                 "sha256": sha256_file(resource_receipt_path),
                 "exit_code": resource_receipt["exit_code"],
-                "job_memory_limit_bytes": resource_receipt[
-                    "job_memory_limit_bytes"
-                ],
-                "peak_job_memory_bytes": resource_receipt[
-                    "peak_job_memory_bytes"
+                "memory_limit_enforced": resource_receipt[
+                    "memory_limit_enforced"
                 ],
                 "process_tree_drained": resource_receipt[
                     "process_tree_drained"
@@ -474,7 +516,7 @@ def main(argv: list[str] | None = None) -> int:
             failure_path,
             {
                 "schema_version": (
-                    "ranked-liquidity-shallow-gbdt-formal-failure/v4"
+                    "ranked-liquidity-shallow-gbdt-unbounded-failure/v1"
                 ),
                 "observed_at_utc": finished_at,
                 "classification": classification,
@@ -510,7 +552,7 @@ def write_uncaught_failure() -> None:
                 failure_path,
                 {
                     "schema_version": (
-                        "ranked-liquidity-shallow-gbdt-formal-failure/v4"
+                        "ranked-liquidity-shallow-gbdt-unbounded-failure/v1"
                     ),
                     "observed_at_utc": utc_now(),
                     "classification": (

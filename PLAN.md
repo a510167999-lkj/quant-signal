@@ -211,7 +211,7 @@
 - 早期 feature-history authority/runner worktree 均干净；其分支提交已由主仓等价提交覆盖，无额外可安全 cherry-pick 的修复。主仓 `test_audited_pit_factor_v3_feature_history_authority.py` 在项目 `.venv` 下 50/50 通过。
 - 新的 `factor-v3-formal-preflight-fix` 分支（工作树干净）协议专项 63/63 通过；其余 `formal_control_contract` 仅排除 `test_actual_completion_supervisor_runtime_and_be3_dispatch_chain` 时 16/16，通过该实际 supervisor 链的单项及合并 308 项 formal 回归均在有界时间内未完成，故不作为通过证据、不整合主仓，也不替代外部 native TCB。
 - 同日只读 TCB 环境诊断显示当前会话非 Windows 管理员、SCM 无目标服务，且未形成可用 CNG handoff 证据；因此 formal 入口继续拒绝 dispatch，不能启动 733-session 采集。
-- 2026-08-02 在启动新统计回放前预注册浅层 GBDT 的技术重放：策略 SHA、十维特征、`xgboost==3.2.0`、`depth=2/200/eta=0.05`、126/63 六折、成本、选择和全部晋级门均保持不变；仅把 bar receipt 的完整 JSON 列表哈希改为等价的增量 canonical JSON 哈希，避免 development_3 的 9 GiB 资源失败重复占用内存。第一次启动仅因未向受控子进程注入 `VPS_RUNTIME_ROLE=local_research` 在研究入口前失败，development_4 证据已保留；修正启动前提后的 development_5、development_6 和 development_7 都在特征阶段达到 9 GiB，均无 OOF/统计结果。现让特征构建在受控正式回放中就地消费 bars（测试调用仍保持复制默认），使用新目录 `audited_pit_ranked_liquidity_shallow_gbdt_rolling126_oof_v1_development_8_inplace_feature_input_local_research_9gib` 做同一假设的受控技术重放；embargo/final-OOS 仍封存，结果无论好坏均仅作 development 证据。
+- 2026-08-02 在启动新统计回放前预注册浅层 GBDT 的技术重放：策略 SHA、十维特征、`xgboost==3.2.0`、`depth=2/200/eta=0.05`、126/63 六折、成本、选择和全部晋级门均保持不变；仅把 bar receipt 的完整 JSON 列表哈希改为等价的增量 canonical JSON 哈希，避免 development_3 的 9 GiB 资源失败重复占用内存。第一次启动仅因未向受控子进程注入 `VPS_RUNTIME_ROLE=local_research` 在研究入口前失败，development_4 证据已保留；development_5 至 development_8 均在特征阶段达到人为 9 GiB 上限，均无 OOF/统计结果。用户已明确当前内存无限，故取消 Job 内存上限，保留同一 PIT/模型/成本/折叠/门槛，使用无上限 launcher 和新目录 `audited_pit_ranked_liquidity_shallow_gbdt_rolling126_oof_v1_development_9_unbounded_local_research` 做唯一正式 development 回放；embargo/final-OOS 仍封存，结果无论好坏均仅作 development 证据。
 
 ### 当前目标完成矩阵（不等同于生产授权）
 
