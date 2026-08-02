@@ -51,6 +51,7 @@ from app.audited_pit_trend_pullback import (
 )
 from app.config import Settings
 from app.current_pool_development_replay import (
+    _canonical_json,
     _sha256,
     _write_content_addressed,
 )
@@ -595,6 +596,21 @@ def _update_length_prefixed_digest(
         digest.update(encoded)
 
 
+def _sha256_canonical_sequence(values: Any) -> str:
+    """Hash a JSON sequence without retaining the complete sequence in memory."""
+
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    first = True
+    for value in values:
+        if not first:
+            digest.update(b",")
+        digest.update(_canonical_json(value))
+        first = False
+    digest.update(b"]")
+    return digest.hexdigest()
+
+
 def _load_bulk_next_open_replay_adapter(
     connection: Any,
     *,
@@ -869,8 +885,14 @@ def _load_ranked_liquidity_bars(
             for row in frame[exact_membership].itertuples(index=False)
         }
     )
-    source_rows = [
-        {
+    ordered_source_rows = frame.sort_values(
+        ["date", "security_id", "source_ts_code"],
+        kind="mergesort",
+    )
+
+    def source_row_payload(row: Any) -> dict[str, Any]:
+        amount = float(row.amount)
+        return {
             "date": str(row.date),
             "ts_code": str(row.ts_code),
             "source_ts_code": str(row.source_ts_code),
@@ -880,15 +902,11 @@ def _load_ranked_liquidity_bars(
             "low": float(row.low),
             "close": float(row.close),
             "amount": (
-                float(row.amount)
-                if math.isfinite(float(row.amount))
-                else f"nonfinite:{float(row.amount)}"
+                amount if math.isfinite(amount) else f"nonfinite:{amount}"
             ),
             "adj_factor": float(row.adj_factor),
             "membership_name": (
-                ""
-                if pd.isna(row.membership_name)
-                else str(row.membership_name)
+                "" if pd.isna(row.membership_name) else str(row.membership_name)
             ),
             "membership_industry": (
                 ""
@@ -911,11 +929,12 @@ def _load_ranked_liquidity_bars(
                 else str(row.membership_receipt_partition)
             ),
         }
-        for row in frame.sort_values(
-            ["date", "security_id", "source_ts_code"],
-            kind="mergesort",
-        ).itertuples(index=False)
-    ]
+
+    source_rows_sha256 = _sha256_canonical_sequence(
+        source_row_payload(row)
+        for row in ordered_source_rows.itertuples(index=False)
+    )
+    del ordered_source_rows
     receipt = {
         "schema_version": "ranked-liquidity-bar-loader-receipt/v2",
         "range": {"start_date": start_date, "end_date": end_date},
@@ -928,7 +947,7 @@ def _load_ranked_liquidity_bars(
             for dataset, partition in membership_refs
         ],
         "membership_receipt_refs_sha256": _sha256(membership_refs),
-        "source_rows_sha256": _sha256(source_rows),
+        "source_rows_sha256": source_rows_sha256,
         "security_code_transition_application": transition_receipt,
         "security_code_transition_application_receipt_sha256": (
             transition_receipt["receipt_sha256"]
