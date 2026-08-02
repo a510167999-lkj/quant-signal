@@ -209,6 +209,7 @@
 - daily_basic run root 当前仅保留锁文件；未触碰 embargo、final-OOS、materialization、production 或 VPS 推荐。上述结论不含 secrets、token、capability 或原始响应。
 - 同日只读盘点发现 AI workspace 内共有 83 个 `quant-signal*` Git worktree；`quant-signal-lkj-oof-consumer` 与 `quant-signal-lkj-oof-dev4-exact-v3-lf` 有未提交 OOF 改动，均保留原状、不清理、不擅自整合；Factor V3 正式/TCB worktree 仍干净。
 - 早期 feature-history authority/runner worktree 均干净；其分支提交已由主仓等价提交覆盖，无额外可安全 cherry-pick 的修复。主仓 `test_audited_pit_factor_v3_feature_history_authority.py` 在项目 `.venv` 下 50/50 通过。
+- 新的 `factor-v3-formal-preflight-fix` 分支（工作树干净）协议专项 63/63 通过；其 `formal_control_contract` 单文件及合并 308 项 formal 回归在有界时间内未完成，故不作为通过证据、不整合主仓，也不替代外部 native TCB。
 
 ## Phase 3: mini-program client
 
