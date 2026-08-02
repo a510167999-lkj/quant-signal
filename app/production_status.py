@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import sqlite3
 import urllib.error
 import urllib.request
@@ -270,9 +271,23 @@ def _market_cache(
             max_bar_date, row_count = connection.execute(
                 "SELECT MAX(date), COUNT(*) FROM daily_bars"
             ).fetchone()
+            non_jiaoch_rows = 0
+            if settings.market_data_provider == "jiaoch":
+                non_jiaoch_rows = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM daily_bars
+                        WHERE lower(trim(coalesce(source, ''))) NOT LIKE 'jiaoch%'
+                        """
+                    ).fetchone()[0]
+                    or 0
+                )
         max_bar_date = str(max_bar_date or "")[:10]
         if not max_bar_date or int(row_count or 0) <= 0:
             raise ValueError("daily_bars is empty")
+        if settings.market_data_provider == "jiaoch" and non_jiaoch_rows:
+            raise ValueError("daily_bars contains non-Jiaoch rows")
 
         expected = sorted(
             value
@@ -302,6 +317,29 @@ def _market_cache(
 
 
 def _provider(settings: Settings, now: datetime) -> dict[str, Any]:
+    if settings.market_data_provider == "jiaoch":
+        missing = [
+            name
+            for name in ("JIAOCH_TOKEN", "JIAOCH_STK_MINS_TOKEN")
+            if not os.getenv(name, "")
+        ]
+        if missing:
+            return _check(
+                "provider",
+                "unhealthy",
+                "Jiaoch credential slots are not configured",
+                domain="enhancement",
+                source="jiaoch",
+                missing_env=missing,
+            )
+        return _check(
+            "provider",
+            "healthy",
+            "Jiaoch-only market provider is configured",
+            domain="enhancement",
+            source="jiaoch",
+            fallback_enabled=False,
+        )
     try:
         payload = _load(settings.akshare_status_path)
         failures = [v for v in (payload.get("endpoints") or {}).values() if v.get("status") == "failed" and _age_hours(v.get("updated_at"), now) <= settings.production_provider_failure_window_hours]

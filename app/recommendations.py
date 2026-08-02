@@ -1000,7 +1000,11 @@ class RecommendationService:
                 self.profile_error = "unknown_recommendation_profile"
             else:
                 self.profile = DEFAULT_PROFILE
-        self.universe = AShareUniverseProvider(settings.universe_cache_path)
+        snapshot_loader = getattr(data_provider, "snapshot", None)
+        self.universe = AShareUniverseProvider(
+            settings.universe_cache_path,
+            snapshot_loader=snapshot_loader if callable(snapshot_loader) else None,
+        )
         self.industry = IndustryStrengthProvider(settings.industry_cache_path, settings.industry_top_n)
         self.industry_history = IndustryHistoryProvider(settings.industry_history_cache_dir)
         self.fund_flow = FundFlowContextProvider(

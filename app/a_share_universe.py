@@ -1,5 +1,6 @@
 import math
 from datetime import datetime
+from collections.abc import Callable
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -42,10 +43,17 @@ def _is_excluded_name(name: str) -> bool:
 
 
 class AShareUniverseProvider:
-    def __init__(self, cache_path: str) -> None:
+    def __init__(
+        self,
+        cache_path: str,
+        snapshot_loader: Callable[..., List[Dict[str, Any]]] | None = None,
+    ) -> None:
         self.cache_path = cache_path
+        self.snapshot_loader = snapshot_loader
 
     def snapshot(self, use_cache_on_error: bool = True) -> List[Dict[str, Any]]:
+        if self.snapshot_loader is not None:
+            return self.snapshot_loader(use_cache_on_error=use_cache_on_error)
         try:
             ak = _load_akshare()
             raw = akshare_call("stock_zh_a_spot", lambda: ak.stock_zh_a_spot())

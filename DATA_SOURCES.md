@@ -2,7 +2,14 @@
 
 ## Current Bottleneck
 
-The current AKShare path is usable for research, but it is too slow for a synchronous intraday wide scan when every candidate fetches daily bars from the network. On the VPS, one 360-day A-share history call has measured around 3 seconds. A 500-symbol scan therefore needs local caching and pre-warming first, regardless of which upstream is used. Fast intraday slots use `INTRADAY_SCAN_MAX_DEEP`; the 15:02 post-close slot can afford the wider `SCAN_MAX_DEEP` review.
+The runtime recommendation path is now Jiaoch-only for daily/minute market data. AKShare/Tushare material below describes isolated legacy/research adapters and is not a permitted live fallback. A 500-symbol scan still needs local cache warming and bounded Jiaoch requests; source errors fail closed instead of switching providers.
+
+## Runtime Source Decision
+
+- `MARKET_DATA_PROVIDER=jiaoch` is the production default.
+- `JIAOCH_TOKEN` is the points-primary slot; `JIAOCH_STK_MINS_TOKEN` is the independent historical-minute/daily slot.
+- The live adapter rejects credential echoes, non-canonical responses, non-Jiaoch cache rows, and unsupported adjustment modes.
+- The recommendation publication gate requires every observed market source to be Jiaoch. `auto_order` remains permanently false and an empty result is valid.
 
 ## Implemented First
 
@@ -69,11 +76,9 @@ python -m app.jobs mootdx-l1-check \
 
 Best use here: fast 09:32/open, 14:55/pre-close, 15:02/post-close context and trading-session alert checks. It should not replace the local daily K-line cache, official exchange lists, CNINFO announcements, or research backtest data.
 
-## Recommendation
+## Research-Only Recommendation
 
-1. Keep the new local SQLite cache as the primary read path.
-2. Use `MARKET_DATA_PROVIDER=tushare` when a Tushare Pro token is available; keep AKShare as fallback.
-3. Keep MOOTDX enabled only as a live L1 overlay. Refresh the VPS quote-server list with `mootdx bestip -l 5 -v` when quote latency rises.
-4. Keep industry taxonomy on AKShare industry-board `BK` codes unless a future paid source can provide point-in-time industry membership; mixing taxonomies makes hot-sector selection and attribution harder to audit.
-5. Run a timed bake-off on the VPS: 100 symbols x 620 trading days, measuring success rate, median latency, p95 latency, and data-field completeness.
-6. Promote Tushare or JQData/RQData only after token/account setup and latency measurements. Do not replace the cache with another network source; use network sources only to refresh the cache.
+1. Keep the Jiaoch-backed local SQLite cache as the primary runtime read path.
+2. Keep AKShare/Tushare available only for explicitly isolated research fixtures; never use them as a live recommendation fallback.
+3. Keep MOOTDX disabled for the Jiaoch-only publication path; any non-Jiaoch L1 observation blocks publication.
+4. Keep industry taxonomy on the existing research adapter until a PIT-compatible Jiaoch industry contract is separately audited; that context cannot override the market-source gate.

@@ -200,9 +200,10 @@ AKShare calls are wrapped by a shared retry layer. `AKSHARE_MAX_RETRIES`, `AKSHA
 
 Optional Tushare Pro daily-bar adapter:
 
-- Set `MARKET_DATA_PROVIDER=tushare` and `TUSHARE_TOKEN=...` to use Tushare Pro as the primary daily K-line source on Linux VPS.
+- The runtime default is `MARKET_DATA_PROVIDER=jiaoch`; live daily bars and snapshots use only the pinned Jiaoch adapter.
+- Set `JIAOCH_TOKEN` for the points-primary slot and `JIAOCH_STK_MINS_TOKEN` for the independent historical-minute/daily slot. Missing slots fail closed.
 - Tushare data is still written into the same SQLite cache, so recommendation scans keep reading from local cache whenever it is fresh.
-- Keep `TUSHARE_FALLBACK_TO_AKSHARE=1` unless you want Tushare failures to fail requests immediately.
+- `TUSHARE_FALLBACK_TO_AKSHARE` is disabled for the live path; AKShare/Tushare are not market-source fallbacks for recommendations.
 - QMT/MiniQMT is not used for the VPS deployment path because it depends on a local logged-in broker client environment.
 
 Optional MOOTDX L1 quote layer:
@@ -235,7 +236,7 @@ Preferred source hierarchy for future hardening:
 - Trading calendar and rules: Shanghai Stock Exchange / Shenzhen Stock Exchange official pages. Current reference pages: [SSE annual market-close schedule](https://www.sse.com.cn/disclosure/dealinstruc/closed/) and [SZSE trading calendar](https://www.szse.cn/aboutus/calendar/index.html).
 - Company announcements and statutory disclosure: exchange announcement pages, [SSE latest announcements](https://www.sse.com.cn/disclosure/listedinfo/announcement/), and [CNINFO](https://www.cninfo.com.cn/). CNINFO is operated by Shenzhen Securities Information Co. and is a statutory disclosure platform; CSRC has also identified CNINFO as a designated disclosure site for ChiNext information disclosure.
 - Financing/margin eligibility: official SSE/SZSE margin lists first; current live recommendations emit `margin_*` tags from this source.
-- Market data adapter: [AKShare stock data](https://akshare.akfamily.xyz/data/stock/stock.html) for personal research, with source and cache metadata retained.
+- Market data adapter: Jiaoch-only daily/adjustment data, with source metadata retained and non-Jiaoch cache rows rejected.
 - Industry-board classification and history: AKShare's industry-board interfaces are the primary source. The stored `BK` board code is reused for board constituents and board K-line history, so hot-sector classification, sector constituents and 1/3/5/10-day sector strength use the same taxonomy. Current board constituents are not historical constituents; do not treat them as no-lookahead stock membership.
 - Fund-flow confirmation: Eastmoney fund-flow interfaces through AKShare; use as confirmation/risk overlay, not as an unverified primary signal.
 - Dragon-tiger / public trading information: exchange pages such as [SSE public trading information](https://www.sse.com.cn/disclosure/diclosure/public/) are the preferred official references; current research uses AKShare/Eastmoney as a practical historical adapter and drops `上榜后*日` future-return columns before tagging.
@@ -267,12 +268,14 @@ Important knobs:
 - `SCAN_PER_INDUSTRY_TOP_N`: how many liquid/popular constituents each eligible industry can contribute. The default is `3`.
 - `INDUSTRY_TOP_N`: how many active industries are fetched into the industry-strength cache. The default is `50`; scanning can still use only the hottest subset through `SCAN_INDUSTRY_TOP_N`.
 - `MARKET_DATA_CACHE_PATH`: persistent SQLite cache for daily K-lines. Recommendation scans read this before calling external data sources; `warm-market-cache` refreshes it ahead of time.
-- `MARKET_DATA_PROVIDER`: `akshare` by default, or `tushare` for VPS-friendly Tushare Pro daily bars with optional AKShare fallback.
+- `MARKET_DATA_PROVIDER`: `jiaoch` by default. Other providers remain isolated legacy/research adapters and cannot publish recommendations.
 - `AKSHARE_MAX_RETRIES`: max attempts for wrapped AKShare calls. The default is `3`.
 - `AKSHARE_MAX_ELAPSED_SECONDS`: optional total outer retry budget for each wrapped AKShare call. `0` disables the extra budget.
 - `AKSHARE_STATUS_PATH`: JSON status file for AKShare recovered/failure events. The default is `data/akshare_status.json`.
 - `TUSHARE_TOKEN`: Tushare Pro token used when `MARKET_DATA_PROVIDER=tushare`.
-- `TUSHARE_FALLBACK_TO_AKSHARE`: when using Tushare, fallback to AKShare if Tushare is unavailable or returns unusable data.
+- `JIAOCH_STK_MINS_TOKEN`: independent Jiaoch historical-minute/daily credential slot.
+- `JIAOCH_LIVE_TIMEOUT_SECONDS`: bounded Jiaoch live request timeout.
+- `TUSHARE_FALLBACK_TO_AKSHARE`: kept disabled for the live path; no source substitution is permitted.
 - `ENABLE_MOOTDX_L1_CONTEXT`: enable MOOTDX L1 snapshots for live recommendations and monitor alerts.
 - `MOOTDX_SERVERS`: comma-separated TongDaXin quote servers. Leave empty only if the runtime has a valid MOOTDX bestip config.
 - `MOOTDX_TIMEOUT_SECONDS`: per-connection quote timeout. The default is `3`.

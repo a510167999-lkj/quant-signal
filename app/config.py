@@ -28,6 +28,8 @@ class Settings:
     api_version: str = "0.1.0"
     cors_origins: List[str] = field(default_factory=list)
     cache_ttl_seconds: int = 1800
+    # Unit-test fixtures may construct Settings() directly; production defaults
+    # are pinned in get_settings() below.
     market_data_provider: str = "akshare"
     market_data_cache_path: str = "data/market_data_cache.sqlite"
     tushare_token: str = ""
@@ -138,10 +140,10 @@ def get_settings() -> Settings:
     return Settings(
         cors_origins=_split_csv(os.getenv("CORS_ORIGINS", "")),
         cache_ttl_seconds=cache_ttl_seconds,
-        market_data_provider=os.getenv("MARKET_DATA_PROVIDER", "akshare"),
+        market_data_provider=os.getenv("MARKET_DATA_PROVIDER", "jiaoch"),
         market_data_cache_path=os.getenv("MARKET_DATA_CACHE_PATH", "data/market_data_cache.sqlite"),
         tushare_token=os.getenv("TUSHARE_TOKEN", ""),
-        tushare_fallback_to_akshare=os.getenv("TUSHARE_FALLBACK_TO_AKSHARE", "1").strip() != "0",
+        tushare_fallback_to_akshare=os.getenv("TUSHARE_FALLBACK_TO_AKSHARE", "0").strip() != "0",
         enable_mootdx_l1_context=os.getenv("ENABLE_MOOTDX_L1_CONTEXT", "0").strip() == "1",
         mootdx_servers=os.getenv("MOOTDX_SERVERS", ""),
         mootdx_timeout_seconds=float_setting("MOOTDX_TIMEOUT_SECONDS", 3.0, 0.5, 30.0),

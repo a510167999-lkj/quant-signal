@@ -613,6 +613,13 @@ def build_market_data_provider(
             fallback_to_akshare=tushare_fallback_to_akshare,
             token=tushare_token,
         )
+    if normalized == "jiaoch":
+        from app.jiaoch_live_market import JiaochMarketDataProvider
+
+        return JiaochMarketDataProvider(
+            cache_ttl_seconds=cache_ttl_seconds,
+            disk_cache_path=disk_cache_path,
+        )
     raise MarketDataError("Unsupported MARKET_DATA_PROVIDER: %s" % provider_name)
 
 
