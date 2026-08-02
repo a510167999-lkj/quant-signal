@@ -22,6 +22,46 @@ FORMAL_WORKTREE_ROOT = Path(
     r"E:\AI workspace\quant-signal-lkj-factor-v3-daily-basic-formal-run-v2"
 )
 EXPECTED_BRANCH = "codex/factor-v3-daily-basic-formal-run-v2"
+FORMAL_REVIEW_SOURCE_RELATIVE_PATHS = (
+    "scripts/build_factor_v3_daily_basic_formal_run_spec.py",
+    "scripts/run_factor_v3_daily_basic_formal.py",
+    "app/__init__.py",
+    "app/audited_pit_factor_v3_feature_history_authority.py",
+    "app/audited_pit_factor_v3_points_contract.py",
+    "app/current_pool.py",
+    "app/current_pool_gate.py",
+    "app/durable_io.py",
+    "app/factor_v3_daily_basic_733_exact_set_authority.py",
+    "app/factor_v3_daily_basic_runner.py",
+    "app/factor_v3_feature_history_frozen_source_attestation.py",
+    "app/factor_v3_feature_history_runner.py",
+    "app/factor_v3_formal_control_contract.py",
+    "app/jiaoch_credential_slots.py",
+    "app/jiaoch_daily_basic_collection_set.py",
+    "app/jiaoch_daily_basic_exact_set_authority.py",
+    "app/jiaoch_minute_collection_set.py",
+    "app/jiaoch_minute_raw_authority.py",
+    "app/jiaoch_minute_reconciliation.py",
+    "app/jiaoch_points_collection_set.py",
+    "app/jiaoch_points_raw_authority.py",
+    "app/jiaoch_points_response_normalization.py",
+    "app/jiaoch_trade_cal_authority.py",
+    "app/research_market_data.py",
+    "app/research_membership.py",
+    "app/research_partitions.py",
+    "app/research_pit_collector.py",
+    "app/research_pit_contracts.py",
+    "app/research_pit_sources.py",
+    "app/research_pit_store.py",
+    "app/research_pit_transport.py",
+    "app/research_provider_evidence_partitions.py",
+    "app/research_provider_pit_tail.py",
+    "app/research_provider_pit_tail_v2.py",
+    "app/research_proxy_data.py",
+    "app/research_scope.py",
+    "app/research_security_code_transition.py",
+    "app/research_suspension_evidence.py",
+)
 MAIN_REPO_ROOT = Path(r"E:\AI workspace\quant-signal-lkj")
 SPEC_OUTPUT_ROOT = (
     MAIN_REPO_ROOT
