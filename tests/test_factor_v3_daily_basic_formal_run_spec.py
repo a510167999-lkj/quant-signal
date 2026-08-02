@@ -277,7 +277,10 @@ def test_isolated_cli_shim_delegates_verify_without_import_path_leak(
 
     assert completed.returncode == 2
     assert "No module named" not in completed.stderr
-    assert "formal bootstrap requires fixed Python -I -B" in completed.stderr
+    assert completed.stderr in {
+        "formal bootstrap requires fixed Python -I -B\n",
+        "formal bootstrap claim unavailable; external trusted bootstrap context required\n",
+    }
     assert completed.stdout == ""
 
 
