@@ -19,15 +19,15 @@ WORKSPACE = Path(r"E:\AI workspace\quant-signal-lkj")
 RELATIVE_OUTPUT_DIR = Path(
     "data/research_runs/"
     "audited_pit_ranked_liquidity_shallow_gbdt_rolling126_oof_v1_"
-    "development_4_streamed_receipt_9gib"
+    "development_5_streamed_receipt_local_research_9gib"
 )
 PARENT_FAILURE = Path(
     "data/research_runs/"
     "audited_pit_ranked_liquidity_shallow_gbdt_rolling126_oof_v1_"
-    "development_3_resource_capped_9gib/formal_run.failure.json"
+    "development_4_streamed_receipt_9gib/formal_run.failure.json"
 )
 EXPECTED_PARENT_FAILURE_SHA256 = (
-    "fe9b80b30c06cc5beaaf90d7637e672864eae9a48562700ba643972104534109"
+    "5dd63ef42ca22e9a2817ebd23d2d06edde7ee7c98f66b51312d433ecd91ca1ea"
 )
 EXPECTED_STRATEGY_SHA256 = (
     "53d00badc8683670ef3d6c02307697e2c3ef8ec769b9d8da072d36420cea70ac"
@@ -218,7 +218,8 @@ def main(argv: list[str] | None = None) -> int:
             "-m",
             "scripts.run_shallow_gbdt_development_3_resource_capped",
         ],
-        "retry_kind": "same_frozen_hypothesis_after_resource_failure_before_oof",
+        "retry_kind": "same_frozen_hypothesis_after_runtime_role_precondition_failure_before_oof",
+        "runtime_role": "local_research",
         "parent_failure_receipt": {
             "path": str(PARENT_FAILURE).replace("\\", "/"),
             "sha256": EXPECTED_PARENT_FAILURE_SHA256,
@@ -260,9 +261,8 @@ def main(argv: list[str] | None = None) -> int:
             "-m",
             "scripts.run_shallow_gbdt_development_3_resource_capped",
         ],
-        "parent_failure_receipt_sha256": (
-            EXPECTED_PARENT_FAILURE_SHA256
-        ),
+        "parent_failure_receipt_sha256": EXPECTED_PARENT_FAILURE_SHA256,
+        "runtime_role": "local_research",
         "research_job_memory_limit_bytes": RESEARCH_JOB_MEMORY_LIMIT_BYTES,
         "embargo_consumed": False,
         "final_oos_consumed": False,
@@ -273,12 +273,15 @@ def main(argv: list[str] | None = None) -> int:
     resource_receipt = None
     launcher_exception = None
     try:
+        child_environment = dict(os.environ)
+        child_environment["VPS_RUNTIME_ROLE"] = "local_research"
         resource_receipt = run_resource_capped_command(
             command=command,
             cwd=WORKSPACE,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             job_memory_limit_bytes=RESEARCH_JOB_MEMORY_LIMIT_BYTES,
+            environment=child_environment,
         )
         write_json(resource_receipt_path, resource_receipt)
     except BaseException:
