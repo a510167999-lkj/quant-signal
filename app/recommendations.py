@@ -1254,6 +1254,7 @@ class RecommendationService:
         market_source_gate_valid = (
             stored_market_source_gate.get("required") == "jiaoch"
             and stored_market_source_gate.get("passed") is True
+            and stored_market_source_gate.get("observed") == observed_market_sources
             and all(_jiaoch_market_source_observed(item) for item in item_values)
         )
         publication_claimed = (
