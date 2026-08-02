@@ -19,15 +19,15 @@ class FormalRunSpecError(RuntimeError):
 
 
 FORMAL_WORKTREE_ROOT = Path(
-    r"E:\AI workspace\quant-signal-lkj-factor-v3-daily-basic-formal-run"
+    r"E:\AI workspace\quant-signal-lkj-factor-v3-daily-basic-formal-run-v2"
 )
-EXPECTED_BRANCH = "codex/factor-v3-daily-basic-formal-run"
+EXPECTED_BRANCH = "codex/factor-v3-daily-basic-formal-run-v2"
 MAIN_REPO_ROOT = Path(r"E:\AI workspace\quant-signal-lkj")
 SPEC_OUTPUT_ROOT = (
     MAIN_REPO_ROOT
     / "data"
     / "research_runs"
-    / "audited_pit_factor_v3_daily_basic_run_spec_v1"
+    / "audited_pit_factor_v3_daily_basic_run_spec_v2"
     / "run_specs"
     / "sha256"
 )
@@ -35,21 +35,21 @@ PLANNED_RUN_ROOT = (
     MAIN_REPO_ROOT
     / "data"
     / "research_runs"
-    / "audited_pit_factor_v3_daily_basic_collection_v1_development_733"
+    / "audited_pit_factor_v3_daily_basic_collection_v2_development_733"
 )
 EXACT_SET_AUTHORITY_INPUTS = {
     "feature_history_frozen_source_attestation_path": str(
         MAIN_REPO_ROOT
         / "data"
         / "research_artifacts"
-        / "factor_v3_feature_history_frozen_source_attestation_v1"
+        / "factor_v3_feature_history_frozen_source_attestation_v3"
         / "factor_v3_feature_history_frozen_source_attestations"
         / "sha256"
-        / "a1"
-        / "a11c966ea7b0a764d657a651f5b038e9cf7c24a4f90e18fdd6b50dc1e381e697.json"
+        / "68"
+        / "68d08661ee0f7a1e216c5ec4c9cbb49ea35193488b1cd50b276e9d72eb9ef675.json"
     ),
     "expected_feature_history_frozen_source_attestation_sha256": (
-        "a11c966ea7b0a764d657a651f5b038e9cf7c24a4f90e18fdd6b50dc1e381e697"
+        "68d08661ee0f7a1e216c5ec4c9cbb49ea35193488b1cd50b276e9d72eb9ef675"
     ),
     "feature_history_frozen_source_root": (
         r"E:\AI workspace\quant-signal-lkj-factor-v3-feature-history-formal-run"
