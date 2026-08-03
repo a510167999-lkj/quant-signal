@@ -2663,8 +2663,104 @@ def _producer_binding() -> dict[str, Any]:
     return {**payload, "root_sha256": canonical_sha256(payload)}
 
 
+def _validated_expected_producer_binding(value: Any) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != {
+        "critical_runtime_constants",
+        "loaded_execution_root_sha256",
+        "root_sha256",
+        "schema_version",
+        "source_manifest_root_sha256",
+    }:
+        raise ValueError("factor-v3 feature history producer binding rejected")
+    if value.get("schema_version") != "factor-v3-feature-history-producer-binding/v2":
+        raise ValueError("factor-v3 feature history producer binding rejected")
+    root_sha256 = _strict_sha256(
+        value.get("root_sha256"),
+        label="feature history producer binding root",
+    )
+    unsigned = {key: item for key, item in value.items() if key != "root_sha256"}
+    if not hmac.compare_digest(root_sha256, canonical_sha256(unsigned)):
+        raise ValueError("factor-v3 feature history producer binding rejected")
+    return deepcopy(value)
+
+
 def _producer_code_root_sha256() -> str:
     return _producer_binding()["root_sha256"]
+
+
+def _factor_v3_feature_history_attestation_binding(
+    *,
+    collection_publication: Mapping[str, Any],
+    collection_publication_output_root: str | Path,
+    collection_plan: Mapping[str, Any],
+    development_session_refs: Sequence[Mapping[str, Any]],
+    temporal_partition_contract: Mapping[str, Any],
+    trade_cal_output_root: str | Path,
+    trade_cal_publication: Mapping[str, Any],
+    feature_history_run_spec_path: str | Path,
+    feature_history_run_spec_sha256: str,
+    feature_history_run_root: str | Path,
+    manifest: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    publication = _validated_collection_publication(collection_publication)
+    issuance = _collection_publication_issuance(publication)
+    public_publication = {
+        key: value
+        for key, value in publication.items()
+        if key != "publication_capability"
+    }
+    spec_path = Path(feature_history_run_spec_path).resolve(strict=True)
+    run_root = Path(feature_history_run_root).resolve(strict=True)
+    publication_root = _safe_collection_output_root(collection_publication_output_root)
+    trade_cal_root = Path(trade_cal_output_root).resolve(strict=True)
+    spec_raw = spec_path.read_bytes()
+    if len(spec_raw) > 4 * 1024 * 1024:
+        raise ValueError("factor-v3 feature history run spec rejected")
+    identity = {
+        "collection_plan_sha256": collection_plan["plan_sha256"],
+        "collection_publication": public_publication,
+        "collection_publication_capability_sha256": issuance[
+            "publication_capability_sha256"
+        ],
+        "collection_publication_issuance_relative_path": (
+            _collection_issuance_relative_path(issuance)
+        ),
+        "collection_publication_issuance_sha256": hashlib.sha256(
+            _canonical_bytes(issuance)
+        ).hexdigest(),
+        "collection_publication_output_root": str(publication_root),
+        "development_session_refs_sha256": canonical_sha256(
+            _validated_development_sessions(development_session_refs)
+        ),
+        "feature_history_run_root": str(run_root),
+        "feature_history_run_spec_file_sha256": hashlib.sha256(spec_raw).hexdigest(),
+        "feature_history_run_spec_path": str(spec_path),
+        "feature_history_run_spec_sha256": _strict_sha256(
+            feature_history_run_spec_sha256,
+            label="feature run spec sha256",
+        ),
+        "manifest_identity_sha256": canonical_sha256(dict(manifest)),
+        "manifest_relative_path": publication["authority_manifest_relative_path"],
+        "manifest_sha256": publication["authority_manifest_sha256"],
+        "pit_store_database_sha256": receipt["pit_store_database_sha256"],
+        "receipt": dict(receipt),
+        "receipt_sha256": receipt["receipt_sha256"],
+        "schema": "factor-v3-feature-history-attestation-authority-binding/v1",
+        "session_authority_refs_sha256": receipt[
+            "session_authority_refs_sha256"
+        ],
+        "session_count": receipt["session_count"],
+        "sessions_sha256": receipt["sessions_sha256"],
+        "snapshot_index_sha256": receipt["snapshot_index_sha256"],
+        "source_authority_root_sha256": receipt["source_authority_root_sha256"],
+        "temporal_partition_contract_sha256": canonical_sha256(
+            _validated_partition_contract(temporal_partition_contract)
+        ),
+        "trade_cal_output_root": str(trade_cal_root),
+        "trade_cal_publication_sha256": canonical_sha256(dict(trade_cal_publication)),
+    }
+    return {**identity, "binding_sha256": canonical_sha256(identity)}
 
 
 def _validated_session_authority_refs(
@@ -3518,6 +3614,7 @@ def _validated_collection_manifest(
     *,
     publication: Mapping[str, Any],
     sessions: Sequence[str],
+    expected_producer_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     manifest = _strict_mapping(
         value,
@@ -3601,7 +3698,12 @@ def _validated_collection_manifest(
         expected_capability_sha256,
     ):
         raise ValueError("factor-v3 feature history collection publication capability rejected")
-    if manifest.get("producer_binding") != _producer_binding():
+    expected_binding = (
+        _producer_binding()
+        if expected_producer_binding is None
+        else _validated_expected_producer_binding(expected_producer_binding)
+    )
+    if manifest.get("producer_binding") != expected_binding:
         raise ValueError("factor-v3 feature history collection producer binding rejected")
     _validated_feature_history_route_policy_descriptor(
         manifest.get("feature_history_route_policy_descriptor")
@@ -3766,7 +3868,7 @@ def _publish_factor_v3_feature_history_collection_candidate(
     return publication
 
 
-def verify_factor_v3_feature_history_collection_authority(
+def _verify_factor_v3_feature_history_collection_authority(
     *,
     collection_publication: Mapping[str, Any],
     collection_publication_output_root: str | Path,
@@ -3775,9 +3877,25 @@ def verify_factor_v3_feature_history_collection_authority(
     temporal_partition_contract: Mapping[str, Any],
     trade_cal_output_root: str | Path,
     trade_cal_publication: Mapping[str, Any],
+    attestation_verification: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Grant feature-history-only authority from a sealed collection publication."""
 
+    attested_context = None
+    expected_producer_binding = None
+    if attestation_verification is not None:
+        if type(attestation_verification) is not dict:
+            raise ValueError(
+                "factor-v3 feature history attestation verification rejected"
+            )
+        from app import factor_v3_feature_history_frozen_source_attestation as frozen
+
+        attested_context = frozen._validated_attested_replay_context(
+            **attestation_verification
+        )
+        if type(attested_context.get("authority_binding")) is not dict:
+            raise ValueError("factor-v3 feature history attestation binding rejected")
+        expected_producer_binding = attested_context["producer_binding"]
     sessions = _verify_plan_self_integrity(collection_plan)
     verify_factor_v3_feature_history_collection_plan(
         collection_plan=collection_plan,
@@ -3794,6 +3912,7 @@ def verify_factor_v3_feature_history_collection_authority(
         ),
         publication=publication,
         sessions=sessions,
+        expected_producer_binding=expected_producer_binding,
     )
     _validated_collection_publication_issuance(
         output_root=collection_publication_output_root,
@@ -3839,6 +3958,14 @@ def verify_factor_v3_feature_history_collection_authority(
     )
     if terminal_manifest != manifest:
         raise ValueError("factor-v3 feature history collection manifest drifted")
+    if attested_context is not None:
+        from app import factor_v3_feature_history_frozen_source_attestation as frozen
+
+        if (
+            frozen._validated_attested_replay_context(**attestation_verification)
+            != attested_context
+        ):
+            raise ValueError("factor-v3 feature history attestation source drift rejected")
     unsigned = {
         "schema_version": "audited-pit-factor-v3-feature-history-authority-receipt/v3",
         "verified": True,
@@ -3866,7 +3993,7 @@ def verify_factor_v3_feature_history_collection_authority(
             "source_authority_root_sha256"
         ],
         "upstream_scope_root_sha256": replay["upstream_scope_root_sha256"],
-        "producer_code_root_sha256": producer_before["root_sha256"],
+        "producer_code_root_sha256": manifest["producer_binding"]["root_sha256"],
         "exact_nonempty_bak_basic_session_count": len(sessions),
         "daily_generation_session_count": len(sessions),
         "suspend_d_authority_session_count": len(sessions),
@@ -3882,4 +4009,79 @@ def verify_factor_v3_feature_history_collection_authority(
         "production_profile_registered": False,
         "production_recommendation_eligible": False,
     }
-    return {**unsigned, "receipt_sha256": canonical_sha256(unsigned)}
+    receipt = {**unsigned, "receipt_sha256": canonical_sha256(unsigned)}
+    if attested_context is not None:
+        actual_binding = _factor_v3_feature_history_attestation_binding(
+            collection_publication=publication,
+            collection_publication_output_root=collection_publication_output_root,
+            collection_plan=collection_plan,
+            development_session_refs=development_session_refs,
+            temporal_partition_contract=temporal_partition_contract,
+            trade_cal_output_root=trade_cal_output_root,
+            trade_cal_publication=trade_cal_publication,
+            feature_history_run_spec_path=attestation_verification[
+                "feature_history_run_spec_path"
+            ],
+            feature_history_run_spec_sha256=attested_context["feature_history"][
+                "feature_run_spec_sha256"
+            ],
+            feature_history_run_root=attestation_verification["feature_history_run_root"],
+            manifest=terminal_manifest,
+            receipt=receipt,
+        )
+        if actual_binding != attested_context["authority_binding"]:
+            raise ValueError("factor-v3 feature history attestation binding mismatch")
+        _validated_collection_publication_issuance(
+            output_root=collection_publication_output_root,
+            publication=publication,
+        )
+    return receipt
+
+
+def verify_factor_v3_feature_history_collection_authority(
+    *,
+    collection_publication: Mapping[str, Any],
+    collection_publication_output_root: str | Path,
+    collection_plan: Mapping[str, Any],
+    development_session_refs: Sequence[Mapping[str, Any]],
+    temporal_partition_contract: Mapping[str, Any],
+    trade_cal_output_root: str | Path,
+    trade_cal_publication: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Grant feature-history-only authority from a sealed collection publication."""
+
+    return _verify_factor_v3_feature_history_collection_authority(
+        collection_publication=collection_publication,
+        collection_publication_output_root=collection_publication_output_root,
+        collection_plan=collection_plan,
+        development_session_refs=development_session_refs,
+        temporal_partition_contract=temporal_partition_contract,
+        trade_cal_output_root=trade_cal_output_root,
+        trade_cal_publication=trade_cal_publication,
+    )
+
+
+def _verify_feature_history_with_attested_producer_binding(
+    *,
+    attestation_path: str | Path,
+    expected_attestation_sha256: str,
+    frozen_source_root: str | Path,
+    expected_frozen_source_commit: str,
+    feature_history_run_spec_path: str | Path,
+    feature_history_run_root: str | Path,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    from app import factor_v3_feature_history_frozen_source_attestation as frozen
+
+    with frozen._locked_physical_frozen_source_binding(frozen_source_root):
+        return _verify_factor_v3_feature_history_collection_authority(
+            **kwargs,
+            attestation_verification={
+                "attestation_path": attestation_path,
+                "expected_attestation_sha256": expected_attestation_sha256,
+                "frozen_source_root": frozen_source_root,
+                "expected_frozen_source_commit": expected_frozen_source_commit,
+                "feature_history_run_spec_path": feature_history_run_spec_path,
+                "feature_history_run_root": feature_history_run_root,
+            },
+        )
