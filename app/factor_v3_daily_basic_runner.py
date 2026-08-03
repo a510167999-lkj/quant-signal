@@ -1003,6 +1003,24 @@ def _result(state: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _mark_verification_failed(
+    *,
+    paths: Mapping[str, Path],
+    spec: Mapping[str, Any],
+    state: Mapping[str, Any],
+) -> None:
+    failed = _state_payload(
+        run_spec_sha256=spec["run_spec_sha256"],
+        status="failed",
+        completed_session_count=state["completed_session_count"],
+        credential_generation_id=state["credential_generation_id"],
+        collection_set_refs=state["collection_set_refs"],
+        exact_set_publication=state["exact_set_publication"],
+        receipt=state["receipt"],
+    )
+    _atomic_json(paths["state"], failed)
+
+
 def _run_factor_v3_daily_basic_collection_with_route_credential(
     *, run_spec_path: str | Path, run_root: str | Path, credential: str, source_generation_id: str,
     daily_basic_policy_descriptor: Mapping[str, Any],
@@ -1141,30 +1159,34 @@ def verify_factor_v3_daily_basic_run(*, run_spec_path: str | Path, run_root: str
         state = _load_or_initialize(paths, spec, allow_initialize=False)
         if state["status"] != "verified" or state["receipt"] is None:
             raise FactorV3DailyBasicRunnerError("factor-v3 daily-basic run is not verified")
-        points_root = _safe_directory(
-            paths["points"], label="points root", create=False
-        )
-        _assert_complete_points_output(
-            points_root, state["collection_set_refs"], sessions
-        )
-        exact_verified = _verify_exact_set_coverage(
-            authority_root=_safe_directory(
-                paths["authority"], label="authority root", create=False
-            ),
-            points_root=points_root,
-            refs=state["collection_set_refs"],
-            inputs=spec["exact_set_authority_inputs"],
-            publication=state["exact_set_publication"],
-            expected_source_authority_root_sha256=spec[
-                "source_authority_root_sha256"
-            ],
-        )
-        _assert_terminal_verification(
-            publication=state["exact_set_publication"],
-            receipt=state["receipt"],
-            verified=exact_verified,
-        )
-        return _result(state)
+        try:
+            points_root = _safe_directory(
+                paths["points"], label="points root", create=False
+            )
+            _assert_complete_points_output(
+                points_root, state["collection_set_refs"], sessions
+            )
+            exact_verified = _verify_exact_set_coverage(
+                authority_root=_safe_directory(
+                    paths["authority"], label="authority root", create=False
+                ),
+                points_root=points_root,
+                refs=state["collection_set_refs"],
+                inputs=spec["exact_set_authority_inputs"],
+                publication=state["exact_set_publication"],
+                expected_source_authority_root_sha256=spec[
+                    "source_authority_root_sha256"
+                ],
+            )
+            _assert_terminal_verification(
+                publication=state["exact_set_publication"],
+                receipt=state["receipt"],
+                verified=exact_verified,
+            )
+            return _result(state)
+        except BaseException:
+            _mark_verification_failed(paths=paths, spec=spec, state=state)
+            raise
 
 
 def _parser() -> argparse.ArgumentParser:
