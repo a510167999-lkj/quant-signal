@@ -658,6 +658,51 @@ def test_resume_reverifies_published_candidate_without_recollecting_or_republish
     assert verification_attempts["count"] == 2
 
 
+def test_public_verify_demotes_stale_verified_state_on_authority_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = _run_spec(tmp_path)
+    spec_path = _write_spec(tmp_path, spec)
+    run_root = tmp_path / "stale-verified-run"
+    paths = runner._run_paths(run_root, create=True)
+    runner._load_or_initialize_run(paths, spec, allow_initialize=True)
+    runner._safe_directory(paths["store"], label="PIT store", create=True)
+    runner._safe_directory(paths["publication_root"], label="publication root", create=True)
+    runner._atomic_json(
+        paths["state"],
+        runner._state_payload(
+            run_spec_sha256=spec["run_spec_sha256"],
+            status="verified",
+            completed_session_count=250,
+            credential_generation_id=SOURCE_GENERATION_ID,
+            collection_publication=PUBLICATION,
+            receipt={"verified": True, "receipt_sha256": "d" * 64},
+        ),
+    )
+
+    monkeypatch.setattr(runner, "_verify_plan", lambda _spec: None)
+
+    def reject(**_kwargs: object) -> dict[str, object]:
+        raise runner.FactorV3FeatureHistoryRunnerError(
+            "synthetic producer binding rejection"
+        )
+
+    monkeypatch.setattr(runner, "_verify_collection_authority", reject)
+
+    with pytest.raises(runner.FactorV3FeatureHistoryRunnerError, match="producer binding"):
+        runner.verify_factor_v3_feature_history_run(
+            run_spec_path=spec_path,
+            run_root=run_root,
+        )
+
+    failed = runner._read_json_file(
+        paths["state"], label="run state", max_bytes=runner._MAX_STATE_BYTES
+    )
+    assert failed["status"] == "failed"
+    assert failed["completed_session_count"] == 250
+    assert failed["collection_publication"] == PUBLICATION
+
+
 def test_run_rejects_nonfrozen_jiaoch_source_before_creating_collector(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

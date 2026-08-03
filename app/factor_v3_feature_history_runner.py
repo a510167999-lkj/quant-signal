@@ -1100,6 +1100,25 @@ def _verify_existing_publication(
     return _result(verified)
 
 
+def _mark_publication_verification_failed(
+    *,
+    paths: Mapping[str, Path],
+    spec: Mapping[str, Any],
+    state: Mapping[str, Any],
+) -> None:
+    """Persist a fail-closed state after a published candidate is rejected."""
+
+    failed = _state_payload(
+        run_spec_sha256=spec["run_spec_sha256"],
+        status="failed",
+        completed_session_count=state["completed_session_count"],
+        credential_generation_id=state["credential_generation_id"],
+        collection_publication=state["collection_publication"],
+        receipt=state["receipt"],
+    )
+    _atomic_json(paths["state"], failed)
+
+
 def _run_factor_v3_feature_history_collection_with_route_credential(
     *,
     run_spec_path: str | Path,
@@ -1289,12 +1308,20 @@ def verify_factor_v3_feature_history_run(
             state["status"] == "failed" and state["collection_publication"] is not None
         ):
             raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history run is not publishable")
-        return _verify_existing_publication(
-            paths=paths,
-            sessions=sessions,
-            spec=spec,
-            state=state,
-        )
+        try:
+            return _verify_existing_publication(
+                paths=paths,
+                sessions=sessions,
+                spec=spec,
+                state=state,
+            )
+        except BaseException:
+            _mark_publication_verification_failed(
+                paths=paths,
+                spec=spec,
+                state=state,
+            )
+            raise
 
 
 def _parser() -> argparse.ArgumentParser:
