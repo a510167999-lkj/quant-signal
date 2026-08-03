@@ -284,6 +284,37 @@ def test_rolling_oof_inputs_normalize_omitted_completed_censor_flag() -> None:
     assert outcome_lookup[completed["candidate_key"]]["right_censored"] is False
 
 
+def test_independent_verifier_normalizes_omitted_completed_censor_flag(
+) -> None:
+    sessions, features, outcomes = _fixture()
+    scored, receipt = build_shallow_gbdt_rolling_oof_scores(
+        features,
+        outcomes,
+        sessions,
+        minimum_training_sessions=4,
+        training_window_sessions=4,
+        validation_sessions=2,
+    )
+    completed = next(outcome for outcome in outcomes if not outcome["right_censored"])
+    omitted_flag_outcomes = [
+        {key: value for key, value in outcome.items() if key != "right_censored"}
+        if outcome is completed
+        else outcome
+        for outcome in outcomes
+    ]
+
+    assert verify_shallow_gbdt_rolling_oof_receipt(
+        features,
+        omitted_flag_outcomes,
+        sessions,
+        scored,
+        receipt,
+        minimum_training_sessions=4,
+        training_window_sessions=4,
+        validation_sessions=2,
+    )["verified"] is True
+
+
 @pytest.mark.parametrize(
     "session_mutation",
     [

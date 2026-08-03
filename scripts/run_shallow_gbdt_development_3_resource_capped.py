@@ -18,15 +18,15 @@ WORKSPACE = Path(r"E:\AI workspace\quant-signal-lkj")
 RELATIVE_OUTPUT_DIR = Path(
     "data/research_runs/"
     "audited_pit_ranked_liquidity_shallow_gbdt_rolling126_oof_v1_"
-    "development_10_unbounded_completed_flag_fix_local_research"
+    "development_11_unbounded_verifier_flag_fix_local_research"
 )
 PARENT_FAILURE = Path(
     "data/research_runs/"
     "audited_pit_ranked_liquidity_shallow_gbdt_rolling126_oof_v1_"
-    "development_9_unbounded_local_research/formal_run.failure.json"
+    "development_10_unbounded_completed_flag_fix_local_research/formal_run.failure.json"
 )
 EXPECTED_PARENT_FAILURE_SHA256 = (
-    "21a7250c8878c1363506b748841f920e27d96141d514bba38648efaca3935cc2"
+    "2f6ff09755a1f0f3811e40d349efb933b782ce98707dbed278854baec356c2fc"
 )
 EXPECTED_STRATEGY_SHA256 = (
     "53d00badc8683670ef3d6c02307697e2c3ef8ec769b9d8da072d36420cea70ac"

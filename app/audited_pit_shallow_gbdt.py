@@ -1109,7 +1109,7 @@ def _independent_shallow_gbdt_rolling_oof_replay(
     outcome_lookup: dict[str, dict[str, Any]] = {}
     for raw_outcome in outcomes:
         key = str(raw_outcome.get("candidate_key") or "")
-        right_censored = raw_outcome.get("right_censored")
+        right_censored = raw_outcome.get("right_censored", False)
         if (
             not key
             or key in outcome_lookup
