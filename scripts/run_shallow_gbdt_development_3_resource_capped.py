@@ -32,7 +32,7 @@ EXPECTED_STRATEGY_SHA256 = (
     "53d00badc8683670ef3d6c02307697e2c3ef8ec769b9d8da072d36420cea70ac"
 )
 EXPECTED_PRODUCER_ROOT_SHA256 = (
-    "98dbcfd7886e1f09d8544efa63a26ae730d153ac73dc0e38c047246d49bb43aa"
+    "a0ecd25793bdc57856facf9d9b2be957383689611989627eea52598556a00b9f"
 )
 HEX_ARTIFACT = re.compile(r"^[0-9a-f]{64}\.json$")
 LAUNCHER_GIT_PATH = "scripts/run_shallow_gbdt_development_3_resource_capped.py"
