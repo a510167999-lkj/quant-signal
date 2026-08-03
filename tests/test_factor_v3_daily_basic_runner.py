@@ -212,12 +212,13 @@ def test_typed_collection_failure_persists_safe_sidecar(
                 "attempt": 1,
                 "body_complete": True,
                 "exception_type": "TimeoutError",
+                "failure_code": "transport_exception",
                 "http_status": None,
                 "outcome": "transport_exception",
             }
         ],
         "route_id": "factor-v3-daily-basic:points-primary:daily_basic",
-        "schema": "jiaoch-factor-v3-daily-basic-collection-failure/v1",
+        "schema": "jiaoch-factor-v3-daily-basic-collection-failure/v2",
         "trade_date": spec["sessions"][0],
     }
     monkeypatch.setattr(

@@ -69,7 +69,18 @@ _SESSION_INDEX_FIELDS = frozenset(
         "trade_date",
     }
 )
-_FAILURE_SCHEMA = "jiaoch-factor-v3-daily-basic-collection-failure/v1"
+_FAILURE_SCHEMA = "jiaoch-factor-v3-daily-basic-collection-failure/v2"
+_SAFE_FAILURE_CODES = frozenset(
+    {
+        "http_entity_rejected",
+        "interface_identity_rejected",
+        "provider_status_rejected",
+        "raw_publication_rejected",
+        "response_shape_rejected",
+        "row_integrity_rejected",
+        "transport_exception",
+    }
+)
 _SAFE_FAILURE_EXCEPTION_TYPES = frozenset(
     {
         "ConnectionError",
@@ -115,6 +126,18 @@ def _safe_failure_status(value: Any) -> int | None:
 
 def _safe_failure_body_complete(value: Any) -> bool | None:
     return value if type(value) is bool else None
+
+
+def _safe_response_failure_code(exc: BaseException) -> str:
+    message = str(exc)
+    for marker, code in (
+        ("provider status rejected", "provider_status_rejected"),
+        ("interface identity rejected", "interface_identity_rejected"),
+        ("row integrity rejected", "row_integrity_rejected"),
+    ):
+        if message.endswith(marker):
+            return code
+    return "response_shape_rejected"
 
 
 def _sha256(raw: bytes) -> str:
@@ -415,6 +438,7 @@ def _collect_jiaoch_daily_basic_collection_set_with_route_credential(
             "attempt": attempt_number,
             "body_complete": None,
             "exception_type": None,
+            "failure_code": None,
             "http_status": None,
             "outcome": "transport_exception",
         }
@@ -455,6 +479,11 @@ def _collect_jiaoch_daily_basic_collection_set_with_route_credential(
                 "http_entity": "http_entity_rejected",
                 "response_shape": "response_shape_rejected",
             }[stage]
+            attempt_diagnostic["failure_code"] = (
+                _safe_response_failure_code(exc)
+                if stage == "response_shape"
+                else attempt_diagnostic["outcome"]
+            )
             attempt_diagnostic["exception_type"] = _safe_failure_exception_type(exc)
             failure_attempts.append(attempt_diagnostic)
     if publication is None:

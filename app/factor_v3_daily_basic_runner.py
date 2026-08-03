@@ -126,12 +126,19 @@ _TERMINAL_VERIFICATION_FIELDS = frozenset(
         "verified",
     }
 )
-_FAILURE_DIAGNOSTIC_SCHEMA = "jiaoch-factor-v3-daily-basic-collection-failure/v1"
+_FAILURE_DIAGNOSTIC_SCHEMA = "jiaoch-factor-v3-daily-basic-collection-failure/v2"
 _FAILURE_DIAGNOSTIC_FIELDS = frozenset(
     {"attempts", "route_id", "schema", "trade_date"}
 )
 _FAILURE_ATTEMPT_FIELDS = frozenset(
-    {"attempt", "body_complete", "exception_type", "http_status", "outcome"}
+    {
+        "attempt",
+        "body_complete",
+        "exception_type",
+        "failure_code",
+        "http_status",
+        "outcome",
+    }
 )
 _FAILURE_OUTCOMES = frozenset(
     {
@@ -139,6 +146,17 @@ _FAILURE_OUTCOMES = frozenset(
         "raw_publication_rejected",
         "http_entity_rejected",
         "response_shape_rejected",
+    }
+)
+_FAILURE_CODES = frozenset(
+    {
+        "http_entity_rejected",
+        "interface_identity_rejected",
+        "provider_status_rejected",
+        "raw_publication_rejected",
+        "response_shape_rejected",
+        "row_integrity_rejected",
+        "transport_exception",
     }
 )
 _FAILURE_EXCEPTION_TYPES = frozenset(
@@ -323,6 +341,7 @@ def _validated_failure_diagnostic(value: Any) -> dict[str, Any]:
             or set(attempt) != _FAILURE_ATTEMPT_FIELDS
             or attempt.get("attempt") != expected_number
             or attempt.get("outcome") not in _FAILURE_OUTCOMES
+            or attempt.get("failure_code") not in _FAILURE_CODES
             or attempt.get("exception_type") not in _FAILURE_EXCEPTION_TYPES
             or (
                 attempt.get("http_status") is not None
