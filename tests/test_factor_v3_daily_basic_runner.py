@@ -503,6 +503,13 @@ def test_already_verified_run_rejects_rehashed_state_receipt_path_drift(
             ),
         )
 
+    failed = runner._read_json(
+        paths["state"], label="run state", max_bytes=runner._MAX_STATE_BYTES
+    )
+    assert failed["status"] == "failed"
+    assert failed["completed_session_count"] == 733
+    assert failed["exact_set_publication"] == publication
+
 
 def test_run_lock_three_processes_remain_fail_closed_after_contention(
     tmp_path: Path,

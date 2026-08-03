@@ -1038,30 +1038,34 @@ def _run_factor_v3_daily_basic_collection_with_route_credential(
     with _run_lock(paths["lock"]):
         state = _load_or_initialize(paths, spec, allow_initialize=True)
         if state["status"] == "verified":
-            points_root = _safe_directory(
-                paths["points"], label="points root", create=False
-            )
-            _assert_complete_points_output(
-                points_root, state["collection_set_refs"], sessions
-            )
-            exact_verified = _verify_exact_set_coverage(
-                authority_root=_safe_directory(
-                    paths["authority"], label="authority root", create=False
-                ),
-                points_root=points_root,
-                refs=state["collection_set_refs"],
-                inputs=spec["exact_set_authority_inputs"],
-                publication=state["exact_set_publication"],
-                expected_source_authority_root_sha256=spec[
-                    "source_authority_root_sha256"
-                ],
-            )
-            _assert_terminal_verification(
-                publication=state["exact_set_publication"],
-                receipt=state["receipt"],
-                verified=exact_verified,
-            )
-            return _result(state)
+            try:
+                points_root = _safe_directory(
+                    paths["points"], label="points root", create=False
+                )
+                _assert_complete_points_output(
+                    points_root, state["collection_set_refs"], sessions
+                )
+                exact_verified = _verify_exact_set_coverage(
+                    authority_root=_safe_directory(
+                        paths["authority"], label="authority root", create=False
+                    ),
+                    points_root=points_root,
+                    refs=state["collection_set_refs"],
+                    inputs=spec["exact_set_authority_inputs"],
+                    publication=state["exact_set_publication"],
+                    expected_source_authority_root_sha256=spec[
+                        "source_authority_root_sha256"
+                    ],
+                )
+                _assert_terminal_verification(
+                    publication=state["exact_set_publication"],
+                    receipt=state["receipt"],
+                    verified=exact_verified,
+                )
+                return _result(state)
+            except BaseException:
+                _mark_verification_failed(paths=paths, spec=spec, state=state)
+                raise
         persisted = state["credential_generation_id"]
         if persisted is not None and persisted != source_generation_id:
             raise FactorV3DailyBasicRunnerError("factor-v3 daily-basic credential generation drifted")
