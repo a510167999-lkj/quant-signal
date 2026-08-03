@@ -10,6 +10,7 @@ import pytest
 
 from app import factor_v3_daily_basic_runner as runner
 from app import factor_v3_feature_history_frozen_source_attestation as frozen
+from app import jiaoch_daily_basic_collection_set as daily_basic_collection
 
 
 def _hold_run_lock(lock_path: str, acquired: object, release: object) -> None:
@@ -195,6 +196,52 @@ def test_failed_collection_never_calls_exact_set_publication(
     state = json.loads((tmp_path / "run" / "state.json").read_text(encoding="utf-8"))
     assert state["status"] == "failed"
     assert state["receipt"] is None
+
+
+def test_typed_collection_failure_persists_safe_sidecar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    spec = _spec(monkeypatch, tmp_path)
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(
+        json.dumps(spec, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+    diagnostic = {
+        "attempts": [
+            {
+                "attempt": 1,
+                "body_complete": True,
+                "exception_type": "TimeoutError",
+                "http_status": None,
+                "outcome": "transport_exception",
+            }
+        ],
+        "route_id": "factor-v3-daily-basic:points-primary:daily_basic",
+        "schema": "jiaoch-factor-v3-daily-basic-collection-failure/v1",
+        "trade_date": spec["sessions"][0],
+    }
+    monkeypatch.setattr(
+        runner,
+        "_collect_one_daily_basic",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            daily_basic_collection.JiaochDailyBasicCollectionError(diagnostic)
+        ),
+    )
+
+    with pytest.raises(daily_basic_collection.JiaochDailyBasicCollectionError):
+        runner._run_factor_v3_daily_basic_collection_with_route_credential(
+            run_spec_path=spec_path,
+            run_root=tmp_path / "run",
+            credential="test-only-credential",
+            source_generation_id=str(uuid.uuid4()),
+            daily_basic_policy_descriptor=runner.FACTOR_V3_DAILY_BASIC_COLLECTION_POLICY_DESCRIPTOR,
+        )
+
+    sidecar = json.loads(
+        (tmp_path / "run" / "collection-failure.json").read_text(encoding="utf-8")
+    )
+    assert sidecar == diagnostic
+    assert "credential" not in repr(sidecar).lower()
 
 
 def test_resume_only_collects_the_missing_session_and_keeps_one_generation(

@@ -126,6 +126,36 @@ _TERMINAL_VERIFICATION_FIELDS = frozenset(
         "verified",
     }
 )
+_FAILURE_DIAGNOSTIC_SCHEMA = "jiaoch-factor-v3-daily-basic-collection-failure/v1"
+_FAILURE_DIAGNOSTIC_FIELDS = frozenset(
+    {"attempts", "route_id", "schema", "trade_date"}
+)
+_FAILURE_ATTEMPT_FIELDS = frozenset(
+    {"attempt", "body_complete", "exception_type", "http_status", "outcome"}
+)
+_FAILURE_OUTCOMES = frozenset(
+    {
+        "transport_exception",
+        "raw_publication_rejected",
+        "http_entity_rejected",
+        "response_shape_rejected",
+    }
+)
+_FAILURE_EXCEPTION_TYPES = frozenset(
+    {
+        "ConnectionError",
+        "HTTPError",
+        "OSError",
+        "Other",
+        "PITCollectionError",
+        "SSLError",
+        "TimeoutError",
+        "TypeError",
+        "URLError",
+        "UnicodeDecodeError",
+        "ValueError",
+    }
+)
 
 _DAILY_BASIC_POLICY_DOCUMENT = {
     "schema": _POLICY_DOCUMENT_SCHEMA,
@@ -262,6 +292,81 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
         fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _validated_failure_diagnostic(value: Any) -> dict[str, Any]:
+    if (
+        type(value) is not dict
+        or set(value) != _FAILURE_DIAGNOSTIC_FIELDS
+        or value.get("schema") != _FAILURE_DIAGNOSTIC_SCHEMA
+        or value.get("route_id") != "factor-v3-daily-basic:points-primary:daily_basic"
+        or type(value.get("trade_date")) is not str
+    ):
+        raise FactorV3DailyBasicRunnerError(
+            "factor-v3 daily-basic failure diagnostic rejected"
+        )
+    try:
+        if date.fromisoformat(value["trade_date"]).isoformat() != value["trade_date"]:
+            raise ValueError
+    except ValueError as exc:
+        raise FactorV3DailyBasicRunnerError(
+            "factor-v3 daily-basic failure diagnostic rejected"
+        ) from exc
+    attempts = value.get("attempts")
+    if type(attempts) is not list or not 1 <= len(attempts) <= 10:
+        raise FactorV3DailyBasicRunnerError(
+            "factor-v3 daily-basic failure diagnostic rejected"
+        )
+    for expected_number, attempt in enumerate(attempts, 1):
+        if (
+            type(attempt) is not dict
+            or set(attempt) != _FAILURE_ATTEMPT_FIELDS
+            or attempt.get("attempt") != expected_number
+            or attempt.get("outcome") not in _FAILURE_OUTCOMES
+            or attempt.get("exception_type") not in _FAILURE_EXCEPTION_TYPES
+            or (
+                attempt.get("http_status") is not None
+                and (
+                    type(attempt.get("http_status")) is not int
+                    or not 100 <= attempt["http_status"] <= 599
+                )
+            )
+            or (
+                attempt.get("body_complete") is not None
+                and type(attempt.get("body_complete")) is not bool
+            )
+        ):
+            raise FactorV3DailyBasicRunnerError(
+                "factor-v3 daily-basic failure diagnostic rejected"
+            )
+    return json.loads(_canonical_bytes(value))
+
+
+def _persist_collection_failure_diagnostic(
+    *, paths: Mapping[str, Path], error: BaseException
+) -> None:
+    from app.jiaoch_daily_basic_collection_set import JiaochDailyBasicCollectionError
+
+    if not isinstance(error, JiaochDailyBasicCollectionError):
+        return
+    payload = _validated_failure_diagnostic(error.diagnostic)
+    path = paths["failure_diagnostic"]
+    if path.exists():
+        existing = _read_json(
+            path,
+            label="collection failure diagnostic",
+            max_bytes=16 * 1024,
+        )
+        if existing != payload:
+            raise FactorV3DailyBasicRunnerError(
+                "factor-v3 daily-basic failure diagnostic drifted"
+            )
+        return
+    _create_only(
+        path,
+        _canonical_bytes(payload) + b"\n",
+        label="collection failure diagnostic",
+    )
 
 
 def _validate_sessions(value: Any, *, expected_count: int | None = None) -> list[str]:
@@ -476,6 +581,7 @@ def _paths(run_root: str | Path, *, create: bool) -> dict[str, Path]:
         "lock": root / ".factor-v3-daily-basic-runner.lock",
         "run_spec": root / "run-spec.json",
         "state": root / "state.json",
+        "failure_diagnostic": root / "collection-failure.json",
         "points": root / "points-output",
         "authority": root / "exact-set-authority",
     }
@@ -988,7 +1094,8 @@ def _run_factor_v3_daily_basic_collection_with_route_credential(
             )
             _atomic_json(paths["state"], verified)
             return _result(verified)
-        except BaseException:
+        except BaseException as exc:
+            _persist_collection_failure_diagnostic(paths=paths, error=exc)
             previous = _validated_state(_read_json(paths["state"], label="run state", max_bytes=_MAX_STATE_BYTES), spec=spec)
             _atomic_json(paths["state"], _state_payload(
                 run_spec_sha256=spec["run_spec_sha256"], status="failed", completed_session_count=previous["completed_session_count"],

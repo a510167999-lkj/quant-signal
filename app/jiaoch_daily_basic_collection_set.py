@@ -69,6 +69,22 @@ _SESSION_INDEX_FIELDS = frozenset(
         "trade_date",
     }
 )
+_FAILURE_SCHEMA = "jiaoch-factor-v3-daily-basic-collection-failure/v1"
+_SAFE_FAILURE_EXCEPTION_TYPES = frozenset(
+    {
+        "ConnectionError",
+        "HTTPError",
+        "OSError",
+        "Other",
+        "PITCollectionError",
+        "SSLError",
+        "TimeoutError",
+        "TypeError",
+        "URLError",
+        "UnicodeDecodeError",
+        "ValueError",
+    }
+)
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -78,6 +94,27 @@ def _canonical_json(value: Any) -> bytes:
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise ValueError("Jiaoch daily_basic collection canonical JSON rejected") from exc
+
+
+class JiaochDailyBasicCollectionError(ValueError):
+    """A collection failure carrying only a bounded, non-secret diagnosis."""
+
+    def __init__(self, diagnostic: Mapping[str, Any]) -> None:
+        self.diagnostic = json.loads(_canonical_json(diagnostic))
+        super().__init__("Jiaoch daily_basic collection failed")
+
+
+def _safe_failure_exception_type(exc: BaseException) -> str:
+    name = type(exc).__name__
+    return name if name in _SAFE_FAILURE_EXCEPTION_TYPES else "Other"
+
+
+def _safe_failure_status(value: Any) -> int | None:
+    return value if type(value) is int and 100 <= value <= 599 else None
+
+
+def _safe_failure_body_complete(value: Any) -> bool | None:
+    return value if type(value) is bool else None
 
 
 def _sha256(raw: bytes) -> str:
@@ -371,7 +408,16 @@ def _collect_jiaoch_daily_basic_collection_set_with_route_credential(
     transport = points_common._transport_factory()
     publication: dict[str, Any] | None = None
     failure: Exception | None = None
-    for _attempt in range(max_attempts):
+    failure_attempts: list[dict[str, Any]] = []
+    for attempt_number in range(1, max_attempts + 1):
+        stage = "transport"
+        attempt_diagnostic: dict[str, Any] = {
+            "attempt": attempt_number,
+            "body_complete": None,
+            "exception_type": None,
+            "http_status": None,
+            "outcome": "transport_exception",
+        }
         try:
             response = transport.post(
                 url=spec["endpoint"], headers=points_common._request_headers(),
@@ -381,6 +427,9 @@ def _collect_jiaoch_daily_basic_collection_set_with_route_credential(
             raw_body = getattr(response, "body", None)
             http_status = getattr(response, "status", None)
             body_complete = getattr(response, "body_complete", None)
+            attempt_diagnostic["http_status"] = _safe_failure_status(http_status)
+            attempt_diagnostic["body_complete"] = _safe_failure_body_complete(body_complete)
+            stage = "raw_publication"
             publication = raw_authority._publish_jiaoch_points_raw_attempt_for_collection(
                 output_root=root, raw_body=raw_body, credential=credential, credential_slot_id=_CREDENTIAL_SLOT_ID,
                 api_name="daily_basic", params=spec["params"], fields=spec["fields"], retrieved_at=timestamp,
@@ -389,7 +438,9 @@ def _collect_jiaoch_daily_basic_collection_set_with_route_credential(
                 producer_root_sha256=producer["root_sha256"],
             )
             if http_status != 200 or body_complete is not True:
+                stage = "http_entity"
                 raise ValueError("Jiaoch daily_basic HTTP entity rejected")
+            stage = "response_shape"
             points_common._response_interface_identity(
                 raw_body, expected_fields=spec["response_fields"],
                 expected_trade_date=session.strftime("%Y%m%d"), role=spec["role"],
@@ -398,8 +449,23 @@ def _collect_jiaoch_daily_basic_collection_set_with_route_credential(
         except Exception as exc:
             publication = None
             failure = exc
+            attempt_diagnostic["outcome"] = {
+                "transport": "transport_exception",
+                "raw_publication": "raw_publication_rejected",
+                "http_entity": "http_entity_rejected",
+                "response_shape": "response_shape_rejected",
+            }[stage]
+            attempt_diagnostic["exception_type"] = _safe_failure_exception_type(exc)
+            failure_attempts.append(attempt_diagnostic)
     if publication is None:
-        raise ValueError("Jiaoch daily_basic collection failed") from failure
+        raise JiaochDailyBasicCollectionError(
+            {
+                "attempts": failure_attempts,
+                "route_id": spec["route_id"],
+                "schema": _FAILURE_SCHEMA,
+                "trade_date": session.isoformat(),
+            }
+        ) from failure
     if _producer_binding() != producer:
         raise ValueError("Jiaoch daily_basic producer drift rejected")
     manifest = {
