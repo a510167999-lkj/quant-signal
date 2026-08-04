@@ -392,6 +392,10 @@ def _required_existing_package_initializers(
 
 def test_formal_paths_and_authority_inputs_are_frozen_exactly() -> None:
     main = Path(r"E:\AI workspace\quant-signal-lkj")
+    assert formal.FORMAL_WORKTREE_ROOT == (
+        Path(r"E:\AI workspace\quant-signal-lkj-factor-v3-daily-basic-formal-run-v3")
+    )
+    assert formal.EXPECTED_BRANCH == "codex/factor-v3-daily-basic-formal-run-v3"
     assert formal.SPEC_OUTPUT_ROOT == (
         main
         / "data/research_runs/audited_pit_factor_v3_daily_basic_run_spec_v2"
@@ -470,6 +474,15 @@ def test_formal_review_manifest_covers_the_complete_runtime_import_closure() -> 
         relative_paths,
     ) <= set(relative_paths)
     assert "app/__init__.py" in relative_paths
+
+
+def test_formal_runner_hash_binds_the_reviewed_v3_worktree() -> None:
+    runner_path = formal.FORMAL_WORKTREE_ROOT / "app/factor_v3_daily_basic_runner.py"
+
+    assert runner_path.is_file()
+    assert hashlib.sha256(runner_path.read_bytes()).hexdigest() == (
+        formal.FACTOR_V3_DAILY_BASIC_RUNNER_SHA256
+    )
 
 
 def test_formal_bootstrap_modules_have_no_top_level_application_imports() -> None:
