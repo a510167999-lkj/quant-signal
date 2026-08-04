@@ -102,6 +102,42 @@ def test_run_spec_derives_exact_ordered_733_session_union(
     )
 
 
+def test_public_collection_bridge_resolves_jiaoch_credential_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from app import jiaoch_credential_slots as slots
+
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        runner,
+        "_run_credential_generation_id",
+        lambda **_kwargs: "test-generation",
+    )
+
+    def collect(**kwargs: object) -> dict[str, object]:
+        calls.update(kwargs)
+        return {"status": "test-only"}
+
+    monkeypatch.setattr(
+        slots,
+        "_collect_jiaoch_factor_v3_daily_basic_from_environment_for_run",
+        collect,
+    )
+    run_spec_path = (tmp_path / "run-spec.json").resolve()
+    run_root = (tmp_path / "run-root").resolve()
+
+    assert runner.run_factor_v3_daily_basic_collection(
+        run_spec_path=run_spec_path,
+        run_root=run_root,
+    ) == {"status": "test-only"}
+    assert calls == {
+        "run_spec_path": run_spec_path,
+        "run_root": run_root,
+        "source_generation_id": "test-generation",
+    }
+
+
 def test_run_spec_bytes_validator_is_canonical_and_shared_by_path_loader(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
