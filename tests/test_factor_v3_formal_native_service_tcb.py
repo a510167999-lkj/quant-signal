@@ -499,6 +499,35 @@ def _build_handoff_fixture(root: Path) -> tuple[Path, Path, Path, Path, bytes, s
     return native, candidate_path, provisional, completed, secret_value, claim_sha256
 
 
+def _canonical_claim_v2_for_signed_launch(
+    launch_authorization: Path,
+) -> bytes:
+    outer = json.loads(launch_authorization.read_bytes())
+    payload = outer["payload"]
+    signature = base64.b64decode(
+        outer["signature_base64"],
+        validate=True,
+    )
+    return _canonical_bytes(
+        {
+            "action": payload["action"],
+            "authorization_id_sha256": payload["authorization_id_sha256"],
+            "authorization_nonce_sha256": payload["authorization_nonce_sha256"],
+            "bootstrap_execution_authorization_sha256": payload[
+                "bootstrap_execution_authorization_sha256"
+            ],
+            "launch_authorization_schema": payload["schema"],
+            "launch_authorization_sha256": _file_sha256(launch_authorization),
+            "launch_authorization_signature_sha256": hashlib.sha256(
+                signature
+            ).hexdigest(),
+            "replay_scope": payload["replay_scope"],
+            "schema": formal_supervisor.CLAIM_SCHEMA,
+            "status": "claimed",
+        }
+    )
+
+
 def _build_production_validation_fixture(
     root: Path,
 ) -> tuple[
@@ -1324,20 +1353,7 @@ def test_native_production_resume_verifies_original_run_and_claim_lineage(
     )
     original_sha256 = _file_sha256(original_launch)
     ledger_root = Path(str(original["execution_ledger_root"]))
-    status_raw = _canonical_bytes(
-        {
-            "action": "run",
-            "authorization_id_sha256": original["authorization_id_sha256"],
-            "authorization_nonce_sha256": original["authorization_nonce_sha256"],
-            "bootstrap_execution_authorization_sha256": original[
-                "bootstrap_execution_authorization_sha256"
-            ],
-            "launch_authorization_sha256": original_sha256,
-            "replay_scope": original["replay_scope"],
-            "schema": formal_supervisor.CLAIM_SCHEMA,
-            "status": "claimed",
-        }
-    )
+    status_raw = _canonical_claim_v2_for_signed_launch(original_launch)
     status_path = formal_supervisor.claim_path_for_authorization(
         ledger_root,
         original_sha256,
@@ -1411,20 +1427,7 @@ def test_native_production_resume_verifies_original_run_and_claim_lineage(
     assert completed.stderr == ""
 
     first_resume_sha256 = _file_sha256(resume_launch)
-    second_status_raw = _canonical_bytes(
-        {
-            "action": "resume",
-            "authorization_id_sha256": resume["authorization_id_sha256"],
-            "authorization_nonce_sha256": resume["authorization_nonce_sha256"],
-            "bootstrap_execution_authorization_sha256": resume[
-                "bootstrap_execution_authorization_sha256"
-            ],
-            "launch_authorization_sha256": first_resume_sha256,
-            "replay_scope": resume["replay_scope"],
-            "schema": formal_supervisor.CLAIM_SCHEMA,
-            "status": "claimed",
-        }
-    )
+    second_status_raw = _canonical_claim_v2_for_signed_launch(resume_launch)
     second_status_path = formal_supervisor.claim_path_for_authorization(
         ledger_root,
         first_resume_sha256,
@@ -1432,9 +1435,34 @@ def test_native_production_resume_verifies_original_run_and_claim_lineage(
     second_status_path.parent.mkdir(parents=True, exist_ok=True)
     second_status_path.write_bytes(second_status_raw)
     resume_of_resume = dict(resume)
+    first_resume_outer = json.loads(resume_launch.read_bytes())
+    first_resume_payload = first_resume_outer["payload"]
+    first_resume_signature_sha256 = hashlib.sha256(
+        base64.b64decode(
+            first_resume_outer["signature_base64"],
+            validate=True,
+        )
+    ).hexdigest()
     resume_of_resume.update(
         {
+            "resume_of_action": first_resume_payload["action"],
+            "resume_of_authorization_id_sha256": first_resume_payload[
+                "authorization_id_sha256"
+            ],
+            "resume_of_authorization_nonce_sha256": first_resume_payload[
+                "authorization_nonce_sha256"
+            ],
             "resume_of_authorization_sha256": first_resume_sha256,
+            "resume_of_bootstrap_execution_authorization_sha256": (
+                first_resume_payload["bootstrap_execution_authorization_sha256"]
+            ),
+            "resume_of_launch_authorization_schema": first_resume_payload[
+                "schema"
+            ],
+            "resume_of_launch_authorization_signature_sha256": (
+                first_resume_signature_sha256
+            ),
+            "resume_of_replay_scope": first_resume_payload["replay_scope"],
             "resume_status_path": str(second_status_path),
             "resume_status_sha256": hashlib.sha256(second_status_raw).hexdigest(),
         }

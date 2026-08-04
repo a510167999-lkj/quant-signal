@@ -10,16 +10,83 @@ without creating a run root.
 from __future__ import annotations
 
 from collections.abc import Mapping
-import hashlib
-import os
 from pathlib import Path
-import stat
 import sys
 
 
 _PYTHON_EXECUTABLE = Path(
     r"E:\AI workspace\quant-signal-lkj\.venv\Scripts\python.exe"
 )
+_WORKTREE_ROOT = Path(
+    r"E:\AI workspace\quant-signal-lkj-factor-v3-daily-basic-formal-run-v2"
+)
+_BUILDER_MODULE_NAME = "scripts.build_factor_v3_daily_basic_formal_run_spec"
+_BUILDER_RELATIVE_PATH = "scripts/build_factor_v3_daily_basic_formal_run_spec.py"
+_LEDGER_ENTRY_FIELDS = frozenset(
+    {
+        "absolute_path",
+        "byte_count",
+        "is_package",
+        "loader_identity",
+        "module_name",
+        "relative_path",
+        "source_sha256",
+    }
+)
+
+
+class FormalBootstrapError(RuntimeError):
+    pass
+
+
+def trusted_dispatch(context: object, frozen_action_config: object) -> int:
+    validate_config = getattr(context, "validate_action_config", None)
+    ledger_entry = getattr(context, "verified_ledger_entry", None)
+    assert_module = getattr(context, "assert_verified_module", None)
+    if (
+        isinstance(context, Mapping)
+        or not callable(validate_config)
+        or not callable(ledger_entry)
+        or not callable(assert_module)
+    ):
+        raise FormalBootstrapError("external trusted bootstrap context required")
+    try:
+        validate_config(frozen_action_config)
+        entry = ledger_entry(_BUILDER_MODULE_NAME)
+    except BaseException as exc:
+        raise FormalBootstrapError(
+            "external trusted bootstrap context rejected"
+        ) from exc
+    if (
+        not isinstance(entry, Mapping)
+        or set(entry) != _LEDGER_ENTRY_FIELDS
+        or entry.get("module_name") != _BUILDER_MODULE_NAME
+        or entry.get("relative_path") != _BUILDER_RELATIVE_PATH
+        or entry.get("absolute_path")
+        != str(_WORKTREE_ROOT / Path(*_BUILDER_RELATIVE_PATH.split("/")))
+        or type(entry.get("source_sha256")) is not str
+        or len(entry["source_sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in entry["source_sha256"])
+        or type(entry.get("byte_count")) is not int
+        or entry["byte_count"] <= 0
+        or entry.get("is_package") is not False
+        or type(entry.get("loader_identity")) is not str
+        or not entry["loader_identity"]
+    ):
+        raise FormalBootstrapError("external verified builder ledger rejected")
+    try:
+        assert_module(
+            _BUILDER_MODULE_NAME,
+            _BUILDER_RELATIVE_PATH,
+            entry["source_sha256"],
+        )
+    except BaseException as exc:
+        raise FormalBootstrapError("external verified builder ledger rejected") from exc
+    builder = sys.modules.get(_BUILDER_MODULE_NAME)
+    dispatch = getattr(builder, "trusted_dispatch", None)
+    if not callable(dispatch):
+        raise FormalBootstrapError("external verified builder module required")
+    return int(dispatch(context, frozen_action_config))
 
 
 def main(argv: list[str] | None = None) -> int:

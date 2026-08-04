@@ -1363,10 +1363,6 @@ def _validated_attestation(
 
 def _validated_attested_authority_binding(
     *,
-    attestation_path: str | Path,
-    expected_attestation_sha256: str,
-    frozen_source_root: str | Path,
-    expected_frozen_source_commit: str,
     feature_history_run_spec_path: Path,
     feature_history_run_root: Path,
     feature: Mapping[str, Any],
@@ -1459,13 +1455,9 @@ def _validated_attested_replay_context(
     feature_history_run_spec_path: str | Path,
     feature_history_run_root: str | Path,
 ) -> dict[str, Any]:
-    context_before = _validated_attested_replay_context(
+    attestation = _validated_attestation(
         attestation_path=attestation_path,
         expected_attestation_sha256=expected_attestation_sha256,
-        frozen_source_root=frozen_source_root,
-        expected_frozen_source_commit=expected_frozen_source_commit,
-        feature_history_run_spec_path=feature_history_run_spec_path,
-        feature_history_run_root=feature_history_run_root,
     )
     root = _validated_frozen_root(
         frozen_source_root,

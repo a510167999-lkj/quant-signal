@@ -67,6 +67,11 @@ FORMAL_REVIEW_SOURCE_RELATIVE_PATHS = (
     "app/research_suspension_evidence.py",
 )
 MAIN_REPO_ROOT = Path(r"E:\AI workspace\quant-signal-lkj")
+GIT_EXECUTABLE = Path(r"C:\Program Files\Git\mingw64\bin\git.exe")
+GIT_EXECUTABLE_SHA256 = (
+    "c39b1b4f7a57935bbeadf246dc2466316619453a6a9da77c4a9c6bd6d8fb21d3"
+)
+_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 PYTHON_EXECUTABLE = Path(
     r"E:\AI workspace\quant-signal-lkj\.venv\Scripts\python.exe"
 )
