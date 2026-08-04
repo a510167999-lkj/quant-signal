@@ -1,4 +1,6 @@
+import os
 import sqlite3
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -8,11 +10,100 @@ from app.audited_pit_development_replay import (
     _exact_membership_sessions,
     _producer_code_binding,
 )
+from app import current_pool_development_replay as current_pool_replay
 from app.config import Settings
 from app.current_pool_development_replay import (
     SIMPLE_BREAKOUT_SPEC,
     _candidate_trades_from_bars,
 )
+
+
+def test_content_addressed_write_publishes_only_via_atomic_create_claim(
+    tmp_path, monkeypatch
+):
+    payload = {"schema_version": "test/v1", "value": 1}
+    output_dir = tmp_path / "artifacts"
+    claims: list[tuple[Path, Path, bool]] = []
+    original_link = os.link
+
+    def record_link(source, destination):
+        source_path = Path(source)
+        destination_path = Path(destination)
+        claims.append(
+            (source_path, destination_path, destination_path.exists())
+        )
+        original_link(source, destination)
+
+    monkeypatch.setattr(os, "link", record_link)
+
+    artifact = current_pool_replay._write_content_addressed(output_dir, payload)
+
+    destination = Path(artifact["path"])
+    assert destination.exists()
+    assert len(claims) == 1
+    source_path, claimed_destination, destination_existed = claims[0]
+    assert claimed_destination == destination
+    assert destination_existed is False
+    assert source_path.parent == output_dir
+    assert not list(output_dir.glob("*.tmp"))
+
+
+def test_content_addressed_write_cleans_temp_when_atomic_claim_fails(
+    tmp_path, monkeypatch
+):
+    payload = {"schema_version": "test/v1", "value": 1}
+    output_dir = tmp_path / "artifacts"
+    digest = current_pool_replay._sha256(payload)
+
+    def fail_link(_source, _destination):
+        raise OSError("injected atomic claim failure")
+
+    monkeypatch.setattr(os, "link", fail_link)
+
+    with pytest.raises(OSError, match="injected atomic claim failure"):
+        current_pool_replay._write_content_addressed(output_dir, payload)
+
+    assert not (output_dir / f"{digest}.json").exists()
+    assert not list(output_dir.glob("*.tmp"))
+
+
+def test_content_addressed_write_rejects_late_conflicting_destination(
+    tmp_path, monkeypatch
+):
+    payload = {"schema_version": "test/v1", "value": 1}
+    output_dir = tmp_path / "artifacts"
+    destination = output_dir / f"{current_pool_replay._sha256(payload)}.json"
+
+    def lose_claim_to_conflicting_writer(_source, target):
+        Path(target).write_text("conflicting", encoding="utf-8")
+        raise FileExistsError
+
+    monkeypatch.setattr(os, "link", lose_claim_to_conflicting_writer)
+
+    with pytest.raises(
+        current_pool_replay.CurrentPoolDevelopmentReplayError,
+        match="content-addressed result conflicts",
+    ):
+        current_pool_replay._write_content_addressed(output_dir, payload)
+
+    assert destination.read_text(encoding="utf-8") == "conflicting"
+    assert not list(output_dir.glob("*.tmp"))
+
+
+def test_content_addressed_write_rejects_existing_conflicting_destination(tmp_path):
+    payload = {"schema_version": "test/v1", "value": 1}
+    output_dir = tmp_path / "artifacts"
+    destination = output_dir / f"{current_pool_replay._sha256(payload)}.json"
+    destination.parent.mkdir()
+    destination.write_text("partial", encoding="utf-8")
+
+    with pytest.raises(
+        current_pool_replay.CurrentPoolDevelopmentReplayError,
+        match="content-addressed result conflicts",
+    ):
+        current_pool_replay._write_content_addressed(output_dir, payload)
+
+    assert destination.read_text(encoding="utf-8") == "partial"
 
 
 def test_simple_current_pool_replay_uses_only_breakout_and_basic_stop():

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -325,7 +327,25 @@ def _write_content_addressed(output_dir: str | Path, payload: Mapping[str, Any])
     if destination.exists() and destination.read_text(encoding="utf-8") != content:
         raise CurrentPoolDevelopmentReplayError("content-addressed result conflicts")
     if not destination.exists():
-        destination.write_text(content, encoding="utf-8")
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=str(destination.parent),
+            text=True,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            try:
+                os.link(temp_name, destination)
+            except FileExistsError:
+                if destination.read_text(encoding="utf-8") != content:
+                    raise CurrentPoolDevelopmentReplayError(
+                        "content-addressed result conflicts"
+                    )
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
     return {"path": str(destination), "artifact_sha256": digest}
 
 
