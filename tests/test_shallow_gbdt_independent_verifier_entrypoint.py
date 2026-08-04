@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from pathlib import Path
 
@@ -210,6 +211,96 @@ def test_replay_input_symlink_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(verifier.IndependentVerificationError):
         verifier._assert_no_reparse(link, "replay")
+
+
+def test_replay_runs_from_frozen_source_root(monkeypatch, tmp_path: Path) -> None:
+    helper_path = tmp_path / "helper.py"
+    source_root = tmp_path / "frozen-source"
+    source_root.mkdir()
+    captured: dict[str, object] = {}
+
+    class Process:
+        def __init__(self) -> None:
+            self.stdout = io.BytesIO(b"INDEPENDENT_FULL_RESULT {}\n")
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self) -> int:
+            return 0
+
+        def kill(self) -> None:
+            raise AssertionError("successful replay must not be killed")
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["cwd"] = kwargs["cwd"]
+        return Process()
+
+    monkeypatch.setattr(verifier.subprocess, "Popen", fake_popen)
+
+    assert verifier._replay_output(
+        {
+            "python_executable_sha256": verifier._python_executable_sha256(),
+            "helper_path": helper_path,
+            "source_root": source_root,
+        }
+    ) == ["INDEPENDENT_FULL_RESULT {}"]
+    assert captured["cwd"] == source_root
+    assert captured["command"][-2:] == [str(helper_path), str(source_root)]
+
+
+def test_replay_keeps_frozen_app_after_helper_adds_its_repo_root(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "frozen-source"
+    source_app = source_root / "app"
+    source_app.mkdir(parents=True)
+    (source_app / "__init__.py").write_text("", encoding="utf-8")
+    (source_app / "audited_pit_continuous_ridge_oof.py").write_text(
+        "def verify_shallow_gbdt_result_bundle():\n"
+        "    return {'origin': 'frozen-source'}\n",
+        encoding="utf-8",
+    )
+    main_root = tmp_path / "mutable-main"
+    main_app = main_root / "app"
+    main_app.mkdir(parents=True)
+    (main_app / "__init__.py").write_text("", encoding="utf-8")
+    (main_app / "audited_pit_continuous_ridge_oof.py").write_text(
+        "def verify_shallow_gbdt_result_bundle():\n"
+        "    return {'origin': 'mutable-main'}\n",
+        encoding="utf-8",
+    )
+    replay_root = main_root / "data" / "research_runs" / "probe"
+    replay_root.mkdir(parents=True)
+    replay_path = replay_root / "replay.py"
+    replay_path.write_text(
+        "from app import audited_pit_continuous_ridge_oof as ridge\n"
+        "ridge.verify_shallow_gbdt_result_bundle()\n",
+        encoding="utf-8",
+    )
+    helper_path = replay_root / "helper.py"
+    helper_path.write_text(
+        "import runpy\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "repo_root = Path(__file__).resolve().parents[3]\n"
+        "if str(repo_root) not in sys.path:\n"
+        "    sys.path.insert(0, str(repo_root))\n"
+        "runpy.run_path(str(Path(__file__).with_name('replay.py')))\n",
+        encoding="utf-8",
+    )
+
+    lines = verifier._replay_output(
+        {
+            "python_executable_sha256": verifier._python_executable_sha256(),
+            "helper_path": helper_path,
+            "source_root": source_root,
+        }
+    )
+
+    result = json.loads(lines[0].removeprefix("INDEPENDENT_FULL_RESULT "))
+    assert result == {"origin": "frozen-source"}
 
 
 def test_run_publishes_content_addressed_receipt_without_mutating_completion(

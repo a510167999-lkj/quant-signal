@@ -89,7 +89,6 @@ import json
 import runpy
 import sys
 
-sys.path.insert(0, sys.argv[3])
 sys.path.insert(0, sys.argv[2])
 from app import audited_pit_continuous_ridge_oof as ridge
 
@@ -466,7 +465,7 @@ def _current_producer_root_sha256(source_root: Path) -> str:
             PRODUCER_PROBE_DRIVER,
             str(source_root),
         ],
-        cwd=PROJECT_ROOT,
+        cwd=source_root,
         check=False,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -737,9 +736,8 @@ def _replay_output(inputs: Mapping[str, Any]) -> list[str]:
             CAPTURE_REPLAY_DRIVER,
             str(inputs["helper_path"]),
             str(inputs["source_root"]),
-            str(PROJECT_ROOT),
         ],
-        cwd=PROJECT_ROOT,
+        cwd=inputs["source_root"],
         env=_isolated_environment(),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
