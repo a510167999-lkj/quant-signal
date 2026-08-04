@@ -291,6 +291,52 @@ def test_load_completed_run_accepts_only_pending_development_result(tmp_path: Pa
     assert loaded["runtime_verification"] == inputs["runtime_verification"]
 
 
+def test_load_completed_run_accepts_launcher_without_redundant_filename_flag(
+    tmp_path: Path,
+) -> None:
+    inputs = _make_completed_inputs(tmp_path)
+    completion_path = inputs["run_root"] / verifier.COMPLETION_NAME
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    completion["result_artifact"].pop("file_name_matches_content_sha256")
+    completion_path.write_bytes(_canonical_bytes(completion) + b"\n")
+
+    loaded = verifier._load_completed_run(inputs["source"])
+
+    assert loaded["main_artifact_sha256"] == inputs["main_artifact_sha256"]
+
+
+def test_load_completed_run_rejects_explicit_filename_hash_mismatch(
+    tmp_path: Path,
+) -> None:
+    inputs = _make_completed_inputs(tmp_path)
+    completion_path = inputs["run_root"] / verifier.COMPLETION_NAME
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    completion["result_artifact"]["file_name_matches_content_sha256"] = False
+    completion_path.write_bytes(_canonical_bytes(completion) + b"\n")
+
+    with pytest.raises(
+        verifier.IndependentVerificationError,
+        match="main artifact binding is invalid",
+    ):
+        verifier._load_completed_run(inputs["source"])
+
+
+def test_load_completed_run_rejects_non_boolean_filename_hash_claim(
+    tmp_path: Path,
+) -> None:
+    inputs = _make_completed_inputs(tmp_path)
+    completion_path = inputs["run_root"] / verifier.COMPLETION_NAME
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    completion["result_artifact"]["file_name_matches_content_sha256"] = 1
+    completion_path.write_bytes(_canonical_bytes(completion) + b"\n")
+
+    with pytest.raises(
+        verifier.IndependentVerificationError,
+        match="main artifact binding is invalid",
+    ):
+        verifier._load_completed_run(inputs["source"])
+
+
 def test_load_completed_run_rejects_open_statistical_interpretation(tmp_path: Path) -> None:
     inputs = _make_completed_inputs(tmp_path)
     completion_path = inputs["run_root"] / verifier.COMPLETION_NAME

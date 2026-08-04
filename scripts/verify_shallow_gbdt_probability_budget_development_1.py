@@ -591,13 +591,14 @@ def _load_completed_run(source: Mapping[str, Any]) -> dict[str, Any]:
     artifact = _content_addressed_document(artifact_path, "main artifact")
     main_sha = artifact["canonical_artifact_sha256"]
     main_document = artifact["document"]
+    file_name_claim = artifact_reference.get("file_name_matches_content_sha256")
     if (
         _require_sha256(artifact_reference.get("canonical_artifact_sha256"), "formal main artifact")
         != main_sha
         or _require_sha256(progress.get("artifact_sha256"), "formal progress artifact")
         != main_sha
         or artifact_reference.get("file_sha256") != artifact["file_sha256"]
-        or artifact_reference.get("file_name_matches_content_sha256") is not True
+        or (file_name_claim is not None and file_name_claim is not True)
         or main_document.get("strategy_sha256") != EXPECTED_STRATEGY_SHA256
         or not isinstance(main_document.get("producer_code"), dict)
         or main_document["producer_code"].get("root_sha256")
