@@ -197,6 +197,64 @@ def test_trade_metrics_uses_full_evaluation_session_grid_through_end_date():
     assert metrics["rolling_1y_latest_return_pct"] == 0.0
 
 
+def test_slot_daily_honors_position_budget_fraction():
+    sessions = ["2024-01-02", "2024-01-03"]
+    trade = {
+        "symbol": "600001",
+        "signal_date": "2024-01-01",
+        "entry_date": sessions[0],
+        "exit_date": sessions[-1],
+        "return_pct": 10.0,
+        "max_adverse_pct": 0.0,
+        "position_budget_fraction": 0.1,
+        "mark_to_market_path": [
+            {"date": sessions[0], "close_return_pct": 0.0, "low_return_pct": 0.0},
+            {"date": sessions[-1], "close_return_pct": 10.0, "low_return_pct": 10.0},
+        ],
+    }
+
+    metrics = _trade_metrics(
+        [trade],
+        hold_days=1,
+        max_active_positions=3,
+        capital_model="slot-daily",
+        evaluation_start_date=sessions[0],
+        evaluation_end_date=sessions[-1],
+        evaluation_session_dates=sessions,
+    )
+
+    assert metrics["portfolio_compounded_return_pct"] == 1.0
+
+
+@pytest.mark.parametrize("budget", [0.0, -0.1, float("nan"), 1 / 3 + 1e-12])
+def test_slot_daily_rejects_invalid_position_budget_fraction(budget: float):
+    sessions = ["2024-01-02", "2024-01-03"]
+    trade = {
+        "symbol": "600001",
+        "signal_date": "2024-01-01",
+        "entry_date": sessions[0],
+        "exit_date": sessions[-1],
+        "return_pct": 1.0,
+        "max_adverse_pct": 0.0,
+        "position_budget_fraction": budget,
+        "mark_to_market_path": [
+            {"date": sessions[0], "close_return_pct": 0.0, "low_return_pct": 0.0},
+            {"date": sessions[-1], "close_return_pct": 1.0, "low_return_pct": 1.0},
+        ],
+    }
+
+    with pytest.raises(ValueError, match="position budget"):
+        _trade_metrics(
+            [trade],
+            hold_days=1,
+            max_active_positions=3,
+            capital_model="slot-daily",
+            evaluation_start_date=sessions[0],
+            evaluation_end_date=sessions[-1],
+            evaluation_session_dates=sessions,
+        )
+
+
 @pytest.mark.parametrize(
     ("sessions", "start_date", "end_date"),
     [

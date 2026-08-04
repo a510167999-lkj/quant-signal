@@ -4,6 +4,7 @@
 模型下的权益曲线与回撤。逐字搬移，未改任何逻辑。
 """
 from collections import defaultdict
+from math import isfinite
 from typing import Any, Dict, List
 
 from app.research_common import _num
@@ -156,11 +157,6 @@ def _equity_points_from_slot_daily_returns(
     slot_count = max(int(max_active_positions or 0), 1)
     exposure = max(float(exposure_multiplier), 0)
     slot_exposure = exposure / slot_count
-    borrowed_slot_exposure = (
-        slot_exposure * max(exposure - 1, 0) / exposure
-        if exposure > 0
-        else 0
-    )
     cost_rate = max(float(roundtrip_cost_bps) + float(slippage_bps) * 2, 0) / 10_000
     half_trade_cost_rate = cost_rate / 2
     financing_daily_rate = max(float(annual_financing_rate_pct), 0) / 100 / 252
@@ -210,11 +206,28 @@ def _equity_points_from_slot_daily_returns(
     for current_date in sorted(all_dates):
         base_equity = realized_equity + sum(_num(item.get("_last_contribution")) for item in active)
         for trade in entries_by_date.get(current_date, []):
-            notional = max(base_equity, 0) * slot_exposure
+            position_budget_fraction = float(
+                trade.get("position_budget_fraction", slot_exposure)
+            )
+            if (
+                not isfinite(position_budget_fraction)
+                or position_budget_fraction <= 0
+                or position_budget_fraction > slot_exposure
+            ):
+                raise ValueError("slot daily position budget is invalid")
+            notional = max(base_equity, 0) * position_budget_fraction
             trade["_notional"] = notional
             trade["_entry_cost"] = notional * half_trade_cost_rate
             trade["_exit_cost"] = notional * half_trade_cost_rate
-            trade["_daily_financing_cost"] = max(base_equity, 0) * borrowed_slot_exposure * financing_daily_rate
+            trade["_daily_financing_cost"] = (
+                max(base_equity, 0)
+                * position_budget_fraction
+                * max(exposure - 1, 0)
+                / exposure
+                * financing_daily_rate
+                if exposure > 0
+                else 0.0
+            )
             trade["_days_held"] = 0
             trade["_last_contribution"] = -trade["_entry_cost"]
             active.append(trade)
