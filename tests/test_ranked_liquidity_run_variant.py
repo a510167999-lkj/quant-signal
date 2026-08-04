@@ -11,6 +11,7 @@ import pytest
 
 from app import audited_pit_continuous_ridge_oof as ridge
 from app import audited_pit_shallow_gbdt as shallow_gbdt
+from app import audited_pit_shallow_gbdt_probability_budget as probability_budget
 from app.audited_pit_score_contract import (
     RIDGE_SCORE_CONTRACT,
     SHALLOW_GBDT_SCORE_CONTRACT,
@@ -125,6 +126,35 @@ def test_shallow_gbdt_producer_binding_binds_runtime_model_and_contract():
         dict(SHALLOW_GBDT_SCORE_CONTRACT)
     )
     assert binding["root_sha256"] == ridge._sha256(identity)
+
+
+def test_probability_budget_variant_has_a_separate_role_bound_contract():
+    variant = ridge.resolve_ranked_liquidity_run_variant(
+        probability_budget.SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC
+    )
+    binding = variant["producer_binding"]()
+
+    assert variant["strategy_schema_version"] == (
+        "development-pit-cross-sectional-shallow-gbdt-probability-budget-"
+        "utility-logit-rolling-126-oof/v1"
+    )
+    assert variant["model_adapter"].model_id == "shallow_gbdt_probability_budget"
+    assert variant["main_rank_mode"] == "positive_utility_probability"
+    assert variant["baseline_rank_mode"] == "positive_utility_probability"
+    assert variant["main_apply_position_budget"] is True
+    assert variant["baseline_apply_position_budget"] is False
+    assert variant["control_name"] == "equal_weight_control"
+    assert variant["selection_evidence_mode"] == "role_separated"
+    assert binding["schema_version"] == (
+        "audited-pit-ranked-liquidity-shallow-gbdt-probability-budget-"
+        "producer/v1"
+    )
+    assert binding["probability_budget_module_sha256"] == hashlib.sha256(
+        Path(probability_budget.__file__).read_bytes()
+    ).hexdigest()
+    assert binding["probability_budget_strategy_sha256"] == (
+        probability_budget._SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC_SHA256
+    )
 
 
 @pytest.mark.parametrize(

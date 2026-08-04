@@ -280,6 +280,35 @@ def resolve_model_oof_adapter(
                 shallow_gbdt.verify_shallow_gbdt_rolling_oof_receipt
             ),
         )
+    from app import audited_pit_shallow_gbdt_probability_budget as probability_budget
+
+    probability_budget_spec_sha256 = (
+        probability_budget._SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC_SHA256
+    )
+    if (
+        _sha256(
+            probability_budget.SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC
+        )
+        == probability_budget_spec_sha256
+        and _sha256(strategy_spec) == probability_budget_spec_sha256
+        and dict(strategy_spec)
+        == probability_budget.SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC
+        and frozen_score_contract(
+            strategy_spec["selection"]["score_contract"]
+        )
+        is SHALLOW_GBDT_SCORE_CONTRACT
+    ):
+        return ModelOOFAdapter(
+            model_id="shallow_gbdt_probability_budget",
+            score_contract=SHALLOW_GBDT_SCORE_CONTRACT,
+            score_field="predicted_positive_utility_probability",
+            build_scores=(
+                shallow_gbdt.build_shallow_gbdt_rolling_oof_scores
+            ),
+            verify_receipt=(
+                shallow_gbdt.verify_shallow_gbdt_rolling_oof_receipt
+            ),
+        )
     raise ValueError("ranked-liquidity model OOF strategy is not frozen")
 
 
@@ -3255,6 +3284,46 @@ def _strict_execution_dataset(
     }
 
 
+def _selected_for_fixed_oof_metrics(
+    selected: Sequence[Mapping[str, Any]],
+    *,
+    strategy_spec: Mapping[str, Any],
+    score_contract: Mapping[str, Any],
+    apply_position_budget: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    selected_values = [dict(trade) for trade in selected]
+    allocation_spec = strategy_spec["selection"].get(
+        "position_budget_allocation"
+    )
+    if allocation_spec is None:
+        return selected_values, None
+    if frozen_score_contract(score_contract) is not SHALLOW_GBDT_SCORE_CONTRACT:
+        raise ValueError(
+            "fixed OOF probability budget requires the shallow GBDT score contract"
+        )
+    from app.audited_pit_shallow_gbdt_probability_budget import (
+        _assert_frozen_allocation_spec,
+        allocate_shallow_gbdt_probability_budget,
+    )
+
+    _assert_frozen_allocation_spec(allocation_spec)
+    if not apply_position_budget:
+        if any(
+            "position_budget_fraction" in trade
+            for trade in selected_values
+        ):
+            raise ValueError("probability budget control must not be preloaded")
+        return selected_values, None
+    return allocate_shallow_gbdt_probability_budget(
+        selected_values,
+        max_active_positions=int(
+            strategy_spec["selection"]["max_active_positions"]
+        ),
+        exposure_multiplier=float(strategy_spec["exposure_multiplier"]),
+        allocation_spec=allocation_spec,
+    )
+
+
 def _evaluate_fixed_oof(
     candidates: Sequence[Mapping[str, Any]],
     *,
@@ -3263,20 +3332,27 @@ def _evaluate_fixed_oof(
     strategy_spec: Mapping[str, Any] = CONTINUOUS_RIDGE_OOF_SPEC,
     sweep_schema_version: str = "strict-ranked-liquidity-ridge-fixed-oof/v2",
     score_contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
+    apply_position_budget: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     frozen_contract = frozen_score_contract(score_contract)
     validate_selection_rank_mode(
         rank_mode,
         contract=score_contract,
     )
-    allowed_sweep_schemas = (
-        {
+    if frozen_contract is RIDGE_SCORE_CONTRACT:
+        allowed_sweep_schemas = {
             "strict-ranked-liquidity-ridge-fixed-oof/v2",
             "strict-ranked-liquidity-ridge-fixed-oof/v3",
         }
-        if frozen_contract is RIDGE_SCORE_CONTRACT
-        else {"strict-ranked-liquidity-shallow-gbdt-fixed-oof/v1"}
-    )
+    elif strategy_spec["selection"].get("position_budget_allocation") is None:
+        allowed_sweep_schemas = {
+            "strict-ranked-liquidity-shallow-gbdt-fixed-oof/v1"
+        }
+    else:
+        allowed_sweep_schemas = {
+            "strict-ranked-liquidity-shallow-gbdt-probability-budget-"
+            "fixed-oof/v1"
+        }
     if sweep_schema_version not in allowed_sweep_schemas:
         raise ValueError(
             "fixed OOF sweep schema differs from score contract"
@@ -3303,11 +3379,21 @@ def _evaluate_fixed_oof(
         max_active_positions=int(selection["max_active_positions"]),
         score_contract=score_contract,
     )
+    metric_selected, allocation_receipt = _selected_for_fixed_oof_metrics(
+        selected,
+        strategy_spec=strategy_spec,
+        score_contract=score_contract,
+        apply_position_budget=apply_position_budget,
+    )
     selected_censored = [
-        trade for trade in selected if trade.get("right_censored") is True
+        trade
+        for trade in metric_selected
+        if trade.get("right_censored") is True
     ]
     selected_complete = [
-        trade for trade in selected if trade.get("right_censored") is not True
+        trade
+        for trade in metric_selected
+        if trade.get("right_censored") is not True
     ]
     metrics = _trade_metrics(
         selected_complete,
@@ -3432,6 +3518,8 @@ def _evaluate_fixed_oof(
             else None
         ),
     }
+    if allocation_receipt is not None:
+        row["position_budget_allocation_receipt"] = allocation_receipt
     sweep = {
         "schema_version": sweep_schema_version,
         "qualified_trade_count": len(selection_candidates)
@@ -3475,6 +3563,7 @@ def _recompute_fixed_oof_gate(
     strategy_spec: Mapping[str, Any],
     rank_mode: str,
     score_contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
+    apply_position_budget: bool = True,
 ) -> dict[str, bool]:
     frozen_contract = frozen_score_contract(score_contract)
     metadata = _score_contract_metadata(score_contract)
@@ -3498,6 +3587,26 @@ def _recompute_fixed_oof_gate(
         or any(key not in candidate_by_trade_key for key in selected_keys)
     ):
         raise ValueError("fixed OOF selection keys are invalid")
+    selected_for_allocation: list[dict[str, Any]] = []
+    for trade_key in selected_keys:
+        candidate = dict(candidate_by_trade_key[trade_key])
+        parts = trade_key.split("|")
+        if len(parts) != 4 or parts[0] != candidate["security_id"]:
+            raise ValueError("fixed OOF selection trade key is invalid")
+        candidate.update(
+            {
+                "signal_date": parts[1],
+                "entry_date": parts[2],
+                "exit_date": parts[3],
+            }
+        )
+        selected_for_allocation.append(candidate)
+    _, expected_allocation_receipt = _selected_for_fixed_oof_metrics(
+        selected_for_allocation,
+        strategy_spec=strategy_spec,
+        score_contract=score_contract,
+        apply_position_budget=apply_position_budget,
+    )
     selected_censored_keys = [
         key
         for key in selected_keys
@@ -3607,11 +3716,15 @@ def _recompute_fixed_oof_gate(
         f"{strategy_spec['signal_tag']}|"
         f"{rank_mode}|all_market_levels"
     )
-    expected_sweep_schema = (
-        "strict-ranked-liquidity-ridge-fixed-oof/v3"
-        if frozen_contract is RIDGE_SCORE_CONTRACT
-        else "strict-ranked-liquidity-shallow-gbdt-fixed-oof/v1"
-    )
+    if frozen_contract is RIDGE_SCORE_CONTRACT:
+        expected_sweep_schema = "strict-ranked-liquidity-ridge-fixed-oof/v3"
+    elif strategy_spec["selection"].get("position_budget_allocation") is None:
+        expected_sweep_schema = "strict-ranked-liquidity-shallow-gbdt-fixed-oof/v1"
+    else:
+        expected_sweep_schema = (
+            "strict-ranked-liquidity-shallow-gbdt-probability-budget-"
+            "fixed-oof/v1"
+        )
     if (
         selection_receipt.get("schema_version")
         != metadata["selection_schema"]
@@ -3658,6 +3771,8 @@ def _recompute_fixed_oof_gate(
         is not rolling_stability_pass
         or row.get("target_all_pass") is not target_all_pass
         or row.get("target_gap_1y_return_pct") != target_gap
+        or row.get("position_budget_allocation_receipt")
+        != expected_allocation_receipt
     ):
         raise ValueError("fixed OOF sweep gate verification failed")
     return {
@@ -3674,14 +3789,43 @@ def _verify_recomputed_trade_metrics(
     frozen_signal_sessions: Sequence[str],
     *,
     strategy_spec: Mapping[str, Any],
+    score_contract: Mapping[str, Any] = RIDGE_SCORE_CONTRACT,
+    apply_position_budget: bool = True,
 ) -> None:
-    selected_complete = [
+    selected = [
         dict(selected_evidence_by_trade_key[trade_key])
         for trade_key in selected_trade_keys
-        if selected_evidence_by_trade_key[trade_key].get(
-            "right_censored"
+    ]
+    allocation_spec = strategy_spec["selection"].get(
+        "position_budget_allocation"
+    )
+    expected_allocation_receipt = None
+    if allocation_spec is not None and apply_position_budget:
+        source = []
+        for trade in selected:
+            if "position_budget_fraction" not in trade:
+                raise ValueError("fixed OOF position budget is missing")
+            item = dict(trade)
+            item.pop("position_budget_fraction")
+            source.append(item)
+        metric_selected, expected_allocation_receipt = (
+            _selected_for_fixed_oof_metrics(
+                source,
+                strategy_spec=strategy_spec,
+                score_contract=score_contract,
+                apply_position_budget=True,
+            )
         )
-        is not True
+        if metric_selected != selected:
+            raise ValueError("fixed OOF position budget replay differs")
+    else:
+        if any("position_budget_fraction" in trade for trade in selected):
+            raise ValueError("fixed OOF position budget is unexpected")
+        metric_selected = selected
+    selected_complete = [
+        trade
+        for trade in metric_selected
+        if trade.get("right_censored") is not True
     ]
     minimum_training_sessions = int(
         strategy_spec["walk_forward"]["minimum_training_sessions"]
@@ -3713,7 +3857,11 @@ def _verify_recomputed_trade_metrics(
         evaluation_session_dates=evaluation_sessions,
     )
     row = sweep["top"][0]
-    if any(row.get(key) != value for key, value in recomputed.items()):
+    if (
+        row.get("position_budget_allocation_receipt")
+        != expected_allocation_receipt
+        or any(row.get(key) != value for key, value in recomputed.items())
+    ):
         raise ValueError("fixed OOF trade metrics replay failed")
 
 
@@ -4087,6 +4235,37 @@ def _shallow_gbdt_producer_binding() -> dict[str, Any]:
     }
 
 
+def _shallow_gbdt_probability_budget_producer_binding() -> dict[str, Any]:
+    from app import audited_pit_shallow_gbdt_probability_budget as probability_budget
+
+    probability_budget._assert_frozen_probability_budget_strategy(
+        probability_budget.SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC
+    )
+    shallow_binding = _shallow_gbdt_producer_binding()
+    identity = {
+        "schema_version": (
+            "audited-pit-ranked-liquidity-shallow-gbdt-probability-"
+            "budget-producer/v1"
+        ),
+        "base_shallow_gbdt_producer_root_sha256": shallow_binding[
+            "root_sha256"
+        ],
+        "shared_ranked_liquidity_module_sha256": hashlib.sha256(
+            Path(__file__).read_bytes()
+        ).hexdigest(),
+        "probability_budget_module_sha256": hashlib.sha256(
+            Path(probability_budget.__file__).read_bytes()
+        ).hexdigest(),
+        "probability_budget_strategy_sha256": (
+            probability_budget._SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC_SHA256
+        ),
+    }
+    return {
+        **identity,
+        "root_sha256": _sha256(identity),
+    }
+
+
 def resolve_ranked_liquidity_run_variant(
     strategy_spec: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -4132,6 +4311,8 @@ def resolve_ranked_liquidity_run_variant(
             "model_adapter": model_adapter,
             "main_rank_mode": "predicted_net_return",
             "baseline_rank_mode": "signal_date_amount",
+            "control_name": "amount_baseline",
+            "control_selected_input_key": "baseline_selected",
             "score_contract": dict(RIDGE_SCORE_CONTRACT),
             "producer_binding": (
                 lambda: _producer_binding(artifact_version=3)
@@ -4177,8 +4358,63 @@ def resolve_ranked_liquidity_run_variant(
             "model_adapter": model_adapter,
             "main_rank_mode": "positive_utility_probability",
             "baseline_rank_mode": "signal_date_amount",
+            "control_name": "amount_baseline",
+            "control_selected_input_key": "baseline_selected",
             "score_contract": dict(SHALLOW_GBDT_SCORE_CONTRACT),
             "producer_binding": _shallow_gbdt_producer_binding,
+            "artifact_semantics_version": 3,
+        }
+    if model_adapter.model_id == "shallow_gbdt_probability_budget":
+        _assert_shallow_gbdt_entrypoints_frozen()
+        return {
+            "strategy_schema_version": (
+                "development-pit-cross-sectional-shallow-gbdt-probability-"
+                "budget-utility-logit-rolling-126-oof/v1"
+            ),
+            "progress_file_name": (
+                ".ranked_liquidity_shallow_gbdt_probability_budget_v1_progress.json"
+            ),
+            "progress_schema_version": (
+                "ranked-liquidity-shallow-gbdt-probability-budget-"
+                "replay-progress/v1"
+            ),
+            "producer_schema_version": (
+                "audited-pit-ranked-liquidity-shallow-gbdt-probability-"
+                "budget-producer/v1"
+            ),
+            "result_schema_version": (
+                "ranked-liquidity-shallow-gbdt-probability-budget-result/v1"
+            ),
+            "sidecar_schema_versions": {
+                name: (
+                    "ranked-liquidity-shallow-gbdt-probability-budget-"
+                    f"{name}-sidecar/v1"
+                )
+                for name in (
+                    "features",
+                    "models",
+                    "execution",
+                    "selection",
+                )
+            },
+            "strict_outcome_schema_version": (
+                "ranked-liquidity-shallow-gbdt-probability-budget-"
+                "strict-outcome/v1"
+            ),
+            "sweep_schema_version": (
+                "strict-ranked-liquidity-shallow-gbdt-probability-budget-"
+                "fixed-oof/v1"
+            ),
+            "model_adapter": model_adapter,
+            "main_rank_mode": "positive_utility_probability",
+            "baseline_rank_mode": "positive_utility_probability",
+            "control_name": "equal_weight_control",
+            "control_selected_input_key": "equal_weight_control_selected",
+            "main_apply_position_budget": True,
+            "baseline_apply_position_budget": False,
+            "selection_evidence_mode": "role_separated",
+            "score_contract": dict(SHALLOW_GBDT_SCORE_CONTRACT),
+            "producer_binding": _shallow_gbdt_probability_budget_producer_binding,
             "artifact_semantics_version": 3,
         }
     raise ValueError(
@@ -4196,6 +4432,11 @@ def _assert_producer_binding_unchanged(
         "audited-pit-ranked-liquidity-shallow-gbdt-producer/v1"
     ):
         actual = _shallow_gbdt_producer_binding()
+    elif schema_version == (
+        "audited-pit-ranked-liquidity-shallow-gbdt-probability-"
+        "budget-producer/v1"
+    ):
+        actual = _shallow_gbdt_probability_budget_producer_binding()
     else:
         actual = _producer_binding()
     if actual != dict(expected):
@@ -4262,16 +4503,7 @@ def build_ranked_liquidity_result_payloads(
     shared_receipts: Mapping[str, Any],
 ) -> dict[str, Any]:
     variant = resolve_ranked_liquidity_run_variant(strategy_spec)
-    if variant["model_adapter"].model_id == "continuous_ridge":
-        frozen_strategy = deepcopy(
-            ROLLING_CONTINUOUS_RIDGE_OOF_SPEC
-        )
-    else:
-        from app import audited_pit_shallow_gbdt as shallow_gbdt
-
-        frozen_strategy = deepcopy(
-            shallow_gbdt.SHALLOW_GBDT_OOF_SPEC
-        )
+    frozen_strategy = _frozen_variant_strategy_spec(variant)
     if _sha256(strategy_spec) != _sha256(frozen_strategy):
         raise ValueError(
             "ranked-liquidity result strategy is not frozen"
@@ -4294,6 +4526,14 @@ def build_ranked_liquidity_result_payloads(
         raise ValueError(
             "ranked-liquidity producer schema differs from variant"
         )
+    control_name = str(variant.get("control_name") or "amount_baseline")
+    if control_name not in {"amount_baseline", "equal_weight_control"}:
+        raise ValueError("ranked-liquidity control name is invalid")
+    control_sweep_key = f"{control_name}_sweep"
+    control_selection_receipt_key = f"{control_name}_selection_receipt"
+    control_selected_key = str(
+        variant.get("control_selected_input_key") or "baseline_selected"
+    )
     strategy_sha256 = _sha256(frozen_strategy)
     sidecar_common = {
         "strategy_sha256": strategy_sha256,
@@ -4343,18 +4583,52 @@ def build_ranked_liquidity_result_payloads(
             "ranked-liquidity positive candidates differ from strict score gate"
         )
     main_selected = list(selection_values.pop("main_selected"))
-    baseline_selected = list(
-        selection_values.pop("baseline_selected")
+    control_selected = list(
+        selection_values.pop(control_selected_key)
     )
-    selected_by_key = {
-        _selection_trade_key(candidate): candidate
-        for candidate in [*main_selected, *baseline_selected]
-    }
-    selected_evidence = [
-        selected_by_key[key] for key in sorted(selected_by_key)
-    ]
-    for candidate in selected_evidence:
+    for candidate in [*main_selected, *control_selected]:
         candidate_score(candidate, contract=score_contract)
+    if variant.get("selection_evidence_mode") == "role_separated":
+        main_selected_keys = list(
+            selection_values["main_selection_receipt"][
+                "selected_trade_keys"
+            ]
+        )
+        control_selected_keys = list(
+            selection_values[control_selection_receipt_key][
+                "selected_trade_keys"
+            ]
+        )
+        if (
+            main_selected_keys != control_selected_keys
+            or [_selection_trade_key(item) for item in main_selected]
+            != main_selected_keys
+            or [_selection_trade_key(item) for item in control_selected]
+            != control_selected_keys
+        ):
+            raise ValueError(
+                "ranked-liquidity probability budget control selection differs"
+            )
+        selection_evidence_values = {
+            "main_selected_evidence": main_selected,
+            "main_selected_evidence_sha256": _sha256(main_selected),
+            f"{control_name}_selected_evidence": control_selected,
+            f"{control_name}_selected_evidence_sha256": _sha256(
+                control_selected
+            ),
+        }
+    else:
+        selected_by_key = {
+            _selection_trade_key(candidate): candidate
+            for candidate in [*main_selected, *control_selected]
+        }
+        selected_evidence = [
+            selected_by_key[key] for key in sorted(selected_by_key)
+        ]
+        selection_evidence_values = {
+            "selected_evidence": selected_evidence,
+            "selected_evidence_sha256": _sha256(selected_evidence),
+        }
     scored_evidence = _compact_scored_execution_evidence(
         scored_candidates,
         score_contract=score_contract,
@@ -4399,9 +4673,7 @@ def build_ranked_liquidity_result_payloads(
         ),
     }
     main_sweep = dict(selection_values["main_sweep"])
-    baseline_sweep = dict(
-        selection_values["amount_baseline_sweep"]
-    )
+    control_sweep = dict(selection_values[control_sweep_key])
     advancement_gate_passed = bool(
         selection_values["advancement_gate_passed"]
     )
@@ -4413,8 +4685,7 @@ def build_ranked_liquidity_result_payloads(
         **selection_values,
         "positive_pool_receipt": positive_pool_receipt,
         "scored_execution_candidate_evidence": scored_evidence,
-        "selected_evidence": selected_evidence,
-        "selected_evidence_sha256": _sha256(selected_evidence),
+        **selection_evidence_values,
         "positive_candidate_count": len(positive_candidates),
         "positive_candidate_payload_hashes_sha256": scored_evidence[
             "positive_candidate_payload_hashes_sha256"
@@ -4429,12 +4700,39 @@ def build_ranked_liquidity_result_payloads(
         and main_sweep["top"]
         else {}
     )
-    baseline_row = (
-        dict(baseline_sweep["top"][0])
-        if isinstance(baseline_sweep.get("top"), list)
-        and baseline_sweep["top"]
+    control_row = (
+        dict(control_sweep["top"][0])
+        if isinstance(control_sweep.get("top"), list)
+        and control_sweep["top"]
         else {}
     )
+    comparison = {
+        "shared_positive_candidate_table": True,
+        "shared_candidate_table_sha256": selection_values[
+            "main_selection_receipt"
+        ].get("candidate_table_sha256"),
+        "independent_portfolio_replays": True,
+        "same_execution_contract": True,
+    }
+    if variant.get("selection_evidence_mode") == "role_separated":
+        comparison.update(
+            {
+                "control_name": control_name,
+                "control_performance_is_advancement_gate": False,
+                "control_evidence_completeness_is_advancement_gate": True,
+                "same_selected_trade_keys": True,
+                "main_allocation": "probability_budget",
+                "control_allocation": "equal_slot_weight",
+                "unallocated_main_cash_remains_cash": True,
+            }
+        )
+    else:
+        comparison.update(
+            {
+                "baseline_performance_is_advancement_gate": False,
+                "baseline_evidence_completeness_is_advancement_gate": True,
+            }
+        )
     main_payload = {
         "schema_version": variant["result_schema_version"],
         "strategy_sha256": strategy_sha256,
@@ -4480,7 +4778,7 @@ def build_ranked_liquidity_result_payloads(
             "receipt_sha256"
         ],
         "main_sweep": main_sweep,
-        "amount_baseline_sweep": baseline_sweep,
+        control_sweep_key: control_sweep,
         "advancement_gate": {
             "main_latest_and_full_quality_passed": bool(
                 main_row.get("target_all_pass")
@@ -4491,23 +4789,14 @@ def build_ranked_liquidity_result_payloads(
             "main_evidence_complete": bool(
                 main_row.get("evidence_complete")
             ),
-            "amount_baseline_evidence_complete": bool(
-                baseline_row.get("evidence_complete")
+            f"{control_name}_evidence_complete": bool(
+                control_row.get("evidence_complete")
             ),
             "all_required_gates_passed": advancement_gate_passed,
             "embargo_consumed": False,
             "final_oos_consumed": False,
         },
-        "comparison": {
-            "shared_positive_candidate_table": True,
-            "shared_candidate_table_sha256": selection_values[
-                "main_selection_receipt"
-            ].get("candidate_table_sha256"),
-            "independent_portfolio_replays": True,
-            "same_execution_contract": True,
-            "baseline_performance_is_advancement_gate": False,
-            "baseline_evidence_completeness_is_advancement_gate": True,
-        },
+        "comparison": comparison,
     }
     return {
         "main_payload": main_payload,
@@ -4543,7 +4832,7 @@ def _verify_shallow_gbdt_result_bundle_oof_replay(
     )
 
 
-def verify_shallow_gbdt_result_bundle(
+def _verify_shallow_gbdt_family_result_bundle(
     result: Mapping[str, Any],
     *,
     tail_features: pd.DataFrame,
@@ -4552,13 +4841,22 @@ def verify_shallow_gbdt_result_bundle(
     scored_oof: pd.DataFrame,
     expected_source: Mapping[str, Any],
     expected_outcome_receipt: Mapping[str, Any],
+    expected_strategy: Mapping[str, Any],
+    expected_strategy_sha256: str,
+    verification_schema_version: str,
 ) -> dict[str, Any]:
     try:
-        from app import audited_pit_shallow_gbdt as shallow_gbdt
-
-        expected_strategy = shallow_gbdt.SHALLOW_GBDT_OOF_SPEC
+        expected_strategy = dict(expected_strategy)
         variant = resolve_ranked_liquidity_run_variant(
             expected_strategy
+        )
+        control_name = str(variant.get("control_name") or "amount_baseline")
+        control_sweep_key = f"{control_name}_sweep"
+        control_selection_receipt_key = (
+            f"{control_name}_selection_receipt"
+        )
+        role_separated = (
+            variant.get("selection_evidence_mode") == "role_separated"
         )
         runtime_result = dict(result)
         artifact = dict(runtime_result["artifact"])
@@ -4586,7 +4884,7 @@ def verify_shallow_gbdt_result_bundle(
         if (
             embedded_strategy != expected_strategy
             or embedded_strategy_sha256
-            != shallow_gbdt._SHALLOW_GBDT_OOF_SPEC_SHA256
+            != expected_strategy_sha256
             or main_document.get("strategy_sha256")
             != embedded_strategy_sha256
         ):
@@ -4764,17 +5062,42 @@ def verify_shallow_gbdt_result_bundle(
                 score_contract=score_contract,
             )
         )
-        replayed_selected_by_key = {
-            _selection_trade_key(candidate): candidate
-            for candidate in [
-                *replayed_selection["main_selected"],
-                *replayed_selection["baseline_selected"],
+        replayed_main_selected_evidence = list(
+            replayed_selection["main_selected"]
+        )
+        replayed_control_selected_evidence = list(
+            replayed_selection["baseline_selected"]
+        )
+        if role_separated:
+            if (
+                [
+                    _selection_trade_key(candidate)
+                    for candidate in replayed_main_selected_evidence
+                ]
+                != replayed_selection["main_selection_receipt"][
+                    "selected_trade_keys"
+                ]
+                or [
+                    _selection_trade_key(candidate)
+                    for candidate in replayed_control_selected_evidence
+                ]
+                != replayed_selection["baseline_selection_receipt"][
+                    "selected_trade_keys"
+                ]
+            ):
+                raise ValueError
+        else:
+            replayed_selected_by_key = {
+                _selection_trade_key(candidate): candidate
+                for candidate in [
+                    *replayed_main_selected_evidence,
+                    *replayed_control_selected_evidence,
+                ]
+            }
+            replayed_selected_evidence = [
+                replayed_selected_by_key[key]
+                for key in sorted(replayed_selected_by_key)
             ]
-        }
-        replayed_selected_evidence = [
-            replayed_selected_by_key[key]
-            for key in sorted(replayed_selected_by_key)
-        ]
         replayed_completed = [
             candidate
             for candidate in outcome_candidates
@@ -4930,7 +5253,7 @@ def verify_shallow_gbdt_result_bundle(
             != positive_pool_sha256
             or selection["main_sweep"].get("schema_version")
             != variant["sweep_schema_version"]
-            or selection["amount_baseline_sweep"].get(
+            or selection[control_sweep_key].get(
                 "schema_version"
             )
             != variant["sweep_schema_version"]
@@ -4938,14 +5261,14 @@ def verify_shallow_gbdt_result_bundle(
                 "schema_version"
             )
             != "shallow-gbdt-industry-selection-receipt/v1"
-            or selection[
-                "amount_baseline_selection_receipt"
-            ].get("schema_version")
+            or selection[control_selection_receipt_key].get(
+                "schema_version"
+            )
             != "shallow-gbdt-industry-selection-receipt/v1"
             or main_document.get("main_sweep")
             != selection["main_sweep"]
-            or main_document.get("amount_baseline_sweep")
-            != selection["amount_baseline_sweep"]
+            or main_document.get(control_sweep_key)
+            != selection[control_sweep_key]
         ):
             raise ValueError
         replayed_positive_candidates = replayed_selection[
@@ -4955,20 +5278,20 @@ def verify_shallow_gbdt_result_bundle(
             "positive_pool_receipt"
         ]
         replayed_main_sweep = replayed_selection["main_sweep"]
-        replayed_baseline_sweep = replayed_selection[
+        replayed_control_sweep = replayed_selection[
             "baseline_sweep"
         ]
         replayed_main_receipt = replayed_selection[
             "main_selection_receipt"
         ]
-        replayed_baseline_receipt = replayed_selection[
+        replayed_control_receipt = replayed_selection[
             "baseline_selection_receipt"
         ]
         replayed_advancement = replayed_selection[
             "advancement_gate_passed"
         ]
         replayed_main_row = replayed_main_sweep["top"][0]
-        replayed_baseline_row = replayed_baseline_sweep["top"][0]
+        replayed_control_row = replayed_control_sweep["top"][0]
         replayed_advancement_gate = {
             "main_latest_and_full_quality_passed": bool(
                 replayed_main_row.get("target_all_pass")
@@ -4981,13 +5304,40 @@ def verify_shallow_gbdt_result_bundle(
             "main_evidence_complete": bool(
                 replayed_main_row.get("evidence_complete")
             ),
-            "amount_baseline_evidence_complete": bool(
-                replayed_baseline_row.get("evidence_complete")
+            f"{control_name}_evidence_complete": bool(
+                replayed_control_row.get("evidence_complete")
             ),
             "all_required_gates_passed": replayed_advancement,
             "embargo_consumed": False,
             "final_oos_consumed": False,
         }
+        if role_separated:
+            selection_evidence_matches = bool(
+                selection.get("main_selected_evidence")
+                == replayed_main_selected_evidence
+                and selection.get("main_selected_evidence_sha256")
+                == _sha256(replayed_main_selected_evidence)
+                and selection.get(
+                    f"{control_name}_selected_evidence"
+                )
+                == replayed_control_selected_evidence
+                and selection.get(
+                    f"{control_name}_selected_evidence_sha256"
+                )
+                == _sha256(replayed_control_selected_evidence)
+                and "selected_evidence" not in selection
+                and "selected_evidence_sha256" not in selection
+                and replayed_main_receipt["selected_trade_keys"]
+                == replayed_control_receipt["selected_trade_keys"]
+            )
+        else:
+            selection_evidence_matches = bool(
+                selection.get("selected_evidence")
+                == replayed_selected_evidence
+                and selection.get("selected_evidence_sha256")
+                == _sha256(replayed_selected_evidence)
+                and "main_selected_evidence" not in selection
+            )
         if (
             selection["scored_execution_candidate_evidence"]
             != replayed_scored_evidence
@@ -5004,16 +5354,12 @@ def verify_shallow_gbdt_result_bundle(
                 "positive_candidate_keys_sha256"
             ]
             or selection["main_sweep"] != replayed_main_sweep
-            or selection["amount_baseline_sweep"]
-            != replayed_baseline_sweep
+            or selection[control_sweep_key] != replayed_control_sweep
             or selection["main_selection_receipt"]
             != replayed_main_receipt
-            or selection["amount_baseline_selection_receipt"]
-            != replayed_baseline_receipt
-            or selection["selected_evidence"]
-            != replayed_selected_evidence
-            or selection["selected_evidence_sha256"]
-            != _sha256(replayed_selected_evidence)
+            or selection[control_selection_receipt_key]
+            != replayed_control_receipt
+            or not selection_evidence_matches
             or selection["advancement_gate_passed"]
             is not replayed_advancement
             or main_document.get("scored_execution_candidate_count")
@@ -5044,8 +5390,8 @@ def verify_shallow_gbdt_result_bundle(
             != replayed_positive_pool_receipt["receipt_sha256"]
             or main_document.get("main_sweep")
             != replayed_main_sweep
-            or main_document.get("amount_baseline_sweep")
-            != replayed_baseline_sweep
+            or main_document.get(control_sweep_key)
+            != replayed_control_sweep
             or main_document.get("advancement_gate")
             != replayed_advancement_gate
             or main_document["scope"].get("advancement_gate_passed")
@@ -5054,13 +5400,47 @@ def verify_shallow_gbdt_result_bundle(
                 "shared_candidate_table_sha256"
             )
             != replayed_main_receipt.get("candidate_table_sha256")
+            or (
+                role_separated
+                and (
+                    main_document.get("comparison", {}).get(
+                        "control_name"
+                    )
+                    != control_name
+                    or main_document.get("comparison", {}).get(
+                        "control_performance_is_advancement_gate"
+                    )
+                    is not False
+                    or main_document.get("comparison", {}).get(
+                        "control_evidence_completeness_is_advancement_gate"
+                    )
+                    is not True
+                    or main_document.get("comparison", {}).get(
+                        "same_selected_trade_keys"
+                    )
+                    is not True
+                    or main_document.get("comparison", {}).get(
+                        "main_allocation"
+                    )
+                    != "probability_budget"
+                    or main_document.get("comparison", {}).get(
+                        "control_allocation"
+                    )
+                    != "equal_slot_weight"
+                    or main_document.get("comparison", {}).get(
+                        "unallocated_main_cash_remains_cash"
+                    )
+                    is not True
+                    or "baseline_performance_is_advancement_gate"
+                    in main_document.get("comparison", {})
+                    or "baseline_evidence_completeness_is_advancement_gate"
+                    in main_document.get("comparison", {})
+                )
+            )
         ):
             raise ValueError
         verification = {
-            "schema_version": (
-                "ranked-liquidity-shallow-gbdt-"
-                "result-bundle-verification/v1"
-            ),
+            "schema_version": verification_schema_version,
             "strategy_sha256": embedded_strategy_sha256,
             "producer_root_sha256": main_document["producer_code"][
                 "root_sha256"
@@ -5089,6 +5469,67 @@ def verify_shallow_gbdt_result_bundle(
         raise ValueError(
             "shallow GBDT result bundle verification failed"
         ) from exc
+
+
+def verify_shallow_gbdt_result_bundle(
+    result: Mapping[str, Any],
+    *,
+    tail_features: pd.DataFrame,
+    outcome_candidates: Sequence[Mapping[str, Any]],
+    sessions: Sequence[str],
+    scored_oof: pd.DataFrame,
+    expected_source: Mapping[str, Any],
+    expected_outcome_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    from app import audited_pit_shallow_gbdt as shallow_gbdt
+
+    return _verify_shallow_gbdt_family_result_bundle(
+        result,
+        tail_features=tail_features,
+        outcome_candidates=outcome_candidates,
+        sessions=sessions,
+        scored_oof=scored_oof,
+        expected_source=expected_source,
+        expected_outcome_receipt=expected_outcome_receipt,
+        expected_strategy=shallow_gbdt.SHALLOW_GBDT_OOF_SPEC,
+        expected_strategy_sha256=shallow_gbdt._SHALLOW_GBDT_OOF_SPEC_SHA256,
+        verification_schema_version=(
+            "ranked-liquidity-shallow-gbdt-result-bundle-verification/v1"
+        ),
+    )
+
+
+def verify_shallow_gbdt_probability_budget_result_bundle(
+    result: Mapping[str, Any],
+    *,
+    tail_features: pd.DataFrame,
+    outcome_candidates: Sequence[Mapping[str, Any]],
+    sessions: Sequence[str],
+    scored_oof: pd.DataFrame,
+    expected_source: Mapping[str, Any],
+    expected_outcome_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    from app import audited_pit_shallow_gbdt_probability_budget as probability_budget
+
+    return _verify_shallow_gbdt_family_result_bundle(
+        result,
+        tail_features=tail_features,
+        outcome_candidates=outcome_candidates,
+        sessions=sessions,
+        scored_oof=scored_oof,
+        expected_source=expected_source,
+        expected_outcome_receipt=expected_outcome_receipt,
+        expected_strategy=(
+            probability_budget.SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC
+        ),
+        expected_strategy_sha256=(
+            probability_budget._SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC_SHA256
+        ),
+        verification_schema_version=(
+            "ranked-liquidity-shallow-gbdt-probability-budget-"
+            "result-bundle-verification/v1"
+        ),
+    )
 
 
 def verify_rolling_result_bundle(
@@ -5963,14 +6404,23 @@ def _frozen_variant_strategy_spec(
         raise ValueError("ranked-liquidity model adapter is invalid")
     if adapter.model_id == "continuous_ridge":
         return deepcopy(ROLLING_CONTINUOUS_RIDGE_OOF_SPEC)
+    if adapter.model_id == "shallow_gbdt_utility_logit":
+        from app import audited_pit_shallow_gbdt as shallow_gbdt
 
-    from app import audited_pit_shallow_gbdt as shallow_gbdt
+        frozen_strategy = deepcopy(shallow_gbdt.SHALLOW_GBDT_OOF_SPEC)
+        expected_sha256 = shallow_gbdt._SHALLOW_GBDT_OOF_SPEC_SHA256
+    elif adapter.model_id == "shallow_gbdt_probability_budget":
+        from app import audited_pit_shallow_gbdt_probability_budget as probability_budget
 
-    frozen_strategy = deepcopy(shallow_gbdt.SHALLOW_GBDT_OOF_SPEC)
-    if (
-        _sha256(frozen_strategy)
-        != shallow_gbdt._SHALLOW_GBDT_OOF_SPEC_SHA256
-    ):
+        frozen_strategy = deepcopy(
+            probability_budget.SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC
+        )
+        expected_sha256 = (
+            probability_budget._SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC_SHA256
+        )
+    else:
+        raise ValueError("ranked-liquidity model adapter is unsupported")
+    if _sha256(frozen_strategy) != expected_sha256:
         raise ValueError("ranked-liquidity frozen strategy copy drifted")
     return frozen_strategy
 
@@ -6085,6 +6535,9 @@ def _evaluate_scored_oof_variant(
         strategy_spec=frozen_strategy,
         sweep_schema_version=variant["sweep_schema_version"],
         score_contract=score_contract,
+        apply_position_budget=bool(
+            variant.get("main_apply_position_budget", True)
+        ),
     )
     baseline_sweep, baseline_selection_receipt = _evaluate_fixed_oof(
         positive_candidates,
@@ -6093,9 +6546,12 @@ def _evaluate_scored_oof_variant(
         strategy_spec=frozen_strategy,
         sweep_schema_version=variant["sweep_schema_version"],
         score_contract=score_contract,
+        apply_position_budget=bool(
+            variant.get("baseline_apply_position_budget", True)
+        ),
     )
     selection_spec = frozen_strategy["selection"]
-    main_selected, replayed_main_receipt = (
+    raw_main_selected, replayed_main_receipt = (
         _select_with_industry_cap_receipt(
             positive_candidates,
             rank_mode=variant["main_rank_mode"],
@@ -6106,7 +6562,7 @@ def _evaluate_scored_oof_variant(
             score_contract=score_contract,
         )
     )
-    baseline_selected, replayed_baseline_receipt = (
+    raw_baseline_selected, replayed_baseline_receipt = (
         _select_with_industry_cap_receipt(
             positive_candidates,
             rank_mode=variant["baseline_rank_mode"],
@@ -6117,9 +6573,35 @@ def _evaluate_scored_oof_variant(
             score_contract=score_contract,
         )
     )
+    main_selected, main_allocation_receipt = _selected_for_fixed_oof_metrics(
+        raw_main_selected,
+        strategy_spec=frozen_strategy,
+        score_contract=score_contract,
+        apply_position_budget=bool(
+            variant.get("main_apply_position_budget", True)
+        ),
+    )
+    baseline_selected, baseline_allocation_receipt = (
+        _selected_for_fixed_oof_metrics(
+            raw_baseline_selected,
+            strategy_spec=frozen_strategy,
+            score_contract=score_contract,
+            apply_position_budget=bool(
+                variant.get("baseline_apply_position_budget", True)
+            ),
+        )
+    )
     if (
         replayed_main_receipt != main_selection_receipt
         or replayed_baseline_receipt != baseline_selection_receipt
+        or main_allocation_receipt
+        != main_sweep["top"][0].get(
+            "position_budget_allocation_receipt"
+        )
+        or baseline_allocation_receipt
+        != baseline_sweep["top"][0].get(
+            "position_budget_allocation_receipt"
+        )
     ):
         raise AuditedPITDevelopmentReplayError(
             "ranked-liquidity selection replay differs from evaluation"
@@ -6267,16 +6749,13 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
         raise AuditedPITDevelopmentReplayError(
             "ranked-liquidity replay version is invalid"
         )
-    shallow_gbdt_strategy_schema = (
-        "development-pit-cross-sectional-shallow-gbdt-"
-        "utility-logit-rolling-126-oof/v1"
-    )
     run_variant = (
         resolve_ranked_liquidity_run_variant(strategy_spec)
         if (
             artifact_version == 3
-            and strategy_spec.get("schema_version")
-            == shallow_gbdt_strategy_schema
+            and str(strategy_spec.get("schema_version") or "").startswith(
+                "development-pit-cross-sectional-shallow-gbdt-"
+            )
         )
         else None
     )
@@ -6285,7 +6764,10 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
         if run_variant is not None
         else "continuous_ridge"
     )
-    is_shallow_gbdt = model_id == "shallow_gbdt_utility_logit"
+    is_shallow_gbdt = model_id in {
+        "shallow_gbdt_utility_logit",
+        "shallow_gbdt_probability_budget",
+    }
     expected_strategy_schema = (
         "development-pit-cross-sectional-ranked-liquidity-ridge-oof/v2"
         if artifact_version == 2
@@ -6742,6 +7224,14 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
         main_selected = evaluated["main_selected"]
         baseline_selected = evaluated["baseline_selected"]
         advancement_gate = evaluated["advancement_gate_passed"]
+        control_name = str(run_variant["control_name"])
+        control_sweep_key = f"{control_name}_sweep"
+        control_selection_receipt_key = (
+            f"{control_name}_selection_receipt"
+        )
+        control_selected_key = str(
+            run_variant["control_selected_input_key"]
+        )
         write_progress(
             "oof_scored",
             oof_candidate_count=len(scored_oof),
@@ -6794,15 +7284,15 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
                     "positive_candidates": positive_candidates,
                     "positive_pool_receipt": positive_pool_receipt,
                     "main_sweep": main_sweep,
-                    "amount_baseline_sweep": baseline_sweep,
+                    control_sweep_key: baseline_sweep,
                     "main_selection_receipt": (
                         main_selection_receipt
                     ),
-                    "amount_baseline_selection_receipt": (
+                    control_selection_receipt_key: (
                         baseline_selection_receipt
                     ),
                     "main_selected": main_selected,
-                    "baseline_selected": baseline_selected,
+                    control_selected_key: baseline_selected,
                     "advancement_gate_passed": advancement_gate,
                 },
                 "scope": {
@@ -6841,7 +7331,13 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
             scored_execution_candidates,
         )
         gc.collect()
-        verification = verify_shallow_gbdt_result_bundle(
+        verifier = (
+            verify_shallow_gbdt_probability_budget_result_bundle
+            if run_variant["model_adapter"].model_id
+            == "shallow_gbdt_probability_budget"
+            else verify_shallow_gbdt_result_bundle
+        )
+        verification = verifier(
             result,
             tail_features=tail_features,
             outcome_candidates=outcome_candidates,
@@ -7478,6 +7974,58 @@ def run_audited_pit_ranked_liquidity_shallow_gbdt_rolling_oof(
         end_date=end_date,
         output_dir=output_dir,
         strategy_spec=shallow_gbdt.SHALLOW_GBDT_OOF_SPEC,
+        artifact_version=3,
+        training_window_sessions=training_window_sessions,
+    )
+
+
+def run_audited_pit_ranked_liquidity_shallow_gbdt_probability_budget_rolling_oof(
+    *,
+    settings: Settings,
+    audited_pit_universe_path: str | Path,
+    expected_coverage_audit_sha256: str,
+    expected_artifact_root_sha256: str,
+    temporal_contract_path: str | Path,
+    expected_temporal_contract_sha256: str,
+    security_code_transition_evidence_root: str | Path,
+    expected_security_code_transition_contract_sha256: str,
+    start_date: str,
+    end_date: str,
+    output_dir: str | Path,
+) -> dict[str, Any]:
+    from app import audited_pit_shallow_gbdt_probability_budget as probability_budget
+
+    strategy_spec = probability_budget.SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC
+    if (
+        _sha256(strategy_spec)
+        != probability_budget._SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC_SHA256
+    ):
+        raise AuditedPITDevelopmentReplayError(
+            "shallow GBDT probability budget strategy differs from "
+            "preregistered canonical hash"
+        )
+    training_window_sessions = int(
+        strategy_spec["walk_forward"]["training_window_sessions"]
+    )
+    return _run_audited_pit_ranked_liquidity_ridge_oof(
+        settings=settings,
+        audited_pit_universe_path=audited_pit_universe_path,
+        expected_coverage_audit_sha256=expected_coverage_audit_sha256,
+        expected_artifact_root_sha256=expected_artifact_root_sha256,
+        temporal_contract_path=temporal_contract_path,
+        expected_temporal_contract_sha256=(
+            expected_temporal_contract_sha256
+        ),
+        security_code_transition_evidence_root=(
+            security_code_transition_evidence_root
+        ),
+        expected_security_code_transition_contract_sha256=(
+            expected_security_code_transition_contract_sha256
+        ),
+        start_date=start_date,
+        end_date=end_date,
+        output_dir=output_dir,
+        strategy_spec=strategy_spec,
         artifact_version=3,
         training_window_sessions=training_window_sessions,
     )

@@ -11,6 +11,7 @@ import pytest
 
 from app import audited_pit_continuous_ridge_oof as ridge
 from app import audited_pit_shallow_gbdt as shallow_gbdt
+from app import audited_pit_shallow_gbdt_probability_budget as probability_budget
 
 
 _SESSIONS = pd.bdate_range(
@@ -285,6 +286,132 @@ def _build_payloads(
     )
 
 
+def _probability_budget_shared_receipts(
+    candidates: list[dict] | None = None,
+    *,
+    sessions: list[str] | None = None,
+) -> dict:
+    session_dates = sessions or _SESSIONS
+    shared = deepcopy(_shared_receipts(candidates, sessions=session_dates))
+    evaluated = ridge._evaluate_scored_oof_variant(
+        scored_execution_candidates=shared["selection"][
+            "scored_execution_candidates"
+        ],
+        sessions=session_dates,
+        strategy_spec=probability_budget.SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC,
+    )
+    control_sweep = evaluated.pop("baseline_sweep")
+    control_receipt = evaluated.pop("baseline_selection_receipt")
+    control_selected = evaluated.pop("baseline_selected")
+    shared["selection"] = {
+        **evaluated,
+        "equal_weight_control_sweep": control_sweep,
+        "equal_weight_control_selection_receipt": control_receipt,
+        "equal_weight_control_selected": control_selected,
+    }
+    outcome_receipt = shared["execution"]["outcome_receipt"]
+    outcome_receipt["schema_version"] = (
+        "ranked-liquidity-shallow-gbdt-probability-budget-"
+        "strict-outcome/v1"
+    )
+    unsigned_outcome_receipt = {
+        key: value
+        for key, value in outcome_receipt.items()
+        if key != "receipt_sha256"
+    }
+    outcome_receipt["receipt_sha256"] = ridge._sha256(
+        unsigned_outcome_receipt
+    )
+    shared["scope"]["advancement_gate_passed"] = shared["selection"][
+        "advancement_gate_passed"
+    ]
+    return shared
+
+
+def _build_probability_budget_payloads(
+    candidates: list[dict] | None = None,
+    *,
+    sessions: list[str] | None = None,
+) -> dict:
+    return ridge.build_ranked_liquidity_result_payloads(
+        strategy_spec=(
+            probability_budget.SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC
+        ),
+        shared_receipts=_probability_budget_shared_receipts(
+            candidates,
+            sessions=sessions,
+        ),
+    )
+
+
+def _probability_budget_bundle_with_fake_oof_replay(
+    monkeypatch,
+    tmp_path: Path,
+) -> tuple[dict, dict]:
+    shared = _probability_budget_shared_receipts()
+    payloads = ridge.build_ranked_liquidity_result_payloads(
+        strategy_spec=(
+            probability_budget.SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC
+        ),
+        shared_receipts=shared,
+    )
+    bundle = ridge._write_result_bundle(
+        tmp_path / "probability-budget-bundle",
+        main_payload=payloads["main_payload"],
+        sidecar_payloads=payloads["sidecar_payloads"],
+        expected_producer_code=payloads["producer_code"],
+    )
+
+    def fake_independent_replay(
+        tail_features,
+        outcome_candidates,
+        sessions,
+        scored_oof,
+        receipt,
+        **kwargs,
+    ):
+        return {
+            "verified": True,
+            "receipt_sha256": receipt["receipt_sha256"],
+            "fold_count": receipt["fold_count"],
+            "oof_candidate_count": 4,
+        }
+
+    monkeypatch.setattr(
+        ridge,
+        "_verify_shallow_gbdt_result_bundle_oof_replay",
+        fake_independent_replay,
+    )
+    candidates = _scored_candidates()
+    return bundle, {
+        "tail_features": pd.DataFrame(),
+        "outcome_candidates": [
+            ridge._outcome_payload_from_scored_candidate(
+                candidate,
+                score_contract=shallow_gbdt.SHALLOW_GBDT_SCORE_CONTRACT,
+            )
+            for candidate in candidates
+        ],
+        "sessions": _SESSIONS,
+        "scored_oof": pd.DataFrame(
+            [
+                {
+                    "candidate_key": candidate["candidate_key"],
+                    "signal_date": candidate["signal_date"],
+                    "predicted_positive_utility_probability": candidate[
+                        "predicted_positive_utility_probability"
+                    ],
+                }
+                for candidate in candidates
+            ]
+        ),
+        "expected_source": shared["source"],
+        "expected_outcome_receipt": shared["execution"][
+            "outcome_receipt"
+        ],
+    }
+
+
 def _replay_inputs(*, sessions: list[str] | None = None) -> dict:
     candidates = _scored_candidates()
     shared = _shared_receipts(candidates, sessions=sessions)
@@ -535,6 +662,90 @@ def test_shallow_gbdt_variant_payload_builder_uses_frozen_schemas_and_probabilit
     ] == int(
         shallow_gbdt.SHALLOW_GBDT_OOF_SPEC["required_oof_fold_count"]
     )
+
+
+def test_probability_budget_payload_builder_preserves_role_separated_selection_evidence():
+    payloads = _build_probability_budget_payloads()
+    selection = payloads["sidecar_payloads"]["selection"]
+
+    assert payloads["main_payload"]["schema_version"] == (
+        "ranked-liquidity-shallow-gbdt-probability-budget-result/v1"
+    )
+    assert "amount_baseline_sweep" not in payloads["main_payload"]
+    assert "selected_evidence" not in selection
+    assert "main_selected_evidence" in selection
+    assert "equal_weight_control_selected_evidence" in selection
+    assert [
+        ridge._selection_trade_key(candidate)
+        for candidate in selection["main_selected_evidence"]
+    ] == [
+        ridge._selection_trade_key(candidate)
+        for candidate in selection["equal_weight_control_selected_evidence"]
+    ]
+    assert all(
+        "position_budget_fraction" in candidate
+        for candidate in selection["main_selected_evidence"]
+    )
+    assert all(
+        "position_budget_fraction" not in candidate
+        for candidate in selection["equal_weight_control_selected_evidence"]
+    )
+    comparison = payloads["main_payload"]["comparison"]
+    assert comparison["control_performance_is_advancement_gate"] is False
+    assert comparison["control_evidence_completeness_is_advancement_gate"] is True
+    assert "baseline_performance_is_advancement_gate" not in comparison
+    assert "baseline_evidence_completeness_is_advancement_gate" not in comparison
+
+
+def test_probability_budget_result_bundle_replays_role_separated_allocations(
+    monkeypatch,
+    tmp_path: Path,
+):
+    bundle, replay_inputs = _probability_budget_bundle_with_fake_oof_replay(
+        monkeypatch,
+        tmp_path,
+    )
+
+    verified = ridge.verify_shallow_gbdt_probability_budget_result_bundle(
+        bundle,
+        **replay_inputs,
+    )
+
+    assert verified["verified"] is True
+    assert verified["schema_version"] == (
+        "ranked-liquidity-shallow-gbdt-probability-budget-"
+        "result-bundle-verification/v1"
+    )
+
+
+def test_probability_budget_result_bundle_rejects_rewritten_allocation_evidence(
+    monkeypatch,
+    tmp_path: Path,
+):
+    bundle, replay_inputs = _probability_budget_bundle_with_fake_oof_replay(
+        monkeypatch,
+        tmp_path,
+    )
+
+    def mutate_selection(selection: dict) -> None:
+        selected = selection["main_selected_evidence"]
+        selected[0]["position_budget_fraction"] = 0.2
+        selection["main_selected_evidence_sha256"] = ridge._sha256(selected)
+
+    tampered = _tamper_selection_bundle(
+        bundle,
+        tmp_path,
+        mutate_selection=mutate_selection,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="shallow GBDT result bundle verification failed",
+    ):
+        ridge.verify_shallow_gbdt_probability_budget_result_bundle(
+            tampered,
+            **replay_inputs,
+        )
 
 
 def test_shallow_gbdt_payload_builder_rejects_positive_candidates_that_do_not_match_strict_score_gate():
