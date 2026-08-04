@@ -23,9 +23,9 @@ class FormalRunSpecError(RuntimeError):
 
 
 FORMAL_WORKTREE_ROOT = Path(
-    r"E:\AI workspace\quant-signal-lkj-factor-v3-daily-basic-formal-run-v2"
+    r"E:\AI workspace\quant-signal-lkj-factor-v3-daily-basic-formal-run-v3"
 )
-EXPECTED_BRANCH = "codex/factor-v3-daily-basic-formal-run-v2"
+EXPECTED_BRANCH = "codex/factor-v3-daily-basic-formal-run-v3"
 FORMAL_REVIEW_SOURCE_RELATIVE_PATHS = (
     "scripts/build_factor_v3_daily_basic_formal_run_spec.py",
     "scripts/run_factor_v3_daily_basic_formal.py",
@@ -126,12 +126,12 @@ FORMAL_REVIEW_SOURCE_RELATIVE_PATHS = (
 )
 FORMAL_REVIEW_RECEIPT_ROOT = (
     MAIN_REPO_ROOT
-    / "data/research_artifacts/factor_v3_daily_basic_formal_review_v1"
+    / "data/research_artifacts/factor_v3_daily_basic_formal_review_v3"
     / "review_receipts/sha256"
 )
 FORMAL_BOOTSTRAP_CLAIM_ROOT = (
     MAIN_REPO_ROOT
-    / "data/research_artifacts/factor_v3_daily_basic_formal_review_v1"
+    / "data/research_artifacts/factor_v3_daily_basic_formal_review_v3"
     / "bootstrap_claims/sha256"
 )
 FORMAL_REVIEW_PUBLIC_KEY_PATH = (
@@ -156,7 +156,7 @@ PLANNED_RUN_ROOT = (
     MAIN_REPO_ROOT
     / "data"
     / "research_runs"
-    / "audited_pit_factor_v3_daily_basic_collection_v2_development_733"
+    / "audited_pit_factor_v3_daily_basic_collection_v3_development_733"
 )
 FEATURE_HISTORY_ATTESTATION_SHA256 = (
     "830dfd19373accfca7358e09f2a2084a42ab517ca518f436713bb9926be07d11"

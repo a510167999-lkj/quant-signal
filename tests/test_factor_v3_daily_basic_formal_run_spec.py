@@ -400,7 +400,7 @@ def test_formal_paths_and_authority_inputs_are_frozen_exactly() -> None:
     assert formal.PLANNED_RUN_ROOT == (
         main
         / "data/research_runs"
-        / "audited_pit_factor_v3_daily_basic_collection_v2_development_733"
+        / "audited_pit_factor_v3_daily_basic_collection_v3_development_733"
     )
     assert formal.EXACT_SET_AUTHORITY_INPUTS == {
         "feature_history_frozen_source_attestation_path": str(
@@ -819,7 +819,7 @@ def test_formal_worktree_requires_external_content_addressed_anchor() -> None:
     assert not hasattr(formal, "FORMAL_REVIEW_RECEIPT_SHA256")
     assert formal.FORMAL_REVIEW_RECEIPT_ROOT == (
         formal.MAIN_REPO_ROOT
-        / "data/research_artifacts/factor_v3_daily_basic_formal_review_v1"
+        / "data/research_artifacts/factor_v3_daily_basic_formal_review_v3"
         / "review_receipts/sha256"
     )
     assert formal.FORMAL_REVIEW_PUBLIC_KEY_PATH == (
