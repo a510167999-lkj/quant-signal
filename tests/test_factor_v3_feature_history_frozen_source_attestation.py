@@ -1259,47 +1259,6 @@ def test_frozen_result_rejects_noncanonical_producer_binding(
         frozen._validated_frozen_result(result)
 
 
-def test_pinned_executable_rejects_reparse_in_any_parent_component(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    parent = tmp_path / "blocked-parent"
-    parent.mkdir()
-    executable = parent / "python.exe"
-    executable.write_bytes(b"fixed executable")
-    original = raw_authority._path_is_link_or_reparse
-    monkeypatch.setattr(
-        raw_authority,
-        "_path_is_link_or_reparse",
-        lambda candidate: Path(candidate) == parent or original(Path(candidate)),
-    )
-
-    with pytest.raises(ValueError, match="link|reparse|executable"):
-        frozen._read_pinned_executable(
-            executable,
-            expected_sha256=_sha(executable.read_bytes()),
-            label="python",
-        )
-
-
-def test_frozen_result_rejects_noncanonical_producer_binding(
-    tmp_path: Path,
-) -> None:
-    spec_path = tmp_path / "feature-spec.json"
-    spec_path.write_bytes(b"{}")
-    run_root = tmp_path / "feature-run"
-    run_root.mkdir()
-    result = _safe_verifier_result(
-        source_root=tmp_path,
-        spec_path=spec_path,
-        run_root=run_root,
-    )
-    result["producer_binding"]["extra"] = "unbound"
-
-    with pytest.raises(ValueError, match="producer binding"):
-        frozen._validated_frozen_result(result)
-
-
 def test_direct_file_read_rejects_reparse_in_any_parent_component(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1335,44 +1294,6 @@ def test_attestation_cas_rejects_intermediate_reparse_and_postverifies(
         raw_authority,
         "_path_is_link_or_reparse",
         lambda candidate: Path(candidate) == kind_root or original_reparse(Path(candidate)),
-    )
-
-    with pytest.raises(ValueError, match="link|reparse"):
-        frozen._write_attestation(output_root, {"safe": True})
-
-    monkeypatch.setattr(
-        raw_authority,
-        "_path_is_link_or_reparse",
-        original_reparse,
-    )
-    reads = 0
-    original_read = raw_authority._read_safe_file
-
-    def counted_read(*args: Any, **kwargs: Any) -> bytes:
-        nonlocal reads
-        reads += 1
-        return original_read(*args, **kwargs)
-
-    monkeypatch.setattr(raw_authority, "_read_safe_file", counted_read)
-    frozen._write_attestation(output_root, {"safe": True})
-    assert reads >= 1
-
-
-def test_attestation_cas_rejects_intermediate_reparse_and_postverifies(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    output_root = (tmp_path / "attestations").resolve()
-    output_root.mkdir()
-    kind_root = output_root / frozen._ATTESTATION_KIND
-    original_reparse = raw_authority._path_is_link_or_reparse
-    monkeypatch.setattr(
-        raw_authority,
-        "_path_is_link_or_reparse",
-        lambda candidate: (
-            Path(candidate) == kind_root
-            or original_reparse(Path(candidate))
-        ),
     )
 
     with pytest.raises(ValueError, match="link|reparse"):

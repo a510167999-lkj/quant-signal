@@ -406,13 +406,13 @@ def test_formal_paths_and_authority_inputs_are_frozen_exactly() -> None:
         "feature_history_frozen_source_attestation_path": str(
             main
             / "data/research_artifacts"
-            / "factor_v3_feature_history_frozen_source_attestation_v3"
+            / "factor_v3_feature_history_frozen_source_attestation_v5"
             / "factor_v3_feature_history_frozen_source_attestations"
-            / "sha256/68"
-            / "68d08661ee0f7a1e216c5ec4c9cbb49ea35193488b1cd50b276e9d72eb9ef675.json"
+            / "sha256/83"
+            / "830dfd19373accfca7358e09f2a2084a42ab517ca518f436713bb9926be07d11.json"
         ),
         "expected_feature_history_frozen_source_attestation_sha256": (
-            "68d08661ee0f7a1e216c5ec4c9cbb49ea35193488b1cd50b276e9d72eb9ef675"
+            "830dfd19373accfca7358e09f2a2084a42ab517ca518f436713bb9926be07d11"
         ),
         "feature_history_frozen_source_root": (
             r"E:\AI workspace\quant-signal-lkj-factor-v3-feature-history-formal-run"

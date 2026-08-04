@@ -35,6 +35,15 @@ FROZEN_FEATURE_RUN_ROOT = Path(
     r"E:\AI workspace\quant-signal-lkj\data\research_runs"
     r"\audited_pit_factor_v3_feature_history_collection_v1_development_prewindow_250"
 )
+FROZEN_FEATURE_RUN_STATE_PATH = Path(
+    r"E:\AI workspace\quant-signal-lkj\data\research_artifacts"
+    r"\factor_v3_feature_history_state_snapshot_v1\states\sha256\fd"
+    r"\fdd90bd58dbd041dde750bff22cc0cf330a09b21030b304c7857bef1a8435c21.json"
+)
+FROZEN_FEATURE_RUN_STATE_BYTES = 2996
+FROZEN_FEATURE_RUN_STATE_SHA256 = (
+    "fdd90bd58dbd041dde750bff22cc0cf330a09b21030b304c7857bef1a8435c21"
+)
 _FROZEN_PRODUCER_SOURCE_MANIFEST = tuple(
     {"relative_path": relative_path}
     for relative_path in (
@@ -79,7 +88,7 @@ ATTESTATION_PUBLICATION_SCHEMA = (
     "factor-v3-feature-history-frozen-source-attestation-publication/v1"
 )
 _ATTESTATION_KIND = "factor_v3_feature_history_frozen_source_attestations"
-_ATTESTOR_VERSION = "app.factor_v3_feature_history_frozen_source_attestation/2"
+_ATTESTOR_VERSION = "app.factor_v3_feature_history_frozen_source_attestation/3"
 _ATTESTOR_RELATIVE_PATHS = (
     "app/__init__.py",
     "app/audited_pit_factor_v3_feature_history_authority.py",
@@ -825,15 +834,18 @@ if sys.flags.isolated != 1 or not sys.dont_write_bytecode:
 source_root = Path(sys.argv[1]).resolve(strict=True)
 spec_path = Path(sys.argv[2]).resolve(strict=True)
 run_root = Path(sys.argv[3]).resolve(strict=True)
-pycache_root = Path(sys.argv[4]).resolve(strict=True)
+state_snapshot_path = Path(sys.argv[4]).resolve(strict=True)
+expected_state_sha256 = sys.argv[5]
+expected_state_bytes = int(sys.argv[6])
+pycache_root = Path(sys.argv[7]).resolve(strict=True)
 if (
     sys.pycache_prefix is None
     or Path(sys.pycache_prefix).resolve(strict=True) != pycache_root
     or next(pycache_root.iterdir(), None) is not None
 ):
     raise RuntimeError("frozen verifier pycache isolation rejected")
-expected_physical = json.loads(sys.argv[5])
-expected_physical_count = int(sys.argv[6])
+expected_physical = json.loads(sys.argv[8])
+expected_physical_count = int(sys.argv[9])
 if (
     type(expected_physical) is not list
     or expected_physical_count <= 0
@@ -892,6 +904,85 @@ def direct_source(relative_path, expected_bytes, expected_sha256):
     ):
         raise RuntimeError("frozen verifier source binding rejected")
     return path
+
+def read_state_snapshot(path, expected_bytes, expected_sha256):
+    current = Path(path.anchor)
+    for index, part in enumerate(path.parts[1:]):
+        current /= part
+        metadata = current.lstat()
+        is_reparse = current.is_symlink() or bool(
+            int(getattr(metadata, "st_file_attributes", 0)) & 0x400
+        )
+        if is_reparse:
+            raise RuntimeError("frozen verifier state snapshot reparse rejected")
+        if index < len(path.parts[1:]) - 1 and not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError("frozen verifier state snapshot parent rejected")
+    before = path.lstat()
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or int(getattr(before, "st_nlink", 1)) != 1
+        or before.st_size != expected_bytes
+    ):
+        raise RuntimeError("frozen verifier state snapshot rejected")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        raw = bytearray()
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                raise RuntimeError("frozen verifier state snapshot size rejected")
+            raw.extend(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise RuntimeError("frozen verifier state snapshot size rejected")
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    path_after = path.lstat()
+    if (
+        not os.path.samestat(before, opened)
+        or not os.path.samestat(opened, after)
+        or not os.path.samestat(after, path_after)
+        or len(raw) != expected_bytes
+        or hashlib.sha256(raw).hexdigest() != expected_sha256
+    ):
+        raise RuntimeError("frozen verifier state snapshot binding rejected")
+    return bytes(raw)
+
+def strict_state_json(raw):
+    canonical_raw = raw[:-1] if raw.endswith(b"\n") else raw
+    if canonical_raw.endswith(b"\r"):
+        raise RuntimeError("frozen verifier state snapshot rejected")
+    def pairs(items):
+        value = {}
+        for key, item in items:
+            if key in value:
+                raise RuntimeError("frozen verifier state snapshot rejected")
+            value[key] = item
+        return value
+    value = json.loads(
+        canonical_raw,
+        object_pairs_hook=pairs,
+        parse_constant=lambda _value: (_ for _ in ()).throw(
+            RuntimeError("frozen verifier state snapshot rejected")
+        ),
+    )
+    if json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8") != canonical_raw:
+        raise RuntimeError("frozen verifier state snapshot rejected")
+    return value
 
 source_paths = {
     item["relative_path"]: direct_source(
@@ -964,10 +1055,12 @@ with existing_read_only_run_lock(paths["lock"]):
     spec = runner.load_factor_v3_feature_history_run_spec(spec_path)
     runner._verify_plan(spec)
     state = runner._validated_state(
-        runner._read_json_file(
-            paths["state"],
-            label="run state",
-            max_bytes=runner._MAX_STATE_BYTES,
+        strict_state_json(
+            read_state_snapshot(
+                state_snapshot_path,
+                expected_state_bytes,
+                expected_state_sha256,
+            ),
         ),
         run_spec_sha256=spec["run_spec_sha256"],
     )
@@ -1050,6 +1143,26 @@ def _run_frozen_verifier(
         FROZEN_PRODUCER_RELATIVE_PATHS
     ):
         raise ValueError("factor-v3 frozen-source physical binding rejected")
+    if feature_history_run_root.resolve(strict=True) == FROZEN_FEATURE_RUN_ROOT.resolve(strict=True):
+        state_snapshot_path = FROZEN_FEATURE_RUN_STATE_PATH
+        state_snapshot_sha256 = FROZEN_FEATURE_RUN_STATE_SHA256
+        state_snapshot_bytes = FROZEN_FEATURE_RUN_STATE_BYTES
+    else:
+        state_snapshot_path = (feature_history_run_root / "state.json").resolve()
+        if state_snapshot_path.is_file():
+            state_snapshot_raw = _read_direct_file(
+                state_snapshot_path,
+                label="feature run state snapshot",
+                max_bytes=_MAX_ATTESTATION_BYTES,
+            )
+            state_snapshot_sha256 = _sha256(state_snapshot_raw)
+            state_snapshot_bytes = len(state_snapshot_raw)
+        else:
+            # The executable-binding unit tests replace subprocess.run and do
+            # not need a real run state; the isolated child still rejects this
+            # deliberately absent snapshot before using any state.
+            state_snapshot_sha256 = _sha256(b"")
+            state_snapshot_bytes = 0
     with tempfile.TemporaryDirectory(prefix="factor-v3-frozen-pycache-") as temporary:
         pycache_root = Path(temporary) / "pycache"
         pycache_root.mkdir()
@@ -1071,6 +1184,9 @@ def _run_frozen_verifier(
                         str(frozen_source_root),
                         str(feature_history_run_spec_path),
                         str(feature_history_run_root),
+                        str(state_snapshot_path),
+                        state_snapshot_sha256,
+                        str(state_snapshot_bytes),
                         str(pycache_root),
                         _canonical_bytes(physical_files).decode("utf-8"),
                         str(len(physical_files)),
@@ -1361,6 +1477,47 @@ def _validated_attestation(
     return value
 
 
+def _read_frozen_feature_run_state(
+    *,
+    run_spec_sha256: str,
+) -> dict[str, Any]:
+    from app import factor_v3_feature_history_runner as runner
+
+    path = Path(FROZEN_FEATURE_RUN_STATE_PATH).resolve(strict=True)
+    expected_tail = (
+        "states",
+        "sha256",
+        FROZEN_FEATURE_RUN_STATE_SHA256[:2],
+        f"{FROZEN_FEATURE_RUN_STATE_SHA256}.json",
+    )
+    if tuple(path.parts[-4:]) != expected_tail:
+        raise ValueError("factor-v3 frozen-source state snapshot path rejected")
+    raw = _read_direct_file(
+        path,
+        label="feature run state snapshot",
+        max_bytes=runner._MAX_STATE_BYTES,
+    )
+    if (
+        len(raw) != FROZEN_FEATURE_RUN_STATE_BYTES
+        or _sha256(raw) != FROZEN_FEATURE_RUN_STATE_SHA256
+    ):
+        raise ValueError("factor-v3 frozen-source state snapshot rejected")
+    canonical_raw = raw[:-1] if raw.endswith(b"\n") else raw
+    if canonical_raw.endswith(b"\r"):
+        raise ValueError("factor-v3 frozen-source state snapshot rejected")
+    state = runner._validated_state(
+        _strict_json(canonical_raw, label="feature run state snapshot"),
+        run_spec_sha256=run_spec_sha256,
+    )
+    if (
+        state["status"] != "verified"
+        or state["completed_session_count"] != 250
+        or type(state["receipt"]) is not dict
+    ):
+        raise ValueError("factor-v3 frozen-source state snapshot rejected")
+    return state
+
+
 def _validated_attested_authority_binding(
     *,
     feature_history_run_spec_path: Path,
@@ -1373,20 +1530,9 @@ def _validated_attested_authority_binding(
 
     spec = runner.load_factor_v3_feature_history_run_spec(feature_history_run_spec_path)
     paths = runner._run_paths(feature_history_run_root, create=False)
-    state = runner._validated_state(
-        runner._read_json_file(
-            paths["state"],
-            label="run state",
-            max_bytes=runner._MAX_STATE_BYTES,
-        ),
+    state = _read_frozen_feature_run_state(
         run_spec_sha256=spec["run_spec_sha256"],
     )
-    if (
-        state["status"] != "verified"
-        or state["completed_session_count"] != 250
-        or type(state["receipt"]) is not dict
-    ):
-        raise ValueError("factor-v3 frozen-source run state rejected")
     publication = runner._validated_publication(state["collection_publication"])
     manifest = authority._validated_collection_manifest(
         authority._read_collection_manifest(
@@ -1538,12 +1684,7 @@ def _replay_current_feature_history(
 
     spec = runner.load_factor_v3_feature_history_run_spec(feature_history_run_spec_path)
     paths = runner._run_paths(feature_history_run_root, create=False)
-    state = runner._validated_state(
-        runner._read_json_file(
-            paths["state"],
-            label="run state",
-            max_bytes=runner._MAX_STATE_BYTES,
-        ),
+    state = _read_frozen_feature_run_state(
         run_spec_sha256=spec["run_spec_sha256"],
     )
     publication = runner._validated_publication(state["collection_publication"])
