@@ -859,6 +859,12 @@ def _publish_receipt(
             "replayed_runtime_verification_matches": True,
             "point_in_time_development_scope_preserved": True,
         },
+        "post_verification_authority": {
+            "development_statistical_interpretation_allowed": True,
+            "profile_registration_authority": False,
+            "production_recommendation_authority": False,
+            "automatic_trading_authority": False,
+        },
         "scope": {
             "point_in_time": True,
             "development_only": True,
@@ -901,6 +907,10 @@ def _record_status(
             else None
         ),
         "error_type": error_type,
+        "development_statistical_interpretation_allowed": verified,
+        "profile_registration_authority": False,
+        "production_recommendation_authority": False,
+        "automatic_trading_authority": False,
         "development_only": True,
         "embargo_consumed": False,
         "final_oos_consumed": False,

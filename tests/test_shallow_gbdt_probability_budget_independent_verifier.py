@@ -366,6 +366,12 @@ def test_publish_receipt_does_not_change_formal_completion(tmp_path: Path) -> No
     payload = json.loads(receipt["path"].read_text(encoding="utf-8"))
     assert payload["scope"]["production_authority"] is False
     assert payload["resource_contract"]["memory_policy"] == "unbounded"
+    assert payload["post_verification_authority"] == {
+        "development_statistical_interpretation_allowed": True,
+        "profile_registration_authority": False,
+        "production_recommendation_authority": False,
+        "automatic_trading_authority": False,
+    }
 
 
 def test_run_records_failure_without_receipt(monkeypatch, tmp_path: Path) -> None:
@@ -427,6 +433,8 @@ def test_run_publishes_terminal_receipt_after_exact_replay(monkeypatch, tmp_path
         (inputs["run_root"] / verifier.STATUS_NAME).read_text(encoding="utf-8")
     )
     assert status["verified"] is True
+    assert status["development_statistical_interpretation_allowed"] is True
+    assert status["profile_registration_authority"] is False
     assert status["receipt"]["sha256"] == result["receipt_sha256"]
     assert not (inputs["run_root"] / verifier.CLAIM_NAME).exists()
 
