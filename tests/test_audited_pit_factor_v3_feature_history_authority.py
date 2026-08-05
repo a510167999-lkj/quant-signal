@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 import hashlib
@@ -757,6 +757,121 @@ def test_windows_bound_delete_uses_exact_boolean_disposition_field() -> None:
     source = inspect.getsource(history_authority._windows_mark_handle_for_deletion)
 
     assert '"delete_file", ctypes.c_ubyte' in source
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows descriptor-bound staging")
+def test_windows_bound_snapshot_staging_creation_blocks_rename(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "snapshot-output"
+    root.mkdir()
+
+    with history_authority._snapshot_directory_chain_guard(root, root) as anchor:
+        staging, handle = (
+            history_authority._windows_create_bound_snapshot_staging_directory(
+                root=root,
+                root_anchor=anchor,
+            )
+        )
+        try:
+            with pytest.raises(PermissionError):
+                os.replace(staging, root / "foreign-staging")
+            assert staging.is_dir()
+        finally:
+            history_authority._windows_close_handle(handle)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows descriptor-bound staging")
+def test_snapshot_capture_keeps_bound_staging_rename_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, _publication, _sessions, store, _refs, _database_sha256 = (
+        _real_store_fixture(tmp_path, monkeypatch)
+    )
+    output_root = tmp_path / "collection-publication"
+    output_root.mkdir()
+    original_copy = history_authority._copy_snapshot_member
+    rename_blocked = False
+
+    def copy_while_staging_is_bound(**kwargs: object) -> dict[str, object]:
+        nonlocal rename_blocked
+        staging = next(
+            output_root.glob(".feature-history-snapshot-*.partial")
+        )
+        with pytest.raises(PermissionError):
+            os.replace(staging, output_root / "foreign-staging")
+        rename_blocked = True
+        return original_copy(**kwargs)
+
+    monkeypatch.setattr(
+        history_authority,
+        "_copy_snapshot_member",
+        copy_while_staging_is_bound,
+    )
+    snapshot = history_authority._capture_feature_history_snapshot(
+        pit_store_root=store.root,
+        output_root=output_root,
+        sessions=plan["prewindow"]["sessions"],
+        temporal_partition_contract=load_temporal_partition_contract(
+            PARTITION_V1_PATH
+        ),
+    )
+
+    assert rename_blocked is True
+    assert snapshot["replay"]["raw_artifact_count"] > 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows descriptor-bound staging")
+def test_snapshot_staging_guard_exit_reclaims_bound_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, _publication, _sessions, store, _refs, _database_sha256 = (
+        _real_store_fixture(tmp_path, monkeypatch)
+    )
+    output_root = tmp_path / "collection-publication"
+    output_root.mkdir()
+    original_guard = history_authority._snapshot_directory_chain_guard
+    original_create = (
+        history_authority._windows_create_bound_snapshot_staging_directory
+    )
+    staging_paths: list[Path] = []
+
+    def track_staging_creation(**kwargs: object) -> tuple[Path, int]:
+        staging, handle = original_create(**kwargs)
+        staging_paths.append(staging)
+        return staging, handle
+
+    @contextmanager
+    def reject_root_guard_exit(root: Path, directory: Path):
+        with original_guard(root, directory) as anchor:
+            yield anchor
+        if root == directory:
+            raise ValueError("factor-v3 feature history snapshot path drifted")
+
+    monkeypatch.setattr(
+        history_authority,
+        "_windows_create_bound_snapshot_staging_directory",
+        track_staging_creation,
+    )
+    monkeypatch.setattr(
+        history_authority,
+        "_snapshot_directory_chain_guard",
+        reject_root_guard_exit,
+    )
+    with pytest.raises(ValueError, match="path drifted"):
+        history_authority._capture_feature_history_snapshot(
+            pit_store_root=store.root,
+            output_root=output_root,
+            sessions=plan["prewindow"]["sessions"],
+            temporal_partition_contract=load_temporal_partition_contract(
+                PARTITION_V1_PATH
+            ),
+        )
+
+    assert len(staging_paths) == 1
+    assert not staging_paths[0].exists()
 
 
 def test_collection_manifest_write_failure_leaves_no_partial_content_address_target(
@@ -1981,11 +2096,19 @@ def test_existing_snapshot_is_flushed_before_postrename_failure_reuse(
         staging: Path,
         final_root: Path,
         final_parent_anchor: int,
+        bound_source_handle: int | None = None,
     ) -> None:
-        del final_parent_anchor
         nonlocal promotion_attempts
         promotion_attempts += 1
-        os.rename(staging, final_root)
+        if bound_source_handle is None:
+            os.rename(staging, final_root)
+        else:
+            history_authority._windows_promote_bound_handle(
+                source_handle=bound_source_handle,
+                final_root=final_root,
+                final_parent_anchor=final_parent_anchor,
+                expected_directory=True,
+            )
         raise ValueError(
             "factor-v3 feature history snapshot promotion rejected"
         )

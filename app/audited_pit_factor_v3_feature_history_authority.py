@@ -724,11 +724,20 @@ def _promote_snapshot_directory(
     staging: Path,
     final_root: Path,
     final_parent_anchor: int,
+    bound_source_handle: int | None = None,
 ) -> None:
     if final_root.name in {"", ".", ".."} or final_root.parent == final_root:
         raise ValueError(
             "factor-v3 feature history snapshot path rejected"
         )
+    if os.name == "nt" and bound_source_handle is not None:
+        _windows_promote_bound_handle(
+            source_handle=bound_source_handle,
+            final_root=final_root,
+            final_parent_anchor=final_parent_anchor,
+            expected_directory=True,
+        )
+        return
     if os.name != "nt":
         import ctypes
         import errno
@@ -903,6 +912,18 @@ def _promote_snapshot_directory(
         close_handle(source_handle)
 
 
+def _windows_close_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    if not close_handle(handle):
+        raise OSError(ctypes.get_last_error(), "bound handle close rejected")
+
+
 def _windows_mark_handle_for_deletion(handle: int) -> None:
     import ctypes
     from ctypes import wintypes
@@ -927,6 +948,158 @@ def _windows_mark_handle_for_deletion(handle: int) -> None:
         ctypes.sizeof(disposition),
     ):
         raise OSError(ctypes.get_last_error(), "bound temporary deletion rejected")
+
+
+def _windows_create_bound_snapshot_staging_directory(
+    *,
+    root: Path,
+    root_anchor: int,
+) -> tuple[Path, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    class _UnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.USHORT),
+            ("maximum_length", wintypes.USHORT),
+            ("buffer", wintypes.LPWSTR),
+        ]
+
+    class _ObjectAttributes(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.ULONG),
+            ("root_directory", wintypes.HANDLE),
+            ("object_name", ctypes.POINTER(_UnicodeString)),
+            ("attributes", wintypes.ULONG),
+            ("security_descriptor", wintypes.LPVOID),
+            ("security_quality_of_service", wintypes.LPVOID),
+        ]
+
+    class _IoStatusValue(ctypes.Union):
+        _fields_ = [
+            ("status", wintypes.LONG),
+            ("pointer", wintypes.LPVOID),
+        ]
+
+    class _IoStatusBlock(ctypes.Structure):
+        _anonymous_ = ("value",)
+        _fields_ = [
+            ("value", _IoStatusValue),
+            ("information", ctypes.c_size_t),
+        ]
+
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("reparse_tag", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    get_information = kernel32.GetFileInformationByHandleEx
+    get_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    get_information.restype = wintypes.BOOL
+    set_handle_information = kernel32.SetHandleInformation
+    set_handle_information.argtypes = (
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    )
+    set_handle_information.restype = wintypes.BOOL
+    nt_create_file = ntdll.NtCreateFile
+    nt_create_file.argtypes = (
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        ctypes.POINTER(_ObjectAttributes),
+        ctypes.POINTER(_IoStatusBlock),
+        wintypes.LPVOID,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.LPVOID,
+        wintypes.ULONG,
+    )
+    nt_create_file.restype = wintypes.LONG
+    nt_status_to_error = ntdll.RtlNtStatusToDosError
+    nt_status_to_error.argtypes = (wintypes.LONG,)
+    nt_status_to_error.restype = wintypes.ULONG
+    invalid_handle = ctypes.c_void_p(-1).value
+    for _ in range(64):
+        name = f".feature-history-snapshot-{uuid.uuid4().hex}.partial"
+        encoded_name = name.encode("utf-16-le")
+        name_buffer = ctypes.create_unicode_buffer(name)
+        unicode_name = _UnicodeString(
+            len(encoded_name),
+            len(encoded_name),
+            ctypes.cast(name_buffer, wintypes.LPWSTR),
+        )
+        attributes = _ObjectAttributes(
+            ctypes.sizeof(_ObjectAttributes),
+            root_anchor,
+            ctypes.pointer(unicode_name),
+            0x00000040,
+            None,
+            None,
+        )
+        status = _IoStatusBlock()
+        handle = wintypes.HANDLE()
+        result = nt_create_file(
+            ctypes.byref(handle),
+            0x00010000 | 0x00000080 | 0x00100000,
+            ctypes.byref(attributes),
+            ctypes.byref(status),
+            None,
+            0x00000010,
+            0x00000001 | 0x00000002,
+            0x00000002,
+            0x00000001 | 0x00000020 | 0x00200000,
+            None,
+            0,
+        )
+        raw_handle = int(handle.value) if handle.value is not None else None
+        if result < 0 or raw_handle in (None, invalid_handle):
+            if raw_handle not in (None, invalid_handle):
+                try:
+                    _windows_mark_handle_for_deletion(raw_handle)
+                finally:
+                    _windows_close_handle(raw_handle)
+            error_code = int(nt_status_to_error(result))
+            if error_code in {80, 183}:
+                continue
+            raise OSError(
+                error_code,
+                "bound snapshot staging creation rejected",
+            )
+        try:
+            tag = _FileAttributeTagInfo()
+            if (
+                not get_information(
+                    raw_handle,
+                    9,
+                    ctypes.byref(tag),
+                    ctypes.sizeof(tag),
+                )
+                or tag.file_attributes & 0x00000400
+                or not tag.file_attributes & 0x00000010
+                or not set_handle_information(raw_handle, 1, 0)
+            ):
+                raise OSError("bound snapshot staging creation rejected")
+            return root / name, raw_handle
+        except BaseException:
+            try:
+                _windows_mark_handle_for_deletion(raw_handle)
+            finally:
+                _windows_close_handle(raw_handle)
+            raise
+    raise ValueError(
+        "factor-v3 feature history snapshot staging creation rejected"
+    )
 
 
 def _windows_create_bound_temporary_file(
@@ -1046,15 +1219,15 @@ def _write_bound_temporary_file(descriptor: int, raw: bytes) -> None:
     os.fsync(descriptor)
 
 
-def _windows_promote_bound_temporary_file(
+def _windows_promote_bound_handle(
     *,
-    descriptor: int,
+    source_handle: int,
     final_root: Path,
     final_parent_anchor: int,
+    expected_directory: bool,
 ) -> None:
     import ctypes
     from ctypes import wintypes
-    import msvcrt
 
     class _FileAttributeTagInfo(ctypes.Structure):
         _fields_ = [
@@ -1085,8 +1258,7 @@ def _windows_promote_bound_temporary_file(
 
     if final_root.name in {"", ".", ".."} or final_root.parent == final_root:
         raise ValueError("factor-v3 feature history snapshot path rejected")
-    source_handle = msvcrt.get_osfhandle(descriptor)
-    if source_handle == -1:
+    if source_handle in {None, -1}:
         raise OSError("bound temporary handle rejected")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     ntdll = ctypes.WinDLL("ntdll")
@@ -1116,7 +1288,9 @@ def _windows_promote_bound_temporary_file(
         9,
         ctypes.byref(attributes),
         ctypes.sizeof(attributes),
-    ) or attributes.file_attributes & 0x00000400:
+    ) or (
+        attributes.file_attributes & 0x00000400
+    ) or bool(attributes.file_attributes & 0x00000010) != expected_directory:
         raise OSError("bound temporary handle rejected")
     encoded_name = final_root.name.encode("utf-16-le")
     offset = _FileRenameInfo.file_name.offset
@@ -1150,6 +1324,23 @@ def _windows_promote_bound_temporary_file(
             )
         raise OSError(error_code, "bound temporary promotion rejected")
     _flush_snapshot_parent(final_parent_anchor)
+
+
+def _windows_promote_bound_temporary_file(
+    *,
+    descriptor: int,
+    final_root: Path,
+    final_parent_anchor: int,
+) -> None:
+    import msvcrt
+
+    source_handle = msvcrt.get_osfhandle(descriptor)
+    _windows_promote_bound_handle(
+        source_handle=source_handle,
+        final_root=final_root,
+        final_parent_anchor=final_parent_anchor,
+        expected_directory=False,
+    )
 
 
 def _promote_bound_temporary_file(
@@ -2201,13 +2392,31 @@ def _capture_feature_history_snapshot(
         raise ValueError(
             "factor-v3 feature history PIT store must be finalized without WAL or SHM"
         )
-    staging = Path(
-        tempfile.mkdtemp(
-            prefix=".feature-history-snapshot-",
-            suffix=".partial",
-            dir=str(root),
+    staging_handle: int | None = None
+    if os.name == "nt":
+        try:
+            with _snapshot_directory_chain_guard(root, root) as root_anchor:
+                staging, staging_handle = (
+                    _windows_create_bound_snapshot_staging_directory(
+                        root=root,
+                        root_anchor=root_anchor,
+                    )
+                )
+        except BaseException:
+            if staging_handle is not None:
+                try:
+                    _windows_mark_handle_for_deletion(staging_handle)
+                finally:
+                    _windows_close_handle(staging_handle)
+            raise
+    else:
+        staging = Path(
+            tempfile.mkdtemp(
+                prefix=".feature-history-snapshot-",
+                suffix=".partial",
+                dir=str(root),
+            )
         )
-    )
     try:
         database = _copy_snapshot_member(
             source_root=source_root,
@@ -2345,6 +2554,9 @@ def _capture_feature_history_snapshot(
                         temporal_partition_contract
                     ),
                 )
+                if staging_handle is not None:
+                    _windows_close_handle(staging_handle)
+                    staging_handle = None
                 _discard_successful_snapshot_staging(root=root, staging=staging)
                 return existing
             try:
@@ -2352,6 +2564,7 @@ def _capture_feature_history_snapshot(
                     staging=staging,
                     final_root=final_root,
                     final_parent_anchor=final_parent_anchor,
+                    bound_source_handle=staging_handle,
                 )
             except FileExistsError:
                 _flush_snapshot_parent(final_parent_anchor)
@@ -2364,6 +2577,9 @@ def _capture_feature_history_snapshot(
                         temporal_partition_contract
                     ),
                 )
+                if staging_handle is not None:
+                    _windows_close_handle(staging_handle)
+                    staging_handle = None
                 _discard_successful_snapshot_staging(root=root, staging=staging)
                 return existing
             return _read_and_replay_collection_snapshot(
@@ -2381,6 +2597,9 @@ def _capture_feature_history_snapshot(
         raise ValueError(
             "factor-v3 feature history snapshot capture rejected"
         ) from None
+    finally:
+        if staging_handle is not None:
+            _windows_close_handle(staging_handle)
 
 
 def _validated_trade_cal_publication(value: Any) -> dict[str, Any]:
