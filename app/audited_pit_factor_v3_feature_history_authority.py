@@ -1087,6 +1087,11 @@ def _write_collection_content_addressed_candidate(
     except (OSError, ValueError):
         raise ValueError(f"factor-v3 feature history collection {label} rejected") from None
     finally:
+        if descriptor != -1 and temporary_identity is None:
+            try:
+                temporary_identity = os.fstat(descriptor)
+            except OSError:
+                pass
         if descriptor != -1:
             try:
                 os.close(descriptor)

@@ -882,7 +882,7 @@ def test_collection_manifest_replacement_before_promotion_is_left_untouched(
     assert temporary.read_bytes() == foreign
 
 
-def test_collection_manifest_fstat_failure_quarantines_temporary_file(
+def test_collection_manifest_fstat_failure_reclaims_temporary_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     raw = b'{"candidate":"value"}'
@@ -912,8 +912,7 @@ def test_collection_manifest_fstat_failure_quarantines_temporary_file(
 
     assert not target.exists()
     assert not list(tmp_path.rglob("*.tmp"))
-    quarantined = [path for path in tmp_path.rglob("*.quarantine") if path.is_file()]
-    assert len(quarantined) == 1
+    assert not list(tmp_path.rglob("*.quarantine"))
 
 
 def test_unidentified_temporary_quarantine_rejects_nonregular_source(
