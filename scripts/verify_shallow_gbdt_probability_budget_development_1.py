@@ -798,6 +798,16 @@ def _validate_replay(inputs: Mapping[str, Any], replay: Mapping[str, Any]) -> No
         "scope",
     }:
         raise IndependentVerificationError("independent replay result fields drifted")
+    verification = value.get("verification")
+    if not isinstance(verification, dict) or "artifact_sha256" in verification:
+        raise IndependentVerificationError("independent replay verification shape differs")
+    replayed_runtime_verification = {
+        **verification,
+        "artifact_sha256": _require_sha256(
+            value.get("runtime_verification_artifact_sha256"),
+            "replayed runtime verification",
+        ),
+    }
     if (
         value.get("schema_version") != REPLAY_RESULT_SCHEMA
         or _require_sha256(value.get("main_artifact_sha256"), "replayed main artifact")
@@ -806,8 +816,7 @@ def _validate_replay(inputs: Mapping[str, Any], replay: Mapping[str, Any]) -> No
             value.get("runtime_verification_artifact_sha256"), "replayed runtime verification"
         )
         != inputs["runtime_verification_artifact_sha256"]
-        or not isinstance(value.get("verification"), dict)
-        or value["verification"] != inputs["runtime_verification"]
+        or replayed_runtime_verification != inputs["runtime_verification"]
         or not isinstance(value.get("scope"), dict)
     ):
         raise IndependentVerificationError("independent replay identity differs")
@@ -816,7 +825,8 @@ def _validate_replay(inputs: Mapping[str, Any], replay: Mapping[str, Any]) -> No
         if value["scope"].get(field) is not expected:
             raise IndependentVerificationError("independent replay scope is invalid")
     _verify_runtime_verification(
-        value["verification"], main_artifact_sha256=inputs["main_artifact_sha256"]
+        replayed_runtime_verification,
+        main_artifact_sha256=inputs["main_artifact_sha256"],
     )
 
 

@@ -147,13 +147,15 @@ def _make_completed_inputs(tmp_path: Path) -> dict[str, object]:
 
 
 def _replay_result(inputs: dict[str, object]) -> dict[str, object]:
+    verification = dict(inputs["runtime_verification"])
+    verification.pop("artifact_sha256")
     result = {
         "schema_version": verifier.REPLAY_RESULT_SCHEMA,
         "main_artifact_sha256": inputs["main_artifact_sha256"],
         "runtime_verification_artifact_sha256": inputs[
             "runtime_verification_artifact_sha256"
         ],
-        "verification": inputs["runtime_verification"],
+        "verification": verification,
         "scope": {
             "development_only": True,
             "embargo_consumed": False,
@@ -358,6 +360,30 @@ def test_validate_replay_requires_exact_runtime_verification_match(tmp_path: Pat
         **replay["result"],
         "runtime_verification_artifact_sha256": "f" * 64,
     }
+    with pytest.raises(verifier.IndependentVerificationError):
+        verifier._validate_replay(inputs, replay)
+
+
+def test_validate_replay_rejects_embedded_runtime_artifact_sha256(tmp_path: Path) -> None:
+    inputs = _make_completed_inputs(tmp_path)
+    replay = {"result": _replay_result(inputs)}
+    replay["result"]["verification"] = {
+        **replay["result"]["verification"],
+        "artifact_sha256": inputs["runtime_verification_artifact_sha256"],
+    }
+
+    with pytest.raises(verifier.IndependentVerificationError):
+        verifier._validate_replay(inputs, replay)
+
+
+def test_validate_replay_rejects_unsigned_runtime_body_tampering(tmp_path: Path) -> None:
+    inputs = _make_completed_inputs(tmp_path)
+    replay = {"result": _replay_result(inputs)}
+    replay["result"]["verification"] = {
+        **replay["result"]["verification"],
+        "verified": False,
+    }
+
     with pytest.raises(verifier.IndependentVerificationError):
         verifier._validate_replay(inputs, replay)
 
