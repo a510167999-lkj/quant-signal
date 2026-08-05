@@ -882,6 +882,60 @@ def test_collection_manifest_replacement_before_promotion_is_left_untouched(
     assert temporary.read_bytes() == foreign
 
 
+def test_collection_manifest_fstat_failure_quarantines_temporary_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = b'{"candidate":"value"}'
+    digest = hashlib.sha256(raw).hexdigest()
+    relative_path = (
+        "feature_history_collection_manifest_candidates/sha256/"
+        f"{digest[:2]}/{digest}.json"
+    )
+    target = tmp_path / relative_path
+    original_fstat = history_authority.os.fstat
+    calls = 0
+
+    def fail_first_fstat(descriptor: int) -> os.stat_result:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected fstat failure")
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(history_authority.os, "fstat", fail_first_fstat)
+    with pytest.raises(ValueError, match="manifest"):
+        history_authority._write_collection_manifest_candidate(
+            output_root=tmp_path,
+            relative_path=relative_path,
+            raw=raw,
+        )
+
+    assert not target.exists()
+    assert not list(tmp_path.rglob("*.tmp"))
+    quarantined = [path for path in tmp_path.rglob("*.quarantine") if path.is_file()]
+    assert len(quarantined) == 1
+
+
+def test_unidentified_temporary_quarantine_rejects_nonregular_source(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "collection-parent"
+    parent.mkdir()
+    temporary = parent / ".unknown.tmp"
+    temporary.mkdir()
+
+    with pytest.raises(ValueError, match="quarantine"):
+        history_authority._quarantine_unidentified_temporary(
+            root=tmp_path,
+            parent=parent,
+            temporary_path=temporary,
+            label="manifest",
+        )
+
+    assert temporary.is_dir()
+    assert not (parent / ".quarantine").exists()
+
+
 def test_public_surface_is_offline_and_caller_cannot_select_history_window() -> None:
     assert history_authority.__all__ == (
         "build_factor_v3_feature_history_collection_plan",

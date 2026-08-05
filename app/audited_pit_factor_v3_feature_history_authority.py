@@ -903,6 +903,54 @@ def _promote_snapshot_directory(
         close_handle(source_handle)
 
 
+def _quarantine_unidentified_temporary(
+    *,
+    root: Path,
+    parent: Path,
+    temporary_path: Path,
+    label: str,
+) -> None:
+    try:
+        temporary_metadata = temporary_path.lstat()
+    except OSError:
+        raise ValueError(
+            f"factor-v3 feature history collection {label} quarantine rejected"
+        ) from None
+    if (
+        not stat.S_ISREG(temporary_metadata.st_mode)
+        or _is_reparse_point(temporary_path)
+    ):
+        raise ValueError(
+            f"factor-v3 feature history collection {label} quarantine rejected"
+        )
+    quarantine_parent = parent / ".quarantine"
+    try:
+        quarantine_parent.mkdir()
+    except FileExistsError:
+        pass
+    except OSError:
+        raise ValueError(
+            f"factor-v3 feature history collection {label} quarantine rejected"
+        ) from None
+    try:
+        fsync_directory(parent)
+        quarantine_parent = raw_authority._safe_existing_directory(
+            quarantine_parent,
+            f"factor-v3 feature history collection {label} quarantine",
+        )
+        quarantine_path = quarantine_parent / f"{uuid.uuid4().hex}.quarantine"
+        with _snapshot_directory_chain_guard(root, quarantine_parent) as final_parent_anchor:
+            _promote_snapshot_directory(
+                staging=temporary_path,
+                final_root=quarantine_path,
+                final_parent_anchor=final_parent_anchor,
+            )
+    except (OSError, ValueError):
+        raise ValueError(
+            f"factor-v3 feature history collection {label} quarantine rejected"
+        ) from None
+
+
 def _safe_collection_output_root(value: str | Path) -> Path:
     try:
         return raw_authority._safe_existing_directory(
@@ -1044,7 +1092,18 @@ def _write_collection_content_addressed_candidate(
                 os.close(descriptor)
             except OSError:
                 pass
-        if not completed and temporary_identity is not None:
+        if not completed and temporary_identity is None and temporary_path is not None:
+            if root is None or parent is None:
+                raise ValueError(
+                    f"factor-v3 feature history collection {label} quarantine rejected"
+                ) from None
+            _quarantine_unidentified_temporary(
+                root=root,
+                parent=parent,
+                temporary_path=temporary_path,
+                label=label,
+            )
+        elif not completed and temporary_identity is not None:
             for candidate in (destination, temporary_path):
                 if candidate is None:
                     continue
