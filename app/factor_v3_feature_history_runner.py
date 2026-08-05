@@ -100,6 +100,22 @@ _STATE_V1_FIELDS = _STATE_FIELDS - {"credential_generation_id"}
 _ALLOWED_DATASETS = ("bak_basic", "daily", "adj_factor", "stk_limit", "suspend_d")
 _MAX_RUN_SPEC_BYTES = 4 * 1024 * 1024
 _MAX_STATE_BYTES = 512 * 1024
+_RESULT_FIELDS = frozenset(
+    {
+        "collection_publication",
+        "completed_session_count",
+        "receipt",
+        "run_spec_sha256",
+        "status",
+    }
+)
+_PUBLICATION_RESULT_FIELDS = (
+    "authority_manifest_created",
+    "authority_manifest_relative_path",
+    "authority_manifest_sha256",
+    "publication_status",
+    "schema",
+)
 
 
 _FEATURE_HISTORY_ROUTE_POLICY_DOCUMENT = {
@@ -236,18 +252,27 @@ def _validated_uuid4(value: Any, *, label: str) -> str:
     return value
 
 
-def _reject_secret_shape(value: Any) -> None:
+def _reject_secret_shape(
+    value: Any, *, reject_publication_capability: bool = False
+) -> None:
     if type(value) is dict:
         for key, nested in value.items():
             normalized = str(key).strip().lower().replace("-", "_")
-            if normalized in {"token", "credential", "password", "api_key", "secret"}:
+            if normalized in {"token", "credential", "password", "api_key", "secret"} or (
+                reject_publication_capability
+                and normalized == "publication_capability"
+            ):
                 raise FactorV3FeatureHistoryRunnerError(
                     "factor-v3 feature-history run spec must not contain credentials"
                 )
-            _reject_secret_shape(nested)
-    elif type(value) is list:
+            _reject_secret_shape(
+                nested, reject_publication_capability=reject_publication_capability
+            )
+    elif type(value) in {list, tuple}:
         for nested in value:
-            _reject_secret_shape(nested)
+                _reject_secret_shape(
+                    nested, reject_publication_capability=reject_publication_capability
+                )
 
 
 def _validated_collector(value: Any) -> dict[str, Any]:
@@ -1063,14 +1088,49 @@ def _verify_collection_authority(
     return json.loads(_canonical_bytes(receipt))
 
 
-def _result(state: Mapping[str, Any]) -> dict[str, Any]:
+def _redacted_publication_result(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if type(value) is not dict or not set(_PUBLICATION_RESULT_FIELDS) <= set(value):
+        raise FactorV3FeatureHistoryRunnerError(
+            "factor-v3 feature-history publication result rejected"
+        )
+    return {field: value[field] for field in _PUBLICATION_RESULT_FIELDS}
+
+
+def _redacted_result(value: Any) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != _RESULT_FIELDS:
+        raise FactorV3FeatureHistoryRunnerError("factor-v3 feature-history result rejected")
     return {
-        "collection_publication": state["collection_publication"],
-        "completed_session_count": state["completed_session_count"],
-        "receipt": state["receipt"],
-        "run_spec_sha256": state["run_spec_sha256"],
-        "status": state["status"],
+        "collection_publication": _redacted_publication_result(
+            value["collection_publication"]
+        ),
+        "completed_session_count": value["completed_session_count"],
+        "receipt": value["receipt"],
+        "run_spec_sha256": value["run_spec_sha256"],
+        "status": value["status"],
     }
+
+
+def _result(state: Mapping[str, Any]) -> dict[str, Any]:
+    publication = state["collection_publication"]
+    if publication is not None:
+        publication = _validated_publication(publication)
+    return _redacted_result(
+        {
+            "collection_publication": publication,
+            "completed_session_count": state["completed_session_count"],
+            "receipt": state["receipt"],
+            "run_spec_sha256": state["run_spec_sha256"],
+            "status": state["status"],
+        }
+    )
+
+
+def _stdout_result(value: Any) -> dict[str, Any]:
+    result = _redacted_result(value)
+    _reject_secret_shape(result, reject_publication_capability=True)
+    return result
 
 
 def _verify_existing_publication(
@@ -1345,10 +1405,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 run_spec_path=args.run_spec,
                 run_root=args.run_root,
             )
+        result = _stdout_result(result)
     except (FactorV3FeatureHistoryRunnerError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    print(
+        json.dumps(
+            _stdout_result(result), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+    )
     return 0
 
 

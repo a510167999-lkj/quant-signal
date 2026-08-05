@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 import hashlib
@@ -11,13 +11,14 @@ from pathlib import Path
 import shutil
 import sqlite3
 import sys
-from types import SimpleNamespace
+from types import FunctionType, ModuleType, SimpleNamespace
 import uuid
 
 import pytest
 
 from app import audited_pit_factor_v3_feature_history_authority as history_authority
 from app import durable_io
+from app import factor_v3_feature_history_runner as feature_history_runner
 from app import factor_v3_feature_history_frozen_source_attestation as frozen_attestation
 from app import jiaoch_trade_cal_authority
 from app.audited_pit_factor_v3_points_contract import (
@@ -739,9 +740,375 @@ def test_collection_manifest_and_issuance_reuse_safe_cas_primitives() -> None:
     )
 
     assert "raw_authority._content_addressed_directory" in source
-    assert "raw_authority._write_create_only" in source
+    assert "_open_bound_temporary_file" in source
+    assert "_promote_bound_temporary_file" in source
+    assert "_read_bound_temporary_file" in source
+    assert "tempfile.mkstemp" in inspect.getsource(
+        history_authority._open_bound_temporary_file
+    )
+    assert "_promote_snapshot_directory" in inspect.getsource(
+        history_authority._promote_bound_temporary_file
+    )
     assert "raw_authority._read_safe_file" in verifier_source
     assert "fsync_directory" in source
+
+
+def test_windows_bound_delete_uses_exact_boolean_disposition_field() -> None:
+    source = inspect.getsource(history_authority._windows_mark_handle_for_deletion)
+
+    assert '"delete_file", ctypes.c_ubyte' in source
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows descriptor-bound staging")
+def test_windows_bound_snapshot_staging_creation_blocks_rename(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "snapshot-output"
+    root.mkdir()
+
+    with history_authority._snapshot_directory_chain_guard(root, root) as anchor:
+        staging, handle = (
+            history_authority._windows_create_bound_snapshot_staging_directory(
+                root=root,
+                root_anchor=anchor,
+            )
+        )
+        try:
+            with pytest.raises(PermissionError):
+                os.replace(staging, root / "foreign-staging")
+            assert staging.is_dir()
+        finally:
+            history_authority._windows_close_handle(handle)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows descriptor-bound staging")
+def test_snapshot_capture_keeps_bound_staging_rename_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, _publication, _sessions, store, _refs, _database_sha256 = (
+        _real_store_fixture(tmp_path, monkeypatch)
+    )
+    output_root = tmp_path / "collection-publication"
+    output_root.mkdir()
+    original_copy = history_authority._copy_snapshot_member
+    rename_blocked = False
+
+    def copy_while_staging_is_bound(**kwargs: object) -> dict[str, object]:
+        nonlocal rename_blocked
+        staging = next(
+            output_root.glob(".feature-history-snapshot-*.partial")
+        )
+        with pytest.raises(PermissionError):
+            os.replace(staging, output_root / "foreign-staging")
+        rename_blocked = True
+        return original_copy(**kwargs)
+
+    monkeypatch.setattr(
+        history_authority,
+        "_copy_snapshot_member",
+        copy_while_staging_is_bound,
+    )
+    snapshot = history_authority._capture_feature_history_snapshot(
+        pit_store_root=store.root,
+        output_root=output_root,
+        sessions=plan["prewindow"]["sessions"],
+        temporal_partition_contract=load_temporal_partition_contract(
+            PARTITION_V1_PATH
+        ),
+    )
+
+    assert rename_blocked is True
+    assert snapshot["replay"]["raw_artifact_count"] > 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows descriptor-bound staging")
+def test_snapshot_staging_guard_exit_reclaims_bound_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, _publication, _sessions, store, _refs, _database_sha256 = (
+        _real_store_fixture(tmp_path, monkeypatch)
+    )
+    output_root = tmp_path / "collection-publication"
+    output_root.mkdir()
+    original_guard = history_authority._snapshot_directory_chain_guard
+    original_create = (
+        history_authority._windows_create_bound_snapshot_staging_directory
+    )
+    staging_paths: list[Path] = []
+
+    def track_staging_creation(**kwargs: object) -> tuple[Path, int]:
+        staging, handle = original_create(**kwargs)
+        staging_paths.append(staging)
+        return staging, handle
+
+    @contextmanager
+    def reject_root_guard_exit(root: Path, directory: Path):
+        with original_guard(root, directory) as anchor:
+            yield anchor
+        if root == directory:
+            raise ValueError("factor-v3 feature history snapshot path drifted")
+
+    monkeypatch.setattr(
+        history_authority,
+        "_windows_create_bound_snapshot_staging_directory",
+        track_staging_creation,
+    )
+    monkeypatch.setattr(
+        history_authority,
+        "_snapshot_directory_chain_guard",
+        reject_root_guard_exit,
+    )
+    with pytest.raises(ValueError, match="path drifted"):
+        history_authority._capture_feature_history_snapshot(
+            pit_store_root=store.root,
+            output_root=output_root,
+            sessions=plan["prewindow"]["sessions"],
+            temporal_partition_contract=load_temporal_partition_contract(
+                PARTITION_V1_PATH
+            ),
+        )
+
+    assert len(staging_paths) == 1
+    assert not staging_paths[0].exists()
+
+
+def test_collection_manifest_write_failure_leaves_no_partial_content_address_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = b'{"candidate":"value"}'
+    digest = hashlib.sha256(raw).hexdigest()
+    relative_path = (
+        "feature_history_collection_manifest_candidates/sha256/"
+        f"{digest[:2]}/{digest}.json"
+    )
+    target = tmp_path / relative_path
+
+    def fail_promotion(**_kwargs: object) -> None:
+        raise OSError("injected promotion failure")
+
+    monkeypatch.setattr(
+        history_authority, "_promote_bound_temporary_file", fail_promotion
+    )
+    with pytest.raises(ValueError, match="manifest"):
+        history_authority._write_collection_manifest_candidate(
+            output_root=tmp_path,
+            relative_path=relative_path,
+            raw=raw,
+        )
+
+    assert not target.exists()
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_collection_manifest_post_link_failure_cleans_its_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = b'{"candidate":"value"}'
+    digest = hashlib.sha256(raw).hexdigest()
+    relative_path = (
+        "feature_history_collection_manifest_candidates/sha256/"
+        f"{digest[:2]}/{digest}.json"
+    )
+    target = tmp_path / relative_path
+
+    promoted = False
+    original_promote = history_authority._promote_bound_temporary_file
+
+    def tracked_promotion(**kwargs: object) -> None:
+        nonlocal promoted
+        original_promote(**kwargs)
+        promoted = True
+
+    def fail_post_link_read(**_kwargs: object) -> bytes:
+        assert promoted
+        raise ValueError("injected post-link read failure")
+
+    monkeypatch.setattr(
+        history_authority, "_promote_bound_temporary_file", tracked_promotion
+    )
+    monkeypatch.setattr(
+        history_authority,
+        "_read_bound_temporary_file",
+        fail_post_link_read,
+    )
+    with pytest.raises(ValueError, match="manifest"):
+        history_authority._write_collection_manifest_candidate(
+            output_root=tmp_path,
+            relative_path=relative_path,
+            raw=raw,
+        )
+
+    assert not target.exists()
+    assert not list(tmp_path.rglob("*.tmp"))
+    assert promoted
+
+
+def test_collection_manifest_candidate_is_postverified_single_link(
+    tmp_path: Path,
+) -> None:
+    raw = b'{"candidate":"value"}'
+    digest = hashlib.sha256(raw).hexdigest()
+    relative_path = (
+        "feature_history_collection_manifest_candidates/sha256/"
+        f"{digest[:2]}/{digest}.json"
+    )
+    target = tmp_path / relative_path
+
+    assert (
+        history_authority._write_collection_manifest_candidate(
+            output_root=tmp_path,
+            relative_path=relative_path,
+            raw=raw,
+        )
+        is True
+    )
+    assert target.read_bytes() == raw
+    assert target.stat().st_nlink == 1
+    assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_collection_manifest_replacement_before_promotion_is_left_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = b'{"candidate":"value"}'
+    digest = hashlib.sha256(raw).hexdigest()
+    relative_path = (
+        "feature_history_collection_manifest_candidates/sha256/"
+        f"{digest[:2]}/{digest}.json"
+    )
+    target = tmp_path / relative_path
+    foreign = b'{"foreign":"replacement"}'
+    replaced = False
+    replacement_blocked = False
+    original_lstat = Path.lstat
+
+    def replace_temporary(path: Path) -> os.stat_result:
+        nonlocal replaced, replacement_blocked
+        if (
+            not replaced
+            and path.name.startswith(f".{digest}.")
+            and path.suffix == ".tmp"
+        ):
+            replacement = path.with_name(".foreign-replacement")
+            replacement.write_bytes(foreign)
+            try:
+                os.replace(replacement, path)
+            except OSError:
+                replacement_blocked = True
+                replacement.unlink(missing_ok=True)
+            else:
+                replaced = True
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", replace_temporary)
+    if os.name == "nt":
+        assert (
+            history_authority._write_collection_manifest_candidate(
+                output_root=tmp_path,
+                relative_path=relative_path,
+                raw=raw,
+            )
+            is True
+        )
+        assert replacement_blocked
+        assert not replaced
+        assert target.read_bytes() == raw
+        assert not list(tmp_path.rglob("*.tmp"))
+        return
+    with pytest.raises(ValueError, match="manifest"):
+        history_authority._write_collection_manifest_candidate(
+            output_root=tmp_path,
+            relative_path=relative_path,
+            raw=raw,
+        )
+
+    assert replaced
+    assert not target.exists()
+    temporary = next(tmp_path.rglob(f".{digest}.*.tmp"))
+    assert temporary.read_bytes() == foreign
+
+
+def test_collection_manifest_fstat_failure_reclaims_temporary_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = b'{"candidate":"value"}'
+    digest = hashlib.sha256(raw).hexdigest()
+    relative_path = (
+        "feature_history_collection_manifest_candidates/sha256/"
+        f"{digest[:2]}/{digest}.json"
+    )
+    target = tmp_path / relative_path
+    original_fstat = history_authority.os.fstat
+    calls = 0
+
+    def fail_first_fstat(descriptor: int) -> os.stat_result:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected fstat failure")
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(history_authority.os, "fstat", fail_first_fstat)
+    with pytest.raises(ValueError, match="manifest"):
+        history_authority._write_collection_manifest_candidate(
+            output_root=tmp_path,
+            relative_path=relative_path,
+            raw=raw,
+        )
+
+    assert not target.exists()
+    assert not list(tmp_path.rglob("*.tmp"))
+    assert not list(tmp_path.rglob("*.quarantine"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows descriptor-bound cleanup")
+def test_collection_manifest_persistent_fstat_failure_deletes_by_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = b'{"candidate":"value"}'
+    digest = hashlib.sha256(raw).hexdigest()
+    relative_path = (
+        "feature_history_collection_manifest_candidates/sha256/"
+        f"{digest[:2]}/{digest}.json"
+    )
+    target = tmp_path / relative_path
+
+    def fail_fstat(_descriptor: int) -> os.stat_result:
+        raise OSError("injected persistent fstat failure")
+
+    monkeypatch.setattr(history_authority.os, "fstat", fail_fstat)
+    with pytest.raises(ValueError, match="manifest"):
+        history_authority._write_collection_manifest_candidate(
+            output_root=tmp_path,
+            relative_path=relative_path,
+            raw=raw,
+        )
+
+    assert not target.exists()
+    assert not list(tmp_path.rglob("*.tmp"))
+    assert not list(tmp_path.rglob("*.quarantine"))
+
+
+def test_unidentified_temporary_quarantine_rejects_nonregular_source(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "collection-parent"
+    parent.mkdir()
+    temporary = parent / ".unknown.tmp"
+    temporary.mkdir()
+
+    with pytest.raises(ValueError, match="quarantine"):
+        history_authority._quarantine_unidentified_temporary(
+            root=tmp_path,
+            parent=parent,
+            temporary_path=temporary,
+            label="manifest",
+        )
+
+    assert temporary.is_dir()
+    assert not (parent / ".quarantine").exists()
 
 
 def test_public_surface_is_offline_and_caller_cannot_select_history_window() -> None:
@@ -822,6 +1189,7 @@ def test_producer_binding_covers_direct_semantic_dependencies_and_loaded_identit
         "audited_pit_factor_v3_feature_history_authority.py",
         "audited_pit_factor_v3_points_contract.py",
         "durable_io.py",
+        "factor_v3_feature_history_runner.py",
         "jiaoch_credential_slots.py",
         "jiaoch_trade_cal_authority.py",
         "research_partitions.py",
@@ -875,6 +1243,91 @@ def test_producer_binding_covers_direct_semantic_dependencies_and_loaded_identit
     assert durable_after["root_sha256"] != class_method_after[
         "root_sha256"
     ]
+
+    monkeypatch.setattr(
+        feature_history_runner,
+        "_MARKET_SESSION_VINTAGE",
+        "tampered-vintage",
+    )
+    runner_after = history_authority._producer_binding()
+    assert runner_after["loaded_execution_root_sha256"] != durable_after[
+        "loaded_execution_root_sha256"
+    ]
+    assert runner_after["root_sha256"] != durable_after["root_sha256"]
+
+
+def test_loaded_producer_module_canonicalizes_direct_runner_identity() -> None:
+    canonical_name = "app.factor_v3_feature_history_runner"
+
+    def entry(marker: str = "fixture") -> str:
+        return marker
+
+    direct_entry = FunctionType(
+        entry.__code__, entry.__globals__, entry.__name__, entry.__defaults__, entry.__closure__
+    )
+    direct_entry.__module__ = "__main__"
+    direct_entry.__qualname__ = entry.__qualname__
+    imported_entry = FunctionType(
+        entry.__code__, entry.__globals__, entry.__name__, entry.__defaults__, entry.__closure__
+    )
+    imported_entry.__module__ = canonical_name
+    imported_entry.__qualname__ = entry.__qualname__
+
+    direct = ModuleType("__main__")
+    direct.__file__ = str(Path(feature_history_runner.__file__).resolve())
+    direct.RUNNER_MARKER = "same"
+    direct.entry = direct_entry
+    imported = ModuleType(canonical_name)
+    imported.__file__ = direct.__file__
+    imported.RUNNER_MARKER = "same"
+    imported.entry = imported_entry
+
+    assert history_authority._loaded_module_descriptor(
+        direct, canonical_module_name=canonical_name
+    ) == history_authority._loaded_module_descriptor(
+        imported, canonical_module_name=canonical_name
+    )
+
+
+def test_loaded_producer_module_rejects_divergent_direct_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical_name = "app.factor_v3_feature_history_runner"
+    runner_path = Path(feature_history_runner.__file__).resolve()
+
+    def entry(marker: str = "fixture") -> str:
+        return marker
+
+    direct_entry = FunctionType(
+        entry.__code__, entry.__globals__, entry.__name__, entry.__defaults__, entry.__closure__
+    )
+    direct_entry.__module__ = "__main__"
+    direct_entry.__qualname__ = entry.__qualname__
+    imported_entry = FunctionType(
+        entry.__code__, entry.__globals__, entry.__name__, entry.__defaults__, entry.__closure__
+    )
+    imported_entry.__module__ = canonical_name
+    imported_entry.__qualname__ = entry.__qualname__
+    direct = ModuleType("__main__")
+    direct.__file__ = str(runner_path)
+    direct.RUNNER_MARKER = "same"
+    direct.entry = direct_entry
+    imported = ModuleType(canonical_name)
+    imported.__file__ = str(runner_path)
+    imported.RUNNER_MARKER = "same"
+    imported.entry = imported_entry
+    monkeypatch.setitem(sys.modules, "__main__", direct)
+    monkeypatch.setattr(
+        history_authority.importlib,
+        "import_module",
+        lambda name: imported if name == canonical_name else None,
+    )
+
+    assert history_authority._loaded_producer_module(path=runner_path) is imported
+
+    direct.RUNNER_MARKER = "changed"
+    with pytest.raises(ValueError, match="duplicate runner runtime"):
+        history_authority._loaded_producer_module(path=runner_path)
 
 
 def test_trade_calendar_loader_requires_offline_verifier_and_content_address(
@@ -1546,6 +1999,34 @@ def test_live_database_drift_after_publication_does_not_change_snapshot(
     assert receipt["verified"] is True
 
 
+def test_snapshot_reuse_discards_successful_staging_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, _publication, sessions, store, _refs, _database_sha256 = _real_store_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    output_root = tmp_path / "snapshot-output"
+    output_root.mkdir()
+    contract = load_temporal_partition_contract(PARTITION_V1_PATH)
+
+    first = history_authority._capture_feature_history_snapshot(
+        pit_store_root=Path(store.root),
+        output_root=output_root,
+        sessions=sessions,
+        temporal_partition_contract=contract,
+    )
+    second = history_authority._capture_feature_history_snapshot(
+        pit_store_root=Path(store.root),
+        output_root=output_root,
+        sessions=sessions,
+        temporal_partition_contract=contract,
+    )
+
+    assert second["sha256"] == first["sha256"]
+    assert not list(output_root.glob(".feature-history-snapshot-*.partial"))
+
+
 def test_public_verifier_replays_snapshot_after_live_store_is_detached(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1615,11 +2096,19 @@ def test_existing_snapshot_is_flushed_before_postrename_failure_reuse(
         staging: Path,
         final_root: Path,
         final_parent_anchor: int,
+        bound_source_handle: int | None = None,
     ) -> None:
-        del final_parent_anchor
         nonlocal promotion_attempts
         promotion_attempts += 1
-        os.rename(staging, final_root)
+        if bound_source_handle is None:
+            os.rename(staging, final_root)
+        else:
+            history_authority._windows_promote_bound_handle(
+                source_handle=bound_source_handle,
+                final_root=final_root,
+                final_parent_anchor=final_parent_anchor,
+                expected_directory=True,
+            )
         raise ValueError(
             "factor-v3 feature history snapshot promotion rejected"
         )
