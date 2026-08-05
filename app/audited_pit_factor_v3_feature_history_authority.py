@@ -15,8 +15,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import stat
+import sys
 import tempfile
 import types
 from typing import Any
@@ -195,6 +197,7 @@ _PRODUCER_FILES = (
     "audited_pit_factor_v3_feature_history_authority.py",
     "audited_pit_factor_v3_points_contract.py",
     "durable_io.py",
+    "factor_v3_feature_history_runner.py",
     "jiaoch_credential_slots.py",
     "jiaoch_trade_cal_authority.py",
     "research_partitions.py",
@@ -980,34 +983,92 @@ def _write_collection_content_addressed_candidate(
         raise ValueError(f"factor-v3 feature history collection {label} rejected")
     parts = relative_path.split("/")
     digest = parts[-1].removesuffix(".json")
+    destination: Path | None = None
+    parent: Path | None = None
+    temporary_path: Path | None = None
+    temporary_identity: os.stat_result | None = None
+    descriptor = -1
+    completed = False
     try:
         parent = raw_authority._content_addressed_directory(
             root,
             parts[0],
             digest,
         )
-        path = parent / parts[-1]
-        if path.relative_to(root).as_posix() != relative_path:
+        destination = parent / parts[-1]
+        if destination.relative_to(root).as_posix() != relative_path:
             raise ValueError
-        raw_authority._write_create_only(
-            path,
-            raw,
-            label=f"factor-v3 feature history collection {label}",
-            reuse_identical=False,
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{digest}.",
+            suffix=".tmp",
+            dir=str(parent),
         )
+        temporary_path = Path(temporary_name)
+        temporary_identity = os.fstat(descriptor)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_metadata = temporary_path.lstat()
+        if (
+            not stat.S_ISREG(temporary_metadata.st_mode)
+            or _is_reparse_point(temporary_path)
+            or not os.path.samestat(temporary_metadata, temporary_identity)
+        ):
+            raise ValueError
+        with _snapshot_directory_chain_guard(root, parent) as final_parent_anchor:
+            _promote_snapshot_directory(
+                staging=temporary_path,
+                final_root=destination,
+                final_parent_anchor=final_parent_anchor,
+            )
+        temporary_path = None
         fsync_directory(parent)
         stored = raw_authority._read_safe_file(
-            path,
+            destination,
             label=f"factor-v3 feature history collection {label}",
             max_bytes=len(raw),
             expected_size=len(raw),
         )
+        if not hmac.compare_digest(stored, raw):
+            raise ValueError(
+                f"factor-v3 feature history collection {label} postverify rejected"
+            )
+        completed = True
     except (OSError, ValueError):
         raise ValueError(f"factor-v3 feature history collection {label} rejected") from None
-    if not hmac.compare_digest(stored, raw):
-        raise ValueError(
-            f"factor-v3 feature history collection {label} postverify rejected"
-        )
+    finally:
+        if descriptor != -1:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if not completed and temporary_identity is not None:
+            for candidate in (destination, temporary_path):
+                if candidate is None:
+                    continue
+                try:
+                    metadata = candidate.lstat()
+                    if (
+                        stat.S_ISREG(metadata.st_mode)
+                        and not _is_reparse_point(candidate)
+                        and os.path.samestat(metadata, temporary_identity)
+                    ):
+                        candidate.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    raise ValueError(
+                        f"factor-v3 feature history collection {label} temporary cleanup rejected"
+                    ) from None
+            if parent is not None:
+                try:
+                    fsync_directory(parent)
+                except OSError:
+                    raise ValueError(
+                        f"factor-v3 feature history collection {label} temporary cleanup rejected"
+                    ) from None
     return True
 
 
@@ -1675,6 +1736,28 @@ def _read_and_replay_collection_snapshot(
     }
 
 
+def _discard_successful_snapshot_staging(*, root: Path, staging: Path) -> None:
+    try:
+        resolved_root = root.resolve(strict=True)
+        if (
+            not staging.name.startswith(".feature-history-snapshot-")
+            or not staging.name.endswith(".partial")
+            or staging.parent.resolve(strict=True) != resolved_root
+            or _is_reparse_point(staging)
+            or not staging.is_dir()
+        ):
+            raise OSError
+        for candidate in staging.rglob("*"):
+            if _is_reparse_point(candidate):
+                raise OSError
+        shutil.rmtree(staging)
+        fsync_directory(resolved_root)
+    except OSError:
+        raise ValueError(
+            "factor-v3 feature history snapshot staging cleanup rejected"
+        ) from None
+
+
 def _capture_feature_history_snapshot(
     *,
     pit_store_root: str | Path,
@@ -1850,6 +1933,7 @@ def _capture_feature_history_snapshot(
                         temporal_partition_contract
                     ),
                 )
+                _discard_successful_snapshot_staging(root=root, staging=staging)
                 return existing
             try:
                 _promote_snapshot_directory(
@@ -1868,6 +1952,7 @@ def _capture_feature_history_snapshot(
                         temporal_partition_contract
                     ),
                 )
+                _discard_successful_snapshot_staging(root=root, staging=staging)
                 return existing
             return _read_and_replay_collection_snapshot(
                 output_root=root,
@@ -2501,7 +2586,17 @@ def _code_object_descriptor(code: types.CodeType) -> dict[str, Any]:
     }
 
 
-def _runtime_identity_descriptor(value: Any) -> dict[str, Any]:
+def _canonical_loaded_module_name(
+    value: str, *, canonical_module_name: str | None
+) -> str:
+    if canonical_module_name is not None and value == "__main__":
+        return canonical_module_name
+    return value
+
+
+def _runtime_identity_descriptor(
+    value: Any, *, canonical_module_name: str | None = None
+) -> dict[str, Any]:
     if value is None or type(value) in {bool, int, float, str, bytes}:
         return {
             "type": type(value).__name__,
@@ -2509,13 +2604,20 @@ def _runtime_identity_descriptor(value: Any) -> dict[str, Any]:
         }
     if type(value) in {list, tuple}:
         return {
-            "items": [_runtime_identity_descriptor(item) for item in value],
+            "items": [
+                _runtime_identity_descriptor(
+                    item, canonical_module_name=canonical_module_name
+                )
+                for item in value
+            ],
             "type": type(value).__name__,
         }
     if type(value) is dict and all(type(key) is str for key in value):
         return {
             "items": {
-                key: _runtime_identity_descriptor(item)
+                key: _runtime_identity_descriptor(
+                    item, canonical_module_name=canonical_module_name
+                )
                 for key, item in sorted(value.items())
             },
             "type": "dict",
@@ -2523,57 +2625,87 @@ def _runtime_identity_descriptor(value: Any) -> dict[str, Any]:
     if type(value) in {set, frozenset}:
         return {
             "items": sorted(
-                canonical_sha256(_runtime_identity_descriptor(item)) for item in value
+                canonical_sha256(
+                    _runtime_identity_descriptor(
+                        item, canonical_module_name=canonical_module_name
+                    )
+                )
+                for item in value
             ),
             "type": type(value).__name__,
         }
     if inspect.isfunction(value):
         return {
             "code": _code_object_descriptor(value.__code__),
-            "module": value.__module__,
+            "module": _canonical_loaded_module_name(
+                value.__module__, canonical_module_name=canonical_module_name
+            ),
             "qualname": value.__qualname__,
             "type": "function",
         }
     if inspect.isclass(value):
         return {
-            "module": value.__module__,
+            "module": _canonical_loaded_module_name(
+                value.__module__, canonical_module_name=canonical_module_name
+            ),
             "qualname": value.__qualname__,
             "type": "class",
         }
     return {
-        "module": type(value).__module__,
+        "module": _canonical_loaded_module_name(
+            type(value).__module__, canonical_module_name=canonical_module_name
+        ),
         "qualname": type(value).__qualname__,
         "type": "opaque",
     }
 
 
-def _function_identity_descriptor(value: Any) -> dict[str, Any]:
+def _function_identity_descriptor(
+    value: Any, *, canonical_module_name: str | None = None
+) -> dict[str, Any]:
     closure = value.__closure__
     return {
         "closure": (
             []
             if closure is None
-            else [_runtime_identity_descriptor(cell.cell_contents) for cell in closure]
+            else [
+                _runtime_identity_descriptor(
+                    cell.cell_contents, canonical_module_name=canonical_module_name
+                )
+                for cell in closure
+            ]
         ),
         "code": _code_object_descriptor(value.__code__),
-        "defaults": _runtime_identity_descriptor(value.__defaults__),
-        "defined_in": value.__module__,
-        "kwdefaults": _runtime_identity_descriptor(value.__kwdefaults__),
+        "defaults": _runtime_identity_descriptor(
+            value.__defaults__, canonical_module_name=canonical_module_name
+        ),
+        "defined_in": _canonical_loaded_module_name(
+            value.__module__, canonical_module_name=canonical_module_name
+        ),
+        "kwdefaults": _runtime_identity_descriptor(
+            value.__kwdefaults__, canonical_module_name=canonical_module_name
+        ),
         "qualname": value.__qualname__,
     }
 
 
-def _loaded_module_descriptor(module: Any) -> dict[str, Any]:
+def _loaded_module_descriptor(
+    module: Any, *, canonical_module_name: str | None = None
+) -> dict[str, Any]:
     bindings = []
     for name, value in sorted(vars(module).items()):
         if inspect.isfunction(value):
             bindings.append(
                 {
                     "binding": name,
-                    **_function_identity_descriptor(value),
+                    **_function_identity_descriptor(
+                        value, canonical_module_name=canonical_module_name
+                    ),
                 }
             )
-        elif inspect.isclass(value) and str(value.__module__).startswith("app."):
+        elif inspect.isclass(value) and (
+            str(value.__module__).startswith("app.") or value.__module__ == module.__name__
+        ):
             methods = []
             for method_name, raw in sorted(vars(value).items()):
                 candidate = raw
@@ -2583,30 +2715,65 @@ def _loaded_module_descriptor(module: Any) -> dict[str, Any]:
                     methods.append(
                         {
                             "name": method_name,
-                            **_function_identity_descriptor(candidate),
+                            **_function_identity_descriptor(
+                                candidate, canonical_module_name=canonical_module_name
+                            ),
                         }
                     )
             bindings.append(
                 {
                     "binding": name,
-                    "class_module": value.__module__,
+                    "class_module": _canonical_loaded_module_name(
+                        value.__module__, canonical_module_name=canonical_module_name
+                    ),
                     "class_qualname": value.__qualname__,
                     "methods": methods,
                 }
             )
     runtime_constants = {
-        name: _runtime_identity_descriptor(value)
+        name: _runtime_identity_descriptor(
+            value, canonical_module_name=canonical_module_name
+        )
         for name, value in sorted(vars(module).items())
         if name.isupper()
     }
     module_path = Path(str(module.__file__)).resolve(strict=True)
     return {
         "bindings_root_sha256": canonical_sha256(bindings),
-        "module": module.__name__,
+        "module": _canonical_loaded_module_name(
+            module.__name__, canonical_module_name=canonical_module_name
+        ),
         "module_file_sha256": _file_sha256(module_path),
         "module_file": str(module_path),
         "runtime_constants_root_sha256": canonical_sha256(runtime_constants),
     }
+
+
+def _loaded_producer_module(*, path: Path) -> types.ModuleType:
+    canonical_module_name = f"app.{path.stem}"
+    module = importlib.import_module(canonical_module_name)
+    active = sys.modules.get("__main__")
+    active_file = getattr(active, "__file__", None)
+    active_matches_producer = False
+    if isinstance(active, types.ModuleType) and isinstance(active_file, str):
+        try:
+            active_matches_producer = (
+                Path(active_file).resolve(strict=True) == path.resolve(strict=True)
+            )
+        except (OSError, RuntimeError, ValueError):
+            pass
+    if active_matches_producer:
+        active_descriptor = _loaded_module_descriptor(
+            active, canonical_module_name=canonical_module_name
+        )
+        module_descriptor = _loaded_module_descriptor(
+            module, canonical_module_name=canonical_module_name
+        )
+        if not hmac.compare_digest(
+            canonical_sha256(active_descriptor), canonical_sha256(module_descriptor)
+        ):
+            raise ValueError("factor-v3 feature history duplicate runner runtime rejected")
+    return module
 
 
 def _producer_binding() -> dict[str, Any]:
@@ -2618,8 +2785,12 @@ def _producer_binding() -> dict[str, Any]:
         source_descriptors.append(
             _source_file_descriptor(path, relative_path=f"app/{filename}")
         )
-        module = importlib.import_module(f"app.{path.stem}")
-        loaded_descriptors.append(_loaded_module_descriptor(module))
+        module = _loaded_producer_module(path=path)
+        loaded_descriptors.append(
+            _loaded_module_descriptor(
+                module, canonical_module_name=f"app.{path.stem}"
+            )
+        )
     payload = {
         "critical_runtime_constants": {
             "factor_v3_feature_history_authority_contract_sha256": (

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import date, timedelta
+import json
 from pathlib import Path
 import sqlite3
 from types import SimpleNamespace
@@ -193,6 +194,84 @@ def test_public_run_delegates_credential_resolution_to_slots(
             "source_generation_id": SOURCE_GENERATION_ID,
         }
     ]
+
+
+def test_result_and_cli_redact_publication_capability(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    state = {
+        "collection_publication": PUBLICATION,
+        "completed_session_count": 250,
+        "receipt": {"receipt_sha256": "b" * 64, "verified": True},
+        "run_spec_sha256": "a" * 64,
+        "status": "verified",
+    }
+    result = runner._result(state)
+
+    assert PUBLICATION["publication_capability"] not in json.dumps(result)
+    assert result["collection_publication"] == {
+        "authority_manifest_created": True,
+        "authority_manifest_relative_path": PUBLICATION[
+            "authority_manifest_relative_path"
+        ],
+        "authority_manifest_sha256": PUBLICATION["authority_manifest_sha256"],
+        "publication_status": "DURABLE_POSTVERIFIED_AND_RETURNED",
+        "schema": "audited-pit-factor-v3-feature-history-publication/v1",
+    }
+
+    monkeypatch.setattr(
+        runner,
+        "run_factor_v3_feature_history_collection",
+        lambda **_kwargs: {**result, "collection_publication": PUBLICATION},
+    )
+    assert runner.main(["run", "--run-spec", "spec", "--run-root", "root"]) == 0
+    stdout = capsys.readouterr().out
+    assert PUBLICATION["publication_capability"] not in stdout
+    assert json.loads(stdout) == result
+
+    monkeypatch.setattr(
+        runner,
+        "verify_factor_v3_feature_history_run",
+        lambda **_kwargs: {**result, "collection_publication": PUBLICATION},
+    )
+    assert runner.main(["verify", "--run-spec", "spec", "--run-root", "root"]) == 0
+    stdout = capsys.readouterr().out
+    assert PUBLICATION["publication_capability"] not in stdout
+    assert json.loads(stdout) == result
+
+    unsafe_result = {
+        **result,
+        "receipt": {
+            **result["receipt"],
+            "publication_capability": PUBLICATION["publication_capability"],
+        },
+    }
+    monkeypatch.setattr(
+        runner,
+        "run_factor_v3_feature_history_collection",
+        lambda **_kwargs: unsafe_result,
+    )
+    assert runner.main(["run", "--run-spec", "spec", "--run-root", "root"]) == 2
+    captured = capsys.readouterr()
+    assert PUBLICATION["publication_capability"] not in captured.out
+    assert PUBLICATION["publication_capability"] not in captured.err
+
+    tuple_result = {
+        **result,
+        "receipt": (
+            result["receipt"],
+            {"publication_capability": PUBLICATION["publication_capability"]},
+        ),
+    }
+    monkeypatch.setattr(
+        runner,
+        "run_factor_v3_feature_history_collection",
+        lambda **_kwargs: tuple_result,
+    )
+    assert runner.main(["run", "--run-spec", "spec", "--run-root", "root"]) == 2
+    captured = capsys.readouterr()
+    assert PUBLICATION["publication_capability"] not in captured.out
+    assert PUBLICATION["publication_capability"] not in captured.err
 
 
 def test_run_uses_only_five_frozen_interfaces_and_two_sequential_collectors(
