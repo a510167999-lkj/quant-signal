@@ -903,6 +903,340 @@ def _promote_snapshot_directory(
         close_handle(source_handle)
 
 
+def _windows_mark_handle_for_deletion(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class _FileDispositionInformation(ctypes.Structure):
+        _fields_ = [("delete_file", ctypes.c_ubyte)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    set_information = kernel32.SetFileInformationByHandle
+    set_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    set_information.restype = wintypes.BOOL
+    disposition = _FileDispositionInformation(1)
+    if not set_information(
+        handle,
+        4,
+        ctypes.byref(disposition),
+        ctypes.sizeof(disposition),
+    ):
+        raise OSError(ctypes.get_last_error(), "bound temporary deletion rejected")
+
+
+def _windows_create_bound_temporary_file(
+    *,
+    parent: Path,
+    digest: str,
+) -> tuple[int, Path]:
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("reparse_tag", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    get_information = kernel32.GetFileInformationByHandleEx
+    get_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    get_information.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    invalid_handle = ctypes.c_void_p(-1).value
+    for _ in range(64):
+        temporary_path = parent / f".{digest}.{uuid.uuid4().hex}.tmp"
+        handle = create_file(
+            str(temporary_path),
+            0x80000000 | 0x40000000 | 0x00010000 | 0x00000080 | 0x00100000,
+            0x00000001,
+            None,
+            1,
+            0x00000080 | 0x00200000 | 0x80000000,
+            None,
+        )
+        if handle in (None, invalid_handle):
+            error_code = ctypes.get_last_error()
+            if error_code in {80, 183}:
+                continue
+            raise OSError(error_code, "bound temporary creation rejected")
+        descriptor = -1
+        try:
+            attributes = _FileAttributeTagInfo()
+            if not get_information(
+                handle,
+                9,
+                ctypes.byref(attributes),
+                ctypes.sizeof(attributes),
+            ) or attributes.file_attributes & 0x00000400:
+                raise OSError("bound temporary creation rejected")
+            descriptor = msvcrt.open_osfhandle(
+                int(handle),
+                os.O_RDWR | getattr(os, "O_BINARY", 0),
+            )
+            handle = invalid_handle
+            os.set_inheritable(descriptor, False)
+            return descriptor, temporary_path
+        except BaseException:
+            if descriptor >= 0:
+                try:
+                    _windows_mark_handle_for_deletion(
+                        msvcrt.get_osfhandle(descriptor)
+                    )
+                finally:
+                    os.close(descriptor)
+            elif handle not in (None, invalid_handle):
+                try:
+                    _windows_mark_handle_for_deletion(int(handle))
+                finally:
+                    close_handle(handle)
+            raise
+    raise ValueError("factor-v3 feature history temporary creation rejected")
+
+
+def _open_bound_temporary_file(
+    *,
+    parent: Path,
+    digest: str,
+) -> tuple[int, Path]:
+    if os.name == "nt":
+        return _windows_create_bound_temporary_file(
+            parent=parent,
+            digest=digest,
+        )
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{digest}.",
+        suffix=".tmp",
+        dir=str(parent),
+    )
+    return descriptor, Path(name)
+
+
+def _write_bound_temporary_file(descriptor: int, raw: bytes) -> None:
+    remaining = memoryview(raw)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise OSError("bound temporary write rejected")
+        remaining = remaining[written:]
+    os.fsync(descriptor)
+
+
+def _windows_promote_bound_temporary_file(
+    *,
+    descriptor: int,
+    final_root: Path,
+    final_parent_anchor: int,
+) -> None:
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("reparse_tag", wintypes.DWORD),
+        ]
+
+    class _FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("replace_if_exists", wintypes.BYTE),
+            ("root_directory", wintypes.HANDLE),
+            ("file_name_length", wintypes.DWORD),
+            ("file_name", wintypes.WCHAR * 1),
+        ]
+
+    class _IoStatusValue(ctypes.Union):
+        _fields_ = [
+            ("status", wintypes.LONG),
+            ("pointer", wintypes.LPVOID),
+        ]
+
+    class _IoStatusBlock(ctypes.Structure):
+        _anonymous_ = ("value",)
+        _fields_ = [
+            ("value", _IoStatusValue),
+            ("information", ctypes.c_size_t),
+        ]
+
+    if final_root.name in {"", ".", ".."} or final_root.parent == final_root:
+        raise ValueError("factor-v3 feature history snapshot path rejected")
+    source_handle = msvcrt.get_osfhandle(descriptor)
+    if source_handle == -1:
+        raise OSError("bound temporary handle rejected")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    get_information = kernel32.GetFileInformationByHandleEx
+    get_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    get_information.restype = wintypes.BOOL
+    nt_set_information = ntdll.NtSetInformationFile
+    nt_set_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(_IoStatusBlock),
+        wintypes.LPVOID,
+        wintypes.ULONG,
+        ctypes.c_int,
+    )
+    nt_set_information.restype = wintypes.LONG
+    nt_status_to_error = ntdll.RtlNtStatusToDosError
+    nt_status_to_error.argtypes = (wintypes.LONG,)
+    nt_status_to_error.restype = wintypes.ULONG
+    attributes = _FileAttributeTagInfo()
+    if not get_information(
+        source_handle,
+        9,
+        ctypes.byref(attributes),
+        ctypes.sizeof(attributes),
+    ) or attributes.file_attributes & 0x00000400:
+        raise OSError("bound temporary handle rejected")
+    encoded_name = final_root.name.encode("utf-16-le")
+    offset = _FileRenameInfo.file_name.offset
+    buffer = ctypes.create_string_buffer(
+        ctypes.sizeof(_FileRenameInfo) + len(encoded_name)
+    )
+    information = _FileRenameInfo.from_buffer(buffer)
+    information.replace_if_exists = 0
+    information.root_directory = final_parent_anchor
+    information.file_name_length = len(encoded_name)
+    ctypes.memmove(
+        ctypes.addressof(buffer) + offset,
+        encoded_name,
+        len(encoded_name),
+    )
+    io_status = _IoStatusBlock()
+    status = nt_set_information(
+        source_handle,
+        ctypes.byref(io_status),
+        buffer,
+        len(buffer),
+        10,
+    )
+    if status < 0:
+        error_code = int(nt_status_to_error(status))
+        if error_code in {80, 183}:
+            raise FileExistsError(
+                error_code,
+                "snapshot CAS already exists",
+                str(final_root),
+            )
+        raise OSError(error_code, "bound temporary promotion rejected")
+    _flush_snapshot_parent(final_parent_anchor)
+
+
+def _promote_bound_temporary_file(
+    *,
+    descriptor: int,
+    staging: Path,
+    final_root: Path,
+    final_parent_anchor: int,
+) -> None:
+    if os.name == "nt":
+        _windows_promote_bound_temporary_file(
+            descriptor=descriptor,
+            final_root=final_root,
+            final_parent_anchor=final_parent_anchor,
+        )
+        return
+    _promote_snapshot_directory(
+        staging=staging,
+        final_root=final_root,
+        final_parent_anchor=final_parent_anchor,
+    )
+
+
+def _discard_bound_temporary_file(descriptor: int) -> None:
+    if os.name != "nt":
+        return
+    import msvcrt
+
+    handle = msvcrt.get_osfhandle(descriptor)
+    if handle == -1:
+        raise OSError("bound temporary handle rejected")
+    _windows_mark_handle_for_deletion(handle)
+
+
+def _read_bound_temporary_file(
+    *,
+    descriptor: int,
+    path: Path,
+    label: str,
+    max_bytes: int,
+    expected_size: int,
+) -> bytes:
+    if os.name != "nt":
+        return raw_authority._read_safe_file(
+            path,
+            label=label,
+            max_bytes=max_bytes,
+            expected_size=expected_size,
+        )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or int(getattr(before, "st_nlink", 1)) != 1
+            or before.st_size != expected_size
+            or before.st_size > max_bytes
+        ):
+            raise OSError
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        remaining = expected_size
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                raise OSError
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise OSError
+        after = os.fstat(descriptor)
+        path_after = path.lstat()
+    except OSError:
+        raise ValueError(f"{label} safe read rejected") from None
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or int(getattr(after, "st_nlink", 1)) != 1
+        or after.st_size != expected_size
+        or after.st_size > max_bytes
+        or not os.path.samestat(before, after)
+        or not stat.S_ISREG(path_after.st_mode)
+        or _is_reparse_point(path)
+        or not os.path.samestat(after, path_after)
+    ):
+        raise ValueError(f"{label} safe read rejected")
+    return b"".join(chunks)
+
+
 def _quarantine_unidentified_temporary(
     *,
     root: Path,
@@ -1046,93 +1380,107 @@ def _write_collection_content_addressed_candidate(
         destination = parent / parts[-1]
         if destination.relative_to(root).as_posix() != relative_path:
             raise ValueError
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{digest}.",
-            suffix=".tmp",
-            dir=str(parent),
-        )
-        temporary_path = Path(temporary_name)
-        temporary_identity = os.fstat(descriptor)
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = -1
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary_metadata = temporary_path.lstat()
-        if (
-            not stat.S_ISREG(temporary_metadata.st_mode)
-            or _is_reparse_point(temporary_path)
-            or not os.path.samestat(temporary_metadata, temporary_identity)
-        ):
-            raise ValueError
         with _snapshot_directory_chain_guard(root, parent) as final_parent_anchor:
-            _promote_snapshot_directory(
+            descriptor, temporary_path = _open_bound_temporary_file(
+                parent=parent,
+                digest=digest,
+            )
+            temporary_identity = os.fstat(descriptor)
+            _write_bound_temporary_file(descriptor, raw)
+            temporary_metadata = temporary_path.lstat()
+            if (
+                not stat.S_ISREG(temporary_metadata.st_mode)
+                or _is_reparse_point(temporary_path)
+                or not os.path.samestat(temporary_metadata, temporary_identity)
+            ):
+                raise ValueError
+            _promote_bound_temporary_file(
+                descriptor=descriptor,
                 staging=temporary_path,
                 final_root=destination,
                 final_parent_anchor=final_parent_anchor,
             )
-        temporary_path = None
-        fsync_directory(parent)
-        stored = raw_authority._read_safe_file(
-            destination,
-            label=f"factor-v3 feature history collection {label}",
-            max_bytes=len(raw),
-            expected_size=len(raw),
-        )
-        if not hmac.compare_digest(stored, raw):
-            raise ValueError(
-                f"factor-v3 feature history collection {label} postverify rejected"
+            temporary_path = None
+            if os.name != "nt":
+                fsync_directory(parent)
+            stored = _read_bound_temporary_file(
+                descriptor=descriptor,
+                path=destination,
+                label=f"factor-v3 feature history collection {label}",
+                max_bytes=len(raw),
+                expected_size=len(raw),
             )
+            if not hmac.compare_digest(stored, raw):
+                raise ValueError(
+                    f"factor-v3 feature history collection {label} postverify rejected"
+                )
         completed = True
     except (OSError, ValueError):
         raise ValueError(f"factor-v3 feature history collection {label} rejected") from None
     finally:
-        if descriptor != -1 and temporary_identity is None:
-            try:
-                temporary_identity = os.fstat(descriptor)
-            except OSError:
-                pass
-        if descriptor != -1:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        if not completed and temporary_identity is None and temporary_path is not None:
-            if root is None or parent is None:
+        if os.name == "nt":
+            cleanup_rejected = False
+            if descriptor != -1:
+                try:
+                    if not completed:
+                        _discard_bound_temporary_file(descriptor)
+                except OSError:
+                    cleanup_rejected = True
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    cleanup_rejected = True
+            if cleanup_rejected:
                 raise ValueError(
-                    f"factor-v3 feature history collection {label} quarantine rejected"
+                    f"factor-v3 feature history collection {label} temporary cleanup rejected"
                 ) from None
-            _quarantine_unidentified_temporary(
-                root=root,
-                parent=parent,
-                temporary_path=temporary_path,
-                label=label,
-            )
-        elif not completed and temporary_identity is not None:
-            for candidate in (destination, temporary_path):
-                if candidate is None:
-                    continue
+        else:
+            if descriptor != -1 and temporary_identity is None:
                 try:
-                    metadata = candidate.lstat()
-                    if (
-                        stat.S_ISREG(metadata.st_mode)
-                        and not _is_reparse_point(candidate)
-                        and os.path.samestat(metadata, temporary_identity)
-                    ):
-                        candidate.unlink()
-                except FileNotFoundError:
+                    temporary_identity = os.fstat(descriptor)
+                except OSError:
                     pass
-                except OSError:
-                    raise ValueError(
-                        f"factor-v3 feature history collection {label} temporary cleanup rejected"
-                    ) from None
-            if parent is not None:
+            if descriptor != -1:
                 try:
-                    fsync_directory(parent)
+                    os.close(descriptor)
                 except OSError:
+                    pass
+            if not completed and temporary_identity is None and temporary_path is not None:
+                if root is None or parent is None:
                     raise ValueError(
-                        f"factor-v3 feature history collection {label} temporary cleanup rejected"
+                        f"factor-v3 feature history collection {label} quarantine rejected"
                     ) from None
+                _quarantine_unidentified_temporary(
+                    root=root,
+                    parent=parent,
+                    temporary_path=temporary_path,
+                    label=label,
+                )
+            elif not completed and temporary_identity is not None:
+                for candidate in (destination, temporary_path):
+                    if candidate is None:
+                        continue
+                    try:
+                        metadata = candidate.lstat()
+                        if (
+                            stat.S_ISREG(metadata.st_mode)
+                            and not _is_reparse_point(candidate)
+                            and os.path.samestat(metadata, temporary_identity)
+                        ):
+                            candidate.unlink()
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        raise ValueError(
+                            f"factor-v3 feature history collection {label} temporary cleanup rejected"
+                        ) from None
+                if parent is not None:
+                    try:
+                        fsync_directory(parent)
+                    except OSError:
+                        raise ValueError(
+                            f"factor-v3 feature history collection {label} temporary cleanup rejected"
+                        ) from None
     return True
 
 

@@ -740,10 +740,23 @@ def test_collection_manifest_and_issuance_reuse_safe_cas_primitives() -> None:
     )
 
     assert "raw_authority._content_addressed_directory" in source
-    assert "tempfile.mkstemp" in source
-    assert "_promote_snapshot_directory" in source
+    assert "_open_bound_temporary_file" in source
+    assert "_promote_bound_temporary_file" in source
+    assert "_read_bound_temporary_file" in source
+    assert "tempfile.mkstemp" in inspect.getsource(
+        history_authority._open_bound_temporary_file
+    )
+    assert "_promote_snapshot_directory" in inspect.getsource(
+        history_authority._promote_bound_temporary_file
+    )
     assert "raw_authority._read_safe_file" in verifier_source
     assert "fsync_directory" in source
+
+
+def test_windows_bound_delete_uses_exact_boolean_disposition_field() -> None:
+    source = inspect.getsource(history_authority._windows_mark_handle_for_deletion)
+
+    assert '"delete_file", ctypes.c_ubyte' in source
 
 
 def test_collection_manifest_write_failure_leaves_no_partial_content_address_target(
@@ -761,7 +774,7 @@ def test_collection_manifest_write_failure_leaves_no_partial_content_address_tar
         raise OSError("injected promotion failure")
 
     monkeypatch.setattr(
-        history_authority, "_promote_snapshot_directory", fail_promotion
+        history_authority, "_promote_bound_temporary_file", fail_promotion
     )
     with pytest.raises(ValueError, match="manifest"):
         history_authority._write_collection_manifest_candidate(
@@ -786,24 +799,24 @@ def test_collection_manifest_post_link_failure_cleans_its_claim(
     target = tmp_path / relative_path
 
     promoted = False
-    original_promote = history_authority._promote_snapshot_directory
+    original_promote = history_authority._promote_bound_temporary_file
 
     def tracked_promotion(**kwargs: object) -> None:
         nonlocal promoted
         original_promote(**kwargs)
         promoted = True
 
-    def fail_post_link_fsync(_path: Path) -> None:
+    def fail_post_link_read(**_kwargs: object) -> bytes:
         assert promoted
-        raise OSError("injected post-link fsync failure")
+        raise ValueError("injected post-link read failure")
 
     monkeypatch.setattr(
-        history_authority, "_promote_snapshot_directory", tracked_promotion
+        history_authority, "_promote_bound_temporary_file", tracked_promotion
     )
     monkeypatch.setattr(
         history_authority,
-        "fsync_directory",
-        fail_post_link_fsync,
+        "_read_bound_temporary_file",
+        fail_post_link_read,
     )
     with pytest.raises(ValueError, match="manifest"):
         history_authority._write_collection_manifest_candidate(
@@ -853,10 +866,11 @@ def test_collection_manifest_replacement_before_promotion_is_left_untouched(
     target = tmp_path / relative_path
     foreign = b'{"foreign":"replacement"}'
     replaced = False
+    replacement_blocked = False
     original_lstat = Path.lstat
 
     def replace_temporary(path: Path) -> os.stat_result:
-        nonlocal replaced
+        nonlocal replaced, replacement_blocked
         if (
             not replaced
             and path.name.startswith(f".{digest}.")
@@ -864,11 +878,30 @@ def test_collection_manifest_replacement_before_promotion_is_left_untouched(
         ):
             replacement = path.with_name(".foreign-replacement")
             replacement.write_bytes(foreign)
-            os.replace(replacement, path)
-            replaced = True
+            try:
+                os.replace(replacement, path)
+            except OSError:
+                replacement_blocked = True
+                replacement.unlink(missing_ok=True)
+            else:
+                replaced = True
         return original_lstat(path)
 
     monkeypatch.setattr(Path, "lstat", replace_temporary)
+    if os.name == "nt":
+        assert (
+            history_authority._write_collection_manifest_candidate(
+                output_root=tmp_path,
+                relative_path=relative_path,
+                raw=raw,
+            )
+            is True
+        )
+        assert replacement_blocked
+        assert not replaced
+        assert target.read_bytes() == raw
+        assert not list(tmp_path.rglob("*.tmp"))
+        return
     with pytest.raises(ValueError, match="manifest"):
         history_authority._write_collection_manifest_candidate(
             output_root=tmp_path,
@@ -903,6 +936,34 @@ def test_collection_manifest_fstat_failure_reclaims_temporary_file(
         return original_fstat(descriptor)
 
     monkeypatch.setattr(history_authority.os, "fstat", fail_first_fstat)
+    with pytest.raises(ValueError, match="manifest"):
+        history_authority._write_collection_manifest_candidate(
+            output_root=tmp_path,
+            relative_path=relative_path,
+            raw=raw,
+        )
+
+    assert not target.exists()
+    assert not list(tmp_path.rglob("*.tmp"))
+    assert not list(tmp_path.rglob("*.quarantine"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows descriptor-bound cleanup")
+def test_collection_manifest_persistent_fstat_failure_deletes_by_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = b'{"candidate":"value"}'
+    digest = hashlib.sha256(raw).hexdigest()
+    relative_path = (
+        "feature_history_collection_manifest_candidates/sha256/"
+        f"{digest[:2]}/{digest}.json"
+    )
+    target = tmp_path / relative_path
+
+    def fail_fstat(_descriptor: int) -> os.stat_result:
+        raise OSError("injected persistent fstat failure")
+
+    monkeypatch.setattr(history_authority.os, "fstat", fail_fstat)
     with pytest.raises(ValueError, match="manifest"):
         history_authority._write_collection_manifest_candidate(
             output_root=tmp_path,
