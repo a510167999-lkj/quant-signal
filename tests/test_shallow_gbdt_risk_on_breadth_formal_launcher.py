@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -248,6 +249,45 @@ def test_unbounded_command_requires_assigned_and_drained_job_object(
         "windows_job_object_active_process_count_zero"
     )
     assert receipt["stderr"]["bytes"] == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="正式 launcher 只允许 Windows")
+def test_job_assignment_failure_never_releases_the_actual_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "actual-command-started.txt"
+    stdout_path = tmp_path / "stdout.log"
+    stderr_path = tmp_path / "stderr.log"
+    environment = launcher._minimal_child_environment(
+        os.environ,
+        python_executable=Path(sys.executable),
+        temp_dir=tmp_path,
+    )
+
+    def fail_assignment(
+        _self: launcher._WindowsJob,
+        _process: object,
+    ) -> None:
+        time.sleep(0.2)
+        raise OSError("synthetic assignment failure")
+
+    monkeypatch.setattr(launcher._WindowsJob, "assign", fail_assignment)
+
+    with pytest.raises(OSError, match="synthetic assignment failure"):
+        launcher.run_unbounded_command(
+            command=[
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(marker)!r}).write_text('started')",
+            ],
+            cwd=tmp_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            environment=environment,
+        )
+
+    assert not marker.exists()
 
 
 def test_risk_on_breadth_producer_binding_rejects_valid_format_drift(
