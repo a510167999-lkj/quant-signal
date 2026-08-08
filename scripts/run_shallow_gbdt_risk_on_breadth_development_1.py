@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
 import time
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -1386,5 +1387,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def cli(argv: Sequence[str] | None = None) -> int:
+    try:
+        return main(argv)
+    except Exception:
+        print("status=failed", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())
