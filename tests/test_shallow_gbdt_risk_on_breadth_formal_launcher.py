@@ -50,6 +50,16 @@ EXPECTED_ARGUMENTS = [
 ]
 
 
+def _write_content_addressed_json(directory: Path, payload: dict) -> tuple[Path, str]:
+    digest = launcher._sha256(payload)
+    path = directory / f"{digest}.json"
+    path.write_text(
+        json.dumps({**payload, "artifact_sha256": digest}, sort_keys=True),
+        encoding="utf-8",
+    )
+    return path, digest
+
+
 def test_formal_risk_on_breadth_run_spec_is_frozen_and_development_only() -> None:
     launcher._assert_frozen_run_spec()
 
@@ -195,6 +205,71 @@ def test_frozen_input_attestation_rejects_unexpected_file_type(tmp_path: Path) -
         launcher.frozen_input_attestation(tmp_path, inputs)
 
 
+def test_result_artifact_accepts_the_real_nested_strategy_binding(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": launcher.EXPECTED_RESULT_SCHEMA,
+        "strategy": {
+            "schema_version": "synthetic-frozen-strategy/v1",
+            "strategy_sha256": launcher.EXPECTED_STRATEGY_SHA256,
+        },
+        "producer_code": {
+            "schema_version": "synthetic-producer/v1",
+            "root_sha256": launcher.EXPECTED_PRODUCER_ROOT_SHA256,
+        },
+        "scope": {
+            "development_only": True,
+            "embargo_consumed": False,
+            "final_oos_consumed": False,
+        },
+    }
+    _path, digest = _write_content_addressed_json(tmp_path, payload)
+
+    artifact, verified = launcher._result_artifact(tmp_path)
+
+    assert verified is True
+    assert artifact is not None
+    assert artifact["canonical_artifact_sha256"] == digest
+
+
+def test_runtime_verification_requires_the_risk_breadth_replay_receipts(
+    tmp_path: Path,
+) -> None:
+    verification_dir = tmp_path / "verifications"
+    verification_dir.mkdir()
+    payload = {
+        "schema_version": launcher.EXPECTED_RESULT_VERIFICATION_SCHEMA,
+        "strategy_sha256": launcher.EXPECTED_STRATEGY_SHA256,
+        "producer_root_sha256": launcher.EXPECTED_PRODUCER_ROOT_SHA256,
+        "main_artifact_sha256": "a" * 64,
+        "sidecar_artifact_sha256": {
+            "features": "b" * 64,
+            "models": "c" * 64,
+            "execution": "d" * 64,
+            "selection": "e" * 64,
+        },
+        "checks": {
+            "independent_rolling_oof_replay": True,
+            "content_addressing_verified": True,
+            "probability_score_contract_verified": True,
+            "shared_positive_candidate_pool_verified": True,
+            "strict_outcome_membership_verified": True,
+            "independent_selection_replay": True,
+            "independent_sweep_and_gate_replay": True,
+            "market_breadth_filter_replayed": True,
+        },
+        "market_breadth_feature_binding_receipt_sha256": "f" * 64,
+        "verified": True,
+    }
+    payload["receipt_sha256"] = launcher._sha256(payload)
+    _write_content_addressed_json(verification_dir, payload)
+
+    verification, verified = launcher._runtime_verification(tmp_path)
+
+    assert verified is True
+    assert verification is not None
+    assert verification["main_artifact_sha256"] == "a" * 64
+
+
 def test_single_attempt_ledger_is_external_and_write_once(tmp_path: Path) -> None:
     output_dir = tmp_path / "runs" / "formal-run"
     ledger_path = tmp_path / "attempts" / "attempt.json"
@@ -288,6 +363,39 @@ def test_job_assignment_failure_never_releases_the_actual_command(
         )
 
     assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="正式 launcher 只允许 Windows")
+def test_job_receipt_waits_for_delayed_descendant(tmp_path: Path) -> None:
+    marker = tmp_path / "descendant-finished.txt"
+    stdout_path = tmp_path / "stdout.log"
+    stderr_path = tmp_path / "stderr.log"
+    environment = launcher._minimal_child_environment(
+        os.environ,
+        python_executable=Path(sys.executable),
+        temp_dir=tmp_path,
+    )
+    descendant = (
+        "import time; from pathlib import Path; time.sleep(0.35); "
+        f"Path({str(marker)!r}).write_text('finished')"
+    )
+    parent = (
+        "import subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', {descendant!r}])"
+    )
+
+    started = time.monotonic()
+    receipt = launcher.run_unbounded_command(
+        command=[sys.executable, "-c", parent],
+        cwd=tmp_path,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        environment=environment,
+    )
+
+    assert time.monotonic() - started >= 0.30
+    assert marker.read_text(encoding="utf-8") == "finished"
+    assert receipt["process_tree_drained"] is True
 
 
 def test_risk_on_breadth_producer_binding_rejects_valid_format_drift(
