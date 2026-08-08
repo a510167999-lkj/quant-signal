@@ -65,7 +65,7 @@ def test_formal_risk_on_breadth_run_spec_is_frozen_and_development_only() -> Non
     launcher._assert_frozen_run_spec()
 
     assert launcher.RUN_SPEC_SHA256 == (
-        "30585397473d61fec12e07669ec4edb22f6c4f6b44e1351047d1c4c07b9a62b2"
+        "51e51fcb51534526d8c8800c7d4f2459c44b011633b150f1d29c0ded7cde236c"
     )
     assert launcher.EXPECTED_STRATEGY_SHA256 == (
         "9b3df2039a3d39b999fd15856c5e8460fe23212b13217625bd21727018adfd19"
@@ -82,6 +82,10 @@ def test_formal_risk_on_breadth_run_spec_is_frozen_and_development_only() -> Non
         "ledger_relative_path": (
             "data/research_attempts/"
             "risk_on_breadth_development_1.formal_attempt.json"
+        ),
+        "terminal_relative_path": (
+            "data/research_attempts/"
+            "risk_on_breadth_development_1.formal_attempt.terminal.json"
         ),
         "max_formal_attempts": 1,
         "ledger_outside_run_root": True,
@@ -105,6 +109,26 @@ def test_formal_risk_on_breadth_run_spec_is_frozen_and_development_only() -> Non
         "pypdf",
         "xgboost",
     ]
+    assert launcher.RUN_SPEC["runtime_contract"]["pycache_policy"] == {
+        "environment_key": "PYTHONPYCACHEPREFIX",
+        "relative_to_runtime_temp": "pycache",
+        "must_not_preexist": True,
+    }
+    assert launcher.RUN_SPEC["runtime_contract"]["bootstrap_contract"] == {
+        "interpreter_flags": ["-I", "-S", "-B"],
+        "site_import_before_job_assignment": False,
+    }
+    assert launcher.RUN_SPEC["runtime_contract"]["launcher_entrypoint"] == (
+        "direct-source-file"
+    )
+    assert launcher.RUN_SPEC["inputs"]["transitive_binding"] == {
+        "schema_version": "formal-transitive-input-binding/v1",
+        "current_pool_audit": {
+            "authority_path_field": "temporal_contract_path",
+            "path_field": "current_pool_development_audit_path",
+            "sha256_field": "expected_current_pool_development_audit_sha256",
+        },
+    }
     assert launcher.RUN_SPEC["inputs"]["current_pool_development_audit_path"] == (
         "data/research_artifacts/current_pool_audits/"
         "6de58a9b42ef6134219ea2b155afa43836cde24cc86bafeb2f71f3653830cf55.json"
@@ -149,12 +173,61 @@ def test_minimal_child_environment_does_not_inherit_secrets(tmp_path: Path) -> N
     assert environment["PYTHONNOUSERSITE"] == "1"
     assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
     assert environment["PYTHONUTF8"] == "1"
+    assert environment["DISABLE_ENV_FILE"] == "1"
+    assert environment["PYTHONPYCACHEPREFIX"] == str(
+        (tmp_path / "pycache").resolve()
+    )
     assert environment["TEMP"] == str(tmp_path.resolve())
     assert environment["TMP"] == str(tmp_path.resolve())
     assert "JIAOCH_TOKEN" not in environment
     assert "ANTHROPIC_AUTH_TOKEN" not in environment
     assert "UNRELATED_SETTING" not in environment
     assert r"C:\untrusted" not in environment["PATH"]
+
+
+def test_temporal_contract_explicitly_binds_the_attested_current_pool_audit(
+    tmp_path: Path,
+) -> None:
+    temporal = tmp_path / "frozen.json"
+    audit = tmp_path / "audit.json"
+    audit.write_bytes(b"audit")
+    audit_sha256 = "a" * 64
+    temporal.write_text(
+        json.dumps(
+            {
+                "development_evidence": {
+                    "current_pool_coverage_audit": {
+                        "path": audit.name,
+                        "canonical_sha256": audit_sha256,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    inputs = {
+        "temporal_contract_path": temporal.name,
+        "current_pool_development_audit_path": audit.name,
+        "expected_current_pool_development_audit_sha256": audit_sha256,
+        "transitive_binding": launcher.RUN_SPEC["inputs"]["transitive_binding"],
+    }
+
+    launcher._assert_transitive_input_binding(tmp_path, inputs)
+    temporal.write_text(
+        json.dumps(
+            {
+                "development_evidence": {
+                    "current_pool_coverage_audit": {
+                        "path": "different.json",
+                        "canonical_sha256": audit_sha256,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="transitive input binding differs"):
+        launcher._assert_transitive_input_binding(tmp_path, inputs)
 
 
 def test_frozen_input_attestation_binds_observed_bytes(tmp_path: Path) -> None:
@@ -305,6 +378,66 @@ def test_runtime_verification_requires_the_risk_breadth_replay_receipts(
     assert verification["main_artifact_sha256"] == "a" * 64
 
 
+def test_completed_result_bundle_rejects_missing_sidecar_files(tmp_path: Path) -> None:
+    sidecar_sha256 = {
+        "features": "b" * 64,
+        "models": "c" * 64,
+        "execution": "d" * 64,
+        "selection": "e" * 64,
+    }
+    main_payload = {
+        "schema_version": launcher.EXPECTED_RESULT_SCHEMA,
+        "strategy_sha256": launcher.EXPECTED_STRATEGY_SHA256,
+        "strategy": {"strategy_sha256": launcher.EXPECTED_STRATEGY_SHA256},
+        "source": {"schema_version": "synthetic-source/v1"},
+        "producer_code": {"root_sha256": launcher.EXPECTED_PRODUCER_ROOT_SHA256},
+        "sidecars": {
+            name: {
+                "artifact_sha256": digest,
+                "relative_path": f"sidecars/{digest}.json",
+            }
+            for name, digest in sidecar_sha256.items()
+        },
+        "scope": {
+            "development_only": True,
+            "embargo_consumed": False,
+            "final_oos_consumed": False,
+        },
+    }
+    _main_path, main_sha256 = _write_content_addressed_json(tmp_path, main_payload)
+    verification_dir = tmp_path / "verifications"
+    verification_dir.mkdir()
+    verification_payload = {
+        "schema_version": launcher.EXPECTED_RESULT_VERIFICATION_SCHEMA,
+        "strategy_sha256": launcher.EXPECTED_STRATEGY_SHA256,
+        "producer_root_sha256": launcher.EXPECTED_PRODUCER_ROOT_SHA256,
+        "main_artifact_sha256": main_sha256,
+        "sidecar_artifact_sha256": sidecar_sha256,
+        "checks": {
+            "independent_rolling_oof_replay": True,
+            "content_addressing_verified": True,
+            "probability_score_contract_verified": True,
+            "shared_positive_candidate_pool_verified": True,
+            "strict_outcome_membership_verified": True,
+            "independent_selection_replay": True,
+            "independent_sweep_and_gate_replay": True,
+            "market_breadth_filter_replayed": True,
+        },
+        "market_breadth_feature_binding_receipt_sha256": "f" * 64,
+        "verified": True,
+    }
+    verification_payload["receipt_sha256"] = launcher._sha256(
+        verification_payload
+    )
+    _write_content_addressed_json(verification_dir, verification_payload)
+
+    main, verification, verified = launcher._result_bundle(tmp_path)
+
+    assert main is None
+    assert verification is None
+    assert verified is False
+
+
 def test_runtime_attestation_binds_minimal_environment_and_distributions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -442,6 +575,7 @@ def _sandbox_launcher_main(
     monkeypatch.setattr(launcher, "WORKSPACE", tmp_path)
     monkeypatch.setattr(launcher, "SCRIPT_PATH", script_path)
     monkeypatch.setattr(launcher, "RELATIVE_OUTPUT_DIR", relative_output)
+    monkeypatch.setattr(launcher, "__package__", "")
     monkeypatch.setattr(launcher, "_preflight", lambda **_kwargs: dict(preflight))
     monkeypatch.setattr(
         launcher,
@@ -534,6 +668,16 @@ def test_main_success_stays_pending_independent_verification(
     assert completion["profile_registration_authority"] is False
     assert completion["production_recommendation_authority"] is False
     assert completion["automatic_trading_authority"] is False
+    attempt_terminal = json.loads(
+        (
+            tmp_path
+            / launcher.RUN_SPEC["attempt_contract"]["terminal_relative_path"]
+        ).read_text(encoding="utf-8")
+    )
+    assert attempt_terminal["status"] == "completed"
+    assert attempt_terminal["completion_sha256"] == launcher.sha256_file(
+        completion_path
+    )
 
 
 def test_main_failure_records_only_stable_error_type_and_no_authority(
@@ -574,6 +718,14 @@ def test_main_failure_records_only_stable_error_type_and_no_authority(
     assert failure["profile_registration_authority"] is False
     assert failure["production_recommendation_authority"] is False
     assert failure["automatic_trading_authority"] is False
+    attempt_terminal = json.loads(
+        (
+            tmp_path
+            / launcher.RUN_SPEC["attempt_contract"]["terminal_relative_path"]
+        ).read_text(encoding="utf-8")
+    )
+    assert attempt_terminal["status"] == "failed"
+    assert attempt_terminal["error_type"] == "RuntimeError"
 
 
 def test_cli_masks_preflight_exception_details(
@@ -646,6 +798,16 @@ def test_unbounded_command_requires_assigned_and_drained_job_object(
         "windows_job_object_active_process_count_zero"
     )
     assert receipt["stderr"]["bytes"] == 0
+
+
+def test_gated_bootstrap_disables_site_before_job_assignment() -> None:
+    command = launcher._gated_bootstrap_command(
+        [sys.executable, "-c", "print('actual')"],
+        event_value=123,
+    )
+
+    assert command[:5] == [sys.executable, "-I", "-S", "-B", "-c"]
+    assert "import site" not in command[5]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="正式 launcher 只允许 Windows")
@@ -773,6 +935,17 @@ def test_path_environment_attempt_and_commit_boundaries_fail_closed(
         )
     with pytest.raises(ValueError, match="full lowercase SHA-1"):
         launcher._validated_expected_commit("ABC")
+
+
+def test_formal_entrypoint_requires_direct_source_execution(tmp_path: Path) -> None:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    script_path = scripts_dir / "launcher.py"
+    script_path.write_text("synthetic", encoding="utf-8")
+
+    launcher._assert_direct_entrypoint("", script_path, tmp_path)
+    with pytest.raises(RuntimeError, match="direct committed source file"):
+        launcher._assert_direct_entrypoint("scripts", script_path, tmp_path)
 
 
 def test_input_attestation_rejects_empty_tree_and_duplicate_paths(
