@@ -65,7 +65,7 @@ def test_formal_risk_on_breadth_run_spec_is_frozen_and_development_only() -> Non
     launcher._assert_frozen_run_spec()
 
     assert launcher.RUN_SPEC_SHA256 == (
-        "5152b35fd399e15f036205c330c5a5765624faf784b2030c87669d7b04a71068"
+        "30585397473d61fec12e07669ec4edb22f6c4f6b44e1351047d1c4c07b9a62b2"
     )
     assert launcher.EXPECTED_STRATEGY_SHA256 == (
         "9b3df2039a3d39b999fd15856c5e8460fe23212b13217625bd21727018adfd19"
@@ -99,6 +99,12 @@ def test_formal_risk_on_breadth_run_spec_is_frozen_and_development_only() -> Non
         "production_authority": False,
         "automatic_trading_authority": False,
     }
+    assert launcher.RUN_SPEC["runtime_contract"]["critical_distributions"] == [
+        "numpy",
+        "pandas",
+        "pypdf",
+        "xgboost",
+    ]
     assert launcher.RUN_SPEC["inputs"]["current_pool_development_audit_path"] == (
         "data/research_artifacts/current_pool_audits/"
         "6de58a9b42ef6134219ea2b155afa43836cde24cc86bafeb2f71f3653830cf55.json"
