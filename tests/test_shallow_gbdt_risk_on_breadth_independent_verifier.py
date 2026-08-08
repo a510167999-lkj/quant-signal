@@ -31,6 +31,12 @@ def _sha256(value: object) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
+def _owned_bytes(ownership: dict) -> bytes:
+    handle = ownership["handle"]
+    handle.seek(0)
+    return handle.read()
+
+
 def _write_content_addressed(directory: Path, body: dict) -> tuple[Path, str]:
     digest = _sha256(body)
     path = directory / f"{digest}.json"
@@ -1100,8 +1106,20 @@ def test_phase3_minimal_environment_drops_unapproved_parent_values(
 ) -> None:
     monkeypatch.setenv("FORMAL_TEST_SECRET", "must-not-cross")
     monkeypatch.setenv("PATH", "must-not-cross")
+    system_root = tmp_path / "Windows"
+    python = tmp_path / "venv" / "Scripts" / "python.exe"
+    blocker = tmp_path / "pycache-blocker"
+    system_root.mkdir()
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"python")
+    blocker.write_bytes(b"blocker")
+    monkeypatch.setenv("SystemRoot", str(system_root))
 
-    observed = verifier._minimal_child_environment(tmp_path)
+    observed = verifier._minimal_child_environment(
+        tmp_path / "runtime-tmp",
+        python_executable=python,
+        pycache_blocker=blocker,
+    )
 
     assert observed["DISABLE_ENV_FILE"] == "1"
     assert observed["PYTHONHASHSEED"] == "0"
@@ -1109,10 +1127,16 @@ def test_phase3_minimal_environment_drops_unapproved_parent_values(
     assert observed["PYTHONDONTWRITEBYTECODE"] == "1"
     assert observed["PYTHONUTF8"] == "1"
     assert observed["VPS_RUNTIME_ROLE"] == "local_research"
-    assert observed["TEMP"] == str(tmp_path.resolve())
-    assert observed["TMP"] == str(tmp_path.resolve())
+    assert observed["TEMP"] == str((tmp_path / "runtime-tmp").resolve())
+    assert observed["TMP"] == str((tmp_path / "runtime-tmp").resolve())
+    assert observed["PYTHONPYCACHEPREFIX"] == str(blocker.resolve())
+    assert observed["PATH"].split(verifier.os.pathsep) == [
+        str(python.parent.resolve()),
+        str(system_root / "System32"),
+        str(system_root),
+    ]
     assert "FORMAL_TEST_SECRET" not in observed
-    assert "PATH" not in observed
+    assert observed["PATH"] != "must-not-cross"
 
 
 def test_phase3_json_document_size_policy_is_exact_and_frozen(
@@ -1400,7 +1424,11 @@ marker.write_text(json.dumps({"argv": sys.argv, "count": count + 1}))
     completed = verifier.subprocess.run(
         command,
         cwd=data_root,
-        env=verifier._minimal_child_environment(tmp_path / "runtime-tmp"),
+        env=verifier._minimal_child_environment(
+            tmp_path / "runtime-tmp",
+            python_executable=python,
+            pycache_blocker=blocker,
+        ),
         stdin=verifier.subprocess.DEVNULL,
         stdout=verifier.subprocess.PIPE,
         stderr=verifier.subprocess.PIPE,
@@ -1455,7 +1483,11 @@ def verify_current_pool_audit(path):
         expected_binding=expected,
         python_executable=python,
         site_packages=site_packages,
-        environment=verifier._minimal_child_environment(tmp_path / "runtime-tmp"),
+        environment=verifier._minimal_child_environment(
+            tmp_path / "runtime-tmp",
+            python_executable=python,
+            pycache_blocker=blocker,
+        ),
         pycache_blocker=blocker,
     )
 
@@ -1495,6 +1527,143 @@ def test_phase3_write_once_is_exclusive_and_preserves_first_bytes(
     assert target.read_bytes() == first
 
 
+def test_retry1_write_once_rejects_parent_identity_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "publication" / "claim.json"
+    target.parent.mkdir()
+    original = verifier._assert_no_reparse
+    parent_calls = 0
+
+    def drift_parent(path: Path, label: str):
+        nonlocal parent_calls
+        observed = original(path, label)
+        if path == target.parent:
+            parent_calls += 1
+            if parent_calls == 2:
+                values = {
+                    name: getattr(observed, name)
+                    for name in (
+                        "st_mode",
+                        "st_size",
+                        "st_mtime_ns",
+                        "st_dev",
+                        "st_ino",
+                    )
+                }
+                values["st_ino"] += 1
+                return SimpleNamespace(**values)
+        return observed
+
+    monkeypatch.setattr(verifier, "_assert_no_reparse", drift_parent)
+
+    with pytest.raises(ValueError, match="parent.*changed"):
+        verifier._write_once(target, b"claim\n", "claim")
+
+
+def test_retry1_write_once_rejects_linked_target_content_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "publication" / "receipt.json"
+    expected = b'{"receipt":true}\n'
+    original_link = verifier.os.link
+
+    def corrupt_after_link(source: object, destination: object) -> None:
+        original_link(source, destination)
+        Path(destination).write_bytes(b"foreign\n")
+
+    monkeypatch.setattr(verifier.os, "link", corrupt_after_link)
+
+    with pytest.raises(PermissionError):
+        verifier._write_once(target, expected, "receipt publication")
+
+    assert not target.exists()
+
+
+def test_retry1_claim_ownership_rejects_replace_restore_before_status(
+    tmp_path: Path,
+) -> None:
+    claim_path = tmp_path / "claim.json"
+    status_path = tmp_path / "status.json"
+    claim_raw = b'{"claim":true}\n'
+    verifier._write_once(claim_path, claim_raw, "claim")
+    claim_ownership = verifier._open_claim_ownership(claim_path, claim_raw)
+    status_ownership = verifier._reserve_status_slot(status_path)
+    try:
+        with pytest.raises(PermissionError):
+            claim_path.write_bytes(b"foreign claim")
+
+        assert _owned_bytes(status_ownership) == b""
+    finally:
+        status_ownership["handle"].close()
+        claim_ownership["handle"].close()
+
+
+def test_retry1_persisted_streams_reject_dangling_reparse(
+    tmp_path: Path,
+) -> None:
+    stdout = tmp_path / verifier.RETRY_REPLAY_STDOUT_NAME
+    try:
+        stdout.symlink_to(tmp_path / "missing.log")
+    except OSError:
+        pytest.skip("test host cannot create a symlink")
+
+    with pytest.raises(ValueError, match="reparse"):
+        verifier._persisted_retry_replay_streams(tmp_path)
+
+
+def test_retry1_success_stream_descriptors_must_match_recomputed_files(
+    tmp_path: Path,
+) -> None:
+    stdout = tmp_path / verifier.RETRY_REPLAY_STDOUT_NAME
+    stderr = tmp_path / verifier.RETRY_REPLAY_STDERR_NAME
+    stdout.write_bytes(b"stdout")
+    stderr.write_bytes(b"stderr")
+    expected = verifier._persisted_retry_replay_streams(tmp_path)
+    expected["stdout"] = {**expected["stdout"], "sha256": "0" * 64}
+
+    with pytest.raises(
+        verifier.IndependentVerificationError,
+        match="stream descriptors",
+    ):
+        verifier._verified_retry_replay_streams(tmp_path, expected)
+
+
+def test_retry1_replay_stream_ownership_blocks_writes_and_keeps_descriptors(
+    tmp_path: Path,
+) -> None:
+    stdout = tmp_path / verifier.RETRY_REPLAY_STDOUT_NAME
+    stderr = tmp_path / verifier.RETRY_REPLAY_STDERR_NAME
+    stdout_raw = b"synthetic stdout"
+    stderr_raw = b"synthetic stderr"
+    stdout.write_bytes(stdout_raw)
+    stderr.write_bytes(stderr_raw)
+
+    streams, ownerships = verifier._owned_retry_replay_streams(tmp_path)
+    try:
+        for _ in range(3):
+            with pytest.raises(PermissionError):
+                stdout.write_bytes(b"sustained foreign write")
+        assert verifier._verify_retry_replay_stream_ownerships(
+            ownerships,
+            streams,
+        ) == streams
+        assert streams["stdout"] == {
+            "path": verifier.RETRY_REPLAY_STDOUT_NAME,
+            "bytes": len(stdout_raw),
+            "sha256": hashlib.sha256(stdout_raw).hexdigest(),
+        }
+        assert streams["stderr"] == {
+            "path": verifier.RETRY_REPLAY_STDERR_NAME,
+            "bytes": len(stderr_raw),
+            "sha256": hashlib.sha256(stderr_raw).hexdigest(),
+        }
+    finally:
+        verifier._close_retry_replay_stream_ownerships(ownerships)
+
+
 @pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
 def test_phase3_sqlite_snapshot_requires_quiescent_source(
     tmp_path: Path,
@@ -1508,22 +1677,277 @@ def test_phase3_sqlite_snapshot_requires_quiescent_source(
         verifier._assert_sqlite_quiescent(database)
 
 
+def _small_complete_frozen_inputs(source: Path) -> dict[str, Path]:
+    relative = verifier.REPLAY_PLAN["inputs"]
+    metadata = source / relative["audited_pit_universe_path"]
+    bundle = metadata.parent
+    manifest = bundle / "manifest.json"
+    raw = bundle / "raw"
+    temporal = source / relative["temporal_contract_path"]
+    audit = source / relative["current_pool_development_audit_path"]
+    transition = (
+        source
+        / relative["security_code_transition_evidence_root"]
+        / "contract.json"
+    )
+    for path, value in (
+        (metadata, b"sqlite"),
+        (manifest, b'{"schema_version":"synthetic-pit-bundle/v1"}\n'),
+        (raw / "daily" / "20260703.json", b"daily"),
+        (raw / "bak_basic" / "20260703.json", b"membership"),
+        (temporal, b"temporal"),
+        (audit, b"audit"),
+        (transition, b"transition"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(value)
+    return {
+        "metadata": metadata,
+        "bundle": bundle,
+        "manifest": manifest,
+        "raw": raw,
+        "temporal": temporal,
+        "audit": audit,
+        "transition": transition,
+    }
+
+
+def test_retry1_copies_complete_pit_bundle_and_preserves_metadata_relative_path(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    paths = _small_complete_frozen_inputs(source)
+    relative_metadata = Path(
+        verifier.REPLAY_PLAN["inputs"]["audited_pit_universe_path"]
+    )
+    bundle_manifest = verifier._universe_bundle_manifest(source)
+
+    binding = verifier._copy_frozen_inputs(
+        source,
+        target,
+        expected_formal_attestation=verifier._observed_frozen_attestation(
+            source
+        ),
+        expected_universe_bundle_manifest_sha256=bundle_manifest[
+            "manifest_sha256"
+        ],
+    )
+
+    copied_metadata = target / relative_metadata
+    assert copied_metadata.read_bytes() == paths["metadata"].read_bytes()
+    assert copied_metadata.parent == target / paths["bundle"].relative_to(source)
+    assert (copied_metadata.parent / "manifest.json").read_bytes() == paths[
+        "manifest"
+    ].read_bytes()
+    assert verifier._manifest_path(copied_metadata.parent / "raw", "raw") == (
+        verifier._manifest_path(paths["raw"], "raw")
+    )
+    assert binding["schema_version"].endswith("frozen-input-copy/v2")
+    assert binding["input_count"] == 4
+    assert binding["universe_bundle_manifest_sha256"] == bundle_manifest[
+        "manifest_sha256"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing_manifest", "bundle"),
+        ("missing_raw", "bundle"),
+        ("raw_extra", "manifest"),
+        ("raw_missing", "manifest"),
+    ],
+)
+def test_retry1_bundle_copy_rejects_missing_or_drifted_raw_tree(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    paths = _small_complete_frozen_inputs(source)
+    expected = verifier._universe_bundle_manifest(source)["manifest_sha256"]
+    if mutation == "missing_manifest":
+        paths["manifest"].unlink()
+    elif mutation == "missing_raw":
+        for candidate in sorted(paths["raw"].rglob("*"), reverse=True):
+            candidate.unlink() if candidate.is_file() else candidate.rmdir()
+        paths["raw"].rmdir()
+    elif mutation == "raw_extra":
+        (paths["raw"] / "extra.json").write_bytes(b"extra")
+    else:
+        (paths["raw"] / "daily" / "20260703.json").unlink()
+
+    with pytest.raises((ValueError, FileNotFoundError), match=message):
+        verifier._copy_frozen_inputs(
+            source,
+            target,
+            expected_formal_attestation=verifier._observed_frozen_attestation(
+                source
+            ),
+            expected_universe_bundle_manifest_sha256=expected,
+        )
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
+def test_retry1_bundle_copy_rejects_sqlite_sidecars(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    paths = _small_complete_frozen_inputs(source)
+    expected = verifier._universe_bundle_manifest(source)["manifest_sha256"]
+    Path(f"{paths['metadata']}{suffix}").write_bytes(b"mutable")
+
+    with pytest.raises(ValueError, match="SQLite"):
+        verifier._copy_frozen_inputs(
+            source,
+            target,
+            expected_formal_attestation=verifier._observed_frozen_attestation(
+                source
+            ),
+            expected_universe_bundle_manifest_sha256=expected,
+        )
+
+
+def test_retry1_bundle_manifest_rejects_reparse_entry(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    paths = _small_complete_frozen_inputs(source)
+    external = tmp_path / "external.json"
+    external.write_bytes(b"external")
+    link = paths["raw"] / "linked.json"
+    try:
+        link.symlink_to(external)
+    except OSError:
+        pytest.skip("test host cannot create a symlink")
+
+    with pytest.raises(ValueError, match="reparse"):
+        verifier._universe_bundle_manifest(source)
+
+
+def test_retry1_bundle_copy_rejects_midflight_source_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    paths = _small_complete_frozen_inputs(source)
+    expected = verifier._universe_bundle_manifest(source)["manifest_sha256"]
+    original_copy = verifier._copy_regular_file_verified
+    replaced = False
+
+    def replace_then_copy(
+        source_path: Path,
+        target_path: Path,
+        expected_entry: dict,
+        label: str,
+    ) -> None:
+        nonlocal replaced
+        if not replaced and source_path == paths["metadata"]:
+            replaced = True
+            source_path.write_bytes(b"forged")
+        original_copy(source_path, target_path, expected_entry, label)
+
+    monkeypatch.setattr(
+        verifier,
+        "_copy_regular_file_verified",
+        replace_then_copy,
+    )
+
+    with pytest.raises(ValueError, match="differs|changed"):
+        verifier._copy_frozen_inputs(
+            source,
+            target,
+            expected_formal_attestation=verifier._observed_frozen_attestation(
+                source
+            ),
+            expected_universe_bundle_manifest_sha256=expected,
+        )
+
+
+@pytest.mark.parametrize("mutation", ["insert", "delete"])
+def test_retry1_directory_manifest_rechecks_exact_set_after_recursion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    first = root / "a.json"
+    second = root / "b.json"
+    first.write_bytes(b"a")
+    second.write_bytes(b"b")
+    original = verifier._regular_file_manifest
+    mutated = False
+
+    def mutate_after_hash(path: Path, label: str) -> dict:
+        nonlocal mutated
+        observed = original(path, label)
+        if not mutated and (
+            (mutation == "insert" and path == first)
+            or (mutation == "delete" and path == second)
+        ):
+            mutated = True
+            if mutation == "insert":
+                (root / "c.json").write_bytes(b"c")
+            else:
+                first.unlink()
+        return observed
+
+    monkeypatch.setattr(
+        verifier,
+        "_regular_file_manifest",
+        mutate_after_hash,
+    )
+
+    with pytest.raises(ValueError, match="changed|exact"):
+        verifier._complete_directory_manifest(root, "tree")
+
+
+@pytest.mark.parametrize("mutation", ["insert", "delete"])
+def test_retry1_directory_manifest_rechecks_after_final_candidate_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    first = root / "a.json"
+    second = root / "b.json"
+    first.write_bytes(b"a")
+    second.write_bytes(b"b")
+    original = verifier._assert_no_reparse
+    second_checks = 0
+
+    def mutate_during_final_scan(path: Path, label: str):
+        nonlocal second_checks
+        observed = original(path, label)
+        if path == second:
+            second_checks += 1
+            if second_checks == 4:
+                if mutation == "insert":
+                    (root / "c.json").write_bytes(b"c")
+                else:
+                    first.unlink()
+        return observed
+
+    monkeypatch.setattr(
+        verifier,
+        "_assert_no_reparse",
+        mutate_during_final_scan,
+    )
+
+    with pytest.raises(ValueError, match="changed|exact"):
+        verifier._complete_directory_manifest(root, "tree")
+
+
 def test_phase3_copies_only_four_frozen_input_classes(tmp_path: Path) -> None:
     source = tmp_path / "source"
     target = tmp_path / "target"
     relative = verifier.REPLAY_PLAN["inputs"]
-    universe = source / relative["audited_pit_universe_path"]
-    temporal = source / relative["temporal_contract_path"]
-    audit = source / relative["current_pool_development_audit_path"]
-    transition = source / relative["security_code_transition_evidence_root"]
-    for path, raw in (
-        (universe, b"sqlite"),
-        (temporal, b"temporal"),
-        (audit, b"audit"),
-        (transition / "contract.json", b"transition"),
-    ):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(raw)
+    _small_complete_frozen_inputs(source)
     unrelated = source / "data" / "not-frozen.txt"
     unrelated.parent.mkdir(parents=True, exist_ok=True)
     unrelated.write_bytes(b"do-not-copy")
@@ -1533,6 +1957,9 @@ def test_phase3_copies_only_four_frozen_input_classes(tmp_path: Path) -> None:
         target,
         expected_formal_attestation=verifier._observed_frozen_attestation(
             source
+        ),
+        expected_universe_bundle_manifest_sha256=(
+            verifier._universe_bundle_manifest(source)["manifest_sha256"]
         ),
     )
 
@@ -1552,19 +1979,7 @@ def test_phase3_separate_data_root_rejects_preexisting_temporal_contract(
     source = tmp_path / "source"
     target = tmp_path / "target"
     relative = verifier.REPLAY_PLAN["inputs"]
-    for path, raw in (
-        (source / relative["audited_pit_universe_path"], b"sqlite"),
-        (source / relative["temporal_contract_path"], b"temporal"),
-        (source / relative["current_pool_development_audit_path"], b"audit"),
-        (
-            source
-            / relative["security_code_transition_evidence_root"]
-            / "contract.json",
-            b"transition",
-        ),
-    ):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(raw)
+    _small_complete_frozen_inputs(source)
     tracked_temporal = target / relative["temporal_contract_path"]
     tracked_temporal.parent.mkdir(parents=True, exist_ok=True)
     tracked_temporal.write_bytes(b"temporal")
@@ -1576,6 +1991,9 @@ def test_phase3_separate_data_root_rejects_preexisting_temporal_contract(
             expected_formal_attestation=verifier._observed_frozen_attestation(
                 source
             ),
+            expected_universe_bundle_manifest_sha256=(
+                verifier._universe_bundle_manifest(source)["manifest_sha256"]
+            ),
         )
 
 
@@ -1583,19 +2001,7 @@ def test_phase3_rejects_drifted_tracked_temporal_contract(tmp_path: Path) -> Non
     source = tmp_path / "source"
     target = tmp_path / "target"
     relative = verifier.REPLAY_PLAN["inputs"]
-    for path, raw in (
-        (source / relative["audited_pit_universe_path"], b"sqlite"),
-        (source / relative["temporal_contract_path"], b"temporal"),
-        (source / relative["current_pool_development_audit_path"], b"audit"),
-        (
-            source
-            / relative["security_code_transition_evidence_root"]
-            / "contract.json",
-            b"transition",
-        ),
-    ):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(raw)
+    _small_complete_frozen_inputs(source)
     tracked_temporal = target / relative["temporal_contract_path"]
     tracked_temporal.parent.mkdir(parents=True, exist_ok=True)
     tracked_temporal.write_bytes(b"drift")
@@ -1606,6 +2012,9 @@ def test_phase3_rejects_drifted_tracked_temporal_contract(tmp_path: Path) -> Non
             target,
             expected_formal_attestation=verifier._observed_frozen_attestation(
                 source
+            ),
+            expected_universe_bundle_manifest_sha256=(
+                verifier._universe_bundle_manifest(source)["manifest_sha256"]
             ),
         )
 
@@ -1746,6 +2155,15 @@ def test_phase3_run_publishes_verification_then_receipt_then_status(
     amendment = _synthetic_verifier_amendment_binding(
         formal_completion_sha256="1" * 64,
     )
+    retry_authority = {
+        "artifact_sha256": "a" * 64,
+        "retry_verifier_git_blob_sha256": "b" * 64,
+        "universe_bundle_manifest_sha256": "c" * 64,
+    }
+    original_failed_attempt = {
+        "claim_sha256": "d" * 64,
+        "status_sha256": "e" * 64,
+    }
     inputs = {
         "run_root": run_root,
         "completion_sha256": "1" * 64,
@@ -1753,6 +2171,8 @@ def test_phase3_run_publishes_verification_then_receipt_then_status(
         "result_bundle": {},
         "formal_runtime_history": {},
         "verifier_amendment": amendment,
+        "retry_authority": retry_authority,
+        "original_failed_attempt": original_failed_attempt,
         "preflight_core": {
             "frozen_input_attestation": {},
             "current_pool_audit_binding": {
@@ -1781,7 +2201,25 @@ def test_phase3_run_publishes_verification_then_receipt_then_status(
         current_pool_probes += 1
         return kwargs["expected_binding"]
 
-    monkeypatch.setattr(verifier, "_load_formal_inputs", stable_formal_loader)
+    def successful_replay(*args: object, **kwargs: object) -> tuple:
+        ownerships = kwargs["replay_stream_ownerships"]
+        streams = {}
+        for ownership in ownerships:
+            verifier._seal_retry_replay_stream_ownership(ownership)
+            name = (
+                "stdout"
+                if ownership["relative"] == verifier.RETRY_REPLAY_STDOUT_NAME
+                else "stderr"
+            )
+            streams[name] = ownership["descriptor"]
+        return (
+            {"schema_version": verifier.REPLAY_RESULT_SCHEMA},
+            {"snapshot_sha256": "4" * 64},
+            streams["stdout"],
+            streams["stderr"],
+        )
+
+    monkeypatch.setattr(verifier, "_load_retry_inputs", stable_formal_loader)
     monkeypatch.setattr(
         verifier,
         "_assert_project_interpreter",
@@ -1810,7 +2248,7 @@ def test_phase3_run_publishes_verification_then_receipt_then_status(
     monkeypatch.setattr(
         verifier,
         "_run_isolated_replay",
-        lambda *args, **kwargs: ({"schema_version": verifier.REPLAY_RESULT_SCHEMA}, {"snapshot_sha256": "4" * 64}, {"bytes": 0, "sha256": "5" * 64}, {"bytes": 0, "sha256": "6" * 64}),
+        successful_replay,
     )
     monkeypatch.setattr(
         verifier,
@@ -1819,9 +2257,14 @@ def test_phase3_run_publishes_verification_then_receipt_then_status(
     )
     original = verifier._write_once
 
-    def recording_write(path: Path, raw: bytes, label: str) -> None:
+    def recording_write(
+        path: Path,
+        raw: bytes,
+        label: str,
+        **kwargs: object,
+    ) -> dict | None:
         writes.append(label)
-        original(path, raw, label)
+        return original(path, raw, label, **kwargs)
 
     monkeypatch.setattr(verifier, "_write_once", recording_write)
 
@@ -1830,22 +2273,22 @@ def test_phase3_run_publishes_verification_then_receipt_then_status(
     assert result["status"] == "completed"
     assert writes.index("independent verification artifact") < writes.index(
         "independent verification receipt"
-    ) < writes.index("independent verification status")
-    assert writes[0] == "independent verification claim"
+    )
+    assert writes[0] == "independent verification retry_1 claim"
     assert formal_loads == 4
     assert current_pool_probes == 2
     claim = json.loads(
-        (run_root / verifier.CLAIM_NAME).read_text(encoding="utf-8")
+        (run_root / verifier.RETRY_CLAIM_NAME).read_text(encoding="utf-8")
     )
     receipt = json.loads(
         (
             run_root
-            / verifier.RECEIPT_ROOT_NAME
+            / verifier.RETRY_RECEIPT_ROOT_NAME
             / f"{result['receipt_sha256']}.json"
         ).read_text(encoding="utf-8")
     )
     status = json.loads(
-        (run_root / verifier.STATUS_NAME).read_text(encoding="utf-8")
+        (run_root / verifier.RETRY_STATUS_NAME).read_text(encoding="utf-8")
     )
     for document in (claim, receipt, status):
         assert document["verifier_amendment_sha256"] == amendment[
@@ -1874,7 +2317,7 @@ def test_phase3_formal_chain_recheck_rejects_midflight_drift(
     drifted["file_sha256"]["completion"] = "4" * 64
     monkeypatch.setattr(
         verifier,
-        "_load_formal_inputs",
+        "_load_retry_inputs",
         lambda root: drifted,
     )
 
@@ -1894,10 +2337,10 @@ def test_phase3_second_run_is_rejected_before_replay(
 ) -> None:
     run_root = tmp_path / "run"
     run_root.mkdir()
-    (run_root / verifier.CLAIM_NAME).write_text("{}", encoding="utf-8")
+    (run_root / verifier.RETRY_CLAIM_NAME).write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
         verifier,
-        "_load_formal_inputs",
+        "_load_retry_inputs",
         lambda root: {"run_root": run_root},
     )
     called = False
@@ -1941,6 +2384,15 @@ def test_phase3_failed_status_contains_error_type_but_not_log_text(
         "verifier_amendment": _synthetic_verifier_amendment_binding(
             formal_completion_sha256="1" * 64,
         ),
+        "retry_authority": {
+            "artifact_sha256": "a" * 64,
+            "retry_verifier_git_blob_sha256": "b" * 64,
+            "universe_bundle_manifest_sha256": "c" * 64,
+        },
+        "original_failed_attempt": {
+            "claim_sha256": "d" * 64,
+            "status_sha256": "e" * 64,
+        },
         "preflight_core": {
             "current_pool_audit_binding": {
                 "canonical_sha256": "9" * 64,
@@ -1950,7 +2402,7 @@ def test_phase3_failed_status_contains_error_type_but_not_log_text(
     }
     secret_log_text = "raw-child-output-must-not-publish"
 
-    monkeypatch.setattr(verifier, "_load_formal_inputs", lambda root: inputs)
+    monkeypatch.setattr(verifier, "_load_retry_inputs", lambda root: inputs)
     monkeypatch.setattr(
         verifier,
         "_assert_project_interpreter",
@@ -1971,7 +2423,9 @@ def test_phase3_failed_status_contains_error_type_but_not_log_text(
     with pytest.raises(RuntimeError, match=secret_log_text):
         verifier.run(str(source_root))
 
-    status = json.loads((run_root / verifier.STATUS_NAME).read_text(encoding="utf-8"))
+    status = json.loads(
+        (run_root / verifier.RETRY_STATUS_NAME).read_text(encoding="utf-8")
+    )
     assert status["error_type"] == "RuntimeError"
     assert secret_log_text not in json.dumps(status)
     assert status["verifier_amendment_sha256"] == "c" * 64
@@ -1980,6 +2434,547 @@ def test_phase3_failed_status_contains_error_type_but_not_log_text(
         status["json_document_size_policy_sha256"]
         == verifier.EXPECTED_JSON_DOCUMENT_SIZE_POLICY_SHA256
     )
+
+
+def test_retry1_child_failure_persists_stage_exit_and_log_hashes_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    python = source_root / ".venv/Scripts/python.exe"
+    site_packages = source_root / ".venv/Lib/site-packages"
+    python.parent.mkdir(parents=True)
+    site_packages.mkdir(parents=True)
+    python.write_bytes(b"python")
+    blocker = source_root / verifier.PYCACHE_BLOCKER_RELATIVE
+    blocker.parent.mkdir(parents=True)
+    blocker.write_bytes(
+        (verifier.PROJECT_ROOT / verifier.PYCACHE_BLOCKER_RELATIVE).read_bytes()
+    )
+    old_claim = run_root / verifier.CLAIM_NAME
+    old_status = run_root / verifier.STATUS_NAME
+    old_claim.write_bytes(b"immutable-old-claim")
+    old_status.write_bytes(b"immutable-old-status")
+    inputs = {
+        "run_root": run_root,
+        "completion_sha256": "1" * 64,
+        "source_authority": {
+            "source_commit": "2" * 40,
+            "source_tree": "3" * 40,
+        },
+        "result_bundle": {},
+        "formal_runtime_history": {},
+        "verifier_amendment": _synthetic_verifier_amendment_binding(
+            formal_completion_sha256="1" * 64,
+        ),
+        "retry_authority": {
+            "artifact_sha256": "a" * 64,
+            "retry_verifier_git_blob_sha256": "b" * 64,
+            "universe_bundle_manifest_sha256": "c" * 64,
+        },
+        "original_failed_attempt": {
+            "claim_sha256": "d" * 64,
+            "status_sha256": "e" * 64,
+        },
+        "preflight_core": {
+            "frozen_input_attestation": {},
+            "current_pool_audit_binding": {
+                "canonical_sha256": "9" * 64,
+                "allowed_symbol_count": 1,
+            },
+        },
+    }
+    raw_child_output = b"synthetic child output must not enter JSON"
+
+    @contextmanager
+    def fake_snapshot(*args: object, **kwargs: object):
+        code = tmp_path / "code"
+        code.mkdir(exist_ok=True)
+        copied_blocker = code / verifier.PYCACHE_BLOCKER_RELATIVE
+        copied_blocker.parent.mkdir(parents=True, exist_ok=True)
+        copied_blocker.write_bytes(blocker.read_bytes())
+        yield code
+
+    def failed_replay(*args: object, **kwargs: object) -> object:
+        ownerships = {
+            ownership["relative"]: ownership
+            for ownership in kwargs["replay_stream_ownerships"]
+        }
+        stdout_handle = ownerships[verifier.RETRY_REPLAY_STDOUT_NAME]["handle"]
+        stdout_handle.write(raw_child_output)
+        stdout_handle.flush()
+        raise verifier.IndependentReplayProcessError(17)
+
+    monkeypatch.setattr(verifier, "_load_retry_inputs", lambda root: inputs)
+    monkeypatch.setattr(
+        verifier,
+        "_assert_project_interpreter",
+        lambda root: python,
+    )
+    monkeypatch.setattr(verifier, "_detached_source_snapshot", fake_snapshot)
+    monkeypatch.setattr(
+        verifier,
+        "_copy_frozen_inputs",
+        lambda *args, **kwargs: {"root_sha256": "8" * 64},
+    )
+    monkeypatch.setattr(verifier, "_probe_runtime", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        verifier,
+        "_probe_current_pool_audit",
+        lambda *args, **kwargs: kwargs["expected_binding"],
+    )
+    monkeypatch.setattr(verifier, "_run_isolated_replay", failed_replay)
+
+    with pytest.raises(verifier.IndependentReplayProcessError):
+        verifier.run(str(source_root))
+
+    assert old_claim.read_bytes() == b"immutable-old-claim"
+    assert old_status.read_bytes() == b"immutable-old-status"
+    status = json.loads(
+        (run_root / verifier.RETRY_STATUS_NAME).read_text(encoding="utf-8")
+    )
+    assert status["stage"] == "replay_execution"
+    assert status["error_type"] == "IndependentReplayProcessError"
+    assert status["independent_replay"]["exit_code"] == 17
+    assert status["independent_replay"]["stdout"] == {
+        "path": verifier.RETRY_REPLAY_STDOUT_NAME,
+        "bytes": len(raw_child_output),
+        "sha256": hashlib.sha256(raw_child_output).hexdigest(),
+    }
+    failure = json.loads(
+        (
+            run_root / status["failure_receipt_path"]
+        ).read_text(encoding="utf-8")
+    )
+    assert failure["child_exit_code"] == 17
+    assert raw_child_output.decode() not in json.dumps(status)
+    assert raw_child_output.decode() not in json.dumps(failure)
+
+
+def _retry1_failure_publication_fixture(
+    tmp_path: Path,
+) -> tuple[Path, dict, dict, dict, dict]:
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    claim_path = run_root / verifier.RETRY_CLAIM_NAME
+    status_path = run_root / verifier.RETRY_STATUS_NAME
+    claim_raw = b'{"retry_id":"retry_1"}\n'
+    verifier._write_once(claim_path, claim_raw, "retry claim")
+    claim_ownership = verifier._open_claim_ownership(claim_path, claim_raw)
+    status_ownership = verifier._reserve_status_slot(status_path)
+    bindings = {
+        "completion_sha256": "1" * 64,
+        "verifier_amendment": {
+            "artifact_sha256": "2" * 64,
+            "successor_verifier_git_blob_sha256": "3" * 64,
+            "json_document_size_policy_sha256": "4" * 64,
+        },
+        "retry_authority": {"artifact_sha256": "5" * 64},
+        "original_failed_attempt": {
+            "claim_sha256": "6" * 64,
+            "status_sha256": "7" * 64,
+        },
+    }
+    return (
+        run_root,
+        claim_ownership,
+        status_ownership,
+        bindings,
+        {"claim_path": claim_path, "status_path": status_path},
+    )
+
+
+def test_retry1_failure_descriptor_error_still_terminalizes_owned_status(
+    tmp_path: Path,
+) -> None:
+    (
+        run_root,
+        claim_ownership,
+        status_ownership,
+        bindings,
+        paths,
+    ) = _retry1_failure_publication_fixture(tmp_path)
+    (run_root / verifier.RETRY_REPLAY_STDOUT_NAME).mkdir()
+    try:
+        verifier._publish_retry_failure(
+            run_root=run_root,
+            status_ownership=status_ownership,
+            claim_ownership=claim_ownership,
+            stage="replay_execution",
+            error=RuntimeError("private error text"),
+            **bindings,
+        )
+
+        status = json.loads(_owned_bytes(status_ownership).decode("utf-8"))
+        assert status["status"] == "failed"
+        assert status["descriptor_error_type"] == "IndependentVerificationError"
+        assert status["publication_error_type"] is None
+        assert status["independent_replay"] == {
+            "exit_code": None,
+            "stdout": None,
+            "stderr": None,
+        }
+        failure = json.loads(
+            (run_root / status["failure_receipt_path"]).read_text(encoding="utf-8")
+        )
+        assert failure["descriptor_error_type"] == "IndependentVerificationError"
+        assert "private error text" not in json.dumps(status)
+        assert "private error text" not in json.dumps(failure)
+    finally:
+        status_ownership["handle"].close()
+        claim_ownership["handle"].close()
+
+
+def test_retry1_existing_stream_seal_error_still_terminalizes_owned_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        run_root,
+        claim_ownership,
+        status_ownership,
+        bindings,
+        _paths,
+    ) = _retry1_failure_publication_fixture(tmp_path)
+    ownerships = verifier._create_retry_replay_stream_ownerships(run_root)
+    original_seal = verifier._seal_retry_replay_stream_ownership
+    seal_calls = 0
+
+    def fail_second_seal(ownership: dict) -> dict:
+        nonlocal seal_calls
+        seal_calls += 1
+        if seal_calls == 2:
+            raise OSError("synthetic stream seal failure")
+        return original_seal(ownership)
+
+    monkeypatch.setattr(
+        verifier,
+        "_seal_retry_replay_stream_ownership",
+        fail_second_seal,
+    )
+    try:
+        verifier._publish_retry_failure(
+            run_root=run_root,
+            status_ownership=status_ownership,
+            claim_ownership=claim_ownership,
+            stage="replay_execution",
+            error=RuntimeError("private error text"),
+            existing_replay_stream_ownerships=ownerships,
+            **bindings,
+        )
+
+        status = json.loads(_owned_bytes(status_ownership).decode("utf-8"))
+        assert status["status"] == "failed"
+        assert status["descriptor_error_type"] == "OSError"
+        assert status["independent_replay"] == {
+            "exit_code": None,
+            "stdout": None,
+            "stderr": None,
+        }
+        assert all(ownership["handle"].closed for ownership in ownerships)
+    finally:
+        verifier._close_retry_replay_stream_ownerships(ownerships)
+        status_ownership["handle"].close()
+        claim_ownership["handle"].close()
+
+
+def test_retry1_failure_receipt_write_error_still_terminalizes_owned_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        run_root,
+        claim_ownership,
+        status_ownership,
+        bindings,
+        paths,
+    ) = _retry1_failure_publication_fixture(tmp_path)
+    original = verifier._write_once
+
+    def fail_receipt(
+        path: Path,
+        raw: bytes,
+        label: str,
+        **kwargs: object,
+    ) -> dict | None:
+        if label == "independent verification retry_1 failure receipt":
+            raise OSError("receipt publication failed")
+        return original(path, raw, label, **kwargs)
+
+    monkeypatch.setattr(verifier, "_write_once", fail_receipt)
+    try:
+        verifier._publish_retry_failure(
+            run_root=run_root,
+            status_ownership=status_ownership,
+            claim_ownership=claim_ownership,
+            stage="runtime_preparation",
+            error=RuntimeError("private error text"),
+            **bindings,
+        )
+
+        status = json.loads(_owned_bytes(status_ownership).decode("utf-8"))
+        assert status["status"] == "failed"
+        assert status["failure_receipt_sha256"] is None
+        assert status["failure_receipt_path"] is None
+        assert status["publication_error_type"] == "OSError"
+        assert "private error text" not in json.dumps(status)
+    finally:
+        status_ownership["handle"].close()
+        claim_ownership["handle"].close()
+
+
+def test_retry1_reverted_owned_status_write_can_terminalize_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        run_root,
+        claim_ownership,
+        status_ownership,
+        bindings,
+        paths,
+    ) = _retry1_failure_publication_fixture(tmp_path)
+    original = verifier._verify_claim_ownership
+    claim_checks = 0
+
+    def fail_first_postwrite_check(ownership: dict) -> None:
+        nonlocal claim_checks
+        claim_checks += 1
+        if claim_checks == 2:
+            raise OSError("synthetic postwrite claim check failure")
+        original(ownership)
+
+    monkeypatch.setattr(
+        verifier,
+        "_verify_claim_ownership",
+        fail_first_postwrite_check,
+    )
+    try:
+        with pytest.raises(OSError, match="postwrite claim check"):
+            verifier._finalize_status_slot(
+                status_ownership,
+                b'{"status":"completed"}\n',
+                claim_ownership=claim_ownership,
+            )
+        assert _owned_bytes(status_ownership) == b""
+
+        verifier._publish_retry_failure(
+            run_root=run_root,
+            status_ownership=status_ownership,
+            claim_ownership=claim_ownership,
+            stage="status_publication",
+            error=OSError("private error text"),
+            **bindings,
+        )
+
+        status = json.loads(_owned_bytes(status_ownership).decode("utf-8"))
+        assert status["status"] == "failed"
+        assert status["error_type"] == "OSError"
+        assert "private error text" not in json.dumps(status)
+    finally:
+        status_ownership["handle"].close()
+        claim_ownership["handle"].close()
+
+
+def test_retry1_failure_receipt_is_locked_until_owned_status_finalizes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        run_root,
+        claim_ownership,
+        status_ownership,
+        bindings,
+        paths,
+    ) = _retry1_failure_publication_fixture(tmp_path)
+    original = verifier._verify_claim_ownership
+    claim_checks = 0
+    blocked = False
+
+    def try_to_replace_published_receipt(ownership: dict) -> None:
+        nonlocal claim_checks, blocked
+        claim_checks += 1
+        original(ownership)
+        if claim_checks == 2:
+            receipts = list(
+                (run_root / verifier.RETRY_FAILURE_RECEIPT_ROOT_NAME).glob(
+                    "*.json"
+                )
+            )
+            assert len(receipts) == 1
+            try:
+                receipts[0].write_bytes(b"foreign\n")
+            except PermissionError:
+                blocked = True
+
+    monkeypatch.setattr(
+        verifier,
+        "_verify_claim_ownership",
+        try_to_replace_published_receipt,
+    )
+    try:
+        verifier._publish_retry_failure(
+            run_root=run_root,
+            status_ownership=status_ownership,
+            claim_ownership=claim_ownership,
+            stage="replay_execution",
+            error=RuntimeError("private error text"),
+            **bindings,
+        )
+
+        status = json.loads(_owned_bytes(status_ownership).decode("utf-8"))
+        failure = json.loads(
+            (run_root / status["failure_receipt_path"]).read_text(encoding="utf-8")
+        )
+        body = dict(failure)
+        artifact_sha256 = body.pop("artifact_sha256")
+        assert blocked is True
+        assert artifact_sha256 == status["failure_receipt_sha256"]
+        assert artifact_sha256 == _sha256(body)
+    finally:
+        status_ownership["handle"].close()
+        claim_ownership["handle"].close()
+
+
+def test_retry1_failure_status_holds_log_ownership_until_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (
+        run_root,
+        claim_ownership,
+        status_ownership,
+        bindings,
+        _paths,
+    ) = _retry1_failure_publication_fixture(tmp_path)
+    stdout = run_root / verifier.RETRY_REPLAY_STDOUT_NAME
+    stdout_raw = b"synthetic failure stdout"
+    stdout.write_bytes(stdout_raw)
+    original = verifier._verify_claim_ownership
+    claim_checks = 0
+    blocked = False
+
+    def try_sustained_log_write(ownership: dict) -> None:
+        nonlocal claim_checks, blocked
+        claim_checks += 1
+        original(ownership)
+        if claim_checks == 2:
+            try:
+                stdout.write_bytes(b"sustained foreign write")
+            except PermissionError:
+                blocked = True
+
+    monkeypatch.setattr(
+        verifier,
+        "_verify_claim_ownership",
+        try_sustained_log_write,
+    )
+    try:
+        verifier._publish_retry_failure(
+            run_root=run_root,
+            status_ownership=status_ownership,
+            claim_ownership=claim_ownership,
+            stage="replay_execution",
+            error=RuntimeError("private error text"),
+            **bindings,
+        )
+
+        status = json.loads(_owned_bytes(status_ownership).decode("utf-8"))
+        expected_stdout = {
+            "path": verifier.RETRY_REPLAY_STDOUT_NAME,
+            "bytes": len(stdout_raw),
+            "sha256": hashlib.sha256(stdout_raw).hexdigest(),
+        }
+        assert blocked is True
+        assert status["independent_replay"]["stdout"] == expected_stdout
+        failure = json.loads(
+            (run_root / status["failure_receipt_path"]).read_text(encoding="utf-8")
+        )
+        assert failure["independent_replay"]["stdout"] == expected_stdout
+    finally:
+        status_ownership["handle"].close()
+        claim_ownership["handle"].close()
+
+
+def test_retry1_status_is_locked_through_final_claim_check(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    claim_path = tmp_path / "claim.json"
+    status_path = tmp_path / "status.json"
+    claim_raw = b'{"claim":true}\n'
+    status_raw = b'{"status":"completed"}\n'
+    verifier._write_once(claim_path, claim_raw, "claim")
+    claim_ownership = verifier._open_claim_ownership(claim_path, claim_raw)
+    status_ownership = verifier._reserve_status_slot(status_path)
+    original = verifier._verify_claim_ownership
+    claim_checks = 0
+    blocked = False
+
+    def try_to_replace_status(ownership: dict) -> None:
+        nonlocal claim_checks, blocked
+        claim_checks += 1
+        original(ownership)
+        if claim_checks == 2:
+            try:
+                status_path.write_bytes(b"foreign\n")
+            except PermissionError:
+                blocked = True
+
+    monkeypatch.setattr(
+        verifier,
+        "_verify_claim_ownership",
+        try_to_replace_status,
+    )
+    try:
+        verifier._finalize_status_slot(
+            status_ownership,
+            status_raw,
+            claim_ownership=claim_ownership,
+        )
+
+        assert blocked is True
+        assert _owned_bytes(status_ownership) == status_raw
+    finally:
+        status_ownership["handle"].close()
+        claim_ownership["handle"].close()
+
+
+def test_retry1_foreign_status_injection_is_not_accepted_but_receipt_survives(
+    tmp_path: Path,
+) -> None:
+    (
+        run_root,
+        claim_ownership,
+        status_ownership,
+        bindings,
+        paths,
+    ) = _retry1_failure_publication_fixture(tmp_path)
+    foreign = b'{"foreign":true}\n'
+    try:
+        with pytest.raises(PermissionError):
+            paths["status_path"].write_bytes(foreign)
+        verifier._publish_retry_failure(
+            run_root=run_root,
+            status_ownership=status_ownership,
+            claim_ownership=claim_ownership,
+            stage="runtime_preparation",
+            error=RuntimeError("private error text"),
+            **bindings,
+        )
+
+        status = json.loads(_owned_bytes(status_ownership).decode("utf-8"))
+        assert status["status"] == "failed"
+        receipts = list(
+            (run_root / verifier.RETRY_FAILURE_RECEIPT_ROOT_NAME).glob("*.json")
+        )
+        assert len(receipts) == 1
+    finally:
+        status_ownership["handle"].close()
+        claim_ownership["handle"].close()
 
 
 def _write_launcher_json(path: Path, value: dict) -> str:
@@ -2093,7 +3088,7 @@ def _post_run_amendment_fixture(
         if arguments == ("status", "--porcelain", "--untracked-files=all"):
             return ""
         if arguments == ("rev-parse", "HEAD"):
-            return amendment_execution
+            raise AssertionError("historical R2 verification must not read live HEAD")
         if arguments == (
             "rev-list",
             "--parents",
@@ -2149,6 +3144,16 @@ def _post_run_amendment_fixture(
         raise AssertionError(arguments)
 
     monkeypatch.setattr(verifier, "SCRIPT_PATH", verifier_path)
+    monkeypatch.setattr(
+        verifier,
+        "EXPECTED_VERIFIER_AMENDMENT_EXECUTION_COMMIT",
+        amendment_execution,
+    )
+    monkeypatch.setattr(
+        verifier,
+        "EXPECTED_VERIFIER_AMENDMENT_ARTIFACT_SHA256",
+        artifact_sha256,
+    )
     monkeypatch.setattr(verifier, "_git_output", fake_git_output)
     monkeypatch.setattr(verifier, "_git_bytes", fake_git_bytes)
     formal_authority = {
@@ -2207,7 +3212,7 @@ def test_phase3_post_run_verifier_amendment_rejects_other_completion(
         )
 
 
-def test_phase3_post_run_verifier_amendment_rejects_successor_test_drift(
+def test_retry1_historical_r2_amendment_ignores_later_live_successor_changes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2218,15 +3223,433 @@ def test_phase3_post_run_verifier_amendment_rejects_successor_test_drift(
         source / "tests/test_shallow_gbdt_risk_on_breadth_formal_launcher.py"
     ).write_bytes(b"drifted successor tests\n")
 
+    observed = verifier._verified_post_run_verifier_amendment(
+        source,
+        formal_source_authority=formal_authority,
+        formal_completion_sha256=completion_sha256,
+    )
+
+    assert observed["execution_commit"] == (
+        verifier.EXPECTED_VERIFIER_AMENDMENT_EXECUTION_COMMIT
+    )
+
+
+def _synthetic_old_failed_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    run_root: Path,
+) -> tuple[bytes, bytes]:
+    claim = {
+        "schema_version": (
+            "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+            "independent-verification-claim/v2"
+        ),
+        "pid": 123,
+        "completion_sha256": "1" * 64,
+        "replay_plan_sha256": verifier.EXPECTED_REPLAY_PLAN_SHA256,
+        "verifier_amendment_sha256": "2" * 64,
+        "successor_verifier_git_blob_sha256": "3" * 64,
+        "json_document_size_policy_sha256": (
+            verifier.EXPECTED_JSON_DOCUMENT_SIZE_POLICY_SHA256
+        ),
+        "development_only": True,
+        "embargo_consumed": False,
+        "final_oos_consumed": False,
+        "production_authority": False,
+        "automatic_trading_authority": False,
+    }
+    claim_raw = _canonical_bytes(claim) + b"\n"
+    claim_sha256 = hashlib.sha256(claim_raw).hexdigest()
+    status = {
+        "schema_version": verifier.STATUS_SCHEMA,
+        "status": "failed",
+        "stage": "failed",
+        "verified": False,
+        "receipt_sha256": None,
+        "error_type": "IndependentVerificationError",
+        "point_in_time": True,
+        "development_only": True,
+        "development_statistical_interpretation_allowed": False,
+        "profile_registration_authority": False,
+        "production_recommendation_authority": False,
+        "automatic_trading_authority": False,
+        "production_authority": False,
+        "embargo_consumed": False,
+        "final_oos_consumed": False,
+        "claim_sha256": claim_sha256,
+        "completion_sha256": "1" * 64,
+        "verifier_amendment_sha256": "2" * 64,
+        "successor_verifier_git_blob_sha256": "3" * 64,
+        "json_document_size_policy_sha256": (
+            verifier.EXPECTED_JSON_DOCUMENT_SIZE_POLICY_SHA256
+        ),
+        "receipt_path": None,
+    }
+    status_raw = _canonical_bytes(status) + b"\n"
+    (run_root / verifier.CLAIM_NAME).write_bytes(claim_raw)
+    (run_root / verifier.STATUS_NAME).write_bytes(status_raw)
+    monkeypatch.setattr(
+        verifier,
+        "EXPECTED_FAILED_CLAIM_SHA256",
+        hashlib.sha256(claim_raw).hexdigest(),
+    )
+    monkeypatch.setattr(
+        verifier,
+        "EXPECTED_FAILED_STATUS_SHA256",
+        hashlib.sha256(status_raw).hexdigest(),
+    )
+    return claim_raw, status_raw
+
+
+def test_retry1_original_failed_evidence_is_exact_and_has_no_success_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    claim_raw, status_raw = _synthetic_old_failed_evidence(
+        monkeypatch,
+        run_root,
+    )
+
+    observed = verifier._verified_original_failed_attempt(run_root)
+
+    assert observed == {
+        "claim_path": verifier.CLAIM_NAME,
+        "claim_sha256": hashlib.sha256(claim_raw).hexdigest(),
+        "status_path": verifier.STATUS_NAME,
+        "status_sha256": hashlib.sha256(status_raw).hexdigest(),
+        "verification_artifacts_state": "absent",
+        "receipts_state": "absent",
+        "status": "failed",
+        "stage": "failed",
+        "verified": False,
+        "error_type": "IndependentVerificationError",
+    }
+
+    verification = run_root / verifier.VERIFICATION_ROOT_NAME
+    verification.mkdir()
     with pytest.raises(
         verifier.IndependentVerificationError,
-        match="amendment authority",
+        match="failed attempt",
     ):
-        verifier._verified_post_run_verifier_amendment(
+        verifier._verified_original_failed_attempt(run_root)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "value"),
+    [
+        ("claim_sha256", "f" * 64),
+        ("receipt_path", "foreign.json"),
+        ("unexpected_field", True),
+    ],
+)
+def test_retry1_original_failed_status_requires_exact_fields_and_claim_link(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: str,
+    value: object,
+) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    _synthetic_old_failed_evidence(monkeypatch, run_root)
+    status_path = run_root / verifier.STATUS_NAME
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status[mutation] = value
+    raw = _canonical_bytes(status) + b"\n"
+    status_path.write_bytes(raw)
+    monkeypatch.setattr(
+        verifier,
+        "EXPECTED_FAILED_STATUS_SHA256",
+        hashlib.sha256(raw).hexdigest(),
+    )
+
+    with pytest.raises(
+        verifier.IndependentVerificationError,
+        match="failed attempt",
+    ):
+        verifier._verified_original_failed_attempt(run_root)
+
+
+def test_retry1_original_failed_claim_requires_exact_field_set(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    _synthetic_old_failed_evidence(monkeypatch, run_root)
+    claim_path = run_root / verifier.CLAIM_NAME
+    status_path = run_root / verifier.STATUS_NAME
+    claim = json.loads(claim_path.read_text(encoding="utf-8"))
+    claim["unexpected_field"] = True
+    claim_raw = _canonical_bytes(claim) + b"\n"
+    claim_path.write_bytes(claim_raw)
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    status["claim_sha256"] = hashlib.sha256(claim_raw).hexdigest()
+    status_raw = _canonical_bytes(status) + b"\n"
+    status_path.write_bytes(status_raw)
+    monkeypatch.setattr(
+        verifier,
+        "EXPECTED_FAILED_CLAIM_SHA256",
+        hashlib.sha256(claim_raw).hexdigest(),
+    )
+    monkeypatch.setattr(
+        verifier,
+        "EXPECTED_FAILED_STATUS_SHA256",
+        hashlib.sha256(status_raw).hexdigest(),
+    )
+
+    with pytest.raises(
+        verifier.IndependentVerificationError,
+        match="failed attempt",
+    ):
+        verifier._verified_original_failed_attempt(run_root)
+
+
+def _post_failure_retry_authority_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> tuple[Path, dict, dict, dict, dict]:
+    source = tmp_path / "source"
+    source.mkdir()
+    run_root = source / "run"
+    run_root.mkdir()
+    _synthetic_old_failed_evidence(monkeypatch, run_root)
+    failed = verifier._verified_original_failed_attempt(run_root)
+    old_amendment = {
+        "artifact_sha256": "5" * 64,
+        "execution_commit": "1" * 40,
+    }
+    r2 = old_amendment["execution_commit"]
+    r3 = "2" * 40
+    r3_tree = "3" * 40
+    r4 = "4" * 40
+    bundle_manifest = {
+        "manifest_sha256": "8" * 64,
+        "bundle_relative_path": "data/bundle",
+        "metadata_relative_path": "data/bundle/metadata.sqlite3",
+    }
+    monkeypatch.setattr(
+        verifier,
+        "EXPECTED_VERIFIER_AMENDMENT_EXECUTION_COMMIT",
+        r2,
+    )
+    changed_bytes = {
+        ".gitattributes": (
+            verifier.VERIFIER_AMENDMENT_GIT_ATTRIBUTES_RULE
+            + "\n"
+            + verifier.RETRY_AUTHORITY_GIT_ATTRIBUTES_RULE
+            + "\n"
+        ).encode(),
+        verifier.VERIFIER_AMENDMENT_VERIFIER_GIT_PATH: b"retry verifier\n",
+        (
+            "tests/test_shallow_gbdt_risk_on_breadth_"
+            "independent_verifier.py"
+        ): b"retry tests\n",
+    }
+    for relative, raw in changed_bytes.items():
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+    changed_sha256 = {
+        path: hashlib.sha256(raw).hexdigest()
+        for path, raw in changed_bytes.items()
+    }
+    authority_root = source / verifier.RETRY_AUTHORITY_RELATIVE_ROOT
+    authority_root.mkdir(parents=True)
+    body = {
+        "schema_version": verifier.RETRY_AUTHORITY_SCHEMA,
+        "retry_id": "retry_1",
+        "original_amendment_execution_commit": r2,
+        "original_amendment_artifact_sha256": old_amendment[
+            "artifact_sha256"
+        ],
+        "original_failed_claim_path": failed["claim_path"],
+        "original_failed_claim_sha256": failed["claim_sha256"],
+        "original_failed_status_path": failed["status_path"],
+        "original_failed_status_sha256": failed["status_sha256"],
+        "original_verification_artifacts_state": "absent",
+        "original_receipts_state": "absent",
+        "universe_bundle_relative_path": bundle_manifest[
+            "bundle_relative_path"
+        ],
+        "universe_metadata_relative_path": bundle_manifest[
+            "metadata_relative_path"
+        ],
+        "universe_bundle_manifest_sha256": bundle_manifest[
+            "manifest_sha256"
+        ],
+        "retry_source_commit": r3,
+        "retry_source_tree": r3_tree,
+        "retry_verifier_git_path": (
+            verifier.VERIFIER_AMENDMENT_VERIFIER_GIT_PATH
+        ),
+        "retry_verifier_git_blob_sha256": changed_sha256[
+            verifier.VERIFIER_AMENDMENT_VERIFIER_GIT_PATH
+        ],
+        "retry_git_blobs_sha256": changed_sha256,
+        "replay_plan_sha256": verifier.EXPECTED_REPLAY_PLAN_SHA256,
+        "failure_classification": verifier.RETRY_FAILURE_CLASSIFICATION,
+        "scope": verifier.RETRY_AUTHORITY_SCOPE,
+        "execution_topology": verifier.RETRY_AUTHORITY_TOPOLOGY,
+    }
+    artifact_sha256 = _sha256(body)
+    document = {**body, "artifact_sha256": artifact_sha256}
+    authority_path = authority_root / f"{artifact_sha256}.json"
+    authority_raw = _canonical_bytes(document) + b"\n"
+    authority_path.write_bytes(authority_raw)
+    authority_relative = authority_path.relative_to(source).as_posix()
+
+    def fake_git_output(root: Path, *arguments: str) -> str:
+        if arguments == ("status", "--porcelain", "--untracked-files=all"):
+            return ""
+        if arguments == ("rev-parse", "HEAD"):
+            return r4
+        if arguments == ("rev-list", "--parents", "-n", "1", r4):
+            return f"{r4} {r3}"
+        if arguments == ("rev-list", "--parents", "-n", "1", r3):
+            return f"{r3} {r2}"
+        if arguments == ("rev-parse", f"{r3}^{{tree}}"):
+            return r3_tree
+        if arguments == (
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            r2,
+            r3,
+        ):
+            return "\n".join(f"M\t{path}" for path in changed_bytes)
+        if arguments == (
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            r3,
+            r4,
+        ):
+            return f"A\t{authority_relative}"
+        raise AssertionError(arguments)
+
+    def fake_git_bytes(root: Path, *arguments: str) -> bytes:
+        if len(arguments) == 2 and arguments[0] == "show":
+            prefix = f"{r3}:"
+            if arguments[1].startswith(prefix):
+                return changed_bytes[arguments[1].removeprefix(prefix)]
+        if arguments == ("show", f"{r4}:{authority_relative}"):
+            return authority_raw
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(verifier, "SCRIPT_PATH", source / verifier.VERIFIER_AMENDMENT_VERIFIER_GIT_PATH)
+    monkeypatch.setattr(verifier, "_git_output", fake_git_output)
+    monkeypatch.setattr(verifier, "_git_bytes", fake_git_bytes)
+    monkeypatch.setattr(
+        verifier,
+        "_universe_bundle_manifest",
+        lambda root: dict(bundle_manifest),
+    )
+    return source, old_amendment, failed, bundle_manifest, document
+
+
+def test_retry1_authority_binds_r2_failure_bundle_and_exact_r3_blobs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source, old_amendment, failed, bundle_manifest, document = (
+        _post_failure_retry_authority_fixture(monkeypatch, tmp_path)
+    )
+
+    observed = verifier._verified_post_failure_retry_authority(
+        source,
+        original_amendment=old_amendment,
+        original_failed_attempt=failed,
+    )
+
+    assert observed["artifact_sha256"] == document["artifact_sha256"]
+    assert observed["execution_commit"] == "4" * 40
+    assert observed["retry_source_tree"] == "3" * 40
+    assert observed["universe_bundle_manifest_sha256"] == bundle_manifest[
+        "manifest_sha256"
+    ]
+    assert observed["failure_classification"] == {
+        "stage": "isolated_replay_bootstrap",
+        "before": "_load_ranked_liquidity_bars",
+        "child_exit_code": 7,
+        "error_chain": [
+            "AuditedPITDevelopmentReplayError",
+            "PITReceiptError",
+        ],
+        "root_cause_code": "incomplete_audited_pit_bundle_copy",
+    }
+    assert observed["scope"] == verifier.RETRY_AUTHORITY_SCOPE
+
+
+def test_retry1_authority_rejects_old_failed_status_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source, old_amendment, failed, _bundle, _document = (
+        _post_failure_retry_authority_fixture(monkeypatch, tmp_path)
+    )
+    failed["status_sha256"] = "9" * 64
+
+    with pytest.raises(
+        verifier.IndependentVerificationError,
+        match="retry authority",
+    ):
+        verifier._verified_post_failure_retry_authority(
             source,
-            formal_source_authority=formal_authority,
-            formal_completion_sha256=completion_sha256,
+            original_amendment=old_amendment,
+            original_failed_attempt=failed,
         )
+
+
+def test_retry1_authority_rejects_failure_classification_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source, old_amendment, failed, _bundle, document = (
+        _post_failure_retry_authority_fixture(monkeypatch, tmp_path)
+    )
+    authority_path = (
+        source
+        / verifier.RETRY_AUTHORITY_RELATIVE_ROOT
+        / f"{document['artifact_sha256']}.json"
+    )
+    drifted = deepcopy(document)
+    drifted["failure_classification"]["child_exit_code"] = 0
+    authority_path.write_bytes(_canonical_bytes(drifted) + b"\n")
+
+    with pytest.raises(
+        verifier.IndependentVerificationError,
+        match="retry authority",
+    ):
+        verifier._verified_post_failure_retry_authority(
+            source,
+            original_amendment=old_amendment,
+            original_failed_attempt=failed,
+        )
+
+
+def test_retry1_preflight_is_read_only_and_never_claims(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    monkeypatch.setattr(
+        verifier,
+        "_load_retry_inputs",
+        lambda root, **kwargs: {"run_root": run_root},
+    )
+    monkeypatch.setattr(
+        verifier,
+        "run",
+        lambda root: (_ for _ in ()).throw(AssertionError("run forbidden")),
+    )
+
+    assert verifier.main(["--source-root", str(tmp_path), "--preflight"]) == 0
+    assert not (run_root / verifier.RETRY_CLAIM_NAME).exists()
+    assert not (run_root / verifier.RETRY_STATUS_NAME).exists()
 
 
 def _formal_chain_fixture(
@@ -2640,20 +4063,16 @@ def test_phase3_frozen_copy_detects_post_copy_snapshot_drift(
     source = tmp_path / "source"
     target = tmp_path / "target"
     relative = verifier.REPLAY_PLAN["inputs"]
-    paths = (
-        source / relative["audited_pit_universe_path"],
-        source / relative["temporal_contract_path"],
-        source / relative["current_pool_development_audit_path"],
-        source / relative["security_code_transition_evidence_root"] / "contract.json",
-    )
-    for index, path in enumerate(paths):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(f"value-{index}".encode())
+    _small_complete_frozen_inputs(source)
     attestation = verifier._observed_frozen_attestation(source)
+    bundle_sha256 = verifier._universe_bundle_manifest(source)[
+        "manifest_sha256"
+    ]
     binding = verifier._copy_frozen_inputs(
         source,
         target,
         expected_formal_attestation=attestation,
+        expected_universe_bundle_manifest_sha256=bundle_sha256,
     )
     (target / relative["temporal_contract_path"]).write_bytes(b"drift")
 
@@ -2704,33 +4123,200 @@ def test_phase3_replay_starts_once_and_rejects_post_probe_drift(
         lambda *args, **kwargs: kwargs["expected_binding"],
     )
 
-    with pytest.raises(
-        verifier.IndependentVerificationError,
-        match="runtime changed",
-    ):
-        verifier._run_isolated_replay(
-            inputs={
-                "formal_runtime_history": {},
-                "preflight_core": {
-                    "frozen_input_attestation": {},
-                    "current_pool_audit_binding": {
-                        "canonical_sha256": "9" * 64,
-                        "allowed_symbol_count": 1,
+    ownerships = verifier._create_retry_replay_stream_ownerships(scratch)
+    try:
+        with pytest.raises(
+            verifier.IndependentVerificationError,
+            match="runtime changed",
+        ):
+            verifier._run_isolated_replay(
+                inputs={
+                    "formal_runtime_history": {},
+                    "preflight_core": {
+                        "frozen_input_attestation": {},
+                        "current_pool_audit_binding": {
+                            "canonical_sha256": "9" * 64,
+                            "allowed_symbol_count": 1,
+                        },
                     },
                 },
-            },
-            source_root=source,
-            code_root=code,
-            data_root=data,
-            python_executable=tmp_path / "python.exe",
-            site_packages=site_packages,
-            environment={},
-            pycache_blocker=tmp_path / "blocker",
-            formal_probe={"probe": "formal"},
-            replay_probe={"probe": "before"},
-            frozen_copy={},
-            scratch_root=scratch,
-        )
+                source_root=source,
+                code_root=code,
+                data_root=data,
+                python_executable=tmp_path / "python.exe",
+                site_packages=site_packages,
+                environment={},
+                pycache_blocker=tmp_path / "blocker",
+                formal_probe={"probe": "formal"},
+                replay_probe={"probe": "before"},
+                frozen_copy={},
+                scratch_root=scratch,
+                replay_stream_ownerships=ownerships,
+            )
+    finally:
+        verifier._close_retry_replay_stream_ownerships(ownerships)
 
     assert len(calls) == 1
     assert calls[0]["shell"] is False
+
+
+@pytest.mark.parametrize("postflight_failure", ["frozen", "current_pool", "runtime"])
+def test_retry1_nonzero_child_exit_wins_over_postflight_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    postflight_failure: str,
+) -> None:
+    roots = {
+        name: tmp_path / name
+        for name in ("source", "code", "data", "site-packages", "scratch")
+    }
+    for path in roots.values():
+        path.mkdir()
+
+    class Process:
+        def wait(self) -> int:
+            return 7
+
+    monkeypatch.setattr(
+        verifier.subprocess,
+        "Popen",
+        lambda *args, **kwargs: Process(),
+    )
+
+    def frozen_check(*args: object, **kwargs: object) -> None:
+        if postflight_failure == "frozen":
+            raise RuntimeError("frozen postflight failed")
+
+    def current_pool(*args: object, **kwargs: object) -> object:
+        if postflight_failure == "current_pool":
+            raise RuntimeError("current-pool postflight failed")
+        return kwargs["expected_binding"]
+
+    def runtime_probe(*args: object, **kwargs: object) -> object:
+        if postflight_failure == "runtime":
+            raise RuntimeError("runtime postflight failed")
+        return {"probe": "before"}
+
+    monkeypatch.setattr(verifier, "_verify_frozen_copy", frozen_check)
+    monkeypatch.setattr(verifier, "_probe_current_pool_audit", current_pool)
+    monkeypatch.setattr(verifier, "_probe_runtime", runtime_probe)
+
+    ownerships = verifier._create_retry_replay_stream_ownerships(roots["scratch"])
+    try:
+        with pytest.raises(verifier.IndependentReplayProcessError) as captured:
+            verifier._run_isolated_replay(
+                inputs={
+                    "formal_runtime_history": {},
+                    "preflight_core": {
+                        "frozen_input_attestation": {},
+                        "current_pool_audit_binding": {
+                            "canonical_sha256": "9" * 64,
+                            "allowed_symbol_count": 1,
+                        },
+                    },
+                },
+                source_root=roots["source"],
+                code_root=roots["code"],
+                data_root=roots["data"],
+                python_executable=tmp_path / "python.exe",
+                site_packages=roots["site-packages"],
+                environment={},
+                pycache_blocker=tmp_path / "blocker",
+                formal_probe={"probe": "formal"},
+                replay_probe={"probe": "before"},
+                frozen_copy={},
+                scratch_root=roots["scratch"],
+                replay_stream_ownerships=ownerships,
+            )
+    finally:
+        verifier._close_retry_replay_stream_ownerships(ownerships)
+
+    assert captured.value.exit_code == 7
+
+
+def test_retry1_controlled_stream_handles_block_second_writer_during_child(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    roots = {
+        name: tmp_path / name
+        for name in ("source", "code", "data", "site-packages", "scratch")
+    }
+    for path in roots.values():
+        path.mkdir()
+    ownerships = verifier._create_retry_replay_stream_ownerships(roots["scratch"])
+    stdout_path = roots["scratch"] / verifier.RETRY_REPLAY_STDOUT_NAME
+    child_output = b"synthetic child stdout"
+    state = {"blocked": False}
+
+    class Process:
+        def wait(self) -> int:
+            try:
+                stdout_path.write_bytes(b"sustained foreign write")
+            except PermissionError:
+                state["blocked"] = True
+            return 7
+
+    def fake_popen(*args: object, **kwargs: object) -> Process:
+        stdout_handle = kwargs["stdout"]
+        stdout_handle.write(child_output)
+        stdout_handle.flush()
+        return Process()
+
+    monkeypatch.setattr(verifier.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        verifier,
+        "_verify_frozen_copy",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        verifier,
+        "_probe_current_pool_audit",
+        lambda *args, **kwargs: kwargs["expected_binding"],
+    )
+    monkeypatch.setattr(
+        verifier,
+        "_probe_runtime",
+        lambda *args, **kwargs: {"probe": "before"},
+    )
+
+    try:
+        with pytest.raises(verifier.IndependentReplayProcessError):
+            verifier._run_isolated_replay(
+                inputs={
+                    "formal_runtime_history": {},
+                    "preflight_core": {
+                        "frozen_input_attestation": {},
+                        "current_pool_audit_binding": {
+                            "canonical_sha256": "9" * 64,
+                            "allowed_symbol_count": 1,
+                        },
+                    },
+                },
+                source_root=roots["source"],
+                code_root=roots["code"],
+                data_root=roots["data"],
+                python_executable=tmp_path / "python.exe",
+                site_packages=roots["site-packages"],
+                environment={},
+                pycache_blocker=tmp_path / "blocker",
+                formal_probe={"probe": "formal"},
+                replay_probe={"probe": "before"},
+                frozen_copy={},
+                scratch_root=roots["scratch"],
+                replay_stream_ownerships=ownerships,
+            )
+
+        stdout_ownership = next(
+            ownership
+            for ownership in ownerships
+            if ownership["relative"] == verifier.RETRY_REPLAY_STDOUT_NAME
+        )
+        assert state["blocked"] is True
+        assert stdout_ownership["descriptor"] == {
+            "path": verifier.RETRY_REPLAY_STDOUT_NAME,
+            "bytes": len(child_output),
+            "sha256": hashlib.sha256(child_output).hexdigest(),
+        }
+    finally:
+        verifier._close_retry_replay_stream_ownerships(ownerships)

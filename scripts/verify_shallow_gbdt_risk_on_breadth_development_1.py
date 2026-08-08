@@ -15,6 +15,11 @@ from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - formal execution is Windows-only
+    msvcrt = None
+
 
 SCRIPT_PATH = Path(__file__).resolve()
 PROJECT_ROOT = SCRIPT_PATH.parents[1]
@@ -58,6 +63,25 @@ VERIFIER_AMENDMENT_SUCCESSOR_GIT_PATHS = (
     "tests/test_shallow_gbdt_risk_on_breadth_independent_verifier.py",
     "tests/test_shallow_gbdt_risk_on_breadth_formal_launcher.py",
 )
+RETRY_AUTHORITY_RELATIVE_ROOT = Path(
+    "docs/research_preregistrations/"
+    "shallow_gbdt_risk_on_breadth_development_1_"
+    "post_failure_verifier_retry_authority_v1"
+)
+RETRY_AUTHORITY_SCHEMA = (
+    "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+    "post-failure-verifier-retry-authority/v1"
+)
+RETRY_AUTHORITY_GIT_ATTRIBUTES_RULE = (
+    "docs/research_preregistrations/"
+    "shallow_gbdt_risk_on_breadth_development_1_"
+    "post_failure_verifier_retry_authority_v1/*.json -text"
+)
+RETRY_AUTHORITY_SUCCESSOR_GIT_PATHS = (
+    ".gitattributes",
+    VERIFIER_AMENDMENT_VERIFIER_GIT_PATH,
+    "tests/test_shallow_gbdt_risk_on_breadth_independent_verifier.py",
+)
 EXPECTED_RUN_SPEC_SHA256 = (
     "d27c352ff362710ecdbf58791a5aa95b25aae75a2a25e0c351b7901b26212471"
 )
@@ -78,6 +102,72 @@ VERIFICATION_ROOT_NAME = "risk_on_breadth_independent_verifications"
 RECEIPT_ROOT_NAME = "risk_on_breadth_independent_verification_receipts"
 REPLAY_STDOUT_NAME = "risk_on_breadth_independent_replay.stdout.log"
 REPLAY_STDERR_NAME = "risk_on_breadth_independent_replay.stderr.log"
+RETRY_CLAIM_NAME = (
+    "formal_run.risk_on_breadth_independent_verification.retry_1.claim.json"
+)
+RETRY_STATUS_NAME = (
+    "formal_run.risk_on_breadth_independent_verification.retry_1.status.json"
+)
+RETRY_VERIFICATION_ROOT_NAME = "risk_on_breadth_independent_verifications_retry_1"
+RETRY_RECEIPT_ROOT_NAME = (
+    "risk_on_breadth_independent_verification_receipts_retry_1"
+)
+RETRY_FAILURE_RECEIPT_ROOT_NAME = (
+    "risk_on_breadth_independent_verification_failure_receipts_retry_1"
+)
+RETRY_REPLAY_STDOUT_NAME = (
+    "risk_on_breadth_independent_replay.retry_1.stdout.log"
+)
+RETRY_REPLAY_STDERR_NAME = (
+    "risk_on_breadth_independent_replay.retry_1.stderr.log"
+)
+EXPECTED_FAILED_CLAIM_SHA256 = (
+    "bbfa49f223b60385716d4d4179955a14e24c23dea5914e4c83b18339187e69f1"
+)
+EXPECTED_FAILED_STATUS_SHA256 = (
+    "98be05575651c0327edb49db3e65be838656c763cecf681866f3c59ec901a38f"
+)
+ORIGINAL_FAILED_CLAIM_FIELDS = frozenset(
+    {
+        "schema_version",
+        "pid",
+        "completion_sha256",
+        "replay_plan_sha256",
+        "verifier_amendment_sha256",
+        "successor_verifier_git_blob_sha256",
+        "json_document_size_policy_sha256",
+        "development_only",
+        "embargo_consumed",
+        "final_oos_consumed",
+        "production_authority",
+        "automatic_trading_authority",
+    }
+)
+ORIGINAL_FAILED_STATUS_FIELDS = frozenset(
+    {
+        "schema_version",
+        "status",
+        "stage",
+        "verified",
+        "receipt_sha256",
+        "error_type",
+        "point_in_time",
+        "development_only",
+        "development_statistical_interpretation_allowed",
+        "profile_registration_authority",
+        "production_recommendation_authority",
+        "automatic_trading_authority",
+        "production_authority",
+        "embargo_consumed",
+        "final_oos_consumed",
+        "claim_sha256",
+        "completion_sha256",
+        "verifier_amendment_sha256",
+        "successor_verifier_git_blob_sha256",
+        "json_document_size_policy_sha256",
+        "receipt_path",
+    }
+)
 HEX_GIT_SHA1 = re.compile(r"^[0-9a-f]{40}$")
 EXPECTED_STRATEGY_SHA256 = (
     "9b3df2039a3d39b999fd15856c5e8460fe23212b13217625bd21727018adfd19"
@@ -195,6 +285,43 @@ VERIFIER_AMENDMENT_TOPOLOGY = {
         "add_single_verifier_amendment_authority_only"
     ),
 }
+EXPECTED_VERIFIER_AMENDMENT_EXECUTION_COMMIT = (
+    "e2bb5ea6e8f5799d3145b1b6cd936c39339ae12b"
+)
+EXPECTED_VERIFIER_AMENDMENT_ARTIFACT_SHA256 = (
+    "76a92ac11c73f2e9f2241a04c8ec296c049e3a8b15830ec10476ef3a3b497f07"
+)
+RETRY_AUTHORITY_SCOPE = {
+    "point_in_time": True,
+    "development_only": True,
+    "post_failure_verification_retry_only": True,
+    "maximum_retry_attempts": 1,
+    "development_statistical_interpretation_allowed": False,
+    "profile_registration_authority": False,
+    "production_recommendation_authority": False,
+    "automatic_trading_authority": False,
+    "production_authority": False,
+    "embargo_consumed": False,
+    "final_oos_consumed": False,
+}
+RETRY_FAILURE_CLASSIFICATION = {
+    "stage": "isolated_replay_bootstrap",
+    "before": "_load_ranked_liquidity_bars",
+    "child_exit_code": 7,
+    "error_chain": [
+        "AuditedPITDevelopmentReplayError",
+        "PITReceiptError",
+    ],
+    "root_cause_code": "incomplete_audited_pit_bundle_copy",
+}
+RETRY_AUTHORITY_TOPOLOGY = {
+    "retry_source_parent_is_original_amendment_execution": True,
+    "retry_source_change": "modify_exact_retry_git_blobs_only",
+    "retry_authority_execution_parent_is_retry_source": True,
+    "retry_authority_execution_change": (
+        "add_single_post_failure_retry_authority_only"
+    ),
+}
 RECEIPT_SCHEMA = (
     "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
     "independent-verification-receipt/v2"
@@ -202,6 +329,18 @@ RECEIPT_SCHEMA = (
 STATUS_SCHEMA = (
     "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
     "independent-verification-status/v2"
+)
+RETRY_RECEIPT_SCHEMA = (
+    "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+    "independent-verification-retry-receipt/v1"
+)
+RETRY_FAILURE_RECEIPT_SCHEMA = (
+    "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+    "independent-verification-retry-failure-receipt/v1"
+)
+RETRY_STATUS_SCHEMA = (
+    "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+    "independent-verification-retry-status/v1"
 )
 REPLAY_RESULT_SCHEMA = (
     "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
@@ -394,6 +533,26 @@ def _metadata_identity(metadata: os.stat_result) -> tuple[int, int, int, int, in
         int(metadata.st_mtime_ns),
         int(metadata.st_dev),
         int(metadata.st_ino),
+    )
+
+
+def _stable_object_identity(metadata: os.stat_result) -> tuple[int, int, int]:
+    return (
+        int(metadata.st_mode),
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+    )
+
+
+def _owned_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(metadata.st_mode),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(getattr(metadata, "st_ctime_ns", 0)),
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(getattr(metadata, "st_nlink", 0)),
     )
 
 
@@ -1871,6 +2030,83 @@ class IndependentVerificationError(RuntimeError):
     pass
 
 
+class IndependentReplayProcessError(IndependentVerificationError):
+    def __init__(self, exit_code: int) -> None:
+        super().__init__("independent replay returned nonzero")
+        self.exit_code = exit_code
+
+
+class ClaimOwnershipError(IndependentVerificationError):
+    pass
+
+
+CONTROL_FILE_LOCK_LENGTH = 1024 * 1024 * 1024
+
+
+def _lock_control_file(handle: Any, label: str) -> bool:
+    if msvcrt is None:
+        return False
+    try:
+        handle.seek(0)
+        msvcrt.locking(
+            handle.fileno(),
+            msvcrt.LK_NBLCK,
+            CONTROL_FILE_LOCK_LENGTH,
+        )
+        handle.seek(0)
+    except OSError as exc:
+        raise IndependentVerificationError(f"{label} lock failed") from exc
+    return True
+
+
+def _open_control_file(
+    path: Path,
+    *,
+    create: bool,
+    writable: bool,
+) -> Any:
+    if os.name != "nt":
+        if create:
+            return path.open("xb+")
+        return path.open("r+b" if writable else "rb")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    desired_access = 0x80000000 | (0x40000000 if writable else 0)
+    native_handle = create_file(
+        str(path),
+        desired_access,
+        0x00000001,
+        None,
+        1 if create else 3,
+        0x00000080,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if native_handle == invalid_handle:
+        error_code = ctypes.get_last_error()
+        raise OSError(error_code, ctypes.FormatError(error_code), str(path))
+    flags = os.O_BINARY | (os.O_RDWR if writable else os.O_RDONLY)
+    try:
+        descriptor = msvcrt.open_osfhandle(native_handle, flags)
+    except BaseException:
+        kernel32.CloseHandle(native_handle)
+        raise
+    return os.fdopen(descriptor, "r+b" if writable else "rb")
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -1879,23 +2115,415 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _write_once(path: Path, raw: bytes, label: str) -> None:
+def _write_once(
+    path: Path,
+    raw: bytes,
+    label: str,
+    *,
+    hold_ownership: bool = False,
+) -> dict[str, Any] | None:
     if not isinstance(raw, bytes):
         raise TypeError(f"{label} bytes are invalid")
     path.parent.mkdir(parents=True, exist_ok=True)
+    parent_before = _assert_no_reparse(path.parent, f"{label} parent")
+    if not stat.S_ISDIR(parent_before.st_mode):
+        raise ValueError(f"{label} parent is invalid")
     temporary = path.with_name(
         f".{path.name}.{os.getpid()}.{os.urandom(12).hex()}.tmp"
     )
+    linked_object_identity: tuple[int, int, int] | None = None
+    handle = None
+    ownership: dict[str, Any] | None = None
     try:
-        with temporary.open("xb") as handle:
-            written = handle.write(raw)
-            if written != len(raw):
-                raise OSError(f"{label} short write")
-            handle.flush()
-            os.fsync(handle.fileno())
+        handle = _open_control_file(
+            temporary,
+            create=True,
+            writable=True,
+        )
+        written = handle.write(raw)
+        if written != len(raw):
+            raise OSError(f"{label} short write")
+        handle.flush()
+        os.fsync(handle.fileno())
+        locked = _lock_control_file(handle, label)
         os.link(temporary, path)
+        opened_after_link = os.fstat(handle.fileno())
+        linked_object_identity = _stable_object_identity(opened_after_link)
+        target_before = _assert_no_reparse(path, label)
+        if (
+            not stat.S_ISREG(opened_after_link.st_mode)
+            or _stable_object_identity(target_before) != linked_object_identity
+            or _owned_file_identity(target_before)
+            != _owned_file_identity(opened_after_link)
+        ):
+            raise ValueError(f"{label} publication identity changed")
+        handle.seek(0)
+        observed = handle.read()
+        opened_after_read = os.fstat(handle.fileno())
+        target_after = _assert_no_reparse(path, label)
+        parent_after = _assert_no_reparse(path.parent, f"{label} parent")
+        if _stable_object_identity(parent_after) != _stable_object_identity(
+            parent_before
+        ):
+            raise ValueError(f"{label} parent changed during publication")
+        if (
+            observed != raw
+            or hashlib.sha256(observed).digest()
+            != hashlib.sha256(raw).digest()
+            or _owned_file_identity(opened_after_read)
+            != _owned_file_identity(opened_after_link)
+            or _owned_file_identity(target_after)
+            != _owned_file_identity(opened_after_link)
+        ):
+            raise ValueError(f"{label} publication changed or differs")
+        if hold_ownership:
+            ownership = {
+                "path": path,
+                "handle": handle,
+                "raw": raw,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "identity": _owned_file_identity(opened_after_read),
+                "object_identity": linked_object_identity,
+                "parent_identity": _stable_object_identity(parent_before),
+                "temporary_path": temporary,
+                "locked": locked,
+                "label": label,
+            }
+            return ownership
+        return None
+    except BaseException:
+        opened_object_identity = None
+        if handle is not None:
+            try:
+                opened_object_identity = _stable_object_identity(
+                    os.fstat(handle.fileno())
+                )
+            except OSError:
+                pass
+            handle.close()
+            handle = None
+        owned_object_identity = (
+            linked_object_identity
+            if linked_object_identity is not None
+            else opened_object_identity
+        )
+        if owned_object_identity is not None:
+            try:
+                current = _assert_no_reparse(path, label)
+                if _stable_object_identity(current) == owned_object_identity:
+                    path.unlink()
+            except BaseException:
+                pass
+        raise
     finally:
+        if ownership is None:
+            if handle is not None:
+                handle.close()
+            temporary.unlink(missing_ok=True)
+
+
+def _verify_publication_ownership(ownership: Mapping[str, Any]) -> None:
+    try:
+        path = ownership["path"]
+        handle = ownership["handle"]
+        raw = ownership["raw"]
+        identity = ownership["identity"]
+        label = str(ownership["label"])
+        if not isinstance(path, Path) or not isinstance(raw, bytes):
+            raise TypeError("publication ownership is invalid")
+        metadata_before = _assert_no_reparse(path, label)
+        opened_before = os.fstat(handle.fileno())
+        handle.seek(0)
+        observed = handle.read()
+        opened_after = os.fstat(handle.fileno())
+        metadata_after = _assert_no_reparse(path, label)
+        parent_after = _assert_no_reparse(path.parent, f"{label} parent")
+        if (
+            _owned_file_identity(metadata_before) != identity
+            or _owned_file_identity(opened_before) != identity
+            or _owned_file_identity(opened_after) != identity
+            or _owned_file_identity(metadata_after) != identity
+            or _stable_object_identity(parent_after)
+            != ownership["parent_identity"]
+            or observed != raw
+            or hashlib.sha256(observed).hexdigest() != ownership["sha256"]
+        ):
+            raise IndependentVerificationError(f"{label} ownership changed")
+    except IndependentVerificationError:
+        raise
+    except BaseException as exc:
+        raise IndependentVerificationError(
+            "published control-file ownership is unavailable"
+        ) from exc
+
+
+def _close_publication_ownership(ownership: Mapping[str, Any] | None) -> None:
+    if ownership is None:
+        return
+    handle = ownership.get("handle")
+    if handle is not None and not handle.closed:
+        handle.close()
+    temporary = ownership.get("temporary_path")
+    if isinstance(temporary, Path):
         temporary.unlink(missing_ok=True)
+
+
+def _open_claim_ownership(path: Path, expected_raw: bytes) -> dict[str, Any]:
+    if not isinstance(expected_raw, bytes):
+        raise TypeError("claim ownership bytes are invalid")
+    label = "independent verification retry_1 claim ownership"
+    metadata_before = _assert_no_reparse(path, label)
+    if not stat.S_ISREG(metadata_before.st_mode):
+        raise ClaimOwnershipError("claim ownership is invalid")
+    handle = None
+    try:
+        handle = _open_control_file(
+            path,
+            create=False,
+            writable=False,
+        )
+        locked = _lock_control_file(handle, label)
+        opened_before = os.fstat(handle.fileno())
+        if _owned_file_identity(opened_before) != _owned_file_identity(
+            metadata_before
+        ):
+            raise ClaimOwnershipError("claim ownership changed before open")
+        raw = handle.read()
+        opened_after = os.fstat(handle.fileno())
+        metadata_after = _assert_no_reparse(path, label)
+        identity = _owned_file_identity(metadata_before)
+        if (
+            raw != expected_raw
+            or _owned_file_identity(opened_after) != identity
+            or _owned_file_identity(metadata_after) != identity
+        ):
+            raise ClaimOwnershipError("claim ownership validation failed")
+        return {
+            "path": path,
+            "handle": handle,
+            "raw": expected_raw,
+            "sha256": hashlib.sha256(expected_raw).hexdigest(),
+            "identity": identity,
+            "object_identity": _stable_object_identity(opened_before),
+            "parent_identity": _stable_object_identity(
+                _assert_no_reparse(path.parent, f"{label} parent")
+            ),
+            "temporary_path": None,
+            "locked": locked,
+            "label": label,
+        }
+    except BaseException:
+        if handle is not None:
+            handle.close()
+        raise
+
+
+def _verify_claim_ownership(ownership: Mapping[str, Any]) -> None:
+    label = "independent verification retry_1 claim ownership"
+    try:
+        path = ownership["path"]
+        handle = ownership["handle"]
+        expected_raw = ownership["raw"]
+        expected_sha256 = ownership["sha256"]
+        expected_identity = ownership["identity"]
+        if not isinstance(path, Path) or not isinstance(expected_raw, bytes):
+            raise TypeError("claim ownership is invalid")
+        metadata_before = _assert_no_reparse(path, label)
+        opened_before = os.fstat(handle.fileno())
+        handle.seek(0)
+        raw = handle.read()
+        opened_after = os.fstat(handle.fileno())
+        metadata_after = _assert_no_reparse(path, label)
+        if (
+            _owned_file_identity(metadata_before) != expected_identity
+            or _owned_file_identity(opened_before) != expected_identity
+            or _owned_file_identity(opened_after) != expected_identity
+            or _owned_file_identity(metadata_after) != expected_identity
+            or raw != expected_raw
+            or hashlib.sha256(raw).hexdigest() != expected_sha256
+        ):
+            raise ClaimOwnershipError("claim ownership changed")
+    except ClaimOwnershipError:
+        raise
+    except BaseException as exc:
+        raise ClaimOwnershipError("claim ownership is unavailable") from exc
+
+
+def _reserve_status_slot(path: Path) -> dict[str, Any]:
+    label = "independent verification retry_1 status slot"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parent_before = _assert_no_reparse(path.parent, f"{label} parent")
+    if not stat.S_ISDIR(parent_before.st_mode):
+        raise IndependentVerificationError(f"{label} parent is invalid")
+    handle = None
+    try:
+        handle = _open_control_file(
+            path,
+            create=True,
+            writable=True,
+        )
+        locked = _lock_control_file(handle, label)
+        handle.flush()
+        os.fsync(handle.fileno())
+        opened = os.fstat(handle.fileno())
+        metadata = _assert_no_reparse(path, label)
+        parent_after = _assert_no_reparse(path.parent, f"{label} parent")
+        identity = _owned_file_identity(opened)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_size != 0
+            or _owned_file_identity(metadata) != identity
+            or _stable_object_identity(parent_after)
+            != _stable_object_identity(parent_before)
+        ):
+            raise IndependentVerificationError(f"{label} reservation failed")
+        return {
+            "path": path,
+            "handle": handle,
+            "identity": identity,
+            "object_identity": _stable_object_identity(opened),
+            "parent_identity": _stable_object_identity(parent_before),
+            "finalized": False,
+            "locked": locked,
+            "label": label,
+        }
+    except BaseException:
+        if handle is not None:
+            handle.close()
+        raise
+
+
+def _verify_empty_status_slot(ownership: Mapping[str, Any]) -> None:
+    label = "independent verification retry_1 status slot"
+    try:
+        path = ownership["path"]
+        handle = ownership["handle"]
+        if ownership.get("finalized") is not False or not isinstance(path, Path):
+            raise TypeError("status slot ownership is invalid")
+        parent = _assert_no_reparse(path.parent, f"{label} parent")
+        metadata = _assert_no_reparse(path, label)
+        opened = os.fstat(handle.fileno())
+        if (
+            _stable_object_identity(parent) != ownership["parent_identity"]
+            or _owned_file_identity(metadata) != ownership["identity"]
+            or _owned_file_identity(opened) != ownership["identity"]
+            or opened.st_size != 0
+        ):
+            raise IndependentVerificationError(f"{label} ownership changed")
+    except IndependentVerificationError:
+        raise
+    except BaseException as exc:
+        raise IndependentVerificationError(f"{label} is unavailable") from exc
+
+
+def _finalize_status_slot(
+    ownership: dict[str, Any],
+    raw: bytes,
+    *,
+    claim_ownership: Mapping[str, Any],
+    publication_ownerships: tuple[Mapping[str, Any], ...] = (),
+    replay_stream_ownerships: tuple[Mapping[str, Any], ...] = (),
+) -> None:
+    if not isinstance(raw, bytes):
+        raise TypeError("status slot bytes are invalid")
+    _verify_claim_ownership(claim_ownership)
+    for publication_ownership in publication_ownerships:
+        _verify_publication_ownership(publication_ownership)
+    for replay_stream_ownership in replay_stream_ownerships:
+        _verify_retry_replay_stream_ownership(replay_stream_ownership)
+    _verify_empty_status_slot(ownership)
+    handle = ownership["handle"]
+    path = ownership["path"]
+    try:
+        handle.seek(0)
+        written = handle.write(raw)
+        if written != len(raw):
+            raise OSError("independent verification retry_1 status short write")
+        handle.flush()
+        os.fsync(handle.fileno())
+        opened = os.fstat(handle.fileno())
+        metadata = _assert_no_reparse(
+            path,
+            "independent verification retry_1 status slot",
+        )
+        handle.seek(0)
+        observed = handle.read()
+        if (
+            _stable_object_identity(opened) != ownership["object_identity"]
+            or _stable_object_identity(metadata) != ownership["object_identity"]
+            or observed != raw
+        ):
+            raise IndependentVerificationError(
+                "independent verification retry_1 status slot changed"
+            )
+        _verify_claim_ownership(claim_ownership)
+        for publication_ownership in publication_ownerships:
+            _verify_publication_ownership(publication_ownership)
+        for replay_stream_ownership in replay_stream_ownerships:
+            _verify_retry_replay_stream_ownership(replay_stream_ownership)
+        handle.seek(0)
+        final_raw = handle.read()
+        final_opened = os.fstat(handle.fileno())
+        final_metadata = _assert_no_reparse(
+            path,
+            "independent verification retry_1 status slot",
+        )
+        if (
+            final_raw != raw
+            or _stable_object_identity(final_opened)
+            != ownership["object_identity"]
+            or _stable_object_identity(final_metadata)
+            != ownership["object_identity"]
+        ):
+            raise IndependentVerificationError(
+                "independent verification retry_1 status slot changed"
+            )
+    except BaseException:
+        try:
+            current = _assert_no_reparse(
+                path,
+                "independent verification retry_1 status slot",
+            )
+            opened = os.fstat(handle.fileno())
+            if (
+                _stable_object_identity(current) == ownership["object_identity"]
+                and _stable_object_identity(opened)
+                == ownership["object_identity"]
+            ):
+                handle.seek(0)
+                handle.truncate(0)
+                handle.flush()
+                os.fsync(handle.fileno())
+                restored_opened = os.fstat(handle.fileno())
+                restored_current = _assert_no_reparse(
+                    path,
+                    "independent verification retry_1 status slot",
+                )
+                restored_parent = _assert_no_reparse(
+                    path.parent,
+                    "independent verification retry_1 status slot parent",
+                )
+                if (
+                    restored_opened.st_size == 0
+                    and _stable_object_identity(restored_opened)
+                    == ownership["object_identity"]
+                    and _stable_object_identity(restored_current)
+                    == ownership["object_identity"]
+                    and _stable_object_identity(restored_parent)
+                    == ownership["parent_identity"]
+                ):
+                    try:
+                        _verify_claim_ownership(claim_ownership)
+                    except BaseException:
+                        pass
+                    else:
+                        ownership["identity"] = _owned_file_identity(
+                            restored_opened
+                        )
+        except BaseException:
+            pass
+        raise
+    ownership["finalized"] = True
 
 
 def _json_raw(value: Mapping[str, Any]) -> bytes:
@@ -2066,63 +2694,417 @@ def _manifest_path(path: Path, label: str) -> dict[str, Any]:
     return {**body, "manifest_sha256": _sha256(body)}
 
 
+def _regular_file_manifest(path: Path, label: str) -> dict[str, Any]:
+    metadata_before = _assert_no_reparse(path, label)
+    if not stat.S_ISREG(metadata_before.st_mode):
+        raise ValueError(f"{label} is not a regular file")
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with path.open("rb") as handle:
+            opened_before = os.fstat(handle.fileno())
+            if _metadata_identity(opened_before) != _metadata_identity(
+                metadata_before
+            ):
+                raise ValueError(f"{label} changed before open")
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                size += len(chunk)
+                digest.update(chunk)
+            opened_after = os.fstat(handle.fileno())
+    except OSError as exc:
+        raise ValueError(f"{label} is unreadable") from exc
+    metadata_after = _assert_no_reparse(path, label)
+    if (
+        size != metadata_before.st_size
+        or _metadata_identity(opened_after) != _metadata_identity(opened_before)
+        or _metadata_identity(metadata_after) != _metadata_identity(metadata_before)
+    ):
+        raise ValueError(f"{label} changed while hashing")
+    return {"bytes": size, "sha256": digest.hexdigest()}
+
+
+def _complete_directory_manifest(path: Path, label: str) -> dict[str, Any]:
+    root_metadata = _assert_no_reparse(path, label)
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise ValueError(f"{label} is not a directory")
+    entries: list[dict[str, Any]] = []
+    directory_snapshots: list[
+        tuple[Path, tuple[int, int, int, int, int], list[tuple[str, str, tuple[int, int, int, int, int]]]]
+    ] = []
+    pending = [path]
+    while pending:
+        directory = pending.pop()
+        directory_before = _assert_no_reparse(directory, label)
+        if not stat.S_ISDIR(directory_before.st_mode):
+            raise ValueError(f"{label} contains an invalid entry")
+        try:
+            children = sorted(
+                directory.iterdir(),
+                key=lambda candidate: candidate.name.casefold(),
+            )
+        except OSError as exc:
+            raise ValueError(f"{label} is unreadable") from exc
+        directory_after_enumeration = _assert_no_reparse(directory, label)
+        if _metadata_identity(directory_after_enumeration) != _metadata_identity(
+            directory_before
+        ):
+            raise ValueError(f"{label} changed while enumerating")
+        child_snapshot: list[
+            tuple[str, str, tuple[int, int, int, int, int]]
+        ] = []
+        child_directories: list[Path] = []
+        for candidate in children:
+            metadata_before = _assert_no_reparse(candidate, label)
+            relative = candidate.relative_to(path).as_posix()
+            if stat.S_ISDIR(metadata_before.st_mode):
+                child_snapshot.append(
+                    ("directory", candidate.name, _metadata_identity(metadata_before))
+                )
+                entries.append({"kind": "directory", "path": relative})
+                child_directories.append(candidate)
+                continue
+            if not stat.S_ISREG(metadata_before.st_mode):
+                raise ValueError(f"{label} contains an invalid entry")
+            child_snapshot.append(
+                ("file", candidate.name, _metadata_identity(metadata_before))
+            )
+            file_manifest = _regular_file_manifest(candidate, label)
+            entries.append(
+                {
+                    "kind": "file",
+                    "path": relative,
+                    **file_manifest,
+                }
+            )
+        directory_snapshots.append(
+            (directory, _metadata_identity(directory_before), child_snapshot)
+        )
+        pending.extend(reversed(child_directories))
+    for directory, directory_identity, expected_children in directory_snapshots:
+        directory_after = _assert_no_reparse(directory, label)
+        if _metadata_identity(directory_after) != directory_identity:
+            raise ValueError(f"{label} changed after recursive enumeration")
+        try:
+            current_paths = sorted(
+                directory.iterdir(),
+                key=lambda candidate: candidate.name.casefold(),
+            )
+        except OSError as exc:
+            raise ValueError(f"{label} is unreadable") from exc
+        current_children: list[
+            tuple[str, str, tuple[int, int, int, int, int]]
+        ] = []
+        for candidate in current_paths:
+            candidate_metadata = _assert_no_reparse(candidate, label)
+            if stat.S_ISDIR(candidate_metadata.st_mode):
+                kind = "directory"
+            elif stat.S_ISREG(candidate_metadata.st_mode):
+                kind = "file"
+            else:
+                raise ValueError(f"{label} contains an invalid entry")
+            current_children.append(
+                (kind, candidate.name, _metadata_identity(candidate_metadata))
+            )
+        if current_children != expected_children:
+            raise ValueError(f"{label} exact entries changed after recursion")
+        directory_after_candidates = _assert_no_reparse(directory, label)
+        if _metadata_identity(directory_after_candidates) != directory_identity:
+            raise ValueError(f"{label} changed during final candidate scan")
+        try:
+            final_paths = sorted(
+                directory.iterdir(),
+                key=lambda candidate: candidate.name.casefold(),
+            )
+        except OSError as exc:
+            raise ValueError(f"{label} is unreadable") from exc
+        directory_after_final_enumeration = _assert_no_reparse(directory, label)
+        if (
+            _metadata_identity(directory_after_final_enumeration)
+            != directory_identity
+        ):
+            raise ValueError(f"{label} changed during final enumeration")
+        final_children: list[
+            tuple[str, str, tuple[int, int, int, int, int]]
+        ] = []
+        for candidate in final_paths:
+            candidate_metadata = _assert_no_reparse(candidate, label)
+            if stat.S_ISDIR(candidate_metadata.st_mode):
+                kind = "directory"
+            elif stat.S_ISREG(candidate_metadata.st_mode):
+                kind = "file"
+            else:
+                raise ValueError(f"{label} contains an invalid entry")
+            final_children.append(
+                (kind, candidate.name, _metadata_identity(candidate_metadata))
+            )
+        directory_final = _assert_no_reparse(directory, label)
+        if (
+            _metadata_identity(directory_final) != directory_identity
+            or final_children != expected_children
+        ):
+            raise ValueError(f"{label} exact entries changed during final check")
+    entries.sort(key=lambda entry: str(entry["path"]).casefold())
+    body = {
+        "kind": "complete_directory_tree",
+        "entries": entries,
+    }
+    return {**body, "manifest_sha256": _sha256(body)}
+
+
+def _copy_regular_file_verified(
+    source: Path,
+    target: Path,
+    expected_entry: Mapping[str, Any],
+    label: str,
+) -> None:
+    metadata_before = _assert_no_reparse(source, label)
+    if not stat.S_ISREG(metadata_before.st_mode):
+        raise ValueError(f"{label} is not a regular file")
+    digest = hashlib.sha256()
+    size = 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with source.open("rb") as source_handle:
+            opened_before = os.fstat(source_handle.fileno())
+            if _metadata_identity(opened_before) != _metadata_identity(
+                metadata_before
+            ):
+                raise ValueError(f"{label} changed before copy")
+            with target.open("xb") as target_handle:
+                for chunk in iter(lambda: source_handle.read(1024 * 1024), b""):
+                    written = target_handle.write(chunk)
+                    if written != len(chunk):
+                        raise OSError(f"{label} short write")
+                    size += written
+                    digest.update(chunk)
+                target_handle.flush()
+                os.fsync(target_handle.fileno())
+            opened_after = os.fstat(source_handle.fileno())
+    except OSError as exc:
+        raise ValueError(f"{label} copy failed") from exc
+    metadata_after = _assert_no_reparse(source, label)
+    observed = {"bytes": size, "sha256": digest.hexdigest()}
+    expected = {
+        "bytes": expected_entry.get("bytes"),
+        "sha256": expected_entry.get("sha256"),
+    }
+    if (
+        _metadata_identity(opened_after) != _metadata_identity(opened_before)
+        or _metadata_identity(metadata_after) != _metadata_identity(metadata_before)
+        or observed != expected
+        or _regular_file_manifest(target, f"copied {label}") != expected
+    ):
+        raise ValueError(f"{label} copy differs")
+
+
+def _copy_complete_directory_verified(
+    source: Path,
+    target: Path,
+    expected_manifest: Mapping[str, Any],
+    label: str,
+) -> None:
+    if target.exists():
+        raise FileExistsError(f"{label} target already exists")
+    expected_tree = {
+        key: expected_manifest.get(key)
+        for key in ("kind", "entries", "manifest_sha256")
+    }
+    if _complete_directory_manifest(source, label) != expected_tree:
+        raise ValueError(f"{label} changed before copy")
+    entries_value = expected_manifest.get("entries")
+    if not isinstance(entries_value, list):
+        raise ValueError(f"{label} manifest is invalid")
+    entries = [dict(entry) for entry in entries_value if isinstance(entry, Mapping)]
+    if len(entries) != len(entries_value):
+        raise ValueError(f"{label} manifest is invalid")
+    target.mkdir(parents=True, exist_ok=False)
+    directories = sorted(
+        (entry for entry in entries if entry.get("kind") == "directory"),
+        key=lambda entry: (len(Path(str(entry["path"])).parts), str(entry["path"])),
+    )
+    files = sorted(
+        (entry for entry in entries if entry.get("kind") == "file"),
+        key=lambda entry: str(entry["path"]),
+    )
+    if len(directories) + len(files) != len(entries):
+        raise ValueError(f"{label} manifest is invalid")
+    for entry in directories:
+        relative = Path(str(entry["path"]))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"{label} manifest path is invalid")
+        source_directory = source / relative
+        before = _assert_no_reparse(source_directory, label)
+        if not stat.S_ISDIR(before.st_mode):
+            raise ValueError(f"{label} directory differs")
+        (target / relative).mkdir(exist_ok=False)
+        after = _assert_no_reparse(source_directory, label)
+        if _metadata_identity(after) != _metadata_identity(before):
+            raise ValueError(f"{label} directory changed during copy")
+    for entry in files:
+        relative = Path(str(entry["path"]))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"{label} manifest path is invalid")
+        _copy_regular_file_verified(
+            source / relative,
+            target / relative,
+            entry,
+            f"{label} {relative.as_posix()}",
+        )
+    if (
+        _complete_directory_manifest(source, label) != expected_tree
+        or _complete_directory_manifest(target, f"copied {label}")
+        != expected_tree
+    ):
+        raise ValueError(f"{label} changed during copy")
+
+
+def _universe_bundle_paths(source_root: Path) -> tuple[Path, Path]:
+    metadata_relative = Path(
+        str(REPLAY_PLAN["inputs"]["audited_pit_universe_path"])
+    )
+    if (
+        metadata_relative.is_absolute()
+        or ".." in metadata_relative.parts
+        or metadata_relative.name != "metadata.sqlite3"
+    ):
+        raise ValueError("audited PIT universe metadata path is invalid")
+    return metadata_relative.parent, metadata_relative
+
+
+def _universe_bundle_manifest(source_root: Path) -> dict[str, Any]:
+    bundle_relative, metadata_relative = _universe_bundle_paths(source_root)
+    bundle_root = source_root / bundle_relative
+    entries = _directory_entries(bundle_root, "audited PIT universe bundle")
+    if {entry.name for entry in entries} != {
+        "manifest.json",
+        "metadata.sqlite3",
+        "raw",
+    }:
+        raise ValueError("audited PIT universe bundle layout is invalid")
+    metadata_path = source_root / metadata_relative
+    manifest_path = bundle_root / "manifest.json"
+    raw_root = bundle_root / "raw"
+    for path, expected_mode, label in (
+        (metadata_path, stat.S_ISREG, "audited PIT universe metadata"),
+        (manifest_path, stat.S_ISREG, "audited PIT universe manifest"),
+        (raw_root, stat.S_ISDIR, "audited PIT universe raw root"),
+    ):
+        if not expected_mode(_assert_no_reparse(path, label).st_mode):
+            raise ValueError("audited PIT universe bundle layout is invalid")
+    _assert_sqlite_quiescent(metadata_path)
+    manifest = _complete_directory_manifest(
+        bundle_root,
+        "audited PIT universe bundle",
+    )
+    if not any(
+        entry.get("kind") == "file"
+        and str(entry.get("path", "")).startswith("raw/")
+        for entry in manifest["entries"]
+    ):
+        raise ValueError("audited PIT universe raw tree is empty")
+    return {
+        **manifest,
+        "bundle_relative_path": bundle_relative.as_posix(),
+        "metadata_relative_path": metadata_relative.as_posix(),
+    }
+
+
 def _copy_frozen_inputs(
     source_root: Path,
     data_root: Path,
     *,
     expected_formal_attestation: Mapping[str, Any],
+    expected_universe_bundle_manifest_sha256: str,
 ) -> dict[str, Any]:
     inputs = REPLAY_PLAN["inputs"]
     formal_attestation = _observed_frozen_attestation(source_root)
     if formal_attestation != dict(expected_formal_attestation):
         raise ValueError("formal frozen input changed before copy")
+    expected_bundle_sha256 = _require_sha256(
+        expected_universe_bundle_manifest_sha256,
+        "audited PIT universe bundle manifest",
+    )
+    universe_bundle_before = _universe_bundle_manifest(source_root)
+    if universe_bundle_before["manifest_sha256"] != expected_bundle_sha256:
+        raise ValueError("audited PIT universe bundle manifest drifted")
+    bundle_relative, metadata_relative = _universe_bundle_paths(source_root)
     plan = (
-        ("audited_pit_universe_path", "file"),
-        ("temporal_contract_path", "file"),
-        ("current_pool_development_audit_path", "file"),
-        ("security_code_transition_evidence_root", "directory_tree"),
+        ("audited_pit_universe_bundle_root", bundle_relative, "directory_tree"),
+        (
+            "temporal_contract_path",
+            Path(str(inputs["temporal_contract_path"])),
+            "file",
+        ),
+        (
+            "current_pool_development_audit_path",
+            Path(str(inputs["current_pool_development_audit_path"])),
+            "file",
+        ),
+        (
+            "security_code_transition_evidence_root",
+            Path(str(inputs["security_code_transition_evidence_root"])),
+            "directory_tree",
+        ),
     )
     source_before: dict[str, dict[str, Any]] = {}
     target_manifests: dict[str, dict[str, Any]] = {}
-    for field, kind in plan:
-        relative = Path(str(inputs[field]))
+    for field, relative, kind in plan:
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError("frozen input path is invalid")
         source = source_root / relative
         target = data_root / relative
-        if field == "audited_pit_universe_path":
-            _assert_sqlite_quiescent(source)
-        source_before[field] = _manifest_path(source, f"frozen input {field}")
+        source_before[field] = (
+            _universe_bundle_manifest(source_root)
+            if field == "audited_pit_universe_bundle_root"
+            else _manifest_path(source, f"frozen input {field}")
+        )
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
             raise FileExistsError("frozen input target already exists")
-        if kind == "file":
+        if field == "audited_pit_universe_bundle_root":
+            _copy_complete_directory_verified(
+                source,
+                target,
+                source_before[field],
+                "audited PIT universe bundle",
+            )
+        elif kind == "file":
             shutil.copyfile(source, target)
         else:
-            shutil.copytree(source, target)
-        if field == "audited_pit_universe_path":
-            _assert_sqlite_quiescent(target)
-        target_manifests[field] = _manifest_path(
-            target,
-            f"copied frozen input {field}",
+            shutil.copytree(source, target, symlinks=True)
+        target_manifests[field] = (
+            _universe_bundle_manifest(data_root)
+            if field == "audited_pit_universe_bundle_root"
+            else _manifest_path(
+                target,
+                f"copied frozen input {field}",
+            )
         )
         if target_manifests[field] != source_before[field]:
             raise ValueError("frozen input copy differs")
     source_after = {
-        field: _manifest_path(source_root / Path(str(inputs[field])), field)
-        for field, _kind in plan
+        field: (
+            _universe_bundle_manifest(source_root)
+            if field == "audited_pit_universe_bundle_root"
+            else _manifest_path(source_root / relative, field)
+        )
+        for field, relative, _kind in plan
     }
     _assert_sqlite_quiescent(
-        source_root / Path(str(inputs["audited_pit_universe_path"]))
+        source_root / metadata_relative
+    )
+    _assert_sqlite_quiescent(
+        data_root / metadata_relative
     )
     if source_after != source_before:
         raise ValueError("frozen input changed during copy")
     if _observed_frozen_attestation(source_root) != formal_attestation:
         raise ValueError("formal frozen input changed during copy")
     body = {
-        "schema_version": "risk-on-breadth-independent-frozen-input-copy/v1",
+        "schema_version": "risk-on-breadth-independent-frozen-input-copy/v2",
         "input_count": 4,
         "manifests": target_manifests,
+        "universe_bundle_manifest_sha256": expected_bundle_sha256,
         "formal_frozen_input_attestation_root_sha256": formal_attestation[
             "root_sha256"
         ],
@@ -2130,27 +3112,51 @@ def _copy_frozen_inputs(
     return {**body, "root_sha256": _sha256(body)}
 
 
-def _minimal_child_environment(temp_dir: Path) -> dict[str, str]:
+def _minimal_child_environment(
+    temp_dir: Path,
+    *,
+    python_executable: Path,
+    pycache_blocker: Path,
+) -> dict[str, str]:
     resolved_temp = temp_dir.resolve()
     resolved_temp.mkdir(parents=True, exist_ok=True)
-    environment = {
-        key: os.environ[key]
-        for key in ("COMSPEC", "SYSTEMROOT", "SystemRoot", "WINDIR")
-        if os.environ.get(key)
-    }
-    environment.update(
-        {
-            "DISABLE_ENV_FILE": "1",
-            "PYTHONHASHSEED": "0",
-            "PYTHONNOUSERSITE": "1",
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONUTF8": "1",
-            "VPS_RUNTIME_ROLE": "local_research",
-            "TEMP": str(resolved_temp),
-            "TMP": str(resolved_temp),
-        }
+    system_root_value = (
+        os.environ.get("SystemRoot")
+        or os.environ.get("SYSTEMROOT")
+        or os.environ.get("WINDIR")
     )
-    return environment
+    if not system_root_value:
+        raise IndependentVerificationError("Windows system root is unavailable")
+    system_root = Path(system_root_value)
+    python = python_executable.resolve(strict=True)
+    blocker = pycache_blocker.resolve(strict=True)
+    path_parts = [
+        str(python.parent),
+        str(system_root / "System32"),
+        str(system_root),
+    ]
+    normalized_paths = list(
+        dict.fromkeys(path_parts_value.casefold() for path_parts_value in path_parts)
+    )
+    frozen_path = [
+        next(value for value in path_parts if value.casefold() == normalized)
+        for normalized in normalized_paths
+    ]
+    return {
+        "DISABLE_ENV_FILE": "1",
+        "PYTHONHASHSEED": "0",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUTF8": "1",
+        "VPS_RUNTIME_ROLE": "local_research",
+        "SYSTEMROOT": str(system_root),
+        "WINDIR": str(system_root),
+        "COMSPEC": str(system_root / "System32" / "cmd.exe"),
+        "PATH": os.pathsep.join(frozen_path),
+        "PYTHONPYCACHEPREFIX": str(blocker),
+        "TEMP": str(resolved_temp),
+        "TMP": str(resolved_temp),
+    }
 
 
 def _isolated_replay_command(
@@ -2433,11 +3439,7 @@ def _verified_post_run_verifier_amendment(
             )
             for path in VERIFIER_AMENDMENT_SUCCESSOR_GIT_PATHS
         }
-        amendment_execution = _git_output(
-            source_root,
-            "rev-parse",
-            "HEAD",
-        ).lower()
+        amendment_execution = EXPECTED_VERIFIER_AMENDMENT_EXECUTION_COMMIT
         relative_path = entries[0].relative_to(source_root).as_posix()
         expected_successor_changes = {
             f"M\t{path}" for path in VERIFIER_AMENDMENT_SUCCESSOR_GIT_PATHS
@@ -2474,12 +3476,8 @@ def _verified_post_run_verifier_amendment(
             or document.get("scope") != VERIFIER_AMENDMENT_SCOPE
             or document.get("execution_topology")
             != VERIFIER_AMENDMENT_TOPOLOGY
-            or _git_output(
-                source_root,
-                "status",
-                "--porcelain",
-                "--untracked-files=all",
-            )
+            or artifact_sha256
+            != EXPECTED_VERIFIER_AMENDMENT_ARTIFACT_SHA256
             or _git_output(
                 source_root,
                 "rev-list",
@@ -2551,23 +3549,12 @@ def _verified_post_run_verifier_amendment(
             path: hashlib.sha256(raw).hexdigest()
             for path, raw in successor_git_blobs.items()
         }
-        live_successor_git_blobs = {
-            path: (
-                SCRIPT_PATH
-                if path == VERIFIER_AMENDMENT_VERIFIER_GIT_PATH
-                else source_root / path
-            )
-            .read_bytes()
-            .replace(b"\r\n", b"\n")
-            for path in VERIFIER_AMENDMENT_SUCCESSOR_GIT_PATHS
-        }
         successor_verifier_sha256 = observed_successor_git_blobs_sha256[
             VERIFIER_AMENDMENT_VERIFIER_GIT_PATH
         ]
         if (
             observed_successor_git_blobs_sha256
             != successor_git_blobs_sha256
-            or successor_git_blobs != live_successor_git_blobs
             or attribute_lines.count(VERIFIER_AMENDMENT_GIT_ATTRIBUTES_RULE) != 1
             or authority_blob != authority_raw
         ):
@@ -2601,6 +3588,338 @@ def _verified_post_run_verifier_amendment(
     except (KeyError, OSError, TypeError, ValueError) as exc:
         raise IndependentVerificationError(
             "post-run verifier amendment authority is invalid"
+        ) from exc
+
+
+def _require_absent(path: Path, label: str) -> str:
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return "absent"
+    except OSError as exc:
+        raise ValueError(f"{label} state is unreadable") from exc
+    else:
+        raise ValueError(f"{label} must be absent")
+
+
+def _verified_original_failed_attempt(run_root: Path) -> dict[str, Any]:
+    try:
+        claim_path = run_root / CLAIM_NAME
+        status_path = run_root / STATUS_NAME
+        claim, claim_raw = _read_launcher_json(
+            claim_path,
+            "original failed independent verification claim",
+            fields=ORIGINAL_FAILED_CLAIM_FIELDS,
+        )
+        status, status_raw = _read_launcher_json(
+            status_path,
+            "original failed independent verification status",
+            fields=ORIGINAL_FAILED_STATUS_FIELDS,
+        )
+        claim_sha256 = hashlib.sha256(claim_raw).hexdigest()
+        status_sha256 = hashlib.sha256(status_raw).hexdigest()
+        verification_state = _require_absent(
+            run_root / VERIFICATION_ROOT_NAME,
+            "original independent verification artifacts",
+        )
+        receipt_state = _require_absent(
+            run_root / RECEIPT_ROOT_NAME,
+            "original independent verification receipts",
+        )
+        if (
+            claim_sha256 != EXPECTED_FAILED_CLAIM_SHA256
+            or status_sha256 != EXPECTED_FAILED_STATUS_SHA256
+            or claim.get("development_only") is not True
+            or claim.get("embargo_consumed") is not False
+            or claim.get("final_oos_consumed") is not False
+            or claim.get("production_authority") is not False
+            or claim.get("automatic_trading_authority") is not False
+            or status.get("schema_version") != STATUS_SCHEMA
+            or status.get("status") != "failed"
+            or status.get("stage") != "failed"
+            or status.get("verified") is not False
+            or status.get("receipt_sha256") is not None
+            or status.get("claim_sha256") != claim_sha256
+            or status.get("receipt_path") is not None
+            or status.get("error_type") != "IndependentVerificationError"
+            or status.get("development_only") is not True
+            or status.get("development_statistical_interpretation_allowed")
+            is not False
+            or status.get("profile_registration_authority") is not False
+            or status.get("production_recommendation_authority") is not False
+            or status.get("automatic_trading_authority") is not False
+            or status.get("production_authority") is not False
+            or status.get("embargo_consumed") is not False
+            or status.get("final_oos_consumed") is not False
+        ):
+            raise ValueError("original failed independent verification drifted")
+        return {
+            "claim_path": CLAIM_NAME,
+            "claim_sha256": claim_sha256,
+            "status_path": STATUS_NAME,
+            "status_sha256": status_sha256,
+            "verification_artifacts_state": verification_state,
+            "receipts_state": receipt_state,
+            "status": "failed",
+            "stage": "failed",
+            "verified": False,
+            "error_type": "IndependentVerificationError",
+        }
+    except IndependentVerificationError:
+        raise
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise IndependentVerificationError(
+            "original failed attempt evidence is invalid"
+        ) from exc
+
+
+def _verified_post_failure_retry_authority(
+    source_root: Path,
+    *,
+    original_amendment: Mapping[str, Any],
+    original_failed_attempt: Mapping[str, Any],
+) -> dict[str, Any]:
+    try:
+        authority_root = source_root / RETRY_AUTHORITY_RELATIVE_ROOT
+        entries = _directory_entries(
+            authority_root,
+            "post-failure verifier retry authority root",
+        )
+        if (
+            len(entries) != 1
+            or not re.fullmatch(r"[0-9a-f]{64}\.json", entries[0].name)
+        ):
+            raise ValueError("post-failure verifier retry authority is not unique")
+        document, authority_raw = _read_launcher_json(
+            entries[0],
+            "post-failure verifier retry authority",
+        )
+        authority_fields = {
+            "schema_version",
+            "retry_id",
+            "original_amendment_execution_commit",
+            "original_amendment_artifact_sha256",
+            "original_failed_claim_path",
+            "original_failed_claim_sha256",
+            "original_failed_status_path",
+            "original_failed_status_sha256",
+            "original_verification_artifacts_state",
+            "original_receipts_state",
+            "universe_bundle_relative_path",
+            "universe_metadata_relative_path",
+            "universe_bundle_manifest_sha256",
+            "retry_source_commit",
+            "retry_source_tree",
+            "retry_verifier_git_path",
+            "retry_verifier_git_blob_sha256",
+            "retry_git_blobs_sha256",
+            "replay_plan_sha256",
+            "failure_classification",
+            "scope",
+            "execution_topology",
+            "artifact_sha256",
+        }
+        unsigned = dict(document)
+        artifact_sha256 = _require_sha256(
+            unsigned.pop("artifact_sha256", None),
+            "post-failure verifier retry authority artifact",
+        )
+        original_execution = str(
+            original_amendment.get("execution_commit") or ""
+        ).lower()
+        original_artifact = _require_sha256(
+            original_amendment.get("artifact_sha256"),
+            "original verifier amendment artifact",
+        )
+        retry_source = str(document.get("retry_source_commit") or "").lower()
+        retry_tree = str(document.get("retry_source_tree") or "").lower()
+        retry_execution = _git_output(source_root, "rev-parse", "HEAD").lower()
+        retry_blobs_value = document.get("retry_git_blobs_sha256")
+        if (
+            not isinstance(retry_blobs_value, Mapping)
+            or set(retry_blobs_value) != set(RETRY_AUTHORITY_SUCCESSOR_GIT_PATHS)
+        ):
+            raise ValueError("post-failure verifier retry Git blobs are invalid")
+        retry_blobs_sha256 = {
+            path: _require_sha256(
+                retry_blobs_value.get(path),
+                f"post-failure verifier retry Git blob {path}",
+            )
+            for path in RETRY_AUTHORITY_SUCCESSOR_GIT_PATHS
+        }
+        bundle_manifest = _universe_bundle_manifest(source_root)
+        relative_path = entries[0].relative_to(source_root).as_posix()
+        expected_retry_changes = {
+            f"M\t{path}" for path in RETRY_AUTHORITY_SUCCESSOR_GIT_PATHS
+        }
+        if (
+            set(document) != authority_fields
+            or artifact_sha256 != _sha256(unsigned)
+            or entries[0].stem != artifact_sha256
+            or document.get("schema_version") != RETRY_AUTHORITY_SCHEMA
+            or document.get("retry_id") != "retry_1"
+            or original_execution
+            != EXPECTED_VERIFIER_AMENDMENT_EXECUTION_COMMIT
+            or document.get("original_amendment_execution_commit")
+            != original_execution
+            or document.get("original_amendment_artifact_sha256")
+            != original_artifact
+            or document.get("original_failed_claim_path")
+            != original_failed_attempt.get("claim_path")
+            or document.get("original_failed_claim_sha256")
+            != original_failed_attempt.get("claim_sha256")
+            or document.get("original_failed_status_path")
+            != original_failed_attempt.get("status_path")
+            or document.get("original_failed_status_sha256")
+            != original_failed_attempt.get("status_sha256")
+            or document.get("original_verification_artifacts_state")
+            != original_failed_attempt.get("verification_artifacts_state")
+            or document.get("original_receipts_state")
+            != original_failed_attempt.get("receipts_state")
+            or document.get("universe_bundle_relative_path")
+            != bundle_manifest.get("bundle_relative_path")
+            or document.get("universe_metadata_relative_path")
+            != bundle_manifest.get("metadata_relative_path")
+            or document.get("universe_bundle_manifest_sha256")
+            != bundle_manifest.get("manifest_sha256")
+            or not HEX_GIT_SHA1.fullmatch(retry_source)
+            or not HEX_GIT_SHA1.fullmatch(retry_tree)
+            or not HEX_GIT_SHA1.fullmatch(retry_execution)
+            or document.get("retry_verifier_git_path")
+            != VERIFIER_AMENDMENT_VERIFIER_GIT_PATH
+            or document.get("retry_verifier_git_blob_sha256")
+            != retry_blobs_sha256[VERIFIER_AMENDMENT_VERIFIER_GIT_PATH]
+            or document.get("retry_git_blobs_sha256") != retry_blobs_sha256
+            or document.get("replay_plan_sha256")
+            != EXPECTED_REPLAY_PLAN_SHA256
+            or document.get("failure_classification")
+            != RETRY_FAILURE_CLASSIFICATION
+            or document.get("scope") != RETRY_AUTHORITY_SCOPE
+            or document.get("execution_topology") != RETRY_AUTHORITY_TOPOLOGY
+            or _git_output(
+                source_root,
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+            )
+            or _git_output(
+                source_root,
+                "rev-list",
+                "--parents",
+                "-n",
+                "1",
+                retry_execution,
+            ).split()
+            != [retry_execution, retry_source]
+            or _git_output(
+                source_root,
+                "rev-list",
+                "--parents",
+                "-n",
+                "1",
+                retry_source,
+            ).split()
+            != [retry_source, original_execution]
+            or _git_output(
+                source_root,
+                "rev-parse",
+                f"{retry_source}^{{tree}}",
+            ).lower()
+            != retry_tree
+            or set(
+                _git_output(
+                    source_root,
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-status",
+                    "-r",
+                    original_execution,
+                    retry_source,
+                ).splitlines()
+            )
+            != expected_retry_changes
+            or _git_output(
+                source_root,
+                "diff-tree",
+                "--no-commit-id",
+                "--name-status",
+                "-r",
+                retry_source,
+                retry_execution,
+            ).splitlines()
+            != [f"A\t{relative_path}"]
+        ):
+            raise ValueError("post-failure verifier retry authority drifted")
+        retry_blobs = {
+            path: _git_bytes(source_root, "show", f"{retry_source}:{path}")
+            for path in RETRY_AUTHORITY_SUCCESSOR_GIT_PATHS
+        }
+        observed_retry_blobs_sha256 = {
+            path: hashlib.sha256(raw).hexdigest()
+            for path, raw in retry_blobs.items()
+        }
+        live_retry_blobs = {
+            path: (
+                SCRIPT_PATH
+                if path == VERIFIER_AMENDMENT_VERIFIER_GIT_PATH
+                else source_root / path
+            )
+            .read_bytes()
+            .replace(b"\r\n", b"\n")
+            for path in RETRY_AUTHORITY_SUCCESSOR_GIT_PATHS
+        }
+        authority_blob = _git_bytes(
+            source_root,
+            "show",
+            f"{retry_execution}:{relative_path}",
+        )
+        attribute_lines = retry_blobs[".gitattributes"].decode("utf-8").splitlines()
+        if (
+            observed_retry_blobs_sha256 != retry_blobs_sha256
+            or retry_blobs != live_retry_blobs
+            or attribute_lines.count(RETRY_AUTHORITY_GIT_ATTRIBUTES_RULE) != 1
+            or authority_blob != authority_raw
+        ):
+            raise ValueError("post-failure verifier retry Git blob drifted")
+        return {
+            "schema_version": (
+                "formal-post-failure-independent-verifier-retry-binding/v1"
+            ),
+            "artifact_sha256": artifact_sha256,
+            "relative_path": relative_path,
+            "original_amendment_execution_commit": original_execution,
+            "original_amendment_artifact_sha256": original_artifact,
+            "original_failed_claim_sha256": original_failed_attempt[
+                "claim_sha256"
+            ],
+            "original_failed_status_sha256": original_failed_attempt[
+                "status_sha256"
+            ],
+            "universe_bundle_relative_path": bundle_manifest[
+                "bundle_relative_path"
+            ],
+            "universe_metadata_relative_path": bundle_manifest[
+                "metadata_relative_path"
+            ],
+            "universe_bundle_manifest_sha256": bundle_manifest[
+                "manifest_sha256"
+            ],
+            "retry_source_commit": retry_source,
+            "retry_source_tree": retry_tree,
+            "execution_commit": retry_execution,
+            "retry_verifier_git_blob_sha256": retry_blobs_sha256[
+                VERIFIER_AMENDMENT_VERIFIER_GIT_PATH
+            ],
+            "retry_git_blobs_sha256": retry_blobs_sha256,
+            "replay_plan_sha256": EXPECTED_REPLAY_PLAN_SHA256,
+            "failure_classification": RETRY_FAILURE_CLASSIFICATION,
+            "scope": RETRY_AUTHORITY_SCOPE,
+        }
+    except IndependentVerificationError:
+        raise
+    except (KeyError, OSError, TypeError, UnicodeDecodeError, ValueError) as exc:
+        raise IndependentVerificationError(
+            "post-failure verifier retry authority is invalid"
         ) from exc
 
 
@@ -3244,6 +4563,45 @@ def _load_formal_inputs(source_root_value: str | Path) -> dict[str, Any]:
         raise IndependentVerificationError("formal completion chain is invalid") from exc
 
 
+def _load_retry_inputs(source_root_value: str | Path) -> dict[str, Any]:
+    inputs = _load_formal_inputs(source_root_value)
+    source_root = Path(source_root_value).resolve(strict=True)
+    run_root = Path(inputs["run_root"])
+    original_failed_attempt = _verified_original_failed_attempt(run_root)
+    retry_authority = _verified_post_failure_retry_authority(
+        source_root,
+        original_amendment=inputs["verifier_amendment"],
+        original_failed_attempt=original_failed_attempt,
+    )
+    return {
+        **inputs,
+        "original_failed_attempt": original_failed_attempt,
+        "retry_authority": retry_authority,
+    }
+
+
+def _assert_retry_slot_unused(run_root: Path) -> None:
+    retry_paths = (
+        RETRY_CLAIM_NAME,
+        RETRY_STATUS_NAME,
+        RETRY_VERIFICATION_ROOT_NAME,
+        RETRY_RECEIPT_ROOT_NAME,
+        RETRY_FAILURE_RECEIPT_ROOT_NAME,
+        RETRY_REPLAY_STDOUT_NAME,
+        RETRY_REPLAY_STDERR_NAME,
+    )
+    for relative in retry_paths:
+        try:
+            os.lstat(run_root / relative)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise IndependentVerificationError(
+                "independent verification retry_1 slot is unreadable"
+            ) from exc
+        raise FileExistsError("independent verification retry_1 is already claimed")
+
+
 RUNTIME_PROBE = r'''
 import json
 from pathlib import Path
@@ -3484,14 +4842,18 @@ def _verify_frozen_copy(
     expected_formal_attestation: Mapping[str, Any],
 ) -> None:
     inputs = REPLAY_PLAN["inputs"]
-    fields = (
-        "audited_pit_universe_path",
+    source_bundle = _universe_bundle_manifest(source_root)
+    target_bundle = _universe_bundle_manifest(data_root)
+    if source_bundle != target_bundle:
+        raise IndependentVerificationError("frozen replay universe bundle drifted")
+    observed: dict[str, dict[str, Any]] = {
+        "audited_pit_universe_bundle_root": target_bundle,
+    }
+    for field in (
         "temporal_contract_path",
         "current_pool_development_audit_path",
         "security_code_transition_evidence_root",
-    )
-    observed: dict[str, dict[str, Any]] = {}
-    for field in fields:
+    ):
         relative = Path(str(inputs[field]))
         source_manifest = _manifest_path(source_root / relative, field)
         target_manifest = _manifest_path(data_root / relative, field)
@@ -3508,9 +4870,10 @@ def _verify_frozen_copy(
     if formal_attestation != dict(expected_formal_attestation):
         raise IndependentVerificationError("formal frozen input history drifted")
     body = {
-        "schema_version": "risk-on-breadth-independent-frozen-input-copy/v1",
+        "schema_version": "risk-on-breadth-independent-frozen-input-copy/v2",
         "input_count": 4,
         "manifests": observed,
+        "universe_bundle_manifest_sha256": source_bundle["manifest_sha256"],
         "formal_frozen_input_attestation_root_sha256": (
             formal_attestation["root_sha256"]
         ),
@@ -3571,10 +4934,22 @@ def _run_isolated_replay(
     replay_probe: Mapping[str, Any],
     frozen_copy: Mapping[str, Any],
     scratch_root: Path,
+    replay_stream_ownerships: tuple[dict[str, Any], ...],
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     output_dir = scratch_root / "replay-output"
-    stdout_path = scratch_root / REPLAY_STDOUT_NAME
-    stderr_path = scratch_root / REPLAY_STDERR_NAME
+    ownership_by_relative = {
+        str(ownership.get("relative")): ownership
+        for ownership in replay_stream_ownerships
+    }
+    if set(ownership_by_relative) != {
+        RETRY_REPLAY_STDOUT_NAME,
+        RETRY_REPLAY_STDERR_NAME,
+    }:
+        raise IndependentVerificationError("retry replay stream ownership is invalid")
+    stdout_ownership = ownership_by_relative[RETRY_REPLAY_STDOUT_NAME]
+    stderr_ownership = ownership_by_relative[RETRY_REPLAY_STDERR_NAME]
+    stdout_handle = stdout_ownership["handle"]
+    stderr_handle = stderr_ownership["handle"]
     command = _isolated_replay_command(
         python_executable=python_executable,
         code_root=code_root,
@@ -3583,55 +4958,68 @@ def _run_isolated_replay(
         pycache_blocker=pycache_blocker,
     )
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    with stdout_path.open("xb") as stdout_handle, stderr_path.open("xb") as stderr_handle:
-        process = subprocess.Popen(
-            command,
-            cwd=data_root,
-            env=dict(environment),
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_handle,
-            stderr=stderr_handle,
-            shell=False,
-            creationflags=creationflags,
+    process = subprocess.Popen(
+        command,
+        cwd=data_root,
+        env=dict(environment),
+        stdin=subprocess.DEVNULL,
+        stdout=stdout_handle,
+        stderr=stderr_handle,
+        shell=False,
+        creationflags=creationflags,
+    )
+    exit_code = process.wait()
+    _seal_retry_replay_stream_ownership(stdout_ownership)
+    _seal_retry_replay_stream_ownership(stderr_ownership)
+    stdout = stdout_ownership["descriptor"]
+    stderr = stderr_ownership["descriptor"]
+    postflight_error: BaseException | None = None
+    try:
+        _verify_frozen_copy(
+            source_root,
+            data_root,
+            frozen_copy,
+            expected_formal_attestation=inputs["preflight_core"][
+                "frozen_input_attestation"
+            ],
         )
-        exit_code = process.wait()
-    _verify_frozen_copy(
-        source_root,
-        data_root,
-        frozen_copy,
-        expected_formal_attestation=inputs["preflight_core"][
-            "frozen_input_attestation"
-        ],
-    )
-    _probe_current_pool_audit(
-        code_root,
-        audit_path=(
-            data_root
-            / Path(
-                str(
-                    REPLAY_PLAN["inputs"][
-                        "current_pool_development_audit_path"
-                    ]
+        _probe_current_pool_audit(
+            code_root,
+            audit_path=(
+                data_root
+                / Path(
+                    str(
+                        REPLAY_PLAN["inputs"][
+                            "current_pool_development_audit_path"
+                        ]
+                    )
                 )
+            ),
+            expected_binding=inputs["preflight_core"][
+                "current_pool_audit_binding"
+            ],
+            python_executable=python_executable,
+            site_packages=site_packages,
+            environment=environment,
+            pycache_blocker=pycache_blocker,
+        )
+        replay_post_probe = _probe_runtime(
+            code_root,
+            python_executable=python_executable,
+            site_packages=site_packages,
+            environment=environment,
+            pycache_blocker=pycache_blocker,
+        )
+        if replay_post_probe != dict(replay_probe):
+            raise IndependentVerificationError(
+                "replay runtime changed during execution"
             )
-        ),
-        expected_binding=inputs["preflight_core"]["current_pool_audit_binding"],
-        python_executable=python_executable,
-        site_packages=site_packages,
-        environment=environment,
-        pycache_blocker=pycache_blocker,
-    )
-    replay_post_probe = _probe_runtime(
-        code_root,
-        python_executable=python_executable,
-        site_packages=site_packages,
-        environment=environment,
-        pycache_blocker=pycache_blocker,
-    )
-    if replay_post_probe != dict(replay_probe):
-        raise IndependentVerificationError("replay runtime changed during execution")
+    except BaseException as exc:
+        postflight_error = exc
     if exit_code != 0:
-        raise IndependentVerificationError("independent replay returned nonzero")
+        raise IndependentReplayProcessError(exit_code) from postflight_error
+    if postflight_error is not None:
+        raise postflight_error
     execution_snapshot = _execution_snapshot(
         formal_probe=formal_probe,
         replay_probe=replay_probe,
@@ -3647,17 +5035,258 @@ def _run_isolated_replay(
         "execution_snapshot": execution_snapshot,
         "result_bundle": replay_bundle,
     }
-    stdout = {
-        "path": REPLAY_STDOUT_NAME,
-        "bytes": stdout_path.stat().st_size,
-        "sha256": _file_sha256(stdout_path),
-    }
-    stderr = {
-        "path": REPLAY_STDERR_NAME,
-        "bytes": stderr_path.stat().st_size,
-        "sha256": _file_sha256(stderr_path),
-    }
     return replay, execution_snapshot, stdout, stderr
+
+
+def _seal_retry_replay_stream_ownership(
+    ownership: dict[str, Any],
+) -> dict[str, Any]:
+    if ownership.get("descriptor") is not None:
+        _verify_retry_replay_stream_ownership(ownership)
+        return ownership
+    path = ownership["path"]
+    handle = ownership["handle"]
+    label = str(ownership["label"])
+    handle.flush()
+    locked = _lock_control_file(handle, label)
+    metadata_before = _assert_no_reparse(path, label)
+    opened_before = os.fstat(handle.fileno())
+    if (
+        not stat.S_ISREG(opened_before.st_mode)
+        or _stable_object_identity(opened_before)
+        != ownership["object_identity"]
+        or _stable_object_identity(metadata_before)
+        != ownership["object_identity"]
+    ):
+        raise IndependentVerificationError(f"{label} changed before sealing")
+    digest = hashlib.sha256()
+    size = 0
+    handle.seek(0)
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        size += len(chunk)
+        digest.update(chunk)
+    opened_after = os.fstat(handle.fileno())
+    metadata_after = _assert_no_reparse(path, label)
+    identity = _owned_file_identity(opened_before)
+    if (
+        _owned_file_identity(opened_after) != identity
+        or _owned_file_identity(metadata_after) != identity
+        or size != opened_before.st_size
+    ):
+        raise IndependentVerificationError(f"{label} changed while sealing")
+    ownership["identity"] = identity
+    ownership["locked"] = locked
+    ownership["descriptor"] = {
+        "path": ownership["relative"],
+        "bytes": size,
+        "sha256": digest.hexdigest(),
+    }
+    return ownership
+
+
+def _create_retry_replay_stream_ownerships(
+    run_root: Path,
+) -> tuple[dict[str, Any], ...]:
+    ownerships: list[dict[str, Any]] = []
+    created_paths: list[Path] = []
+    try:
+        for name, relative in (
+            ("stdout", RETRY_REPLAY_STDOUT_NAME),
+            ("stderr", RETRY_REPLAY_STDERR_NAME),
+        ):
+            path = run_root / relative
+            handle = _open_control_file(
+                path,
+                create=True,
+                writable=True,
+            )
+            created_paths.append(path)
+            opened = os.fstat(handle.fileno())
+            ownerships.append(
+                {
+                    "path": path,
+                    "relative": relative,
+                    "handle": handle,
+                    "object_identity": _stable_object_identity(opened),
+                    "parent_identity": _stable_object_identity(
+                        _assert_no_reparse(
+                            path.parent,
+                            f"retry replay {name} parent",
+                        )
+                    ),
+                    "identity": None,
+                    "descriptor": None,
+                    "locked": False,
+                    "label": f"retry replay {name}",
+                }
+            )
+        return tuple(ownerships)
+    except BaseException:
+        _close_retry_replay_stream_ownerships(tuple(ownerships))
+        for path in created_paths:
+            path.unlink(missing_ok=True)
+        raise
+
+
+def _retry_replay_stream_ownership(
+    path: Path,
+    *,
+    relative: str,
+    label: str,
+) -> dict[str, Any]:
+    metadata_before = _assert_no_reparse(path, label)
+    if not stat.S_ISREG(metadata_before.st_mode):
+        raise IndependentVerificationError(f"{label} is invalid")
+    handle = None
+    try:
+        handle = _open_control_file(
+            path,
+            create=False,
+            writable=False,
+        )
+        opened = os.fstat(handle.fileno())
+        if _owned_file_identity(opened) != _owned_file_identity(metadata_before):
+            raise IndependentVerificationError(f"{label} changed before open")
+        ownership = {
+            "path": path,
+            "relative": relative,
+            "handle": handle,
+            "object_identity": _stable_object_identity(opened),
+            "parent_identity": _stable_object_identity(
+                _assert_no_reparse(path.parent, f"{label} parent")
+            ),
+            "identity": None,
+            "descriptor": None,
+            "locked": False,
+            "label": label,
+        }
+        return _seal_retry_replay_stream_ownership(ownership)
+    except BaseException:
+        if handle is not None:
+            handle.close()
+        raise
+
+
+def _verify_retry_replay_stream_ownership(
+    ownership: Mapping[str, Any],
+) -> dict[str, Any]:
+    try:
+        path = ownership["path"]
+        handle = ownership["handle"]
+        identity = ownership["identity"]
+        expected = ownership["descriptor"]
+        label = str(ownership["label"])
+        metadata_before = _assert_no_reparse(path, label)
+        opened_before = os.fstat(handle.fileno())
+        digest = hashlib.sha256()
+        size = 0
+        handle.seek(0)
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            size += len(chunk)
+            digest.update(chunk)
+        opened_after = os.fstat(handle.fileno())
+        metadata_after = _assert_no_reparse(path, label)
+        parent_after = _assert_no_reparse(path.parent, f"{label} parent")
+        observed = {
+            "path": expected["path"],
+            "bytes": size,
+            "sha256": digest.hexdigest(),
+        }
+        if (
+            _owned_file_identity(metadata_before) != identity
+            or _owned_file_identity(opened_before) != identity
+            or _owned_file_identity(opened_after) != identity
+            or _owned_file_identity(metadata_after) != identity
+            or _stable_object_identity(parent_after)
+            != ownership["parent_identity"]
+            or observed != expected
+        ):
+            raise IndependentVerificationError(f"{label} ownership changed")
+        return observed
+    except IndependentVerificationError:
+        raise
+    except BaseException as exc:
+        raise IndependentVerificationError(
+            "retry replay stream ownership is unavailable"
+        ) from exc
+
+
+def _owned_retry_replay_streams(
+    run_root: Path,
+) -> tuple[dict[str, Any], tuple[dict[str, Any], ...]]:
+    result: dict[str, Any] = {}
+    ownerships: list[dict[str, Any]] = []
+    try:
+        for name, relative in (
+            ("stdout", RETRY_REPLAY_STDOUT_NAME),
+            ("stderr", RETRY_REPLAY_STDERR_NAME),
+        ):
+            path = run_root / relative
+            try:
+                os.lstat(path)
+            except FileNotFoundError:
+                result[name] = None
+                continue
+            except OSError as exc:
+                raise IndependentVerificationError(
+                    f"retry replay {name} is unavailable"
+                ) from exc
+            ownership = _retry_replay_stream_ownership(
+                path,
+                relative=relative,
+                label=f"retry replay {name}",
+            )
+            ownerships.append(ownership)
+            result[name] = ownership["descriptor"]
+        return result, tuple(ownerships)
+    except BaseException:
+        _close_retry_replay_stream_ownerships(tuple(ownerships))
+        raise
+
+
+def _verify_retry_replay_stream_ownerships(
+    ownerships: tuple[Mapping[str, Any], ...],
+    expected: Mapping[str, Any],
+) -> dict[str, Any]:
+    observed = {"stdout": None, "stderr": None}
+    for ownership in ownerships:
+        descriptor = _verify_retry_replay_stream_ownership(ownership)
+        name = "stdout" if descriptor["path"] == RETRY_REPLAY_STDOUT_NAME else "stderr"
+        observed[name] = descriptor
+    if observed != dict(expected):
+        raise IndependentVerificationError(
+            "retry replay stream descriptors changed"
+        )
+    return observed
+
+
+def _close_retry_replay_stream_ownerships(
+    ownerships: tuple[Mapping[str, Any], ...],
+) -> None:
+    for ownership in ownerships:
+        handle = ownership.get("handle")
+        if handle is not None and not handle.closed:
+            handle.close()
+
+
+def _persisted_retry_replay_streams(run_root: Path) -> dict[str, Any]:
+    streams, ownerships = _owned_retry_replay_streams(run_root)
+    try:
+        return streams
+    finally:
+        _close_retry_replay_stream_ownerships(ownerships)
+
+
+def _verified_retry_replay_streams(
+    run_root: Path,
+    expected: Mapping[str, Any],
+) -> dict[str, Any]:
+    observed = _persisted_retry_replay_streams(run_root)
+    if observed != dict(expected):
+        raise IndependentVerificationError(
+            "retry replay stream descriptors changed"
+        )
+    return observed
 
 
 def _content_addressed_payload(body: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
@@ -3694,6 +5323,8 @@ def _formal_chain_fingerprint(inputs: Mapping[str, Any]) -> str:
             "formal_stdout": inputs.get("formal_stdout"),
             "formal_stderr": inputs.get("formal_stderr"),
             "file_sha256": inputs.get("file_sha256"),
+            "original_failed_attempt": inputs.get("original_failed_attempt"),
+            "retry_authority": inputs.get("retry_authority"),
         }
     )
 
@@ -3702,27 +5333,190 @@ def _assert_formal_chain_unchanged(
     source_root: Path,
     expected_fingerprint: str,
 ) -> None:
-    observed = _formal_chain_fingerprint(_load_formal_inputs(source_root))
+    observed = _formal_chain_fingerprint(_load_retry_inputs(source_root))
     if observed != expected_fingerprint:
         raise IndependentVerificationError("formal completion chain changed during replay")
 
 
+def _publish_retry_failure(
+    *,
+    run_root: Path,
+    status_ownership: dict[str, Any] | None,
+    claim_ownership: Mapping[str, Any],
+    stage: str,
+    error: BaseException,
+    completion_sha256: object,
+    verifier_amendment: Mapping[str, Any],
+    retry_authority: Mapping[str, Any],
+    original_failed_attempt: Mapping[str, Any],
+    existing_replay_stream_ownerships: (
+        tuple[dict[str, Any], ...] | None
+    ) = None,
+) -> None:
+    _verify_claim_ownership(claim_ownership)
+    descriptor_error_type: str | None = None
+    replay_stream_ownerships: tuple[dict[str, Any], ...] = ()
+    try:
+        if existing_replay_stream_ownerships is None:
+            replay_streams, replay_stream_ownerships = (
+                _owned_retry_replay_streams(run_root)
+            )
+        else:
+            replay_stream_ownerships = existing_replay_stream_ownerships
+            replay_streams = {"stdout": None, "stderr": None}
+            for ownership in replay_stream_ownerships:
+                _seal_retry_replay_stream_ownership(ownership)
+                descriptor = _verify_retry_replay_stream_ownership(ownership)
+                name = (
+                    "stdout"
+                    if descriptor["path"] == RETRY_REPLAY_STDOUT_NAME
+                    else "stderr"
+                )
+                replay_streams[name] = descriptor
+    except BaseException as descriptor_error:
+        descriptor_error_type = type(descriptor_error).__name__
+        replay_streams = {"stdout": None, "stderr": None}
+        invalid_ownerships = replay_stream_ownerships
+        replay_stream_ownerships = ()
+        try:
+            _close_retry_replay_stream_ownerships(invalid_ownerships)
+        except BaseException:
+            pass
+    child_exit_code = getattr(error, "exit_code", None)
+    failure_body = {
+        "schema_version": RETRY_FAILURE_RECEIPT_SCHEMA,
+        "retry_id": "retry_1",
+        "stage": stage,
+        "error_type": type(error).__name__,
+        "child_exit_code": child_exit_code,
+        "descriptor_error_type": descriptor_error_type,
+        "independent_replay": replay_streams,
+        "claim_sha256": claim_ownership["sha256"],
+        "completion_sha256": completion_sha256,
+        "retry_authority_sha256": retry_authority["artifact_sha256"],
+        "original_failed_claim_sha256": original_failed_attempt[
+            "claim_sha256"
+        ],
+        "original_failed_status_sha256": original_failed_attempt[
+            "status_sha256"
+        ],
+        "verified": False,
+        "point_in_time": True,
+        "development_only": True,
+        "profile_registration_authority": False,
+        "production_recommendation_authority": False,
+        "automatic_trading_authority": False,
+        "production_authority": False,
+        "embargo_consumed": False,
+        "final_oos_consumed": False,
+    }
+    failure_document, candidate_failure_sha256 = _content_addressed_payload(
+        failure_body
+    )
+    candidate_failure_path = (
+        run_root
+        / RETRY_FAILURE_RECEIPT_ROOT_NAME
+        / f"{candidate_failure_sha256}.json"
+    )
+    failure_sha256: str | None = candidate_failure_sha256
+    failure_path: str | None = (
+        f"{RETRY_FAILURE_RECEIPT_ROOT_NAME}/{candidate_failure_sha256}.json"
+    )
+    publication_error_type: str | None = None
+    failure_ownership: dict[str, Any] | None = None
+    try:
+        failure_ownership = _write_once(
+            candidate_failure_path,
+            _json_raw(failure_document),
+            "independent verification retry_1 failure receipt",
+            hold_ownership=True,
+        )
+        if failure_ownership is None:
+            raise IndependentVerificationError(
+                "failure receipt ownership was not retained"
+            )
+    except BaseException as publication_error:
+        _close_publication_ownership(failure_ownership)
+        failure_ownership = None
+        failure_sha256 = None
+        failure_path = None
+        publication_error_type = type(publication_error).__name__
+    _verify_claim_ownership(claim_ownership)
+    if status_ownership is None:
+        _close_publication_ownership(failure_ownership)
+        _close_retry_replay_stream_ownerships(replay_stream_ownerships)
+        raise IndependentVerificationError(
+            "independent verification retry_1 status slot is not owned"
+        )
+    failed = {
+        **_status_payload(
+            verified=False,
+            receipt_sha256=None,
+            error_type=type(error).__name__,
+        ),
+        "schema_version": RETRY_STATUS_SCHEMA,
+        "stage": stage,
+        "retry_id": "retry_1",
+        "claim_sha256": claim_ownership["sha256"],
+        "completion_sha256": completion_sha256,
+        "verifier_amendment_sha256": verifier_amendment[
+            "artifact_sha256"
+        ],
+        "successor_verifier_git_blob_sha256": verifier_amendment[
+            "successor_verifier_git_blob_sha256"
+        ],
+        "json_document_size_policy_sha256": verifier_amendment[
+            "json_document_size_policy_sha256"
+        ],
+        "retry_authority_sha256": retry_authority["artifact_sha256"],
+        "original_failed_claim_sha256": original_failed_attempt[
+            "claim_sha256"
+        ],
+        "original_failed_status_sha256": original_failed_attempt[
+            "status_sha256"
+        ],
+        "failure_receipt_sha256": failure_sha256,
+        "failure_receipt_path": failure_path,
+        "descriptor_error_type": descriptor_error_type,
+        "publication_error_type": publication_error_type,
+        "independent_replay": {
+            "exit_code": child_exit_code,
+            **replay_streams,
+        },
+        "receipt_path": None,
+    }
+    try:
+        _finalize_status_slot(
+            status_ownership,
+            _json_raw(failed),
+            claim_ownership=claim_ownership,
+            publication_ownerships=(
+                () if failure_ownership is None else (failure_ownership,)
+            ),
+            replay_stream_ownerships=replay_stream_ownerships,
+        )
+    finally:
+        _close_publication_ownership(failure_ownership)
+        _close_retry_replay_stream_ownerships(replay_stream_ownerships)
+
+
 def run(source_root_value: str) -> dict[str, str]:
-    inputs = _load_formal_inputs(source_root_value)
+    inputs = _load_retry_inputs(source_root_value)
     formal_chain_fingerprint = _formal_chain_fingerprint(inputs)
     run_root = Path(inputs["run_root"])
-    claim_path = run_root / CLAIM_NAME
-    status_path = run_root / STATUS_NAME
-    if claim_path.exists() or status_path.exists():
-        raise FileExistsError("independent verification is already claimed")
+    _assert_retry_slot_unused(run_root)
+    claim_path = run_root / RETRY_CLAIM_NAME
+    status_path = run_root / RETRY_STATUS_NAME
     source_root = Path(source_root_value).resolve(strict=True)
-    python_executable = _assert_project_interpreter(source_root)
     verifier_amendment = inputs["verifier_amendment"]
+    retry_authority = inputs["retry_authority"]
+    original_failed_attempt = inputs["original_failed_attempt"]
     claim = {
         "schema_version": (
             "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
-            "independent-verification-claim/v2"
+            "independent-verification-retry-claim/v1"
         ),
+        "retry_id": "retry_1",
         "pid": os.getpid(),
         "completion_sha256": inputs.get("completion_sha256"),
         "replay_plan_sha256": EXPECTED_REPLAY_PLAN_SHA256,
@@ -3733,6 +5527,19 @@ def run(source_root_value: str) -> dict[str, str]:
         "json_document_size_policy_sha256": verifier_amendment[
             "json_document_size_policy_sha256"
         ],
+        "retry_authority_sha256": retry_authority["artifact_sha256"],
+        "retry_verifier_git_blob_sha256": retry_authority[
+            "retry_verifier_git_blob_sha256"
+        ],
+        "original_failed_claim_sha256": original_failed_attempt[
+            "claim_sha256"
+        ],
+        "original_failed_status_sha256": original_failed_attempt[
+            "status_sha256"
+        ],
+        "universe_bundle_manifest_sha256": retry_authority[
+            "universe_bundle_manifest_sha256"
+        ],
         "development_only": True,
         "embargo_consumed": False,
         "final_oos_consumed": False,
@@ -3740,19 +5547,38 @@ def run(source_root_value: str) -> dict[str, str]:
         "automatic_trading_authority": False,
     }
     claim_raw = _json_raw(claim)
-    _write_once(claim_path, claim_raw, "independent verification claim")
+    claim_ownership = _write_once(
+        claim_path,
+        claim_raw,
+        "independent verification retry_1 claim",
+        hold_ownership=True,
+    )
+    if claim_ownership is None:
+        raise IndependentVerificationError("retry claim ownership was not retained")
+    status_ownership: dict[str, Any] | None = None
+    verification_ownership: dict[str, Any] | None = None
+    receipt_ownership: dict[str, Any] | None = None
+    replay_stream_ownerships: tuple[dict[str, Any], ...] = ()
+    stage = "status_reservation"
     try:
+        status_ownership = _reserve_status_slot(status_path)
+        stage = "runtime_preparation"
+        python_executable = _assert_project_interpreter(source_root)
         site_packages = (source_root / ".venv/Lib/site-packages").resolve(
             strict=True
         )
         with tempfile.TemporaryDirectory(prefix="risk-breadth-independent-") as temporary:
             temporary_root = Path(temporary)
-            environment = _minimal_child_environment(temporary_root / "runtime-tmp")
             formal_blocker = (source_root / PYCACHE_BLOCKER_RELATIVE).resolve(
                 strict=True
             )
             if _file_sha256(formal_blocker) != EXPECTED_PYCACHE_BLOCKER_SHA256:
                 raise IndependentVerificationError("formal pycache blocker drifted")
+            environment = _minimal_child_environment(
+                temporary_root / "runtime-tmp",
+                python_executable=python_executable,
+                pycache_blocker=formal_blocker,
+            )
             formal_probe = _probe_runtime(
                 source_root,
                 python_executable=python_executable,
@@ -3785,11 +5611,15 @@ def run(source_root_value: str) -> dict[str, str]:
                     environment=environment,
                     pycache_blocker=blocker,
                 )
+                stage = "frozen_input_copy"
                 frozen_copy = _copy_frozen_inputs(
                     source_root,
                     data_root,
                     expected_formal_attestation=inputs["preflight_core"][
                         "frozen_input_attestation"
+                    ],
+                    expected_universe_bundle_manifest_sha256=retry_authority[
+                        "universe_bundle_manifest_sha256"
                     ],
                 )
                 replay_probe = _probe_runtime(
@@ -3808,6 +5638,10 @@ def run(source_root_value: str) -> dict[str, str]:
                     environment=environment,
                     pycache_blocker=blocker,
                 )
+                stage = "replay_execution"
+                replay_stream_ownerships = (
+                    _create_retry_replay_stream_ownerships(run_root)
+                )
                 replay, snapshot, stdout, stderr = _run_isolated_replay(
                     inputs=inputs,
                     source_root=source_root,
@@ -3821,7 +5655,9 @@ def run(source_root_value: str) -> dict[str, str]:
                     replay_probe=replay_probe,
                     frozen_copy=frozen_copy,
                     scratch_root=temporary_root,
+                    replay_stream_ownerships=replay_stream_ownerships,
                 )
+                stage = "replay_validation"
                 verification = _validate_replay(inputs, replay, snapshot)
                 _verify_frozen_copy(
                     source_root,
@@ -3835,25 +5671,48 @@ def run(source_root_value: str) -> dict[str, str]:
                 source_root,
                 formal_chain_fingerprint,
             )
+            _verify_claim_ownership(claim_ownership)
+            expected_replay_streams = {
+                "stdout": stdout,
+                "stderr": stderr,
+            }
+            _verify_retry_replay_stream_ownerships(
+                replay_stream_ownerships,
+                expected_replay_streams,
+            )
             verification_document, verification_sha256 = _content_addressed_payload(
                 verification
             )
+            stage = "verification_publication"
             verification_path = (
                 run_root
-                / VERIFICATION_ROOT_NAME
+                / RETRY_VERIFICATION_ROOT_NAME
                 / f"{verification_sha256}.json"
             )
-            _write_once(
+            verification_raw = _json_raw(verification_document)
+            verification_ownership = _write_once(
                 verification_path,
-                _json_raw(verification_document),
+                verification_raw,
                 "independent verification artifact",
+                hold_ownership=True,
             )
+            if verification_ownership is None:
+                raise IndependentVerificationError(
+                    "verification artifact ownership was not retained"
+                )
             _assert_formal_chain_unchanged(
                 source_root,
                 formal_chain_fingerprint,
             )
+            _verify_claim_ownership(claim_ownership)
+            _verify_retry_replay_stream_ownerships(
+                replay_stream_ownerships,
+                expected_replay_streams,
+            )
             receipt_body = {
                 **_receipt_body(verification_sha256=verification_sha256),
+                "schema_version": RETRY_RECEIPT_SCHEMA,
+                "retry_id": "retry_1",
                 "completion_sha256": inputs["completion_sha256"],
                 "verifier_amendment_sha256": verifier_amendment[
                     "artifact_sha256"
@@ -3863,6 +5722,18 @@ def run(source_root_value: str) -> dict[str, str]:
                 ],
                 "json_document_size_policy_sha256": verifier_amendment[
                     "json_document_size_policy_sha256"
+                ],
+                "retry_authority_sha256": retry_authority[
+                    "artifact_sha256"
+                ],
+                "original_failed_claim_sha256": original_failed_attempt[
+                    "claim_sha256"
+                ],
+                "original_failed_status_sha256": original_failed_attempt[
+                    "status_sha256"
+                ],
+                "universe_bundle_manifest_sha256": retry_authority[
+                    "universe_bundle_manifest_sha256"
                 ],
                 "execution_snapshot_sha256": snapshot["snapshot_sha256"],
                 "replay_plan_sha256": EXPECTED_REPLAY_PLAN_SHA256,
@@ -3876,17 +5747,28 @@ def run(source_root_value: str) -> dict[str, str]:
             receipt_document, receipt_sha256 = _content_addressed_payload(
                 receipt_body
             )
-            receipt_path = (
-                run_root / RECEIPT_ROOT_NAME / f"{receipt_sha256}.json"
-            )
-            _write_once(
+            stage = "receipt_publication"
+            receipt_path = run_root / RETRY_RECEIPT_ROOT_NAME / f"{receipt_sha256}.json"
+            receipt_raw = _json_raw(receipt_document)
+            receipt_ownership = _write_once(
                 receipt_path,
-                _json_raw(receipt_document),
+                receipt_raw,
                 "independent verification receipt",
+                hold_ownership=True,
             )
+            if receipt_ownership is None:
+                raise IndependentVerificationError(
+                    "verification receipt ownership was not retained"
+                )
+            _verify_claim_ownership(claim_ownership)
         _assert_formal_chain_unchanged(
             source_root,
             formal_chain_fingerprint,
+        )
+        _verify_claim_ownership(claim_ownership)
+        final_replay_streams = _verify_retry_replay_stream_ownerships(
+            replay_stream_ownerships,
+            expected_replay_streams,
         )
         status = {
             **_status_payload(
@@ -3894,7 +5776,10 @@ def run(source_root_value: str) -> dict[str, str]:
                 receipt_sha256=receipt_sha256,
                 error_type=None,
             ),
-            "claim_sha256": hashlib.sha256(claim_raw).hexdigest(),
+            "schema_version": RETRY_STATUS_SCHEMA,
+            "stage": "completed",
+            "retry_id": "retry_1",
+            "claim_sha256": claim_ownership["sha256"],
             "completion_sha256": inputs["completion_sha256"],
             "verifier_amendment_sha256": verifier_amendment[
                 "artifact_sha256"
@@ -3905,43 +5790,59 @@ def run(source_root_value: str) -> dict[str, str]:
             "json_document_size_policy_sha256": verifier_amendment[
                 "json_document_size_policy_sha256"
             ],
+            "retry_authority_sha256": retry_authority["artifact_sha256"],
+            "original_failed_claim_sha256": original_failed_attempt[
+                "claim_sha256"
+            ],
+            "original_failed_status_sha256": original_failed_attempt[
+                "status_sha256"
+            ],
+            "failure_receipt_sha256": None,
+            "failure_receipt_path": None,
+            "independent_replay": {
+                "exit_code": 0,
+                **final_replay_streams,
+            },
             "receipt_path": (
-                f"{RECEIPT_ROOT_NAME}/{receipt_sha256}.json"
+                f"{RETRY_RECEIPT_ROOT_NAME}/{receipt_sha256}.json"
             ),
         }
-        _write_once(
-            status_path,
+        _finalize_status_slot(
+            status_ownership,
             _json_raw(status),
-            "independent verification status",
+            claim_ownership=claim_ownership,
+            publication_ownerships=(
+                verification_ownership,
+                receipt_ownership,
+            ),
+            replay_stream_ownerships=replay_stream_ownerships,
         )
         return {"status": "completed", "receipt_sha256": receipt_sha256}
     except BaseException as exc:
-        if not status_path.exists():
-            failed = {
-                **_status_payload(
-                    verified=False,
-                    receipt_sha256=None,
-                    error_type=type(exc).__name__,
+        try:
+            _publish_retry_failure(
+                run_root=run_root,
+                status_ownership=status_ownership,
+                claim_ownership=claim_ownership,
+                stage=stage,
+                error=exc,
+                completion_sha256=inputs.get("completion_sha256"),
+                verifier_amendment=verifier_amendment,
+                retry_authority=retry_authority,
+                original_failed_attempt=original_failed_attempt,
+                existing_replay_stream_ownerships=(
+                    replay_stream_ownerships or None
                 ),
-                "claim_sha256": hashlib.sha256(claim_raw).hexdigest(),
-                "completion_sha256": inputs.get("completion_sha256"),
-                "verifier_amendment_sha256": verifier_amendment[
-                    "artifact_sha256"
-                ],
-                "successor_verifier_git_blob_sha256": verifier_amendment[
-                    "successor_verifier_git_blob_sha256"
-                ],
-                "json_document_size_policy_sha256": verifier_amendment[
-                    "json_document_size_policy_sha256"
-                ],
-                "receipt_path": None,
-            }
-            _write_once(
-                status_path,
-                _json_raw(failed),
-                "independent verification status",
             )
+        except BaseException as publication_error:
+            raise publication_error from exc
         raise
+    finally:
+        _close_retry_replay_stream_ownerships(replay_stream_ownerships)
+        _close_publication_ownership(receipt_ownership)
+        _close_publication_ownership(verification_ownership)
+        _close_publication_ownership(status_ownership)
+        _close_publication_ownership(claim_ownership)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3954,7 +5855,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.preflight:
-            _load_formal_inputs(args.source_root)
+            inputs = _load_retry_inputs(args.source_root)
+            _assert_retry_slot_unused(Path(inputs["run_root"]))
             print("status=preflight_verified")
             return 0
         run(args.source_root)
