@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from contextlib import contextmanager
 from contextvars import ContextVar
 import ctypes
@@ -21,6 +22,14 @@ from typing import Any, Iterator, Mapping, Sequence
 SCRIPT_PATH = Path(__file__).resolve()
 WORKSPACE = Path(r"E:\AI workspace\quant-signal-lkj")
 LAUNCHER_GIT_PATH = "scripts/run_shallow_gbdt_risk_on_breadth_development_1.py"
+VERIFIER_GIT_PATH = "scripts/verify_shallow_gbdt_risk_on_breadth_development_1.py"
+SOURCE_AUTHORITY_RELATIVE_ROOT = Path(
+    "docs/research_preregistrations/"
+    "shallow_gbdt_risk_on_breadth_development_1_source_authority_v1"
+)
+SOURCE_AUTHORITY_SCHEMA = (
+    "ranked-liquidity-shallow-gbdt-risk-on-breadth-source-authority/v1"
+)
 PYCACHE_BLOCKER_RELATIVE = Path("scripts/formal_pycache_blocker_v1")
 EXPECTED_PYCACHE_BLOCKER_SHA256 = (
     "78c73250a8d2c984878b6dbc5e7775a261be07d81e36af54a0fad8c926d98576"
@@ -39,6 +48,12 @@ EXPECTED_PRODUCER_ROOT_SHA256 = (
 EXPECTED_RUN_SPEC_SHA256 = (
     "d27c352ff362710ecdbf58791a5aa95b25aae75a2a25e0c351b7901b26212471"
 )
+EXPECTED_REPLAY_PLAN_SHA256 = (
+    "c9df60391347c24903053d9ead13777188f052f845e167a365c0e42c92538043"
+)
+EXPECTED_VERIFIER_GIT_BLOB_SHA256 = (
+    "ca1346a992e92f943b7c8727bcc4292f0a66b3edca63ba05fe2e2689b877ea63"
+)
 EXPECTED_PROGRESS_SCHEMA = (
     "ranked-liquidity-shallow-gbdt-risk-on-breadth-replay-progress/v1"
 )
@@ -54,6 +69,7 @@ PROGRESS_FILE_NAME = (
 )
 HEX_ARTIFACT = re.compile(r"^[0-9a-f]{64}\.json$")
 HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+HEX_GIT_SHA1 = re.compile(r"^[0-9a-f]{40}$")
 _CURRENT_ATTEMPT_OWNERSHIP: ContextVar[tuple[Path, str, Any] | None] = ContextVar(
     "current_formal_attempt_ownership",
     default=None,
@@ -211,6 +227,36 @@ RUN_SPEC: dict[str, Any] = {
 }
 
 RUN_SPEC_SHA256 = EXPECTED_RUN_SPEC_SHA256
+SOURCE_AUTHORITY_SCOPE = {
+    "point_in_time": True,
+    "development_only": True,
+    "embargo_consumed": False,
+    "final_oos_consumed": False,
+    "production_authority": False,
+    "automatic_trading_authority": False,
+}
+SOURCE_AUTHORITY_TOPOLOGY = {
+    "source_commit_is_only_execution_parent": True,
+    "execution_commit_change": "add_single_source_authority_only",
+}
+SOURCE_AUTHORITY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "source_commit",
+        "source_tree",
+        "launcher_git_path",
+        "launcher_git_blob_sha256",
+        "verifier_git_path",
+        "verifier_git_blob_sha256",
+        "run_spec_sha256",
+        "replay_plan_sha256",
+        "strategy_sha256",
+        "producer_root_sha256",
+        "scope",
+        "execution_topology",
+        "artifact_sha256",
+    }
+)
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -359,6 +405,202 @@ def _safe_workspace_path(workspace: Path, relative: Any, label: str) -> Path:
     except (OSError, ValueError) as exc:
         raise RuntimeError(f"{label} path is invalid") from exc
     return resolved
+
+
+def _validated_git_sha1(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not HEX_GIT_SHA1.fullmatch(value):
+        raise RuntimeError(f"formal source authority {label} is invalid")
+    return value
+
+
+def _verifier_replay_plan_sha256(verifier_blob: bytes) -> str:
+    try:
+        module = ast.parse(verifier_blob.decode("utf-8"))
+        assignments: dict[str, list[ast.expr]] = {
+            "REPLAY_PLAN": [],
+            "EXPECTED_REPLAY_PLAN_SHA256": [],
+        }
+        protected_targets: dict[str, list[ast.expr]] = {
+            name: [] for name in assignments
+        }
+        for node in ast.walk(module):
+            if isinstance(node, (ast.Assign, ast.Delete)):
+                targets = node.targets
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+                targets = [node.target]
+            else:
+                continue
+            for target_node in targets:
+                for name_node in ast.walk(target_node):
+                    if (
+                        isinstance(name_node, ast.Name)
+                        and name_node.id in protected_targets
+                    ):
+                        protected_targets[name_node.id].append(target_node)
+        for statement in module.body:
+            if isinstance(statement, ast.AnnAssign) and isinstance(
+                statement.target,
+                ast.Name,
+            ):
+                target = statement.target.id
+                value = statement.value
+            elif (
+                isinstance(statement, ast.Assign)
+                and len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Name)
+            ):
+                target = statement.targets[0].id
+                value = statement.value
+            else:
+                continue
+            if target in assignments and value is not None:
+                assignments[target].append(value)
+        if any(len(values) != 1 for values in assignments.values()) or any(
+            len(targets) != 1 for targets in protected_targets.values()
+        ):
+            raise RuntimeError("formal source authority replay plan is not unique")
+        replay_plan = ast.literal_eval(assignments["REPLAY_PLAN"][0])
+        frozen_sha256 = ast.literal_eval(
+            assignments["EXPECTED_REPLAY_PLAN_SHA256"][0]
+        )
+        if not isinstance(replay_plan, dict) or not isinstance(frozen_sha256, str):
+            raise RuntimeError("formal source authority replay plan is not literal")
+        replay_plan_sha256 = _sha256(replay_plan)
+        if (
+            not HEX_SHA256.fullmatch(frozen_sha256)
+            or frozen_sha256 != replay_plan_sha256
+        ):
+            raise RuntimeError("formal source authority replay plan drifted")
+        return replay_plan_sha256
+    except RuntimeError:
+        raise
+    except (SyntaxError, UnicodeError, ValueError) as exc:
+        raise RuntimeError("formal source authority replay plan is invalid") from exc
+
+
+def _source_authority(workspace: Path) -> dict[str, Any]:
+    try:
+        root = _safe_workspace_path(
+            workspace,
+            SOURCE_AUTHORITY_RELATIVE_ROOT.as_posix(),
+            "formal source authority root",
+        )
+        if not root.is_dir():
+            raise RuntimeError("formal source authority root is invalid")
+        candidates = sorted(root.iterdir(), key=lambda path: path.name)
+        if len(candidates) != 1 or not HEX_ARTIFACT.fullmatch(candidates[0].name):
+            raise RuntimeError("formal source authority must be unique")
+        authority_path = _safe_workspace_path(
+            workspace,
+            candidates[0].relative_to(workspace.resolve(strict=True)).as_posix(),
+            "formal source authority",
+        )
+        if (
+            not stat.S_ISREG(authority_path.lstat().st_mode)
+            or _is_reparse(authority_path)
+        ):
+            raise RuntimeError("formal source authority file is invalid")
+        raw = authority_path.read_bytes()
+        document = json.loads(raw.decode("utf-8"))
+        if not isinstance(document, dict) or set(document) != SOURCE_AUTHORITY_FIELDS:
+            raise RuntimeError("formal source authority fields drifted")
+        if raw != _canonical_bytes(document) + b"\n":
+            raise RuntimeError("formal source authority is not canonical JSON")
+        unsigned = dict(document)
+        embedded = unsigned.pop("artifact_sha256")
+        canonical = _sha256(unsigned)
+        if embedded != canonical or authority_path.stem != canonical:
+            raise RuntimeError("formal source authority content address drifted")
+        source_commit = _validated_git_sha1(
+            document["source_commit"],
+            "source commit",
+        )
+        source_tree = _validated_git_sha1(document["source_tree"], "source tree")
+        expected_values = {
+            "schema_version": SOURCE_AUTHORITY_SCHEMA,
+            "launcher_git_path": LAUNCHER_GIT_PATH,
+            "verifier_git_path": VERIFIER_GIT_PATH,
+            "verifier_git_blob_sha256": EXPECTED_VERIFIER_GIT_BLOB_SHA256,
+            "run_spec_sha256": RUN_SPEC_SHA256,
+            "replay_plan_sha256": EXPECTED_REPLAY_PLAN_SHA256,
+            "strategy_sha256": EXPECTED_STRATEGY_SHA256,
+            "producer_root_sha256": EXPECTED_PRODUCER_ROOT_SHA256,
+            "scope": SOURCE_AUTHORITY_SCOPE,
+            "execution_topology": SOURCE_AUTHORITY_TOPOLOGY,
+        }
+        if any(document.get(name) != value for name, value in expected_values.items()):
+            raise RuntimeError("formal source authority contract drifted")
+        for name in ("launcher_git_blob_sha256", "verifier_git_blob_sha256"):
+            if not isinstance(document[name], str) or not HEX_SHA256.fullmatch(
+                document[name]
+            ):
+                raise RuntimeError("formal source authority blob hash is invalid")
+
+        execution_commit = _validated_git_sha1(
+            git_output("rev-parse", "HEAD").lower(),
+            "execution commit",
+        )
+        if git_output("status", "--porcelain", "--untracked-files=all"):
+            raise RuntimeError("formal source authority worktree is not clean")
+        if git_output("rev-list", "--parents", "-n", "1", execution_commit).split() != [
+            execution_commit,
+            source_commit,
+        ]:
+            raise RuntimeError("formal source authority execution topology drifted")
+        if git_output("rev-parse", f"{source_commit}^{{tree}}").lower() != source_tree:
+            raise RuntimeError("formal source authority source tree drifted")
+        authority_relative = authority_path.relative_to(
+            workspace.resolve(strict=True)
+        ).as_posix()
+        if git_output(
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            source_commit,
+            execution_commit,
+        ).splitlines() != [f"A\t{authority_relative}"]:
+            raise RuntimeError("formal source authority execution diff drifted")
+
+        launcher_blob = git_bytes("show", f"{source_commit}:{LAUNCHER_GIT_PATH}")
+        verifier_blob = git_bytes("show", f"{source_commit}:{VERIFIER_GIT_PATH}")
+        replay_plan_sha256 = _verifier_replay_plan_sha256(verifier_blob)
+        if (
+            hashlib.sha256(launcher_blob).hexdigest()
+            != document["launcher_git_blob_sha256"]
+            or hashlib.sha256(verifier_blob).hexdigest()
+            != document["verifier_git_blob_sha256"]
+            or replay_plan_sha256 != document["replay_plan_sha256"]
+        ):
+            raise RuntimeError("formal source authority Git blob drifted")
+        verifier_path = _safe_workspace_path(
+            workspace,
+            VERIFIER_GIT_PATH,
+            "formal independent verifier",
+        )
+        if launcher_blob != normalized_source_bytes(SCRIPT_PATH) or verifier_blob != (
+            normalized_source_bytes(verifier_path)
+        ):
+            raise RuntimeError("formal source authority source bytes drifted")
+        return {
+            "schema_version": "formal-source-authority-binding/v1",
+            "artifact_sha256": canonical,
+            "relative_path": authority_relative,
+            "source_commit": source_commit,
+            "source_tree": source_tree,
+            "execution_commit": execution_commit,
+            "launcher_git_blob_sha256": document["launcher_git_blob_sha256"],
+            "verifier_git_blob_sha256": document["verifier_git_blob_sha256"],
+            "run_spec_sha256": document["run_spec_sha256"],
+            "replay_plan_sha256": document["replay_plan_sha256"],
+            "strategy_sha256": document["strategy_sha256"],
+            "producer_root_sha256": document["producer_root_sha256"],
+            "scope": document["scope"],
+        }
+    except RuntimeError:
+        raise
+    except (OSError, subprocess.CalledProcessError, UnicodeError, ValueError) as exc:
+        raise RuntimeError("formal source authority validation failed") from exc
 
 
 def _assert_transitive_input_binding(
@@ -1555,29 +1797,14 @@ def _result_bundle(
         return None, None, False
 
 
-def _validated_expected_commit(value: str) -> str:
-    expected = value.strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{40}", expected):
-        raise ValueError("expected commit must be a full lowercase SHA-1")
-    return expected
-
-
 def _preflight(
     *,
-    expected_commit: str,
     python_executable: Path,
     environment: Mapping[str, str],
 ) -> dict[str, Any]:
     _assert_frozen_run_spec()
     _assert_transitive_input_binding(WORKSPACE, RUN_SPEC["inputs"])
-    current_commit = git_output("rev-parse", "HEAD").lower()
-    if current_commit != expected_commit:
-        raise RuntimeError("formal risk-on breadth commit drifted")
-    if git_output("status", "--porcelain", "--untracked-files=all"):
-        raise RuntimeError("formal risk-on breadth worktree is not clean")
-    launcher_blob = git_bytes("show", f"{expected_commit}:{LAUNCHER_GIT_PATH}")
-    if launcher_blob != normalized_source_bytes(SCRIPT_PATH):
-        raise RuntimeError("formal risk-on breadth launcher does not match commit")
+    source_authority = _source_authority(WORKSPACE)
     binding = risk_on_breadth_producer_binding(
         python_executable,
         environment=environment,
@@ -1595,12 +1822,19 @@ def _preflight(
         ],
     )
     return {
-        "git_commit": current_commit,
+        "git_commit": source_authority["execution_commit"],
+        "source_authority": source_authority,
         "strategy_sha256": binding["strategy_sha256"],
         "producer_binding": binding["producer_binding"],
         "current_pool_audit_binding": audit_binding,
         "formal_launcher_sha256": sha256_file(SCRIPT_PATH),
-        "formal_launcher_git_blob_sha256": hashlib.sha256(launcher_blob).hexdigest(),
+        "formal_launcher_git_blob_sha256": source_authority[
+            "launcher_git_blob_sha256"
+        ],
+        "independent_verifier_git_blob_sha256": source_authority[
+            "verifier_git_blob_sha256"
+        ],
+        "replay_plan_sha256": source_authority["replay_plan_sha256"],
         "run_spec_sha256": RUN_SPEC_SHA256,
         "frozen_input_attestation": frozen_input_attestation(
             WORKSPACE,
@@ -1761,10 +1995,8 @@ def _assert_top_level_interpreter(
 
 def _main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
-    expected_commit = _validated_expected_commit(args.expected_commit)
     _assert_direct_entrypoint(__package__, SCRIPT_PATH, WORKSPACE)
     _assert_top_level_interpreter(
         sys.flags,
@@ -1792,7 +2024,6 @@ def _main(argv: Sequence[str] | None = None) -> int:
         temp_dir=runtime_temp_dir,
     )
     preliminary = _preflight(
-        expected_commit=expected_commit,
         python_executable=python_executable,
         environment=environment,
     )
@@ -1805,7 +2036,11 @@ def _main(argv: Sequence[str] | None = None) -> int:
         "schema_version": "formal-single-attempt-claim/v1",
         "started_at_utc": started_at,
         "run_spec_sha256": RUN_SPEC_SHA256,
-        "expected_commit": expected_commit,
+        "execution_commit": preliminary["source_authority"]["execution_commit"],
+        "source_commit": preliminary["source_authority"]["source_commit"],
+        "source_authority_sha256": preliminary["source_authority"][
+            "artifact_sha256"
+        ],
         "output_dir": RELATIVE_OUTPUT_DIR.as_posix(),
         "preflight_sha256": _sha256(preliminary),
         "max_formal_attempts": 1,
@@ -1856,7 +2091,6 @@ def _main(argv: Sequence[str] | None = None) -> int:
     try:
         with _held_frozen_inputs(WORKSPACE, RUN_SPEC["inputs"]):
             preflight = _preflight(
-                expected_commit=expected_commit,
                 python_executable=python_executable,
                 environment=environment,
             )
@@ -1917,7 +2151,6 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 resource_receipt = None
             try:
                 postflight = _preflight(
-                    expected_commit=expected_commit,
                     python_executable=python_executable,
                     environment=environment,
                 )

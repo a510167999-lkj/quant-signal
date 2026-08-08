@@ -70,6 +70,168 @@ def _write_pycache_blocker(workspace: Path) -> Path:
     return blocker
 
 
+def _git(repo: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return completed.stdout.strip()
+
+
+def _git_bytes(repo: Path, *args: str) -> bytes:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    ).stdout
+
+
+def _source_authority_repository(
+    root: Path,
+    *,
+    mode: str = "valid",
+) -> tuple[Path, str, str]:
+    _git(root, "init")
+    _git(root, "config", "user.email", "formal@example.invalid")
+    _git(root, "config", "user.name", "Formal Test")
+    launcher_path = root / launcher.LAUNCHER_GIT_PATH
+    verifier_path = root / launcher.VERIFIER_GIT_PATH
+    launcher_path.parent.mkdir(parents=True)
+    launcher_path.write_bytes(b"synthetic launcher\n")
+    verifier_source = (
+        Path(__file__).parents[1] / launcher.VERIFIER_GIT_PATH
+    ).read_bytes()
+    if mode == "synthetic_verifier":
+        verifier_source = b"synthetic verifier\n"
+    elif mode == "replay_plan_drift":
+        marker = b'"direct_callable_allowed": False'
+        assert verifier_source.count(marker) >= 1
+        verifier_source = verifier_source.replace(
+            marker,
+            b'"direct_callable_allowed": True',
+            1,
+        )
+    elif mode == "tuple_rebind":
+        replacement_plan = {"schema_version": "synthetic-replay-plan/v1"}
+        replacement_sha256 = launcher._sha256(replacement_plan)
+        verifier_source += (
+            "\nREPLAY_PLAN, EXPECTED_REPLAY_PLAN_SHA256 = "
+            f"({replacement_plan!r}, {replacement_sha256!r})\n"
+        ).encode("utf-8")
+    elif mode == "globals_update_rebind":
+        replacement_plan = {"schema_version": "synthetic-replay-plan/v1"}
+        replacement_sha256 = launcher._sha256(replacement_plan)
+        verifier_source += (
+            "\nglobals().update("
+            f"REPLAY_PLAN={replacement_plan!r}, "
+            f"EXPECTED_REPLAY_PLAN_SHA256={replacement_sha256!r})\n"
+        ).encode("utf-8")
+    verifier_path.write_bytes(verifier_source)
+    _git(root, "add", "--", launcher.LAUNCHER_GIT_PATH, launcher.VERIFIER_GIT_PATH)
+    _git(root, "commit", "-m", "source C")
+    source_commit = _git(root, "rev-parse", "HEAD")
+    source_tree = _git(root, "rev-parse", f"{source_commit}^{{tree}}")
+    unsigned = {
+        "schema_version": launcher.SOURCE_AUTHORITY_SCHEMA,
+        "source_commit": source_commit,
+        "source_tree": source_tree,
+        "launcher_git_path": launcher.LAUNCHER_GIT_PATH,
+        "launcher_git_blob_sha256": launcher.hashlib.sha256(
+            _git_bytes(
+                root,
+                "show",
+                f"{source_commit}:{launcher.LAUNCHER_GIT_PATH}",
+            )
+        ).hexdigest(),
+        "verifier_git_path": launcher.VERIFIER_GIT_PATH,
+        "verifier_git_blob_sha256": launcher.hashlib.sha256(
+            _git_bytes(
+                root,
+                "show",
+                f"{source_commit}:{launcher.VERIFIER_GIT_PATH}",
+            )
+        ).hexdigest(),
+        "run_spec_sha256": launcher.RUN_SPEC_SHA256,
+        "replay_plan_sha256": launcher.EXPECTED_REPLAY_PLAN_SHA256,
+        "strategy_sha256": launcher.EXPECTED_STRATEGY_SHA256,
+        "producer_root_sha256": launcher.EXPECTED_PRODUCER_ROOT_SHA256,
+        "scope": launcher.SOURCE_AUTHORITY_SCOPE,
+        "execution_topology": launcher.SOURCE_AUTHORITY_TOPOLOGY,
+    }
+    if mode == "launcher_blob_drift":
+        unsigned["launcher_git_blob_sha256"] = "0" * 64
+    digest = launcher._sha256(unsigned)
+    document = {**unsigned, "artifact_sha256": digest}
+    authority_root = root / launcher.SOURCE_AUTHORITY_RELATIVE_ROOT
+    authority_root.mkdir(parents=True)
+    authority_path = authority_root / f"{digest}.json"
+    raw = launcher._canonical_bytes(document) + b"\n"
+    if mode == "noncanonical":
+        raw = json.dumps(document, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    authority_path.write_bytes(raw)
+    if mode == "duplicate":
+        (authority_root / f"{'f' * 64}.json").write_bytes(raw)
+    if mode == "extra_diff":
+        (root / "extra.txt").write_text("not authority\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", "authority A in execution D")
+    return launcher_path, source_commit, _git(root, "rev-parse", "HEAD")
+
+
+def test_source_authority_binds_single_parent_c_to_authority_only_d(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    launcher_path, source_commit, execution_commit = _source_authority_repository(
+        tmp_path
+    )
+    monkeypatch.setattr(launcher, "WORKSPACE", tmp_path)
+    monkeypatch.setattr(launcher, "SCRIPT_PATH", launcher_path)
+
+    binding = launcher._source_authority(tmp_path)
+
+    assert binding["source_commit"] == source_commit
+    assert binding["execution_commit"] == execution_commit
+    assert binding["run_spec_sha256"] == launcher.RUN_SPEC_SHA256
+    assert binding["replay_plan_sha256"] == launcher.EXPECTED_REPLAY_PLAN_SHA256
+    assert binding["strategy_sha256"] == launcher.EXPECTED_STRATEGY_SHA256
+    assert binding["producer_root_sha256"] == launcher.EXPECTED_PRODUCER_ROOT_SHA256
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "launcher_blob_drift",
+        "synthetic_verifier",
+        "replay_plan_drift",
+        "tuple_rebind",
+        "globals_update_rebind",
+        "noncanonical",
+        "duplicate",
+        "extra_diff",
+    ],
+)
+def test_source_authority_rejects_contract_or_topology_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    launcher_path, _source_commit, _execution_commit = _source_authority_repository(
+        tmp_path,
+        mode=mode,
+    )
+    monkeypatch.setattr(launcher, "WORKSPACE", tmp_path)
+    monkeypatch.setattr(launcher, "SCRIPT_PATH", launcher_path)
+
+    with pytest.raises(RuntimeError, match="source authority"):
+        launcher._source_authority(tmp_path)
+
+
 def test_formal_risk_on_breadth_run_spec_is_frozen_and_development_only() -> None:
     launcher._assert_frozen_run_spec()
 
@@ -707,7 +869,23 @@ def test_runtime_attestation_binds_minimal_environment_and_distributions(
 def test_preflight_binds_source_input_runtime_and_producer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    expected_commit = "1" * 40
+    source_authority = {
+        "schema_version": "formal-source-authority-binding/v1",
+        "artifact_sha256": "4" * 64,
+        "relative_path": (
+            launcher.SOURCE_AUTHORITY_RELATIVE_ROOT / f"{'4' * 64}.json"
+        ).as_posix(),
+        "source_commit": "5" * 40,
+        "source_tree": "6" * 40,
+        "execution_commit": "1" * 40,
+        "launcher_git_blob_sha256": "7" * 64,
+        "verifier_git_blob_sha256": "8" * 64,
+        "run_spec_sha256": launcher.RUN_SPEC_SHA256,
+        "replay_plan_sha256": launcher.EXPECTED_REPLAY_PLAN_SHA256,
+        "strategy_sha256": launcher.EXPECTED_STRATEGY_SHA256,
+        "producer_root_sha256": launcher.EXPECTED_PRODUCER_ROOT_SHA256,
+        "scope": launcher.SOURCE_AUTHORITY_SCOPE,
+    }
     input_attestation = {
         "schema_version": "formal-frozen-input-attestation/v1",
         "root_sha256": "2" * 64,
@@ -717,18 +895,10 @@ def test_preflight_binds_source_input_runtime_and_producer(
         "root_sha256": "3" * 64,
     }
 
-    def fake_git_output(*args: str) -> str:
-        if args == ("rev-parse", "HEAD"):
-            return expected_commit
-        if args == ("status", "--porcelain", "--untracked-files=all"):
-            return ""
-        raise AssertionError(args)
-
-    monkeypatch.setattr(launcher, "git_output", fake_git_output)
     monkeypatch.setattr(
         launcher,
-        "git_bytes",
-        lambda *_args: launcher.normalized_source_bytes(launcher.SCRIPT_PATH),
+        "_source_authority",
+        lambda _workspace: source_authority,
     )
     monkeypatch.setattr(
         launcher,
@@ -763,12 +933,12 @@ def test_preflight_binds_source_input_runtime_and_producer(
     )
 
     preflight = launcher._preflight(
-        expected_commit=expected_commit,
         python_executable=Path(sys.executable),
         environment={"PYTHONHASHSEED": "0"},
     )
 
-    assert preflight["git_commit"] == expected_commit
+    assert preflight["git_commit"] == source_authority["execution_commit"]
+    assert preflight["source_authority"] == source_authority
     assert preflight["frozen_input_attestation"] == input_attestation
     assert preflight["runtime_attestation"] == runtime_attestation
     assert preflight["current_pool_audit_binding"] == audit_binding
@@ -790,6 +960,11 @@ def _sandbox_launcher_main(
     relative_output = Path("data/research_runs/formal-risk-run")
     preflight = {
         "git_commit": "1" * 40,
+        "source_authority": {
+            "artifact_sha256": "4" * 64,
+            "source_commit": "5" * 40,
+            "execution_commit": "1" * 40,
+        },
         "strategy_sha256": launcher.EXPECTED_STRATEGY_SHA256,
         "producer_binding": {
             "root_sha256": launcher.EXPECTED_PRODUCER_ROOT_SHA256
@@ -829,7 +1004,7 @@ def test_main_dry_run_does_not_claim_the_formal_attempt(
     _relative_output, _preflight = _sandbox_launcher_main(monkeypatch, tmp_path)
     original_cwd = Path.cwd()
     try:
-        result = launcher.main(["--expected-commit", "1" * 40, "--dry-run"])
+        result = launcher.main(["--dry-run"])
     finally:
         os.chdir(original_cwd)
 
@@ -837,6 +1012,16 @@ def test_main_dry_run_does_not_claim_the_formal_attempt(
     assert not (
         tmp_path / launcher.RUN_SPEC["attempt_contract"]["ledger_relative_path"]
     ).exists()
+
+
+def test_main_rejects_removed_expected_commit_argument(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _sandbox_launcher_main(monkeypatch, tmp_path)
+
+    with pytest.raises(SystemExit):
+        launcher.main(["--expected-commit", "1" * 40, "--dry-run"])
 
 
 def test_main_success_stays_pending_independent_verification(
@@ -901,7 +1086,7 @@ def test_main_success_stays_pending_independent_verification(
     )
     original_cwd = Path.cwd()
     try:
-        result = launcher.main(["--expected-commit", "1" * 40])
+        result = launcher.main([])
     finally:
         os.chdir(original_cwd)
 
@@ -950,7 +1135,7 @@ def test_main_failure_records_only_stable_error_type_and_no_authority(
     monkeypatch.setattr(launcher, "run_unbounded_command", fail_run)
     original_cwd = Path.cwd()
     try:
-        result = launcher.main(["--expected-commit", "1" * 40])
+        result = launcher.main([])
     finally:
         os.chdir(original_cwd)
 
@@ -1005,7 +1190,7 @@ def test_main_directory_creation_failure_writes_external_terminal(
 
     original_cwd = Path.cwd()
     try:
-        result = launcher.main(["--expected-commit", "1" * 40])
+        result = launcher.main([])
     finally:
         os.chdir(original_cwd)
 
@@ -1078,7 +1263,7 @@ def test_claimed_attempt_write_failure_still_writes_external_terminal(
     monkeypatch.setattr(launcher, "_write_json_once", fail_selected_write)
     original_cwd = Path.cwd()
     try:
-        result = launcher.main(["--expected-commit", "1" * 40])
+        result = launcher.main([])
     finally:
         os.chdir(original_cwd)
 
@@ -1108,7 +1293,7 @@ def test_cli_masks_preflight_exception_details(
 
     monkeypatch.setattr(launcher, "main", fail_main)
 
-    assert launcher.cli(["--expected-commit", "1" * 40, "--dry-run"]) == 1
+    assert launcher.cli(["--dry-run"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "status=failed\n"
@@ -1211,7 +1396,7 @@ def test_post_publication_claim_read_failure_still_writes_terminal(
     monkeypatch.setattr(launcher, "sha256_file", fail_first_claim_read)
     original_cwd = Path.cwd()
     try:
-        result = launcher.main(["--expected-commit", "1" * 40])
+        result = launcher.main([])
     finally:
         os.chdir(original_cwd)
 
@@ -1249,7 +1434,7 @@ def test_preexisting_attempt_is_never_closed_by_a_later_invocation(
     original_cwd = Path.cwd()
     try:
         with pytest.raises(FileExistsError, match="already claimed"):
-            launcher.main(["--expected-commit", "1" * 40])
+            launcher.main([])
     finally:
         os.chdir(original_cwd)
 
@@ -1508,8 +1693,8 @@ def test_path_environment_attempt_and_commit_boundaries_fail_closed(
             output_dir=output_dir,
             claim={"schema_version": "synthetic/v1"},
         )
-    with pytest.raises(ValueError, match="full lowercase SHA-1"):
-        launcher._validated_expected_commit("ABC")
+    with pytest.raises(RuntimeError, match="source commit is invalid"):
+        launcher._validated_git_sha1("ABC", "source commit")
 
 
 def test_workspace_path_rejects_internal_reparse_alias(tmp_path: Path) -> None:
@@ -1547,7 +1732,7 @@ def test_module_entrypoint_is_rejected_before_claim(
     monkeypatch.setattr(launcher, "__package__", "scripts")
 
     with pytest.raises(RuntimeError, match="direct committed source file"):
-        launcher.main(["--expected-commit", "1" * 40])
+        launcher.main([])
 
     assert not (
         tmp_path / launcher.RUN_SPEC["attempt_contract"]["ledger_relative_path"]
@@ -1644,34 +1829,16 @@ def test_progress_and_content_address_boundaries_fail_closed(tmp_path: Path) -> 
     assert launcher._content_addressed_document(bad_json) is None
 
 
-@pytest.mark.parametrize("mode", ["wrong_commit", "dirty", "blob_drift"])
 def test_preflight_source_identity_drift_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
-    mode: str,
 ) -> None:
-    expected_commit = "1" * 40
+    def fail_source_authority(_workspace: Path) -> dict:
+        raise RuntimeError("formal source authority source identity drifted")
 
-    def fake_git_output(*args: str) -> str:
-        if args == ("rev-parse", "HEAD"):
-            return "2" * 40 if mode == "wrong_commit" else expected_commit
-        if args == ("status", "--porcelain", "--untracked-files=all"):
-            return " M tracked.py" if mode == "dirty" else ""
-        raise AssertionError(args)
+    monkeypatch.setattr(launcher, "_source_authority", fail_source_authority)
 
-    monkeypatch.setattr(launcher, "git_output", fake_git_output)
-    monkeypatch.setattr(
-        launcher,
-        "git_bytes",
-        lambda *_args: (
-            b"drifted"
-            if mode == "blob_drift"
-            else launcher.normalized_source_bytes(launcher.SCRIPT_PATH)
-        ),
-    )
-
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="source identity drifted"):
         launcher._preflight(
-            expected_commit=expected_commit,
             python_executable=Path(sys.executable),
             environment={"PYTHONHASHSEED": "0"},
         )
