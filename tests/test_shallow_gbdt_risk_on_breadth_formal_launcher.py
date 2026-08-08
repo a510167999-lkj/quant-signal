@@ -1187,6 +1187,44 @@ def test_attempt_terminal_rejects_replaced_claim(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(os.name != "nt", reason="正式 launcher 只允许 Windows")
+def test_post_publication_claim_read_failure_still_writes_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _sandbox_launcher_main(monkeypatch, tmp_path)
+    attempt_path = (
+        tmp_path / launcher.RUN_SPEC["attempt_contract"]["ledger_relative_path"]
+    )
+    terminal_path = (
+        tmp_path / launcher.RUN_SPEC["attempt_contract"]["terminal_relative_path"]
+    )
+    original_sha256_file = launcher.sha256_file
+    injected = False
+
+    def fail_first_claim_read(path: Path) -> str:
+        nonlocal injected
+        if path.resolve(strict=False) == attempt_path.resolve(strict=False) and not injected:
+            injected = True
+            raise OSError("synthetic post-publication read failure")
+        return original_sha256_file(path)
+
+    monkeypatch.setattr(launcher, "sha256_file", fail_first_claim_read)
+    original_cwd = Path.cwd()
+    try:
+        result = launcher.main(["--expected-commit", "1" * 40])
+    finally:
+        os.chdir(original_cwd)
+
+    terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+    assert injected is True
+    assert result == 1
+    assert attempt_path.is_file()
+    assert terminal["status"] == "failed"
+    assert terminal["error_type"] == "OSError"
+    assert terminal["attempt_claim_sha256"] == original_sha256_file(attempt_path)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="正式 launcher 只允许 Windows")
 def test_preexisting_attempt_is_never_closed_by_a_later_invocation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

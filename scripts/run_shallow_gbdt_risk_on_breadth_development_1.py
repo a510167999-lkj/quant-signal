@@ -884,16 +884,20 @@ def _reserve_single_attempt(
         _write_json_once(ledger_path, claim)
     except FileExistsError as exc:
         raise FileExistsError("formal risk-on breadth attempt is already claimed") from exc
+    if register_ownership:
+        _CURRENT_ATTEMPT_OWNERSHIP.set(
+            (resolved_ledger, claim_sha256, None)
+        )
     if sha256_file(ledger_path) != claim_sha256:
         raise RuntimeError("formal risk-on breadth claim publication differs")
     if register_ownership:
-        resolved = ledger_path.resolve(strict=True)
-        _CURRENT_ATTEMPT_OWNERSHIP.set((resolved, claim_sha256, None))
-        handle = _open_windows_read_lock(resolved)
-        if sha256_file(resolved) != claim_sha256:
+        handle = _open_windows_read_lock(resolved_ledger)
+        if sha256_file(resolved_ledger) != claim_sha256:
             _close_windows_handle(handle)
             raise RuntimeError("formal risk-on breadth claim ownership differs")
-        _CURRENT_ATTEMPT_OWNERSHIP.set((resolved, claim_sha256, handle))
+        _CURRENT_ATTEMPT_OWNERSHIP.set(
+            (resolved_ledger, claim_sha256, handle)
+        )
     return claim_sha256
 
 
