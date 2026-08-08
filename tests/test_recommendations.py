@@ -1494,6 +1494,24 @@ def test_live_snapshot_can_only_shrink_audited_current_pool(tmp_path):
         [
             {"symbol": "600519", "market": "a", "name": "审计内", "latest": 100, "amount": 100000000, "change_pct": 7.0, "volume": 10000},
             {"symbol": "600520", "market": "a", "name": "实时扩池", "latest": 100, "amount": 100000000, "change_pct": 7.0, "volume": 10000},
+            {
+                "symbol": "688001",
+                "market": "a",
+                "name": "科创板",
+                "latest": 100,
+                "amount": 100000000,
+                "change_pct": 7.0,
+                "volume": 10000,
+            },
+            {
+                "symbol": "830001",
+                "market": "a",
+                "name": "北交所",
+                "latest": 100,
+                "amount": 100000000,
+                "change_pct": 7.0,
+                "volume": 10000,
+            },
         ]
     )
 
