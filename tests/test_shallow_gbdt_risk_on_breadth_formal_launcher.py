@@ -570,6 +570,22 @@ def test_main_failure_records_only_stable_error_type_and_no_authority(
     assert failure["automatic_trading_authority"] is False
 
 
+def test_cli_masks_preflight_exception_details(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail_main(_argv: object = None) -> int:
+        raise RuntimeError("synthetic sensitive detail")
+
+    monkeypatch.setattr(launcher, "main", fail_main)
+
+    assert launcher.cli(["--expected-commit", "1" * 40, "--dry-run"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "status=failed\n"
+    assert "sensitive" not in captured.err
+
+
 def test_single_attempt_ledger_is_external_and_write_once(tmp_path: Path) -> None:
     output_dir = tmp_path / "runs" / "formal-run"
     ledger_path = tmp_path / "attempts" / "attempt.json"
