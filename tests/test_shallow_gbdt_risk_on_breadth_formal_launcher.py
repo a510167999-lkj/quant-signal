@@ -183,9 +183,12 @@ def test_formal_research_child_uses_isolated_runpy_app_jobs(
         "import sys\n"
         "print(json.dumps({\n"
         "    'argv': sys.argv[1:],\n"
+        "    'hash_probe': hash('formal-hash-seed-probe'),\n"
         "    'site_loaded': 'site' in sys.modules,\n"
         "    'isolated': sys.flags.isolated,\n"
+        "    'ignore_environment': sys.flags.ignore_environment,\n"
         "    'no_site': sys.flags.no_site,\n"
+        "    'safe_path': sys.flags.safe_path,\n"
         "    'dont_write_bytecode': sys.flags.dont_write_bytecode,\n"
         "}, sort_keys=True))\n",
         encoding="utf-8",
@@ -204,9 +207,9 @@ def test_formal_research_child_uses_isolated_runpy_app_jobs(
 
     assert command[:7] == [
         sys.executable,
-        "-I",
         "-S",
         "-B",
+        "-P",
         "-X",
         f"pycache_prefix={environment['PYTHONPYCACHEPREFIX']}",
         "-c",
@@ -223,13 +226,24 @@ def test_formal_research_child_uses_isolated_runpy_app_jobs(
         text=True,
     )
     observed = json.loads(completed.stdout)
-    assert observed == {
-        "argv": EXPECTED_ARGUMENTS[2:],
-        "site_loaded": False,
-        "isolated": 1,
-        "no_site": 1,
-        "dont_write_bytecode": 1,
-    }
+    repeated = json.loads(
+        subprocess.run(
+            command,
+            cwd=tmp_path,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
+    assert observed["argv"] == EXPECTED_ARGUMENTS[2:]
+    assert observed["site_loaded"] is False
+    assert observed["isolated"] == 0
+    assert observed["ignore_environment"] == 0
+    assert observed["no_site"] == 1
+    assert observed["safe_path"] is True
+    assert observed["dont_write_bytecode"] == 1
+    assert observed["hash_probe"] == repeated["hash_probe"]
 
 
 def test_minimal_child_environment_does_not_inherit_secrets(tmp_path: Path) -> None:
@@ -308,6 +322,26 @@ def test_temporal_contract_explicitly_binds_the_attested_current_pool_audit(
     )
     with pytest.raises(RuntimeError, match="transitive input binding differs"):
         launcher._assert_transitive_input_binding(tmp_path, inputs)
+
+
+def test_invalid_current_pool_audit_fails_before_attempt_claim(
+    tmp_path: Path,
+) -> None:
+    audit = tmp_path / "invalid-audit.json"
+    audit.write_text('{"not":"an authority audit"}', encoding="utf-8")
+    environment = launcher._minimal_child_environment(
+        os.environ,
+        python_executable=Path(sys.executable),
+        temp_dir=tmp_path / "runtime-temp",
+    )
+
+    with pytest.raises(RuntimeError, match="current-pool audit"):
+        launcher.current_pool_audit_binding(
+            Path(sys.executable),
+            environment=environment,
+            audit_path=audit,
+            expected_canonical_sha256="a" * 64,
+        )
 
 
 def test_frozen_input_attestation_binds_observed_bytes(tmp_path: Path) -> None:
@@ -736,7 +770,7 @@ def _sandbox_launcher_main(
     monkeypatch.setattr(
         launcher,
         "_assert_top_level_interpreter",
-        lambda _flags: None,
+        lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(launcher, "_preflight", lambda **_kwargs: dict(preflight))
     monkeypatch.setattr(
@@ -1066,6 +1100,51 @@ def test_single_attempt_ledger_is_external_and_write_once(tmp_path: Path) -> Non
         )
 
 
+def test_write_once_never_exposes_partial_target_when_fsync_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "claim.json"
+
+    def fail_fsync(_descriptor: int) -> None:
+        raise OSError("synthetic fsync detail")
+
+    monkeypatch.setattr(launcher.os, "fsync", fail_fsync)
+    with pytest.raises(OSError, match="fsync detail"):
+        launcher._write_json_once(target, {"schema_version": "synthetic/v1"})
+
+    assert not target.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_attempt_terminal_rejects_replaced_claim(tmp_path: Path) -> None:
+    attempt_path = tmp_path / "attempt.json"
+    terminal_path = tmp_path / "terminal.json"
+    launcher._write_json_once(
+        attempt_path,
+        {"schema_version": "formal-single-attempt-claim/v1", "owner": "first"},
+    )
+    owned_sha256 = launcher.sha256_file(attempt_path)
+    attempt_path.unlink()
+    launcher._write_json_once(
+        attempt_path,
+        {"schema_version": "formal-single-attempt-claim/v1", "owner": "foreign"},
+    )
+
+    with pytest.raises(RuntimeError, match="claim ownership"):
+        launcher._write_attempt_terminal(
+            terminal_path,
+            status="failed",
+            attempt_path=attempt_path,
+            expected_claim_sha256=owned_sha256,
+            completion_path=None,
+            failure_path=None,
+            error_type="RuntimeError",
+        )
+
+    assert not terminal_path.exists()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="正式 launcher 只允许 Windows")
 def test_preexisting_attempt_is_never_closed_by_a_later_invocation(
     monkeypatch: pytest.MonkeyPatch,
@@ -1130,24 +1209,46 @@ def test_unbounded_command_requires_assigned_and_drained_job_object(
     assert receipt["stderr"]["bytes"] == 0
 
 
-def test_gated_bootstrap_disables_site_before_job_assignment() -> None:
+def test_gated_bootstrap_disables_site_and_legacy_pyc_before_job_assignment(
+    tmp_path: Path,
+) -> None:
+    blocker = tmp_path / "formal-pycache-blocker"
+    blocker.write_bytes(b"formal-pycache-prefix-blocker-v1\n")
     command = launcher._gated_bootstrap_command(
         [sys.executable, "-c", "print('actual')"],
         event_value=123,
+        pycache_prefix=blocker,
     )
 
-    assert command[:5] == [sys.executable, "-I", "-S", "-B", "-c"]
-    assert "import site" not in command[5]
+    assert command[:7] == [
+        sys.executable,
+        "-I",
+        "-S",
+        "-B",
+        "-X",
+        f"pycache_prefix={blocker}",
+        "-c",
+    ]
+    assert "import site" not in command[7]
 
 
-def test_top_level_launcher_requires_isolated_no_site_interpreter() -> None:
+def test_top_level_launcher_requires_isolated_no_site_interpreter(
+    tmp_path: Path,
+) -> None:
+    blocker = tmp_path / "scripts/formal_pycache_blocker_v1"
+    blocker.parent.mkdir()
+    blocker.write_bytes(b"formal-pycache-prefix-blocker-v1\n")
     good = SimpleNamespace(
         isolated=1,
         no_site=1,
         ignore_environment=1,
         dont_write_bytecode=1,
     )
-    launcher._assert_top_level_interpreter(good)
+    launcher._assert_top_level_interpreter(
+        good,
+        pycache_prefix=str(blocker),
+        workspace=tmp_path,
+    )
 
     for field in (
         "isolated",
@@ -1158,7 +1259,17 @@ def test_top_level_launcher_requires_isolated_no_site_interpreter() -> None:
         bad = SimpleNamespace(**vars(good))
         setattr(bad, field, 0)
         with pytest.raises(RuntimeError, match="isolated no-site interpreter"):
-            launcher._assert_top_level_interpreter(bad)
+            launcher._assert_top_level_interpreter(
+                bad,
+                pycache_prefix=str(blocker),
+                workspace=tmp_path,
+            )
+    with pytest.raises(RuntimeError, match="pycache blocker"):
+        launcher._assert_top_level_interpreter(
+            good,
+            pycache_prefix=str(tmp_path / "wrong"),
+            workspace=tmp_path,
+        )
 
 
 def test_preflight_probe_uses_isolated_no_site_source_paths(
@@ -1315,6 +1426,19 @@ def test_path_environment_attempt_and_commit_boundaries_fail_closed(
         )
     with pytest.raises(ValueError, match="full lowercase SHA-1"):
         launcher._validated_expected_commit("ABC")
+
+
+def test_workspace_path_rejects_internal_reparse_alias(tmp_path: Path) -> None:
+    real = tmp_path / "real.json"
+    alias = tmp_path / "alias.json"
+    real.write_text("{}", encoding="utf-8")
+    try:
+        alias.symlink_to(real)
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {type(exc).__name__}")
+
+    with pytest.raises(RuntimeError, match="reparse"):
+        launcher._safe_workspace_path(tmp_path, alias.name, "synthetic")
 
 
 def test_formal_entrypoint_requires_direct_source_execution(tmp_path: Path) -> None:
