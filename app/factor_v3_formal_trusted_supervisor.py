@@ -473,10 +473,55 @@ class _ByHandleFileInformation(ctypes.Structure):
     ]
 
 
+class _Win32FindData(ctypes.Structure):
+    _fields_ = [
+        ("dwFileAttributes", wintypes.DWORD),
+        ("ftCreationTime", wintypes.FILETIME),
+        ("ftLastAccessTime", wintypes.FILETIME),
+        ("ftLastWriteTime", wintypes.FILETIME),
+        ("nFileSizeHigh", wintypes.DWORD),
+        ("nFileSizeLow", wintypes.DWORD),
+        ("dwReserved0", wintypes.DWORD),
+        ("dwReserved1", wintypes.DWORD),
+        ("cFileName", wintypes.WCHAR * 260),
+        ("cAlternateFileName", wintypes.WCHAR * 14),
+    ]
+
+
+class _FileRenameInformation(ctypes.Structure):
+    _fields_ = [
+        ("replace_if_exists", wintypes.BYTE),
+        ("root_directory", wintypes.HANDLE),
+        ("file_name_length", wintypes.DWORD),
+        ("file_name", wintypes.WCHAR * 1),
+    ]
+
+
+class _IoStatusValue(ctypes.Union):
+    _fields_ = [
+        ("status", wintypes.LONG),
+        ("pointer", wintypes.LPVOID),
+    ]
+
+
+class _IoStatusBlock(ctypes.Structure):
+    _anonymous_ = ("value",)
+    _fields_ = [
+        ("value", _IoStatusValue),
+        ("information", ctypes.c_size_t),
+    ]
+
+
 def _kernel32() -> Any:
     if os.name != "nt":
         raise FormalSupervisorError("trusted supervisor requires Windows")
     return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def _ntdll() -> Any:
+    if os.name != "nt":
+        raise FormalSupervisorError("trusted supervisor requires Windows")
+    return ctypes.WinDLL("ntdll")
 
 
 def _open_directory_handle(
@@ -928,10 +973,66 @@ class _HeldNativeCredential:
         self._stream.close()
 
 
-class _HeldLedgerFile:
-    def __init__(self, path: Path, raw: bytes, *, replay_label: str) -> None:
-        self._chain = _HeldDirectoryChain(path.parent)
-        candidate = self._chain.path / path.name
+_LEDGER_STAGING_PREFIX = ".unproven-ledger-staging-"
+_LEDGER_STAGING_NAME_RE = re.compile(
+    rf"{re.escape(_LEDGER_STAGING_PREFIX)}[0-9a-f]{{32}}\.tmp"
+)
+_LEDGER_LEASE_NAME = ".factor-v3-ledger-publisher.lease"
+_LEDGER_LEASE_WAIT_SECONDS = 30
+_LEDGER_STAGING_STALE_SECONDS = 5 * 60
+_MAX_LEDGER_STAGING_SCAN = 256
+_MAX_LEDGER_STAGING_RECOVERY = 32
+_LEDGER_STAGING_RECOVERY_SECONDS = 1.0
+
+
+def _ledger_handle_information(handle: Any) -> _ByHandleFileInformation:
+    kernel32 = _kernel32()
+    information = _ByHandleFileInformation()
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    )
+    get_information.restype = wintypes.BOOL
+    if not get_information(handle, ctypes.byref(information)):
+        raise FormalSupervisorError("execution ledger handle rejected")
+    return information
+
+
+def _mark_ledger_handle_delete_on_close(handle: Any) -> None:
+    class _FileDispositionInfo(ctypes.Structure):
+        _fields_ = [("DeleteFile", wintypes.BOOL)]
+
+    kernel32 = _kernel32()
+    set_information = kernel32.SetFileInformationByHandle
+    set_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    set_information.restype = wintypes.BOOL
+    disposition = _FileDispositionInfo(True)
+    if not set_information(
+        wintypes.HANDLE(handle),
+        4,
+        ctypes.byref(disposition),
+        ctypes.sizeof(disposition),
+    ):
+        raise FormalSupervisorError("execution ledger partial cleanup rejected")
+
+
+def _mark_ledger_descriptor_delete_on_close(descriptor: int) -> None:
+    _mark_ledger_handle_delete_on_close(
+        msvcrt.get_osfhandle(descriptor),
+    )
+
+
+class _HeldLedgerLease:
+    def __init__(self, chain: _HeldDirectoryChain) -> None:
+        self._chain = chain
+        self._handle = None
+        self._identity: tuple[int, int, int] | None = None
         kernel32 = _kernel32()
         create_file = kernel32.CreateFileW
         create_file.argtypes = (
@@ -944,90 +1045,506 @@ class _HeldLedgerFile:
             wintypes.HANDLE,
         )
         create_file.restype = wintypes.HANDLE
-        handle = create_file(
-            str(candidate),
-            0x80000000 | 0x40000000 | 0x00010000,
-            0x00000001,
-            None,
-            1,
-            0x00200000 | 0x08000000,
-            None,
-        )
         invalid = ctypes.c_void_p(-1).value
-        if handle in (None, invalid):
-            self._chain.close()
-            if ctypes.get_last_error() in {80, 183}:
-                raise FormalSupervisorError(f"{replay_label} replay rejected") from None
-            raise FormalSupervisorError("execution ledger write rejected")
+        deadline = time.monotonic() + _LEDGER_LEASE_WAIT_SECONDS
+        lease_path = chain.path / _LEDGER_LEASE_NAME
+        while True:
+            handle = create_file(
+                str(lease_path),
+                0x80000000 | 0x40000000,
+                0,
+                None,
+                4,
+                0x00200000 | 0x08000000,
+                None,
+            )
+            if handle not in (None, invalid):
+                break
+            if (
+                ctypes.get_last_error() not in {5, 32, 33}
+                or time.monotonic() >= deadline
+            ):
+                raise FormalSupervisorError("execution ledger lease rejected")
+            time.sleep(0.01)
+        try:
+            information = _ledger_handle_information(handle)
+            if (
+                int(information.dwFileAttributes) & 0x00000010
+                or int(information.dwFileAttributes) & _REPARSE_ATTRIBUTE
+                or int(information.nNumberOfLinks) != 1
+            ):
+                raise FormalSupervisorError("execution ledger lease rejected")
+            self._identity = (
+                int(information.dwVolumeSerialNumber),
+                int(information.nFileIndexHigh),
+                int(information.nFileIndexLow),
+            )
+            self._handle = handle
+        except BaseException:
+            kernel32.CloseHandle(handle)
+            raise
+
+    def postverify(self) -> None:
+        if (
+            self._handle is None
+            or self._identity is None
+        ):
+            raise FormalSupervisorError("execution ledger lease rejected")
+        self._chain.postverify()
+        information = _ledger_handle_information(self._handle)
+        identity = (
+            int(information.dwVolumeSerialNumber),
+            int(information.nFileIndexHigh),
+            int(information.nFileIndexLow),
+        )
+        if (
+            identity != self._identity
+            or int(information.dwFileAttributes) & 0x00000010
+            or int(information.dwFileAttributes) & _REPARSE_ATTRIBUTE
+            or int(information.nNumberOfLinks) != 1
+        ):
+            raise FormalSupervisorError("execution ledger lease drifted")
+
+    def close(self) -> None:
+        if self._handle is not None:
+            _kernel32().CloseHandle(self._handle)
+            self._handle = None
+
+
+def _recover_one_stale_ledger_staging(
+    path: Path,
+    *,
+    stale_before_ns: int,
+    reject_unsafe: bool = False,
+) -> bool:
+    if (
+        not reject_unsafe
+        and _LEDGER_STAGING_NAME_RE.fullmatch(path.name) is None
+    ):
+        return False
+    kernel32 = _kernel32()
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        0x80000000 | 0x00010000,
+        0x00000001,
+        None,
+        3,
+        0x00200000 | 0x08000000,
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if handle in (None, invalid):
+        if reject_unsafe:
+            raise FormalSupervisorError(
+                "execution ledger reserved staging pollution rejected"
+            )
+        return False
+    descriptor: int | None = None
+    try:
         try:
             descriptor = msvcrt.open_osfhandle(
                 int(handle),
-                os.O_RDWR | getattr(os, "O_BINARY", 0),
+                os.O_RDONLY | getattr(os, "O_BINARY", 0),
             )
         except BaseException:
             kernel32.CloseHandle(handle)
-            self._chain.close()
+            if reject_unsafe:
+                raise FormalSupervisorError(
+                    "execution ledger reserved staging pollution rejected"
+                ) from None
+            return False
+        try:
+            opened = os.fstat(descriptor)
+        except OSError:
+            if reject_unsafe:
+                raise FormalSupervisorError(
+                    "execution ledger reserved staging pollution rejected"
+                ) from None
             raise
-        self._stream = os.fdopen(descriptor, "w+b")
-        self.path = candidate
+        try:
+            terminal = path.lstat()
+        except OSError:
+            if reject_unsafe:
+                raise FormalSupervisorError(
+                    "execution ledger reserved staging pollution rejected"
+                ) from None
+            return False
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(terminal.st_mode)
+            or not os.path.samestat(opened, terminal)
+            or opened.st_size > _MAX_AUTHORIZATION_BYTES
+            or terminal.st_size > _MAX_AUTHORIZATION_BYTES
+            or int(getattr(opened, "st_file_attributes", 0)) & _REPARSE_ATTRIBUTE
+            or int(getattr(terminal, "st_file_attributes", 0)) & _REPARSE_ATTRIBUTE
+            or int(getattr(opened, "st_nlink", 1)) != 1
+            or int(getattr(terminal, "st_nlink", 1)) != 1
+        ):
+            if reject_unsafe:
+                raise FormalSupervisorError(
+                    "execution ledger reserved staging pollution rejected"
+                )
+            return False
+        if (
+            opened.st_mtime_ns > stale_before_ns
+            or terminal.st_mtime_ns > stale_before_ns
+        ):
+            return False
+        _mark_ledger_descriptor_delete_on_close(descriptor)
+        return True
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+@contextmanager
+def _exact_ledger_staging_paths(parent: Path) -> Iterator[Iterator[Path]]:
+    kernel32 = _kernel32()
+    find_first = kernel32.FindFirstFileExW
+    find_first.argtypes = (
+        wintypes.LPCWSTR,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    find_first.restype = wintypes.HANDLE
+    find_next = kernel32.FindNextFileW
+    find_next.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(_Win32FindData),
+    )
+    find_next.restype = wintypes.BOOL
+    find_close = kernel32.FindClose
+    find_close.argtypes = (wintypes.HANDLE,)
+    find_close.restype = wintypes.BOOL
+    find_data = _Win32FindData()
+    handle = find_first(
+        str(parent / f"{_LEDGER_STAGING_PREFIX}*.tmp"),
+        1,
+        ctypes.byref(find_data),
+        0,
+        None,
+        2,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if handle in (None, invalid):
+        if ctypes.get_last_error() == 2:
+            yield iter(())
+            return
+        raise FormalSupervisorError("execution ledger recovery rejected")
+
+    def paths() -> Iterator[Path]:
+        while True:
+            name = str(find_data.cFileName)
+            yield parent / name
+            if find_next(handle, ctypes.byref(find_data)):
+                continue
+            if ctypes.get_last_error() != 18:
+                raise FormalSupervisorError("execution ledger recovery rejected")
+            return
+
+    try:
+        yield paths()
+    finally:
+        find_close(handle)
+
+
+def _recover_stale_ledger_staging(
+    chain: _HeldDirectoryChain,
+    lease: _HeldLedgerLease,
+) -> int:
+    lease.postverify()
+    stale_before_ns = time.time_ns() - (
+        _LEDGER_STAGING_STALE_SECONDS * 1_000_000_000
+    )
+    recovery_deadline = time.monotonic() + _LEDGER_STAGING_RECOVERY_SECONDS
+    entries_scanned = 0
+    recovered = 0
+    with _exact_ledger_staging_paths(chain.path) as candidates:
+        iterator = iter(candidates)
+        while True:
+            if time.monotonic() >= recovery_deadline:
+                raise FormalSupervisorError(
+                    "execution ledger recovery incomplete"
+                )
+            try:
+                candidate = next(iterator)
+            except StopIteration:
+                if time.monotonic() >= recovery_deadline:
+                    raise FormalSupervisorError(
+                        "execution ledger recovery incomplete"
+                    ) from None
+                break
+            entries_scanned += 1
+            if time.monotonic() >= recovery_deadline:
+                raise FormalSupervisorError(
+                    "execution ledger recovery incomplete"
+                )
+            if (
+                entries_scanned > _MAX_LEDGER_STAGING_SCAN
+                or recovered >= _MAX_LEDGER_STAGING_RECOVERY
+            ):
+                raise FormalSupervisorError(
+                    "execution ledger recovery incomplete"
+                )
+            if _recover_one_stale_ledger_staging(
+                candidate,
+                stale_before_ns=stale_before_ns,
+                reject_unsafe=(
+                    _LEDGER_STAGING_NAME_RE.fullmatch(candidate.name) is None
+                ),
+            ):
+                recovered += 1
+            if time.monotonic() >= recovery_deadline:
+                raise FormalSupervisorError(
+                    "execution ledger recovery incomplete"
+                )
+    lease.postverify()
+    return recovered
+
+
+def _rename_ledger_staging_no_replace(
+    stream: Any,
+    parent_handle: Any,
+    final_name: str,
+    *,
+    replay_label: str,
+) -> None:
+    if (
+        not final_name
+        or final_name in {".", ".."}
+        or "/" in final_name
+        or "\\" in final_name
+    ):
+        raise FormalSupervisorError("execution ledger promotion rejected")
+    encoded_name = final_name.encode("utf-16-le")
+    offset = _FileRenameInformation.file_name.offset
+    buffer = ctypes.create_string_buffer(
+        ctypes.sizeof(_FileRenameInformation) + len(encoded_name)
+    )
+    information = _FileRenameInformation.from_buffer(buffer)
+    information.replace_if_exists = 0
+    information.root_directory = parent_handle
+    information.file_name_length = len(encoded_name)
+    ctypes.memmove(
+        ctypes.addressof(buffer) + offset,
+        encoded_name,
+        len(encoded_name),
+    )
+    ntdll = _ntdll()
+    set_information = ntdll.NtSetInformationFile
+    set_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(_IoStatusBlock),
+        wintypes.LPVOID,
+        wintypes.ULONG,
+        ctypes.c_int,
+    )
+    set_information.restype = wintypes.LONG
+    status_to_error = ntdll.RtlNtStatusToDosError
+    status_to_error.argtypes = (wintypes.LONG,)
+    status_to_error.restype = wintypes.ULONG
+    io_status = _IoStatusBlock()
+    status = set_information(
+        wintypes.HANDLE(msvcrt.get_osfhandle(stream.fileno())),
+        ctypes.byref(io_status),
+        buffer,
+        len(buffer),
+        10,
+    )
+    if status < 0:
+        error_code = int(status_to_error(status))
+        if error_code in {80, 183}:
+            raise FormalSupervisorError(f"{replay_label} replay rejected") from None
+        raise FormalSupervisorError("execution ledger promotion rejected")
+
+
+def _flush_ledger_parent_handle(handle: Any) -> None:
+    kernel32 = _kernel32()
+    flush = kernel32.FlushFileBuffers
+    flush.argtypes = (wintypes.HANDLE,)
+    flush.restype = wintypes.BOOL
+    if not flush(handle):
+        raise FormalSupervisorError("execution ledger directory flush rejected")
+
+
+class _HeldLedgerFile:
+    def __init__(self, path: Path, raw: bytes, *, replay_label: str) -> None:
+        self._chain = _HeldDirectoryChain(path.parent)
+        self._stream = None
+        self._parent_flush_handle = None
+        self._lease = None
+        self._committed = False
+        self._promotion_may_have_committed = False
+        self.path = self._chain.path / path.name
         self.raw = raw
         self._sha256 = hashlib.sha256(raw).hexdigest()
+        kernel32 = _kernel32()
         try:
+            parent_handle, parent_identity = _open_directory_handle(
+                self._chain.path,
+                desired_access=0x40000000,
+            )
+            if parent_identity != self._chain._handles[-1][2]:
+                kernel32.CloseHandle(parent_handle)
+                raise FormalSupervisorError("execution ledger directory drifted")
+            self._parent_flush_handle = parent_handle
+            self._lease = _HeldLedgerLease(self._chain)
+            if _recover_stale_ledger_staging(self._chain, self._lease):
+                _flush_ledger_parent_handle(self._parent_flush_handle)
+            staging_path, handle = self._create_staging()
+            self._staging_path = staging_path
+            try:
+                descriptor = msvcrt.open_osfhandle(
+                    int(handle),
+                    os.O_RDWR | getattr(os, "O_BINARY", 0),
+                )
+            except BaseException:
+                try:
+                    _mark_ledger_handle_delete_on_close(handle)
+                finally:
+                    kernel32.CloseHandle(handle)
+                raise
+            try:
+                self._stream = os.fdopen(descriptor, "w+b")
+            except BaseException:
+                try:
+                    _mark_ledger_descriptor_delete_on_close(descriptor)
+                finally:
+                    os.close(descriptor)
+                raise
             _write_all(self._stream.fileno(), raw, writer=os.write)
             self._stream.flush()
             os.fsync(self._stream.fileno())
+            self._postverify_path(self._staging_path)
+            self._promotion_may_have_committed = True
+            _rename_ledger_staging_no_replace(
+                self._stream,
+                self._chain._handles[-1][0],
+                self.path.name,
+                replay_label=replay_label,
+            )
+            self._committed = True
+            self._stream.flush()
+            os.fsync(self._stream.fileno())
+            _flush_ledger_parent_handle(self._parent_flush_handle)
             self.postverify()
+            self._lease.close()
+            self._lease = None
         except BaseException:
-            try:
-                self._discard_precommit()
-            finally:
+            if (
+                self._stream is not None
+                and not self._committed
+                and not self._promotion_may_have_committed
+            ):
+                try:
+                    self._discard_precommit()
+                finally:
+                    self.close()
+            else:
                 self.close()
             raise
 
-    def _discard_precommit(self) -> None:
-        class _FileDispositionInfo(ctypes.Structure):
-            _fields_ = [("DeleteFile", wintypes.BOOL)]
-
+    def _create_staging(self) -> tuple[Path, Any]:
         kernel32 = _kernel32()
-        set_information = kernel32.SetFileInformationByHandle
-        set_information.argtypes = (
-            wintypes.HANDLE,
-            ctypes.c_int,
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
             wintypes.LPVOID,
             wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
         )
-        set_information.restype = wintypes.BOOL
-        disposition = _FileDispositionInfo(True)
-        if not set_information(
-            wintypes.HANDLE(msvcrt.get_osfhandle(self._stream.fileno())),
-            4,
-            ctypes.byref(disposition),
-            ctypes.sizeof(disposition),
-        ):
-            raise FormalSupervisorError("execution ledger partial cleanup rejected")
+        create_file.restype = wintypes.HANDLE
+        invalid = ctypes.c_void_p(-1).value
+        for _attempt in range(32):
+            staging_path = (
+                self._chain.path
+                / f"{_LEDGER_STAGING_PREFIX}{os.urandom(16).hex()}.tmp"
+            )
+            handle = create_file(
+                str(staging_path),
+                0x80000000 | 0x40000000 | 0x00010000,
+                0x00000001,
+                None,
+                1,
+                0x00200000 | 0x08000000,
+                None,
+            )
+            if handle not in (None, invalid):
+                return staging_path, handle
+            if ctypes.get_last_error() not in {80, 183}:
+                break
+        raise FormalSupervisorError("execution ledger staging rejected")
 
-    def postverify(self) -> None:
+    def _postverify_path(self, expected_path: Path) -> None:
+        if self._stream is None:
+            raise FormalSupervisorError("execution ledger terminal write rejected")
         self._chain.postverify()
         opened = os.fstat(self._stream.fileno())
-        terminal = self.path.lstat()
+        terminal = expected_path.lstat()
         self._stream.seek(0)
         observed = self._stream.read(_MAX_AUTHORIZATION_BYTES + 1)
         self._stream.seek(0)
         if (
             not stat.S_ISREG(opened.st_mode)
+            or opened.st_size != len(self.raw)
             or not os.path.samestat(opened, terminal)
+            or int(getattr(opened, "st_file_attributes", 0)) & _REPARSE_ATTRIBUTE
             or int(getattr(terminal, "st_file_attributes", 0)) & _REPARSE_ATTRIBUTE
+            or int(getattr(opened, "st_nlink", 1)) != 1
             or int(getattr(terminal, "st_nlink", 1)) != 1
             or not hmac.compare_digest(observed, self.raw)
             or hashlib.sha256(observed).hexdigest() != self._sha256
         ):
             raise FormalSupervisorError("execution ledger terminal write rejected")
 
+    def _discard_precommit(self) -> None:
+        if (
+            self._stream is None
+            or self._committed
+            or self._promotion_may_have_committed
+        ):
+            raise FormalSupervisorError("execution ledger partial cleanup rejected")
+        _mark_ledger_descriptor_delete_on_close(self._stream.fileno())
+
+    def postverify(self) -> None:
+        if not self._committed:
+            raise FormalSupervisorError("execution ledger terminal write rejected")
+        self._postverify_path(self.path)
+
     def close(self) -> None:
-        if self._stream is not None:
-            self._stream.close()
-            self._stream = None
-        self._chain.close()
+        try:
+            if self._stream is not None:
+                self._stream.close()
+                self._stream = None
+        finally:
+            try:
+                if self._parent_flush_handle is not None:
+                    _kernel32().CloseHandle(self._parent_flush_handle)
+                    self._parent_flush_handle = None
+            finally:
+                try:
+                    if self._lease is not None:
+                        self._lease.close()
+                        self._lease = None
+                finally:
+                    self._chain.close()
 
 
 def _der_length(raw: bytes, offset: int) -> tuple[int, int]:

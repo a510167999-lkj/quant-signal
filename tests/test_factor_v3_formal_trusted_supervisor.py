@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import ExitStack, contextmanager
 import ctypes
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -9,9 +10,11 @@ import inspect
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import threading
+import time
 from typing import Any
 
 import pytest
@@ -37,6 +40,47 @@ def _sha256(raw: bytes) -> str:
 
 def _file_sha256(path: Path) -> str:
     return _sha256(path.read_bytes())
+
+
+def _ledger_staging_paths(parent: Path) -> tuple[Path, ...]:
+    return tuple(
+        candidate
+        for candidate in parent.iterdir()
+        if supervisor._LEDGER_STAGING_NAME_RE.fullmatch(candidate.name) is not None
+    )
+
+
+def _write_exact_ledger_candidates(
+    parent: Path,
+    count: int,
+    *,
+    raw: bytes,
+) -> list[Path]:
+    candidates: list[Path] = []
+    for index in range(count):
+        candidate = (
+            parent
+            / f"{supervisor._LEDGER_STAGING_PREFIX}{index:032x}.tmp"
+        )
+        candidate.write_bytes(raw)
+        candidates.append(candidate)
+    return candidates
+
+
+def _ledger_nonlease_files(parent: Path) -> tuple[Path, ...]:
+    return tuple(
+        candidate
+        for candidate in parent.iterdir()
+        if candidate.is_file() and candidate.name != supervisor._LEDGER_LEASE_NAME
+    )
+
+
+def _assert_persistent_ledger_lease(parent: Path) -> None:
+    lease = parent / supervisor._LEDGER_LEASE_NAME
+    opened = lease.lstat()
+    assert stat.S_ISREG(opened.st_mode)
+    assert int(getattr(opened, "st_file_attributes", 0)) & 0x400 == 0
+    assert int(getattr(opened, "st_nlink", 1)) == 1
 
 
 def _cas_write(root: Path, category: str, raw: bytes, suffix: str) -> tuple[Path, str]:
@@ -882,6 +926,1359 @@ def test_held_ledger_file_keeps_original_delete_lease_until_close(
     finally:
         held.close()
 
+    assert path.read_bytes() == raw
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_held_ledger_file_never_exposes_partial_final_during_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    path = parent / "partial-write.json"
+    raw = _canonical_bytes({"schema": "test-ledger/v1", "value": "complete"})
+    real_write = supervisor.os.write
+    final_visibility: list[bool] = []
+    calls = 0
+
+    def partial_then_fail(descriptor: int, value: bytes | memoryview) -> int:
+        nonlocal calls
+        final_visibility.append(path.exists())
+        calls += 1
+        if calls == 1:
+            return real_write(descriptor, bytes(value[:3]))
+        raise OSError("injected partial write failure")
+
+    monkeypatch.setattr(supervisor.os, "write", partial_then_fail)
+
+    with pytest.raises(OSError, match="injected partial write"):
+        supervisor._HeldLedgerFile(path, raw, replay_label="partial write test")
+
+    assert final_visibility
+    assert not any(final_visibility)
+    assert not path.exists()
+    assert not _ledger_nonlease_files(parent)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_held_ledger_file_never_exposes_final_before_precommit_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    path = parent / "fsync.json"
+    final_visibility: list[bool] = []
+
+    def fail_fsync(_descriptor: int) -> None:
+        final_visibility.append(path.exists())
+        raise OSError("injected staging fsync failure")
+
+    monkeypatch.setattr(supervisor.os, "fsync", fail_fsync)
+
+    with pytest.raises(OSError, match="injected staging fsync"):
+        supervisor._HeldLedgerFile(
+            path,
+            _canonical_bytes({"schema": "test-ledger/v1"}),
+            replay_label="staging fsync test",
+        )
+
+    assert final_visibility == [False]
+    assert not path.exists()
+    assert not _ledger_nonlease_files(parent)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_held_ledger_file_promotion_failure_preserves_staging_for_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    path = parent / "rename.json"
+
+    def fail_rename(
+        _stream: Any,
+        _parent_handle: Any,
+        _final_name: str,
+        *,
+        replay_label: str,
+    ) -> None:
+        del replay_label
+        raise OSError("injected rename failure")
+
+    monkeypatch.setattr(
+        supervisor,
+        "_rename_ledger_staging_no_replace",
+        fail_rename,
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match="injected rename"):
+        supervisor._HeldLedgerFile(
+            path,
+            _canonical_bytes({"schema": "test-ledger/v1"}),
+            replay_label="rename test",
+        )
+
+    assert not path.exists()
+    staging = _ledger_staging_paths(parent)
+    assert len(staging) == 1
+    opened = staging[0].lstat()
+    assert stat.S_ISREG(opened.st_mode)
+    assert int(getattr(opened, "st_file_attributes", 0)) & 0x400 == 0
+    assert int(getattr(opened, "st_nlink", 1)) == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_real_rename_then_immediate_fault_never_deletes_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    path = parent / "rename-committed.json"
+    raw = _canonical_bytes({"schema": "rename-committed/v1"})
+    real_rename = supervisor._rename_ledger_staging_no_replace
+
+    def rename_then_fault(
+        stream: Any,
+        parent_handle: Any,
+        final_name: str,
+        *,
+        replay_label: str,
+    ) -> None:
+        real_rename(
+            stream,
+            parent_handle,
+            final_name,
+            replay_label=replay_label,
+        )
+        raise OSError("injected fault after real rename")
+
+    monkeypatch.setattr(
+        supervisor,
+        "_rename_ledger_staging_no_replace",
+        rename_then_fault,
+    )
+
+    with pytest.raises(OSError, match="injected fault after real rename"):
+        supervisor._HeldLedgerFile(path, raw, replay_label="real rename fault")
+
+    assert path.read_bytes() == raw
+    assert not _ledger_staging_paths(parent)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_held_ledger_file_collision_never_overwrites_winner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    path = parent / "collision.json"
+    winner = _canonical_bytes({"schema": "winner/v1"})
+    loser = _canonical_bytes({"schema": "loser/v1"})
+    real_rename = supervisor._rename_ledger_staging_no_replace
+
+    def collide_then_rename(
+        stream: Any,
+        parent_handle: Any,
+        final_name: str,
+        *,
+        replay_label: str,
+    ) -> None:
+        path.write_bytes(winner)
+        real_rename(
+            stream,
+            parent_handle,
+            final_name,
+            replay_label=replay_label,
+        )
+
+    monkeypatch.setattr(
+        supervisor,
+        "_rename_ledger_staging_no_replace",
+        collide_then_rename,
+    )
+
+    with pytest.raises(supervisor.FormalSupervisorError, match="replay rejected"):
+        supervisor._HeldLedgerFile(path, loser, replay_label="collision test")
+
+    assert path.read_bytes() == winner
+    assert len(_ledger_staging_paths(parent)) == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_held_ledger_file_postcommit_failure_keeps_complete_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    path = parent / "postcommit.json"
+    raw = _canonical_bytes({"schema": "test-ledger/v1", "value": "complete"})
+
+    def fail_parent_flush(_handle: Any) -> None:
+        raise OSError("injected postcommit parent flush failure")
+
+    monkeypatch.setattr(
+        supervisor,
+        "_flush_ledger_parent_handle",
+        fail_parent_flush,
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match="injected postcommit parent flush"):
+        supervisor._HeldLedgerFile(path, raw, replay_label="postcommit test")
+
+    assert path.read_bytes() == raw
+    assert _ledger_nonlease_files(parent) == (path,)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_ledger_write_once_uses_atomic_publisher_for_every_terminal_category(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "execution-ledger"
+    root.mkdir()
+    categories = (
+        "claims",
+        "bootstrap_authorizations",
+        "authorization_ids",
+        "authorization_nonces",
+        "resumed_authorizations",
+        "worker_terminals",
+        "completed",
+    )
+    published: list[tuple[Path, bytes]] = []
+
+    with supervisor._held_directory_chain(root) as chain, ExitStack() as stack:
+        for index, category in enumerate(categories):
+            identity = hashlib.sha256(category.encode("ascii")).hexdigest()
+            raw = _canonical_bytes(
+                {
+                    "category": category,
+                    "index": index,
+                    "schema": "test-ledger/v1",
+                }
+            )
+            held, path, digest = supervisor._ledger_write_once(
+                chain,
+                stack=stack,
+                category=category,
+                authorization_sha256=identity,
+                raw=raw,
+                replay_label=f"{category} test",
+            )
+            held.postverify()
+            assert digest == _sha256(raw)
+            published.append((path, raw))
+
+    assert [(path.read_bytes(), raw) for path, raw in published] == [
+        (raw, raw) for _path, raw in published
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_held_ledger_file_never_scavenges_unproven_orphan_staging(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    orphan = parent / ".unproven-ledger-staging-orphan"
+    orphan_raw = b"unproven orphan"
+    orphan.write_bytes(orphan_raw)
+    path = parent / "committed.json"
+    raw = _canonical_bytes({"schema": "test-ledger/v1"})
+
+    held = supervisor._HeldLedgerFile(path, raw, replay_label="orphan test")
+    held.close()
+
+    assert path.read_bytes() == raw
+    assert orphan.read_bytes() == orphan_raw
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_success_releases_publisher_lease_while_final_handle_remains_held(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    first_path = parent / "first.json"
+    second_path = parent / "second.json"
+    first_raw = _canonical_bytes({"schema": "first/v1"})
+    second_raw = _canonical_bytes({"schema": "second/v1"})
+    first = supervisor._HeldLedgerFile(
+        first_path,
+        first_raw,
+        replay_label="first publisher",
+    )
+    try:
+        first.postverify()
+        with pytest.raises(PermissionError):
+            first_path.read_bytes()
+        started = time.monotonic()
+        second = supervisor._HeldLedgerFile(
+            second_path,
+            second_raw,
+            replay_label="second publisher",
+        )
+        try:
+            assert time.monotonic() - started < 1
+            first.postverify()
+            second.postverify()
+        finally:
+            second.close()
+    finally:
+        first.close()
+
+    assert first_path.read_bytes() == first_raw
+    assert second_path.read_bytes() == second_raw
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_held_ledger_file_short_final_name_uses_valid_rename_abi(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    path = parent / "x"
+    raw = _canonical_bytes({"schema": "test-ledger/v1"})
+
+    held = supervisor._HeldLedgerFile(path, raw, replay_label="short ABI test")
+    held.close()
+
+    assert path.read_bytes() == raw
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_open_osfhandle_failure_disposes_staging_and_closes_raw_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    path = parent / "open-osfhandle.json"
+    captured_handles: list[int] = []
+
+    def fail_open_osfhandle(handle: int, _flags: int) -> int:
+        captured_handles.append(handle)
+        raise OSError("injected open_osfhandle failure")
+
+    monkeypatch.setattr(supervisor.msvcrt, "open_osfhandle", fail_open_osfhandle)
+
+    with pytest.raises(OSError, match="injected open_osfhandle"):
+        supervisor._HeldLedgerFile(
+            path,
+            _canonical_bytes({"schema": "test-ledger/v1"}),
+            replay_label="open_osfhandle test",
+        )
+
+    assert len(captured_handles) == 1
+    flags = supervisor.wintypes.DWORD()
+    get_handle_information = supervisor._kernel32().GetHandleInformation
+    get_handle_information.argtypes = (
+        supervisor.wintypes.HANDLE,
+        ctypes.POINTER(supervisor.wintypes.DWORD),
+    )
+    get_handle_information.restype = supervisor.wintypes.BOOL
+    assert not get_handle_information(
+        supervisor.wintypes.HANDLE(captured_handles[0]),
+        ctypes.byref(flags),
+    )
+    assert not tuple(
+        candidate
+        for candidate in parent.iterdir()
+        if candidate.name.startswith(supervisor._LEDGER_STAGING_PREFIX)
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_fdopen_failure_disposes_staging_and_closes_transferred_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    path = parent / "fdopen.json"
+    captured_descriptors: list[int] = []
+
+    def fail_fdopen(descriptor: int, _mode: str) -> Any:
+        captured_descriptors.append(descriptor)
+        raise OSError("injected fdopen failure")
+
+    monkeypatch.setattr(supervisor.os, "fdopen", fail_fdopen)
+
+    with pytest.raises(OSError, match="injected fdopen"):
+        supervisor._HeldLedgerFile(
+            path,
+            _canonical_bytes({"schema": "test-ledger/v1"}),
+            replay_label="fdopen test",
+        )
+
+    assert len(captured_descriptors) == 1
+    descriptor_was_open = True
+    try:
+        os.fstat(captured_descriptors[0])
+    except OSError:
+        descriptor_was_open = False
+    finally:
+        if descriptor_was_open:
+            os.close(captured_descriptors[0])
+    assert not descriptor_was_open
+    assert not tuple(
+        candidate
+        for candidate in parent.iterdir()
+        if candidate.name.startswith(supervisor._LEDGER_STAGING_PREFIX)
+    )
+
+
+def _open_active_ledger_staging(path: Path) -> Any:
+    kernel32 = supervisor._kernel32()
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        supervisor.wintypes.LPCWSTR,
+        supervisor.wintypes.DWORD,
+        supervisor.wintypes.DWORD,
+        supervisor.wintypes.LPVOID,
+        supervisor.wintypes.DWORD,
+        supervisor.wintypes.DWORD,
+        supervisor.wintypes.HANDLE,
+    )
+    create_file.restype = supervisor.wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        0x80000000 | 0x40000000 | 0x00010000,
+        0x00000001,
+        None,
+        3,
+        0x00200000 | 0x08000000,
+        None,
+    )
+    assert handle not in (None, ctypes.c_void_p(-1).value)
+    return handle
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_stale_staging_recovery_skips_active_handle_then_reclaims_after_close(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    orphan = (
+        parent
+        / f"{supervisor._LEDGER_STAGING_PREFIX}{'a' * 32}.tmp"
+    )
+    orphan.write_bytes(b"legacy partial")
+    stale_time = time.time() - 60 * 60
+    os.utime(orphan, (stale_time, stale_time))
+    active_handle = _open_active_ledger_staging(orphan)
+    first_path = parent / "first.json"
+    second_path = parent / "second.json"
+
+    try:
+        first = supervisor._HeldLedgerFile(
+            first_path,
+            _canonical_bytes({"schema": "first/v1"}),
+            replay_label="active recovery test",
+        )
+        first.close()
+        assert orphan.is_file()
+    finally:
+        supervisor._kernel32().CloseHandle(active_handle)
+
+    second = supervisor._HeldLedgerFile(
+        second_path,
+        _canonical_bytes({"schema": "second/v1"}),
+        replay_label="inactive recovery test",
+    )
+    second.close()
+
+    assert not orphan.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_nonmatching_directory_entries_do_not_starve_stale_staging_recovery(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    for index in range(supervisor._MAX_LEDGER_STAGING_SCAN + 50):
+        (parent / f".ordinary-{index:04d}").write_bytes(b"ordinary")
+    orphan = parent / f"{supervisor._LEDGER_STAGING_PREFIX}{'b' * 32}.tmp"
+    orphan.write_bytes(b"partial")
+    stale_time = time.time() - 60 * 60
+    os.utime(orphan, (stale_time, stale_time))
+
+    held = supervisor._HeldLedgerFile(
+        parent / "committed.json",
+        _canonical_bytes({"schema": "nonmatch-scan/v1"}),
+        replay_label="nonmatch scan test",
+    )
+    held.close()
+
+    assert not orphan.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_stale_reserved_wildcard_pollution_is_bounded_and_eventually_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    pollution: list[Path] = []
+    for index in range(supervisor._MAX_LEDGER_STAGING_SCAN + 50):
+        candidate = (
+            parent
+            / f"{supervisor._LEDGER_STAGING_PREFIX}pollution-{index:04d}.tmp"
+        )
+        candidate.write_bytes(b"stale pollution")
+        pollution.append(candidate)
+    exact = parent / f"{supervisor._LEDGER_STAGING_PREFIX}{'9' * 32}.tmp"
+    exact.write_bytes(b"stale exact")
+    stale_time = time.time() - 60 * 60
+    for candidate in [*pollution, exact]:
+        os.utime(candidate, (stale_time, stale_time))
+    chain = supervisor._HeldDirectoryChain(parent)
+    lease = supervisor._HeldLedgerLease(chain)
+    monkeypatch.setattr(supervisor.time, "monotonic", lambda: 0.0)
+    rejected_rounds = 0
+    successful_recovery: int | None = None
+    try:
+        for _round in range(32):
+            before = sum(
+                candidate.exists()
+                for candidate in [*pollution, exact]
+            )
+            try:
+                recovered = supervisor._recover_stale_ledger_staging(chain, lease)
+            except supervisor.FormalSupervisorError as exc:
+                assert "execution ledger recovery incomplete" in str(exc)
+                rejected_rounds += 1
+                recovered = None
+            after = sum(
+                candidate.exists()
+                for candidate in [*pollution, exact]
+            )
+            assert 0 <= before - after <= supervisor._MAX_LEDGER_STAGING_RECOVERY
+            if recovered is not None:
+                successful_recovery = recovered
+                break
+    finally:
+        lease.close()
+        chain.close()
+
+    assert rejected_rounds > 1
+    assert successful_recovery is not None
+    assert not exact.exists()
+    assert not any(candidate.exists() for candidate in pollution)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_fresh_safe_reserved_wildcard_pollution_is_preserved(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    candidate = (
+        parent / f"{supervisor._LEDGER_STAGING_PREFIX}fresh-pollution.tmp"
+    )
+    candidate.write_bytes(b"fresh pollution")
+    chain = supervisor._HeldDirectoryChain(parent)
+    lease = supervisor._HeldLedgerLease(chain)
+    try:
+        recovered = supervisor._recover_stale_ledger_staging(chain, lease)
+    finally:
+        lease.close()
+        chain.close()
+
+    assert recovered == 0
+    assert candidate.read_bytes() == b"fresh pollution"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_exact_scan_limit_with_fresh_candidates_proves_eof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    candidates = _write_exact_ledger_candidates(
+        parent,
+        supervisor._MAX_LEDGER_STAGING_SCAN,
+        raw=b"fresh",
+    )
+    chain = supervisor._HeldDirectoryChain(parent)
+    lease = supervisor._HeldLedgerLease(chain)
+    monkeypatch.setattr(supervisor.time, "monotonic", lambda: 0.0)
+    try:
+        recovered = supervisor._recover_stale_ledger_staging(chain, lease)
+    finally:
+        lease.close()
+        chain.close()
+
+    assert recovered == 0
+    assert all(candidate.read_bytes() == b"fresh" for candidate in candidates)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_exact_scan_limit_plus_one_fresh_candidate_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    candidates = _write_exact_ledger_candidates(
+        parent,
+        supervisor._MAX_LEDGER_STAGING_SCAN + 1,
+        raw=b"fresh",
+    )
+    chain = supervisor._HeldDirectoryChain(parent)
+    lease = supervisor._HeldLedgerLease(chain)
+    monkeypatch.setattr(supervisor.time, "monotonic", lambda: 0.0)
+    try:
+        with pytest.raises(
+            supervisor.FormalSupervisorError,
+            match="execution ledger recovery incomplete",
+        ):
+            supervisor._recover_stale_ledger_staging(chain, lease)
+    finally:
+        lease.close()
+        chain.close()
+
+    assert all(candidate.read_bytes() == b"fresh" for candidate in candidates)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_scan_limit_lookahead_rejects_unsafe_tail_without_processing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    candidates: list[Path] = []
+    for index in range(supervisor._MAX_LEDGER_STAGING_SCAN + 1):
+        candidate = (
+            parent
+            / f"{supervisor._LEDGER_STAGING_PREFIX}lookahead-{index:04d}.tmp"
+        )
+        assert supervisor._LEDGER_STAGING_NAME_RE.fullmatch(candidate.name) is None
+        candidate.write_bytes(b"fresh")
+        candidates.append(candidate)
+    with supervisor._exact_ledger_staging_paths(parent) as enumerated:
+        observed = list(enumerated)
+    assert len(observed) == len(candidates)
+    unsafe_tail = observed[-1]
+    sibling = parent / "unsafe-tail-hardlink"
+    os.link(unsafe_tail, sibling)
+    with supervisor._exact_ledger_staging_paths(parent) as enumerated:
+        observed_after_link = list(enumerated)
+    assert observed_after_link[-1] == unsafe_tail
+    chain = supervisor._HeldDirectoryChain(parent)
+    lease = supervisor._HeldLedgerLease(chain)
+    monkeypatch.setattr(supervisor.time, "monotonic", lambda: 0.0)
+    try:
+        with pytest.raises(
+            supervisor.FormalSupervisorError,
+            match="execution ledger recovery incomplete",
+        ):
+            supervisor._recover_stale_ledger_staging(chain, lease)
+    finally:
+        lease.close()
+        chain.close()
+
+    assert unsafe_tail.stat().st_nlink == 2
+    assert all(candidate.exists() for candidate in candidates)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+@pytest.mark.parametrize("pollution_kind", ["active", "directory", "hardlink"])
+def test_unsafe_reserved_wildcard_pollution_is_rejected(
+    tmp_path: Path,
+    pollution_kind: str,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    candidate = (
+        parent
+        / f"{supervisor._LEDGER_STAGING_PREFIX}unsafe-{pollution_kind}.tmp"
+    )
+    sibling = parent / "hardlink-sibling"
+    active_handle: Any | None = None
+    if pollution_kind == "directory":
+        candidate.mkdir()
+    else:
+        candidate.write_bytes(b"unsafe pollution")
+        stale_time = time.time() - 60 * 60
+        os.utime(candidate, (stale_time, stale_time))
+        if pollution_kind == "active":
+            active_handle = _open_active_ledger_staging(candidate)
+        else:
+            os.link(candidate, sibling)
+    chain = supervisor._HeldDirectoryChain(parent)
+    lease = supervisor._HeldLedgerLease(chain)
+    try:
+        with pytest.raises(
+            supervisor.FormalSupervisorError,
+            match="reserved staging pollution rejected",
+        ):
+            supervisor._recover_stale_ledger_staging(chain, lease)
+    finally:
+        lease.close()
+        chain.close()
+        if active_handle is not None:
+            supervisor._kernel32().CloseHandle(active_handle)
+
+    assert candidate.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+@pytest.mark.parametrize(
+    (
+        "deadline_phase",
+        "ticks",
+        "candidate_count",
+        "expected_visited",
+        "expected_processed",
+    ),
+    [
+        ("before_take", (0.0, 2.0), 1, 0, 0),
+        ("after_take", (0.0, 0.1, 2.0), 1, 1, 0),
+        ("after_process", (0.0, 0.1, 0.2, 2.0), 1, 1, 1),
+        ("at_eof", (0.0, 0.1, 2.0), 0, 0, 0),
+    ],
+)
+def test_staging_recovery_deadline_without_timely_eof_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    deadline_phase: str,
+    ticks: tuple[float, ...],
+    candidate_count: int,
+    expected_visited: int,
+    expected_processed: int,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    candidates = [
+        parent / f"{supervisor._LEDGER_STAGING_PREFIX}{index:032x}.tmp"
+        for index in range(candidate_count)
+    ]
+    chain = supervisor._HeldDirectoryChain(parent)
+    lease = supervisor._HeldLedgerLease(chain)
+    visited: list[str] = []
+    processed: list[str] = []
+    enumerator_closed: list[bool] = []
+    monotonic_ticks = iter(ticks)
+
+    @contextmanager
+    def injected_candidates(_parent: Path) -> Any:
+        def paths() -> Any:
+            for candidate in candidates:
+                visited.append(candidate.name)
+                yield candidate
+
+        try:
+            yield paths()
+        finally:
+            enumerator_closed.append(True)
+
+    def recover_candidate(
+        candidate: Path,
+        *,
+        stale_before_ns: int,
+        reject_unsafe: bool = False,
+    ) -> bool:
+        del stale_before_ns, reject_unsafe
+        processed.append(candidate.name)
+        return False
+
+    monkeypatch.setattr(
+        supervisor,
+        "_exact_ledger_staging_paths",
+        injected_candidates,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_recover_one_stale_ledger_staging",
+        recover_candidate,
+    )
+    monkeypatch.setattr(
+        supervisor.time,
+        "monotonic",
+        lambda: next(monotonic_ticks, 2.0),
+    )
+    try:
+        with pytest.raises(
+            supervisor.FormalSupervisorError,
+            match="execution ledger recovery incomplete",
+        ):
+            supervisor._recover_stale_ledger_staging(chain, lease)
+    finally:
+        lease.close()
+        chain.close()
+
+    assert len(visited) == expected_visited
+    assert len(processed) == expected_processed
+    assert enumerator_closed == [True]
+    parent.rename(tmp_path / f"closed-{deadline_phase}")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_held_ledger_file_recovery_rejection_closes_all_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    enumerator_closed: list[bool] = []
+
+    @contextmanager
+    def injected_candidates(_parent: Path) -> Any:
+        try:
+            yield iter(())
+        finally:
+            enumerator_closed.append(True)
+
+    ticks = iter((0.0, 0.0, 2.0))
+    monkeypatch.setattr(
+        supervisor,
+        "_exact_ledger_staging_paths",
+        injected_candidates,
+    )
+    monkeypatch.setattr(
+        supervisor.time,
+        "monotonic",
+        lambda: next(ticks, 2.0),
+    )
+
+    with pytest.raises(
+        supervisor.FormalSupervisorError,
+        match="execution ledger recovery incomplete",
+    ):
+        supervisor._HeldLedgerFile(
+            parent / "must-not-publish.json",
+            _canonical_bytes({"schema": "deadline-rejection/v1"}),
+            replay_label="deadline rejection",
+        )
+
+    assert enumerator_closed == [True]
+    assert not (parent / "must-not-publish.json").exists()
+    parent.rename(tmp_path / "ledger-closed")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_exact_recovery_limit_proves_eof(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    candidates = _write_exact_ledger_candidates(
+        parent,
+        supervisor._MAX_LEDGER_STAGING_RECOVERY,
+        raw=b"partial",
+    )
+    stale_time = time.time() - 60 * 60
+    for candidate in candidates:
+        os.utime(candidate, (stale_time, stale_time))
+    chain = supervisor._HeldDirectoryChain(parent)
+    lease = supervisor._HeldLedgerLease(chain)
+    try:
+        recovered = supervisor._recover_stale_ledger_staging(chain, lease)
+    finally:
+        lease.close()
+        chain.close()
+
+    assert recovered == supervisor._MAX_LEDGER_STAGING_RECOVERY
+    assert not any(candidate.exists() for candidate in candidates)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_recovery_limit_plus_one_rejects_then_retry_proves_eof(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    candidates = _write_exact_ledger_candidates(
+        parent,
+        supervisor._MAX_LEDGER_STAGING_RECOVERY + 1,
+        raw=b"partial",
+    )
+    stale_time = time.time() - 60 * 60
+    for candidate in candidates:
+        os.utime(candidate, (stale_time, stale_time))
+    chain = supervisor._HeldDirectoryChain(parent)
+    lease = supervisor._HeldLedgerLease(chain)
+    try:
+        with pytest.raises(
+            supervisor.FormalSupervisorError,
+            match="execution ledger recovery incomplete",
+        ):
+            supervisor._recover_stale_ledger_staging(chain, lease)
+        remaining_after_rejection = sum(
+            candidate.exists() for candidate in candidates
+        )
+        recovered = supervisor._recover_stale_ledger_staging(chain, lease)
+    finally:
+        lease.close()
+        chain.close()
+
+    assert remaining_after_rejection == 1
+    assert recovered == 1
+    assert not any(candidate.exists() for candidate in candidates)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_fresh_inactive_staging_is_not_recovered(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    candidate = parent / f"{supervisor._LEDGER_STAGING_PREFIX}{'c' * 32}.tmp"
+    candidate.write_bytes(b"fresh")
+
+    held = supervisor._HeldLedgerFile(
+        parent / "committed.json",
+        _canonical_bytes({"schema": "fresh-candidate/v1"}),
+        replay_label="fresh candidate test",
+    )
+    held.close()
+
+    assert candidate.read_bytes() == b"fresh"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_hardlinked_staging_is_not_recovered(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    candidate = parent / f"{supervisor._LEDGER_STAGING_PREFIX}{'d' * 32}.tmp"
+    sibling = parent / "hardlink-sibling"
+    candidate.write_bytes(b"linked")
+    os.link(candidate, sibling)
+    stale_time = time.time() - 60 * 60
+    os.utime(candidate, (stale_time, stale_time))
+
+    held = supervisor._HeldLedgerFile(
+        parent / "committed.json",
+        _canonical_bytes({"schema": "hardlink-candidate/v1"}),
+        replay_label="hardlink candidate test",
+    )
+    held.close()
+
+    assert candidate.read_bytes() == b"linked"
+    assert sibling.read_bytes() == b"linked"
+    assert candidate.stat().st_nlink == 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_staging_path_file_id_swap_is_not_recovered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    candidate = parent / f"{supervisor._LEDGER_STAGING_PREFIX}{'e' * 32}.tmp"
+    swapped = parent / "swapped"
+    candidate.write_bytes(b"candidate")
+    swapped.write_bytes(b"swapped")
+    stale_time = time.time() - 60 * 60
+    os.utime(candidate, (stale_time, stale_time))
+    os.utime(swapped, (stale_time, stale_time))
+    real_lstat = Path.lstat
+
+    def swapped_lstat(path: Path) -> os.stat_result:
+        if os.path.normcase(str(path)) == os.path.normcase(str(candidate)):
+            return real_lstat(swapped)
+        return real_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", swapped_lstat)
+
+    recovered = supervisor._recover_one_stale_ledger_staging(
+        candidate,
+        stale_before_ns=time.time_ns() - 60 * 1_000_000_000,
+    )
+
+    assert recovered is False
+    assert candidate.read_bytes() == b"candidate"
+    assert swapped.read_bytes() == b"swapped"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_staging_reparse_metadata_is_not_recovered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    candidate = parent / f"{supervisor._LEDGER_STAGING_PREFIX}{'f' * 32}.tmp"
+    candidate.write_bytes(b"candidate")
+    stale_time = time.time() - 60 * 60
+    os.utime(candidate, (stale_time, stale_time))
+    real_lstat = Path.lstat
+    terminal = real_lstat(candidate)
+
+    class _ReparseStat:
+        st_dev = terminal.st_dev
+        st_ino = terminal.st_ino
+        st_mode = terminal.st_mode
+        st_mtime_ns = terminal.st_mtime_ns
+        st_size = terminal.st_size
+        st_nlink = terminal.st_nlink
+        st_file_attributes = 0x400
+
+    def reparse_lstat(path: Path) -> Any:
+        if os.path.normcase(str(path)) == os.path.normcase(str(candidate)):
+            return _ReparseStat()
+        return real_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", reparse_lstat)
+
+    recovered = supervisor._recover_one_stale_ledger_staging(
+        candidate,
+        stale_before_ns=time.time_ns() - 60 * 1_000_000_000,
+    )
+
+    assert recovered is False
+    assert candidate.read_bytes() == b"candidate"
+
+
+def _spawn_ledger_crash_child(
+    *,
+    path: Path,
+    raw: bytes,
+    barrier: Path,
+    phase: str,
+) -> subprocess.Popen[bytes]:
+    source = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "import time\n"
+        "from app import factor_v3_formal_trusted_supervisor as supervisor\n"
+        "path = Path(sys.argv[1])\n"
+        "raw = bytes.fromhex(sys.argv[2])\n"
+        "barrier = Path(sys.argv[3])\n"
+        "phase = sys.argv[4]\n"
+        "def stop_before_rename(stream, parent_handle, final_name, *, replay_label):\n"
+        "    del stream, parent_handle, final_name, replay_label\n"
+        "    barrier.write_bytes(b'ready')\n"
+        "    while True:\n"
+        "        time.sleep(1)\n"
+        "def stop_after_rename(parent_handle):\n"
+        "    del parent_handle\n"
+        "    barrier.write_bytes(b'ready')\n"
+        "    while True:\n"
+        "        time.sleep(1)\n"
+        "if phase == 'pre-rename':\n"
+        "    supervisor._rename_ledger_staging_no_replace = stop_before_rename\n"
+        "elif phase == 'post-rename':\n"
+        "    supervisor._flush_ledger_parent_handle = stop_after_rename\n"
+        "else:\n"
+        "    raise RuntimeError('unknown phase')\n"
+        "supervisor._HeldLedgerFile(path, raw, replay_label='crash child')\n"
+    )
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            source,
+            str(path),
+            raw.hex(),
+            str(barrier),
+            phase,
+        ],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        shell=False,
+    )
+
+
+def _spawn_ledger_lease_holder(
+    *,
+    parent: Path,
+    ready: Path,
+    release: Path,
+    crash: bool,
+) -> subprocess.Popen[bytes]:
+    source = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "import time\n"
+        "from app import factor_v3_formal_trusted_supervisor as supervisor\n"
+        "parent = Path(sys.argv[1])\n"
+        "ready = Path(sys.argv[2])\n"
+        "release = Path(sys.argv[3])\n"
+        "crash = sys.argv[4] == 'crash'\n"
+        "chain = supervisor._HeldDirectoryChain(parent)\n"
+        "lease = supervisor._HeldLedgerLease(chain)\n"
+        "ready.write_bytes(b'ready')\n"
+        "try:\n"
+        "    if crash:\n"
+        "        while True:\n"
+        "            time.sleep(1)\n"
+        "    deadline = time.monotonic() + 10\n"
+        "    while not release.is_file():\n"
+        "        if time.monotonic() >= deadline:\n"
+        "            raise RuntimeError('release barrier timed out')\n"
+        "        time.sleep(0.01)\n"
+        "finally:\n"
+        "    lease.close()\n"
+        "    chain.close()\n"
+    )
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            source,
+            str(parent),
+            str(ready),
+            str(release),
+            "crash" if crash else "release",
+        ],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        shell=False,
+    )
+
+
+def _spawn_ledger_lease_contender(
+    *,
+    path: Path,
+    started: Path,
+    completed: Path,
+) -> subprocess.Popen[bytes]:
+    source = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "from app import factor_v3_formal_trusted_supervisor as supervisor\n"
+        "path = Path(sys.argv[1])\n"
+        "started = Path(sys.argv[2])\n"
+        "completed = Path(sys.argv[3])\n"
+        "started.write_bytes(b'started')\n"
+        "held = supervisor._HeldLedgerFile(\n"
+        "    path,\n"
+        "    b'{\"schema\":\"lease-contender/v1\"}',\n"
+        "    replay_label='lease contender',\n"
+        ")\n"
+        "held.close()\n"
+        "completed.write_bytes(b'completed')\n"
+    )
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            source,
+            str(path),
+            str(started),
+            str(completed),
+        ],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        shell=False,
+    )
+
+
+def _wait_for_crash_barrier(
+    process: subprocess.Popen[bytes],
+    barrier: Path,
+) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if barrier.is_file():
+            return
+        if process.poll() is not None:
+            _stdout, stderr = process.communicate()
+            pytest.fail(f"crash child exited before barrier: {stderr!r}")
+        time.sleep(0.01)
+    pytest.fail("crash child barrier timed out")
+
+
+def _kill_crash_child(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        process.kill()
+    process.communicate(timeout=10)
+
+
+def _finish_test_child(
+    process: subprocess.Popen[bytes],
+    *,
+    label: str,
+) -> None:
+    _stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 0, f"{label} failed: {stderr!r}"
+
+
+def test_ledger_lease_wait_budget_is_frozen() -> None:
+    assert supervisor._LEDGER_LEASE_WAIT_SECONDS == 30
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_persistent_lease_contender_waits_for_legal_holder_then_succeeds(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    ready = tmp_path / "holder.ready"
+    release = tmp_path / "holder.release"
+    started = tmp_path / "contender.started"
+    completed = tmp_path / "contender.completed"
+    path = parent / "contender.json"
+    holder = _spawn_ledger_lease_holder(
+        parent=parent,
+        ready=ready,
+        release=release,
+        crash=False,
+    )
+    contender: subprocess.Popen[bytes] | None = None
+    try:
+        _wait_for_crash_barrier(holder, ready)
+        contender = _spawn_ledger_lease_contender(
+            path=path,
+            started=started,
+            completed=completed,
+        )
+        _wait_for_crash_barrier(contender, started)
+        time.sleep(0.2)
+        assert contender.poll() is None
+        released_at = time.monotonic()
+        release.write_bytes(b"release")
+        _finish_test_child(holder, label="lease holder")
+        _finish_test_child(contender, label="lease contender")
+        assert time.monotonic() - released_at < 2
+    finally:
+        if holder.poll() is None:
+            _kill_crash_child(holder)
+        if contender is not None and contender.poll() is None:
+            _kill_crash_child(contender)
+
+    assert completed.read_bytes() == b"completed"
+    assert path.read_bytes() == b'{"schema":"lease-contender/v1"}'
+    _assert_persistent_ledger_lease(parent)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_persistent_lease_contender_succeeds_after_holder_process_crash(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    ready = tmp_path / "holder.ready"
+    release = tmp_path / "unused.release"
+    started = tmp_path / "contender.started"
+    completed = tmp_path / "contender.completed"
+    path = parent / "crash-contender.json"
+    holder = _spawn_ledger_lease_holder(
+        parent=parent,
+        ready=ready,
+        release=release,
+        crash=True,
+    )
+    contender: subprocess.Popen[bytes] | None = None
+    try:
+        _wait_for_crash_barrier(holder, ready)
+        contender = _spawn_ledger_lease_contender(
+            path=path,
+            started=started,
+            completed=completed,
+        )
+        _wait_for_crash_barrier(contender, started)
+        time.sleep(0.2)
+        assert contender.poll() is None
+        released_at = time.monotonic()
+        _kill_crash_child(holder)
+        _finish_test_child(contender, label="crash lease contender")
+        assert time.monotonic() - released_at < 2
+    finally:
+        if holder.poll() is None:
+            _kill_crash_child(holder)
+        if contender is not None and contender.poll() is None:
+            _kill_crash_child(contender)
+
+    assert completed.read_bytes() == b"completed"
+    assert path.read_bytes() == b'{"schema":"lease-contender/v1"}'
+    _assert_persistent_ledger_lease(parent)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_pre_rename_process_crash_leaves_only_recoverable_staging(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    path = parent / "pre-crash.json"
+    barrier = tmp_path / "pre-crash.ready"
+    raw = _canonical_bytes({"schema": "pre-crash/v1"})
+    process = _spawn_ledger_crash_child(
+        path=path,
+        raw=raw,
+        barrier=barrier,
+        phase="pre-rename",
+    )
+    try:
+        _wait_for_crash_barrier(process, barrier)
+    finally:
+        _kill_crash_child(process)
+
+    assert not path.exists()
+    staging = tuple(
+        candidate
+        for candidate in parent.iterdir()
+        if candidate.name.startswith(supervisor._LEDGER_STAGING_PREFIX)
+    )
+    assert len(staging) == 1
+    stale_time = time.time() - 60 * 60
+    os.utime(staging[0], (stale_time, stale_time))
+
+    held = supervisor._HeldLedgerFile(path, raw, replay_label="pre-crash recovery")
+    held.close()
+
+    assert path.read_bytes() == raw
+    assert not tuple(
+        candidate
+        for candidate in parent.iterdir()
+        if candidate.name.startswith(supervisor._LEDGER_STAGING_PREFIX)
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="held ledger file is Windows-only")
+def test_post_rename_process_crash_preserves_complete_final(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "ledger"
+    parent.mkdir()
+    path = parent / "post-crash.json"
+    barrier = tmp_path / "post-crash.ready"
+    raw = _canonical_bytes({"schema": "post-crash/v1"})
+    process = _spawn_ledger_crash_child(
+        path=path,
+        raw=raw,
+        barrier=barrier,
+        phase="post-rename",
+    )
+    try:
+        _wait_for_crash_barrier(process, barrier)
+    finally:
+        _kill_crash_child(process)
+
+    assert path.read_bytes() == raw
+    with pytest.raises(supervisor.FormalSupervisorError, match="replay rejected"):
+        supervisor._HeldLedgerFile(
+            path,
+            _canonical_bytes({"schema": "loser/v1"}),
+            replay_label="post-crash replay",
+        )
     assert path.read_bytes() == raw
 
 
