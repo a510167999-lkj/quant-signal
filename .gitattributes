@@ -1,2 +1,3 @@
 scripts/formal_pycache_blocker_v1 -text
 docs/research_preregistrations/shallow_gbdt_risk_on_breadth_development_1_source_authority_v1/*.json -text
+docs/research_preregistrations/shallow_gbdt_risk_on_breadth_development_1_post_run_verifier_amendment_authority_v1/*.json -text

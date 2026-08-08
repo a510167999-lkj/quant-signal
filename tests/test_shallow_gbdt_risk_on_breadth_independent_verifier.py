@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from copy import deepcopy
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1113,6 +1115,199 @@ def test_phase3_minimal_environment_drops_unapproved_parent_values(
     assert "PATH" not in observed
 
 
+def test_phase3_json_document_size_policy_is_exact_and_frozen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert verifier._json_document_size_limit("formal_control") == 64 * 1024 * 1024
+    assert (
+        verifier._json_document_size_limit("runtime_verification")
+        == 64 * 1024 * 1024
+    )
+    assert verifier._json_document_size_limit("result_main") == 64 * 1024 * 1024
+    assert (
+        verifier._json_document_size_limit("result_sidecar_features")
+        == 64 * 1024 * 1024
+    )
+    assert (
+        verifier._json_document_size_limit("result_sidecar_models")
+        == 64 * 1024 * 1024
+    )
+    assert (
+        verifier._json_document_size_limit("result_sidecar_execution")
+        == 512 * 1024 * 1024
+    )
+    assert (
+        verifier._json_document_size_limit("result_sidecar_selection")
+        == 768 * 1024 * 1024
+    )
+    assert (
+        _sha256(verifier.JSON_DOCUMENT_SIZE_POLICY)
+        == verifier.EXPECTED_JSON_DOCUMENT_SIZE_POLICY_SHA256
+    )
+
+    monkeypatch.setitem(
+        verifier.JSON_DOCUMENT_SIZE_POLICY["limits_bytes"]["result_sidecars"],
+        "execution",
+        513 * 1024 * 1024,
+    )
+    with pytest.raises(ValueError, match="size policy drifted"):
+        verifier._json_document_size_limit("result_sidecar_execution")
+
+
+def test_phase3_json_reader_rechecks_length_after_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "document.json"
+    path.write_text('{"value":"longer-than-eight"}', encoding="utf-8")
+    metadata = path.stat()
+    claimed = SimpleNamespace(
+        st_mode=metadata.st_mode,
+        st_size=8,
+        st_mtime_ns=metadata.st_mtime_ns,
+        st_dev=metadata.st_dev,
+        st_ino=metadata.st_ino,
+    )
+    monkeypatch.setattr(
+        verifier,
+        "_json_document_size_limit",
+        lambda _document_class: 8,
+    )
+    monkeypatch.setattr(verifier, "_assert_no_reparse", lambda *_args: claimed)
+    monkeypatch.setattr(verifier.os, "fstat", lambda _fd: claimed)
+
+    with pytest.raises(ValueError, match="bounded regular file"):
+        verifier._read_json_object(
+            path,
+            "synthetic document",
+            document_class="formal_control",
+        )
+
+
+def test_phase3_json_reader_rejects_class_limit_before_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "document.json"
+    path.write_text("{}", encoding="utf-8")
+    metadata = path.stat()
+    oversized = SimpleNamespace(
+        st_mode=metadata.st_mode,
+        st_size=512 * 1024 * 1024 + 1,
+        st_mtime_ns=metadata.st_mtime_ns,
+        st_dev=metadata.st_dev,
+        st_ino=metadata.st_ino,
+    )
+    monkeypatch.setattr(verifier, "_assert_no_reparse", lambda *_args: oversized)
+
+    opened = False
+
+    def forbidden_open(*_args: object, **_kwargs: object) -> object:
+        nonlocal opened
+        opened = True
+        raise AssertionError("oversized JSON must not be opened")
+
+    monkeypatch.setattr(
+        Path,
+        "open",
+        forbidden_open,
+    )
+
+    with pytest.raises(ValueError, match="bounded regular file"):
+        verifier._read_json_object(
+            path,
+            "synthetic execution sidecar",
+            document_class="result_sidecar_execution",
+        )
+    assert opened is False
+
+
+def test_phase3_json_reader_uses_one_handle_and_limit_plus_one(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "document.json"
+    path.write_bytes(b"{}")
+    metadata = path.stat()
+    read_sizes: list[int] = []
+
+    class RecordingHandle(io.BytesIO):
+        def fileno(self) -> int:
+            return 17
+
+        def read(self, size: int = -1) -> bytes:
+            read_sizes.append(size)
+            return super().read(size)
+
+    handle = RecordingHandle(b"{}")
+    monkeypatch.setattr(
+        verifier,
+        "_json_document_size_limit",
+        lambda _document_class: 8,
+    )
+    monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: handle)
+    monkeypatch.setattr(verifier.os, "fstat", lambda _fd: metadata)
+
+    document = verifier._read_json_object(
+        path,
+        "synthetic document",
+        document_class="formal_control",
+    )
+
+    assert document == {}
+    assert read_sizes == [9]
+
+
+def test_phase3_json_reader_rejects_short_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "document.json"
+    path.write_bytes(b"{}")
+    metadata = path.stat()
+    claimed = SimpleNamespace(
+        st_mode=metadata.st_mode,
+        st_size=metadata.st_size + 1,
+        st_mtime_ns=metadata.st_mtime_ns,
+        st_dev=metadata.st_dev,
+        st_ino=metadata.st_ino,
+    )
+    monkeypatch.setattr(verifier, "_assert_no_reparse", lambda *_args: claimed)
+    monkeypatch.setattr(verifier.os, "fstat", lambda _fd: claimed)
+
+    with pytest.raises(ValueError, match="bounded regular file"):
+        verifier._read_json_object(
+            path,
+            "synthetic document",
+            document_class="formal_control",
+        )
+
+
+def test_phase3_json_reader_rejects_open_handle_identity_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "document.json"
+    path.write_bytes(b"{}")
+    metadata = path.stat()
+    drifted = SimpleNamespace(
+        st_mode=metadata.st_mode,
+        st_size=metadata.st_size,
+        st_mtime_ns=metadata.st_mtime_ns + 1,
+        st_dev=metadata.st_dev,
+        st_ino=metadata.st_ino,
+    )
+    observed = iter((metadata, drifted))
+    monkeypatch.setattr(verifier.os, "fstat", lambda _fd: next(observed))
+
+    with pytest.raises(ValueError, match="bounded regular file"):
+        verifier._read_json_object(
+            path,
+            "synthetic document",
+            document_class="formal_control",
+        )
+
+
 def test_phase3_isolated_command_uses_exact_runpy_envelope(tmp_path: Path) -> None:
     python = tmp_path / "python.exe"
     code_root = tmp_path / "code"
@@ -1458,6 +1653,75 @@ def test_phase3_source_snapshot_checks_detached_c_before_and_after(
     assert any(call[:3] == ("worktree", "remove", "--force") for call in calls)
 
 
+def _synthetic_verifier_amendment_binding(
+    *,
+    formal_source_authority_sha256: str = "a" * 64,
+    formal_execution_commit: str = "1" * 40,
+    formal_completion_sha256: str = "2" * 64,
+    predecessor_verifier_git_blob_sha256: str = "b" * 64,
+) -> dict:
+    successor_git_blobs_sha256 = {
+        path: (
+            "d" * 64
+            if path == verifier.VERIFIER_AMENDMENT_VERIFIER_GIT_PATH
+            else "e" * 64
+        )
+        for path in verifier.VERIFIER_AMENDMENT_SUCCESSOR_GIT_PATHS
+    }
+    return {
+        "schema_version": (
+            "formal-post-run-independent-verifier-amendment-binding/v1"
+        ),
+        "artifact_sha256": "c" * 64,
+        "relative_path": (
+            f"{verifier.VERIFIER_AMENDMENT_RELATIVE_ROOT.as_posix()}/"
+            f"{'c' * 64}.json"
+        ),
+        "formal_source_authority_sha256": formal_source_authority_sha256,
+        "formal_execution_commit": formal_execution_commit,
+        "formal_completion_sha256": formal_completion_sha256,
+        "predecessor_verifier_git_blob_sha256": (
+            predecessor_verifier_git_blob_sha256
+        ),
+        "successor_source_commit": "3" * 40,
+        "successor_source_tree": "4" * 40,
+        "execution_commit": "5" * 40,
+        "successor_verifier_git_blob_sha256": "d" * 64,
+        "successor_git_blobs_sha256": successor_git_blobs_sha256,
+        "json_document_size_policy": verifier.JSON_DOCUMENT_SIZE_POLICY,
+        "json_document_size_policy_sha256": (
+            verifier.EXPECTED_JSON_DOCUMENT_SIZE_POLICY_SHA256
+        ),
+        "replay_plan_sha256": verifier.EXPECTED_REPLAY_PLAN_SHA256,
+        "scope": verifier.VERIFIER_AMENDMENT_SCOPE,
+    }
+
+
+def test_phase3_amendment_fields_are_bound_into_formal_chain_fingerprint() -> None:
+    inputs = {
+        "completion_sha256": "1" * 64,
+        "verifier_amendment": _synthetic_verifier_amendment_binding(),
+    }
+    baseline = verifier._formal_chain_fingerprint(inputs)
+
+    for field, replacement in (
+        ("artifact_sha256", "e" * 64),
+        ("successor_verifier_git_blob_sha256", "f" * 64),
+        ("json_document_size_policy_sha256", "0" * 64),
+    ):
+        drifted = deepcopy(inputs)
+        drifted["verifier_amendment"][field] = replacement
+        assert verifier._formal_chain_fingerprint(drifted) != baseline
+
+
+def test_phase3_amendment_authority_json_is_frozen_as_binary() -> None:
+    lines = (verifier.PROJECT_ROOT / ".gitattributes").read_text(
+        encoding="utf-8"
+    ).splitlines()
+
+    assert lines.count(verifier.VERIFIER_AMENDMENT_GIT_ATTRIBUTES_RULE) == 1
+
+
 def test_phase3_run_publishes_verification_then_receipt_then_status(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1479,12 +1743,16 @@ def test_phase3_run_publishes_verification_then_receipt_then_status(
     writes: list[str] = []
     formal_loads = 0
     current_pool_probes = 0
+    amendment = _synthetic_verifier_amendment_binding(
+        formal_completion_sha256="1" * 64,
+    )
     inputs = {
         "run_root": run_root,
         "completion_sha256": "1" * 64,
         "source_authority": {"source_commit": "2" * 40, "source_tree": "3" * 40},
         "result_bundle": {},
         "formal_runtime_history": {},
+        "verifier_amendment": amendment,
         "preflight_core": {
             "frozen_input_attestation": {},
             "current_pool_audit_binding": {
@@ -1566,6 +1834,29 @@ def test_phase3_run_publishes_verification_then_receipt_then_status(
     assert writes[0] == "independent verification claim"
     assert formal_loads == 4
     assert current_pool_probes == 2
+    claim = json.loads(
+        (run_root / verifier.CLAIM_NAME).read_text(encoding="utf-8")
+    )
+    receipt = json.loads(
+        (
+            run_root
+            / verifier.RECEIPT_ROOT_NAME
+            / f"{result['receipt_sha256']}.json"
+        ).read_text(encoding="utf-8")
+    )
+    status = json.loads(
+        (run_root / verifier.STATUS_NAME).read_text(encoding="utf-8")
+    )
+    for document in (claim, receipt, status):
+        assert document["verifier_amendment_sha256"] == amendment[
+            "artifact_sha256"
+        ]
+        assert document["successor_verifier_git_blob_sha256"] == amendment[
+            "successor_verifier_git_blob_sha256"
+        ]
+        assert document["json_document_size_policy_sha256"] == amendment[
+            "json_document_size_policy_sha256"
+        ]
 
 
 def test_phase3_formal_chain_recheck_rejects_midflight_drift(
@@ -1647,6 +1938,9 @@ def test_phase3_failed_status_contains_error_type_but_not_log_text(
         "source_authority": {"source_commit": "2" * 40, "source_tree": "3" * 40},
         "result_bundle": {},
         "formal_runtime_history": {},
+        "verifier_amendment": _synthetic_verifier_amendment_binding(
+            formal_completion_sha256="1" * 64,
+        ),
         "preflight_core": {
             "current_pool_audit_binding": {
                 "canonical_sha256": "9" * 64,
@@ -1680,6 +1974,12 @@ def test_phase3_failed_status_contains_error_type_but_not_log_text(
     status = json.loads((run_root / verifier.STATUS_NAME).read_text(encoding="utf-8"))
     assert status["error_type"] == "RuntimeError"
     assert secret_log_text not in json.dumps(status)
+    assert status["verifier_amendment_sha256"] == "c" * 64
+    assert status["successor_verifier_git_blob_sha256"] == "d" * 64
+    assert (
+        status["json_document_size_policy_sha256"]
+        == verifier.EXPECTED_JSON_DOCUMENT_SIZE_POLICY_SHA256
+    )
 
 
 def _write_launcher_json(path: Path, value: dict) -> str:
@@ -1701,6 +2001,232 @@ def _runtime_attestation(files_sha256: str = "a" * 64) -> dict:
         "environment": {"inherit_parent_environment": False},
     }
     return {**body, "root_sha256": _sha256(body)}
+
+
+def _post_run_amendment_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> tuple[Path, dict, str, dict]:
+    source = tmp_path / "source"
+    source.mkdir()
+    verifier_path = source / "scripts/verify_shallow_gbdt_risk_on_breadth_development_1.py"
+    independent_test_path = (
+        source
+        / "tests/test_shallow_gbdt_risk_on_breadth_independent_verifier.py"
+    )
+    launcher_test_path = (
+        source / "tests/test_shallow_gbdt_risk_on_breadth_formal_launcher.py"
+    )
+    attributes_path = source / ".gitattributes"
+    verifier_path.parent.mkdir(parents=True)
+    independent_test_path.parent.mkdir(parents=True)
+    successor_bytes = b"successor verifier\n"
+    independent_test_bytes = b"successor independent tests\n"
+    launcher_test_bytes = b"successor launcher tests\n"
+    verifier_path.write_bytes(successor_bytes)
+    independent_test_path.write_bytes(independent_test_bytes)
+    launcher_test_path.write_bytes(launcher_test_bytes)
+    attributes_bytes = (
+        verifier.VERIFIER_AMENDMENT_GIT_ATTRIBUTES_RULE + "\n"
+    ).encode("utf-8")
+    attributes_path.write_bytes(attributes_bytes)
+    formal_execution = "1" * 40
+    successor_source = "2" * 40
+    successor_tree = "3" * 40
+    amendment_execution = "4" * 40
+    formal_source_authority_sha256 = "5" * 64
+    formal_completion_sha256 = "6" * 64
+    predecessor_verifier_sha256 = "7" * 64
+    successor_git_blob_bytes = {
+        ".gitattributes": attributes_bytes,
+        (
+            "scripts/verify_shallow_gbdt_"
+            "risk_on_breadth_development_1.py"
+        ): successor_bytes,
+        (
+            "tests/test_shallow_gbdt_risk_on_breadth_"
+            "independent_verifier.py"
+        ): independent_test_bytes,
+        (
+            "tests/test_shallow_gbdt_risk_on_breadth_"
+            "formal_launcher.py"
+        ): launcher_test_bytes,
+    }
+    successor_git_blobs_sha256 = {
+        path: hashlib.sha256(raw).hexdigest()
+        for path, raw in successor_git_blob_bytes.items()
+    }
+    relative_root = verifier.VERIFIER_AMENDMENT_RELATIVE_ROOT
+    authority_root = source / relative_root
+    authority_root.mkdir(parents=True)
+    body = {
+        "schema_version": verifier.VERIFIER_AMENDMENT_SCHEMA,
+        "formal_source_authority_sha256": formal_source_authority_sha256,
+        "formal_execution_commit": formal_execution,
+        "formal_completion_sha256": formal_completion_sha256,
+        "predecessor_verifier_git_blob_sha256": predecessor_verifier_sha256,
+        "successor_source_commit": successor_source,
+        "successor_source_tree": successor_tree,
+        "successor_verifier_git_path": (
+            "scripts/verify_shallow_gbdt_risk_on_breadth_development_1.py"
+        ),
+        "successor_verifier_git_blob_sha256": hashlib.sha256(
+            successor_bytes
+        ).hexdigest(),
+        "successor_git_blobs_sha256": successor_git_blobs_sha256,
+        "json_document_size_policy_sha256": (
+            verifier.EXPECTED_JSON_DOCUMENT_SIZE_POLICY_SHA256
+        ),
+        "json_document_size_policy": verifier.JSON_DOCUMENT_SIZE_POLICY,
+        "replay_plan_sha256": verifier.EXPECTED_REPLAY_PLAN_SHA256,
+        "scope": verifier.VERIFIER_AMENDMENT_SCOPE,
+        "execution_topology": verifier.VERIFIER_AMENDMENT_TOPOLOGY,
+    }
+    artifact_sha256 = _sha256(body)
+    document = {**body, "artifact_sha256": artifact_sha256}
+    authority_path = authority_root / f"{artifact_sha256}.json"
+    authority_raw = _canonical_bytes(document) + b"\n"
+    authority_path.write_bytes(authority_raw)
+    authority_relative = authority_path.relative_to(source).as_posix()
+
+    def fake_git_output(root: Path, *arguments: str) -> str:
+        if arguments == ("status", "--porcelain", "--untracked-files=all"):
+            return ""
+        if arguments == ("rev-parse", "HEAD"):
+            return amendment_execution
+        if arguments == (
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+            amendment_execution,
+        ):
+            return f"{amendment_execution} {successor_source}"
+        if arguments == (
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+            successor_source,
+        ):
+            return f"{successor_source} {formal_execution}"
+        if arguments == ("rev-parse", f"{successor_source}^{{tree}}"):
+            return successor_tree
+        if arguments == (
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            formal_execution,
+            successor_source,
+        ):
+            return "\n".join(
+                (
+                    "M\t.gitattributes",
+                    "M\tscripts/verify_shallow_gbdt_risk_on_breadth_development_1.py",
+                    "M\ttests/test_shallow_gbdt_risk_on_breadth_independent_verifier.py",
+                    "M\ttests/test_shallow_gbdt_risk_on_breadth_formal_launcher.py",
+                )
+            )
+        if arguments == (
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            successor_source,
+            amendment_execution,
+        ):
+            return f"A\t{authority_relative}"
+        raise AssertionError(arguments)
+
+    def fake_git_bytes(root: Path, *arguments: str) -> bytes:
+        if len(arguments) == 2 and arguments[0] == "show":
+            prefix = f"{successor_source}:"
+            if arguments[1].startswith(prefix):
+                return successor_git_blob_bytes[arguments[1].removeprefix(prefix)]
+        if arguments == ("show", f"{amendment_execution}:{authority_relative}"):
+            return authority_raw
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(verifier, "SCRIPT_PATH", verifier_path)
+    monkeypatch.setattr(verifier, "_git_output", fake_git_output)
+    monkeypatch.setattr(verifier, "_git_bytes", fake_git_bytes)
+    formal_authority = {
+        "artifact_sha256": formal_source_authority_sha256,
+        "execution_commit": formal_execution,
+        "verifier_git_blob_sha256": predecessor_verifier_sha256,
+    }
+    return source, formal_authority, formal_completion_sha256, document
+
+
+def test_phase3_post_run_verifier_amendment_binds_successor_and_history(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source, formal_authority, completion_sha256, document = (
+        _post_run_amendment_fixture(monkeypatch, tmp_path)
+    )
+
+    observed = verifier._verified_post_run_verifier_amendment(
+        source,
+        formal_source_authority=formal_authority,
+        formal_completion_sha256=completion_sha256,
+    )
+
+    assert observed["artifact_sha256"] == document["artifact_sha256"]
+    assert (
+        observed["successor_verifier_git_blob_sha256"]
+        == document["successor_verifier_git_blob_sha256"]
+    )
+    assert (
+        observed["successor_git_blobs_sha256"]
+        == document["successor_git_blobs_sha256"]
+    )
+    assert (
+        observed["json_document_size_policy_sha256"]
+        == verifier.EXPECTED_JSON_DOCUMENT_SIZE_POLICY_SHA256
+    )
+
+
+def test_phase3_post_run_verifier_amendment_rejects_other_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source, formal_authority, _completion_sha256, _document = (
+        _post_run_amendment_fixture(monkeypatch, tmp_path)
+    )
+
+    with pytest.raises(
+        verifier.IndependentVerificationError,
+        match="amendment authority",
+    ):
+        verifier._verified_post_run_verifier_amendment(
+            source,
+            formal_source_authority=formal_authority,
+            formal_completion_sha256="8" * 64,
+        )
+
+
+def test_phase3_post_run_verifier_amendment_rejects_successor_test_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source, formal_authority, completion_sha256, _document = (
+        _post_run_amendment_fixture(monkeypatch, tmp_path)
+    )
+    (
+        source / "tests/test_shallow_gbdt_risk_on_breadth_formal_launcher.py"
+    ).write_bytes(b"drifted successor tests\n")
+
+    with pytest.raises(
+        verifier.IndependentVerificationError,
+        match="amendment authority",
+    ):
+        verifier._verified_post_run_verifier_amendment(
+            source,
+            formal_source_authority=formal_authority,
+            formal_completion_sha256=completion_sha256,
+        )
 
 
 def _formal_chain_fixture(
@@ -1992,6 +2518,31 @@ def _formal_chain_fixture(
         verifier,
         "_verified_source_authority",
         lambda root, expected: dict(expected),
+    )
+
+    def synthetic_amendment(
+        root: Path,
+        *,
+        formal_source_authority: dict,
+        formal_completion_sha256: str,
+    ) -> dict:
+        return _synthetic_verifier_amendment_binding(
+            formal_source_authority_sha256=formal_source_authority[
+                "artifact_sha256"
+            ],
+            formal_execution_commit=formal_source_authority[
+                "execution_commit"
+            ],
+            formal_completion_sha256=formal_completion_sha256,
+            predecessor_verifier_git_blob_sha256=formal_source_authority[
+                "verifier_git_blob_sha256"
+            ],
+        )
+
+    monkeypatch.setattr(
+        verifier,
+        "_verified_post_run_verifier_amendment",
+        synthetic_amendment,
     )
     monkeypatch.setattr(
         verifier,

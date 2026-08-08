@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -91,6 +92,25 @@ def _git_bytes(repo: Path, *args: str) -> bytes:
     ).stdout
 
 
+def _formal_predecessor_verifier_source() -> bytes:
+    project_root = Path(__file__).parents[1]
+    authority_root = project_root / launcher.SOURCE_AUTHORITY_RELATIVE_ROOT
+    candidates = sorted(authority_root.glob("*.json"))
+    assert len(candidates) == 1
+    authority = json.loads(candidates[0].read_text(encoding="utf-8"))
+    source_commit = authority["source_commit"]
+    verifier_source = _git_bytes(
+        project_root,
+        "show",
+        f"{source_commit}:{launcher.VERIFIER_GIT_PATH}",
+    )
+    assert (
+        hashlib.sha256(verifier_source).hexdigest()
+        == launcher.EXPECTED_VERIFIER_GIT_BLOB_SHA256
+    )
+    return verifier_source
+
+
 def _source_authority_repository(
     root: Path,
     *,
@@ -103,10 +123,16 @@ def _source_authority_repository(
     verifier_path = root / launcher.VERIFIER_GIT_PATH
     launcher_path.parent.mkdir(parents=True)
     launcher_path.write_bytes(b"synthetic launcher\n")
-    verifier_source = (
-        Path(__file__).parents[1] / launcher.VERIFIER_GIT_PATH
-    ).read_bytes()
-    if mode == "synthetic_verifier":
+    verifier_source = _formal_predecessor_verifier_source()
+    if mode == "live_successor":
+        verifier_source = (
+            Path(__file__).parents[1] / launcher.VERIFIER_GIT_PATH
+        ).read_bytes().replace(b"\r\n", b"\n")
+        assert (
+            hashlib.sha256(verifier_source).hexdigest()
+            != launcher.EXPECTED_VERIFIER_GIT_BLOB_SHA256
+        )
+    elif mode == "synthetic_verifier":
         verifier_source = b"synthetic verifier\n"
     elif mode == "replay_plan_drift":
         marker = b'"direct_callable_allowed": False'
@@ -207,6 +233,7 @@ def test_source_authority_binds_single_parent_c_to_authority_only_d(
     "mode",
     [
         "launcher_blob_drift",
+        "live_successor",
         "synthetic_verifier",
         "replay_plan_drift",
         "tuple_rebind",

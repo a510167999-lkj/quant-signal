@@ -35,6 +35,29 @@ SOURCE_AUTHORITY_RELATIVE_ROOT = Path(
     "docs/research_preregistrations/"
     "shallow_gbdt_risk_on_breadth_development_1_source_authority_v1"
 )
+VERIFIER_AMENDMENT_RELATIVE_ROOT = Path(
+    "docs/research_preregistrations/"
+    "shallow_gbdt_risk_on_breadth_development_1_"
+    "post_run_verifier_amendment_authority_v1"
+)
+VERIFIER_AMENDMENT_SCHEMA = (
+    "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+    "post-run-verifier-amendment-authority/v1"
+)
+VERIFIER_AMENDMENT_GIT_ATTRIBUTES_RULE = (
+    "docs/research_preregistrations/"
+    "shallow_gbdt_risk_on_breadth_development_1_"
+    "post_run_verifier_amendment_authority_v1/*.json -text"
+)
+VERIFIER_AMENDMENT_VERIFIER_GIT_PATH = (
+    "scripts/verify_shallow_gbdt_risk_on_breadth_development_1.py"
+)
+VERIFIER_AMENDMENT_SUCCESSOR_GIT_PATHS = (
+    ".gitattributes",
+    VERIFIER_AMENDMENT_VERIFIER_GIT_PATH,
+    "tests/test_shallow_gbdt_risk_on_breadth_independent_verifier.py",
+    "tests/test_shallow_gbdt_risk_on_breadth_formal_launcher.py",
+)
 EXPECTED_RUN_SPEC_SHA256 = (
     "d27c352ff362710ecdbf58791a5aa95b25aae75a2a25e0c351b7901b26212471"
 )
@@ -133,14 +156,52 @@ MARKET_BREADTH_FILTER_RECEIPT_FIELDS = frozenset(
     }
 )
 HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
-MAX_JSON_BYTES = 64 * 1024 * 1024
+JSON_DOCUMENT_SIZE_POLICY: dict[str, Any] = {
+    "schema_version": (
+        "risk-on-breadth-independent-json-document-size-policy/v1"
+    ),
+    "limits_bytes": {
+        "formal_control": 64 * 1024 * 1024,
+        "runtime_verification": 64 * 1024 * 1024,
+        "result_main": 64 * 1024 * 1024,
+        "result_sidecars": {
+            "features": 64 * 1024 * 1024,
+            "models": 64 * 1024 * 1024,
+            "execution": 512 * 1024 * 1024,
+            "selection": 768 * 1024 * 1024,
+        },
+    },
+}
+EXPECTED_JSON_DOCUMENT_SIZE_POLICY_SHA256 = (
+    "e30af910f48cfb5a95f68cda2defd64597af841cf5911d0b628500105538e216"
+)
+VERIFIER_AMENDMENT_SCOPE = {
+    "point_in_time": True,
+    "development_only": True,
+    "formal_completion_reverification_only": True,
+    "development_statistical_interpretation_allowed": False,
+    "profile_registration_authority": False,
+    "production_recommendation_authority": False,
+    "automatic_trading_authority": False,
+    "production_authority": False,
+    "embargo_consumed": False,
+    "final_oos_consumed": False,
+}
+VERIFIER_AMENDMENT_TOPOLOGY = {
+    "successor_source_parent_is_formal_execution": True,
+    "successor_source_change": "modify_exact_successor_git_blobs_only",
+    "amendment_execution_parent_is_successor_source": True,
+    "amendment_execution_change": (
+        "add_single_verifier_amendment_authority_only"
+    ),
+}
 RECEIPT_SCHEMA = (
     "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
-    "independent-verification-receipt/v1"
+    "independent-verification-receipt/v2"
 )
 STATUS_SCHEMA = (
     "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
-    "independent-verification-status/v1"
+    "independent-verification-status/v2"
 )
 REPLAY_RESULT_SCHEMA = (
     "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
@@ -301,12 +362,70 @@ def _assert_no_reparse(path: Path, label: str) -> os.stat_result:
     return metadata
 
 
-def _read_json_object(path: Path, label: str) -> dict[str, Any]:
-    metadata = _assert_no_reparse(path, label)
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_JSON_BYTES:
+def _json_document_size_limit(document_class: str) -> int:
+    if _sha256(JSON_DOCUMENT_SIZE_POLICY) != (
+        EXPECTED_JSON_DOCUMENT_SIZE_POLICY_SHA256
+    ):
+        raise ValueError("JSON document size policy drifted")
+    limits = JSON_DOCUMENT_SIZE_POLICY["limits_bytes"]
+    if document_class in {
+        "formal_control",
+        "runtime_verification",
+        "result_main",
+    }:
+        value = limits[document_class]
+    elif document_class.startswith("result_sidecar_"):
+        name = document_class.removeprefix("result_sidecar_")
+        sidecars = limits["result_sidecars"]
+        if name not in RESULT_BUNDLE_SIDECAR_SCHEMAS:
+            raise ValueError("JSON document class is invalid")
+        value = sidecars[name]
+    else:
+        raise ValueError("JSON document class is invalid")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("JSON document size policy is invalid")
+    return value
+
+
+def _metadata_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        int(metadata.st_mode),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+    )
+
+
+def _read_json_bytes(
+    path: Path,
+    label: str,
+    *,
+    document_class: str,
+) -> tuple[dict[str, Any], bytes]:
+    limit = _json_document_size_limit(document_class)
+    metadata_before = _assert_no_reparse(path, label)
+    if not stat.S_ISREG(metadata_before.st_mode) or metadata_before.st_size > limit:
         raise ValueError(f"{label} is not a bounded regular file")
     try:
-        raw = path.read_bytes()
+        with path.open("rb") as handle:
+            opened_before = os.fstat(handle.fileno())
+            if _metadata_identity(opened_before) != _metadata_identity(
+                metadata_before
+            ):
+                raise ValueError(f"{label} is not a bounded regular file")
+            raw = handle.read(limit + 1)
+            opened_after = os.fstat(handle.fileno())
+        metadata_after = _assert_no_reparse(path, label)
+        if (
+            len(raw) > limit
+            or len(raw) != opened_before.st_size
+            or _metadata_identity(opened_after)
+            != _metadata_identity(opened_before)
+            or _metadata_identity(metadata_after)
+            != _metadata_identity(metadata_before)
+        ):
+            raise ValueError(f"{label} is not a bounded regular file")
         value = json.loads(
             raw.decode("utf-8"),
             object_pairs_hook=_reject_duplicate_keys,
@@ -315,11 +434,34 @@ def _read_json_object(path: Path, label: str) -> dict[str, Any]:
         raise ValueError(f"{label} is not valid JSON") from exc
     if not isinstance(value, dict):
         raise ValueError(f"{label} is not a JSON object")
+    return value, raw
+
+
+def _read_json_object(
+    path: Path,
+    label: str,
+    *,
+    document_class: str,
+) -> dict[str, Any]:
+    value, _raw = _read_json_bytes(
+        path,
+        label,
+        document_class=document_class,
+    )
     return value
 
 
-def _content_addressed_document(path: Path, label: str) -> dict[str, Any]:
-    document = _read_json_object(path, label)
+def _content_addressed_document(
+    path: Path,
+    label: str,
+    *,
+    document_class: str,
+) -> dict[str, Any]:
+    document = _read_json_object(
+        path,
+        label,
+        document_class=document_class,
+    )
     unsigned = dict(document)
     embedded = _require_sha256(unsigned.pop("artifact_sha256", None), label)
     canonical = _sha256(unsigned)
@@ -579,6 +721,7 @@ def _verify_runtime_verification(
         document = _content_addressed_document(
             entries[0],
             "runtime verification artifact",
+            document_class="runtime_verification",
         )
         return _runtime_envelope(
             document,
@@ -654,6 +797,7 @@ def _load_content_addressed_result_bundle(
         main_document = _content_addressed_document(
             main_path,
             "result bundle main artifact",
+            document_class="result_main",
         )
         strategy = _verified_strategy_binding(
             main_document.get("strategy"),
@@ -710,6 +854,7 @@ def _load_content_addressed_result_bundle(
             document = _content_addressed_document(
                 path,
                 f"result bundle {name} sidecar",
+                document_class=f"result_sidecar_{name}",
             )
             if (
                 document.get("artifact_sha256") != digest
@@ -1763,13 +1908,13 @@ def _read_launcher_json(
     *,
     fields: frozenset[str] | None = None,
 ) -> tuple[dict[str, Any], bytes]:
-    metadata = _assert_no_reparse(path, label)
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_JSON_BYTES:
-        raise ValueError(f"{label} is invalid")
-    raw = path.read_bytes()
     try:
-        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
-    except (UnicodeDecodeError, ValueError) as exc:
+        value, raw = _read_json_bytes(
+            path,
+            label,
+            document_class="formal_control",
+        )
+    except (OSError, TypeError, ValueError) as exc:
         raise ValueError(f"{label} is invalid") from exc
     if (
         not isinstance(value, dict)
@@ -2081,7 +2226,10 @@ def _verified_source_authority(
         entries = _directory_entries(authority_root, "source authority root")
         if len(entries) != 1 or not re.fullmatch(r"[0-9a-f]{64}\.json", entries[0].name):
             raise ValueError("source authority is not unique")
-        document, _raw = _read_launcher_json(entries[0], "source authority")
+        document, authority_raw = _read_launcher_json(
+            entries[0],
+            "source authority",
+        )
         authority_fields = {
             "schema_version",
             "source_commit",
@@ -2105,7 +2253,9 @@ def _verified_source_authority(
         )
         source_commit = str(document.get("source_commit") or "").lower()
         source_tree = str(document.get("source_tree") or "").lower()
-        execution_commit = _git_output(source_root, "rev-parse", "HEAD").lower()
+        execution_commit = str(
+            expected_binding.get("execution_commit") or ""
+        ).lower()
         relative_path = entries[0].relative_to(source_root).as_posix()
         if (
             set(document) != authority_fields
@@ -2115,6 +2265,7 @@ def _verified_source_authority(
             != "ranked-liquidity-shallow-gbdt-risk-on-breadth-source-authority/v1"
             or not HEX_GIT_SHA1.fullmatch(source_commit)
             or not HEX_GIT_SHA1.fullmatch(source_tree)
+            or not HEX_GIT_SHA1.fullmatch(execution_commit)
             or document.get("launcher_git_path")
             != "scripts/run_shallow_gbdt_risk_on_breadth_development_1.py"
             or document.get("verifier_git_path")
@@ -2139,7 +2290,6 @@ def _verified_source_authority(
                 "source_commit_is_only_execution_parent": True,
                 "execution_commit_change": "add_single_source_authority_only",
             }
-            or _git_output(source_root, "status", "--porcelain", "--untracked-files=all")
             or _git_output(source_root, "rev-list", "--parents", "-n", "1", execution_commit).split()
             != [execution_commit, source_commit]
             or _git_output(source_root, "rev-parse", f"{source_commit}^{{tree}}").lower()
@@ -2166,12 +2316,17 @@ def _verified_source_authority(
             "show",
             f"{source_commit}:{document['verifier_git_path']}",
         )
+        authority_blob = _git_bytes(
+            source_root,
+            "show",
+            f"{execution_commit}:{relative_path}",
+        )
         if (
             hashlib.sha256(launcher_blob).hexdigest()
             != document.get("launcher_git_blob_sha256")
             or hashlib.sha256(verifier_blob).hexdigest()
             != document.get("verifier_git_blob_sha256")
-            or verifier_blob != SCRIPT_PATH.read_bytes().replace(b"\r\n", b"\n")
+            or authority_blob != authority_raw
         ):
             raise ValueError("source authority Git blob drifted")
         binding = {
@@ -2194,6 +2349,259 @@ def _verified_source_authority(
         return binding
     except (OSError, TypeError, ValueError) as exc:
         raise IndependentVerificationError("source authority is invalid") from exc
+
+
+def _verified_post_run_verifier_amendment(
+    source_root: Path,
+    *,
+    formal_source_authority: Mapping[str, Any],
+    formal_completion_sha256: str,
+) -> dict[str, Any]:
+    try:
+        _json_document_size_limit("formal_control")
+        authority_root = source_root / VERIFIER_AMENDMENT_RELATIVE_ROOT
+        entries = _directory_entries(
+            authority_root,
+            "post-run verifier amendment authority root",
+        )
+        if (
+            len(entries) != 1
+            or not re.fullmatch(r"[0-9a-f]{64}\.json", entries[0].name)
+        ):
+            raise ValueError("post-run verifier amendment authority is not unique")
+        document, authority_raw = _read_launcher_json(
+            entries[0],
+            "post-run verifier amendment authority",
+        )
+        authority_fields = {
+            "schema_version",
+            "formal_source_authority_sha256",
+            "formal_execution_commit",
+            "formal_completion_sha256",
+            "predecessor_verifier_git_blob_sha256",
+            "successor_source_commit",
+            "successor_source_tree",
+            "successor_verifier_git_path",
+            "successor_verifier_git_blob_sha256",
+            "successor_git_blobs_sha256",
+            "json_document_size_policy",
+            "json_document_size_policy_sha256",
+            "replay_plan_sha256",
+            "scope",
+            "execution_topology",
+            "artifact_sha256",
+        }
+        unsigned = dict(document)
+        artifact_sha256 = _require_sha256(
+            unsigned.pop("artifact_sha256", None),
+            "post-run verifier amendment artifact",
+        )
+        formal_authority_sha256 = _require_sha256(
+            formal_source_authority.get("artifact_sha256"),
+            "formal source authority artifact",
+        )
+        completion_sha256 = _require_sha256(
+            formal_completion_sha256,
+            "formal completion artifact",
+        )
+        predecessor_verifier_sha256 = _require_sha256(
+            formal_source_authority.get("verifier_git_blob_sha256"),
+            "formal predecessor verifier",
+        )
+        formal_execution = str(
+            formal_source_authority.get("execution_commit") or ""
+        ).lower()
+        successor_source = str(
+            document.get("successor_source_commit") or ""
+        ).lower()
+        successor_tree = str(
+            document.get("successor_source_tree") or ""
+        ).lower()
+        successor_git_blobs_value = document.get(
+            "successor_git_blobs_sha256"
+        )
+        if (
+            not isinstance(successor_git_blobs_value, Mapping)
+            or set(successor_git_blobs_value)
+            != set(VERIFIER_AMENDMENT_SUCCESSOR_GIT_PATHS)
+        ):
+            raise ValueError("post-run verifier successor Git blobs are invalid")
+        successor_git_blobs_sha256 = {
+            path: _require_sha256(
+                successor_git_blobs_value.get(path),
+                f"post-run verifier successor Git blob {path}",
+            )
+            for path in VERIFIER_AMENDMENT_SUCCESSOR_GIT_PATHS
+        }
+        amendment_execution = _git_output(
+            source_root,
+            "rev-parse",
+            "HEAD",
+        ).lower()
+        relative_path = entries[0].relative_to(source_root).as_posix()
+        expected_successor_changes = {
+            f"M\t{path}" for path in VERIFIER_AMENDMENT_SUCCESSOR_GIT_PATHS
+        }
+        if (
+            set(document) != authority_fields
+            or artifact_sha256 != _sha256(unsigned)
+            or entries[0].stem != artifact_sha256
+            or document.get("schema_version") != VERIFIER_AMENDMENT_SCHEMA
+            or not HEX_GIT_SHA1.fullmatch(formal_execution)
+            or not HEX_GIT_SHA1.fullmatch(successor_source)
+            or not HEX_GIT_SHA1.fullmatch(successor_tree)
+            or not HEX_GIT_SHA1.fullmatch(amendment_execution)
+            or document.get("formal_source_authority_sha256")
+            != formal_authority_sha256
+            or document.get("formal_execution_commit") != formal_execution
+            or document.get("formal_completion_sha256") != completion_sha256
+            or document.get("predecessor_verifier_git_blob_sha256")
+            != predecessor_verifier_sha256
+            or document.get("successor_verifier_git_path")
+            != VERIFIER_AMENDMENT_VERIFIER_GIT_PATH
+            or document.get("successor_git_blobs_sha256")
+            != successor_git_blobs_sha256
+            or document.get("successor_verifier_git_blob_sha256")
+            != successor_git_blobs_sha256[
+                VERIFIER_AMENDMENT_VERIFIER_GIT_PATH
+            ]
+            or document.get("json_document_size_policy")
+            != JSON_DOCUMENT_SIZE_POLICY
+            or document.get("json_document_size_policy_sha256")
+            != EXPECTED_JSON_DOCUMENT_SIZE_POLICY_SHA256
+            or document.get("replay_plan_sha256")
+            != EXPECTED_REPLAY_PLAN_SHA256
+            or document.get("scope") != VERIFIER_AMENDMENT_SCOPE
+            or document.get("execution_topology")
+            != VERIFIER_AMENDMENT_TOPOLOGY
+            or _git_output(
+                source_root,
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+            )
+            or _git_output(
+                source_root,
+                "rev-list",
+                "--parents",
+                "-n",
+                "1",
+                amendment_execution,
+            ).split()
+            != [amendment_execution, successor_source]
+            or _git_output(
+                source_root,
+                "rev-list",
+                "--parents",
+                "-n",
+                "1",
+                successor_source,
+            ).split()
+            != [successor_source, formal_execution]
+            or _git_output(
+                source_root,
+                "rev-parse",
+                f"{successor_source}^{{tree}}",
+            ).lower()
+            != successor_tree
+            or set(
+                _git_output(
+                    source_root,
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-status",
+                    "-r",
+                    formal_execution,
+                    successor_source,
+                ).splitlines()
+            )
+            != expected_successor_changes
+            or _git_output(
+                source_root,
+                "diff-tree",
+                "--no-commit-id",
+                "--name-status",
+                "-r",
+                successor_source,
+                amendment_execution,
+            ).splitlines()
+            != [f"A\t{relative_path}"]
+        ):
+            raise ValueError("post-run verifier amendment authority drifted")
+        successor_git_blobs = {
+            path: _git_bytes(
+                source_root,
+                "show",
+                f"{successor_source}:{path}",
+            )
+            for path in VERIFIER_AMENDMENT_SUCCESSOR_GIT_PATHS
+        }
+        authority_blob = _git_bytes(
+            source_root,
+            "show",
+            f"{amendment_execution}:{relative_path}",
+        )
+        try:
+            attribute_lines = successor_git_blobs[".gitattributes"].decode(
+                "utf-8"
+            ).splitlines()
+        except UnicodeDecodeError as exc:
+            raise ValueError("post-run verifier attributes are invalid") from exc
+        observed_successor_git_blobs_sha256 = {
+            path: hashlib.sha256(raw).hexdigest()
+            for path, raw in successor_git_blobs.items()
+        }
+        live_successor_git_blobs = {
+            path: (
+                SCRIPT_PATH
+                if path == VERIFIER_AMENDMENT_VERIFIER_GIT_PATH
+                else source_root / path
+            )
+            .read_bytes()
+            .replace(b"\r\n", b"\n")
+            for path in VERIFIER_AMENDMENT_SUCCESSOR_GIT_PATHS
+        }
+        successor_verifier_sha256 = observed_successor_git_blobs_sha256[
+            VERIFIER_AMENDMENT_VERIFIER_GIT_PATH
+        ]
+        if (
+            observed_successor_git_blobs_sha256
+            != successor_git_blobs_sha256
+            or successor_git_blobs != live_successor_git_blobs
+            or attribute_lines.count(VERIFIER_AMENDMENT_GIT_ATTRIBUTES_RULE) != 1
+            or authority_blob != authority_raw
+        ):
+            raise ValueError("post-run verifier amendment Git blob drifted")
+        return {
+            "schema_version": (
+                "formal-post-run-independent-verifier-amendment-binding/v1"
+            ),
+            "artifact_sha256": artifact_sha256,
+            "relative_path": relative_path,
+            "formal_source_authority_sha256": formal_authority_sha256,
+            "formal_execution_commit": formal_execution,
+            "formal_completion_sha256": completion_sha256,
+            "predecessor_verifier_git_blob_sha256": (
+                predecessor_verifier_sha256
+            ),
+            "successor_source_commit": successor_source,
+            "successor_source_tree": successor_tree,
+            "execution_commit": amendment_execution,
+            "successor_verifier_git_blob_sha256": successor_verifier_sha256,
+            "successor_git_blobs_sha256": successor_git_blobs_sha256,
+            "json_document_size_policy": JSON_DOCUMENT_SIZE_POLICY,
+            "json_document_size_policy_sha256": (
+                EXPECTED_JSON_DOCUMENT_SIZE_POLICY_SHA256
+            ),
+            "replay_plan_sha256": EXPECTED_REPLAY_PLAN_SHA256,
+            "scope": VERIFIER_AMENDMENT_SCOPE,
+        }
+    except IndependentVerificationError:
+        raise
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise IndependentVerificationError(
+            "post-run verifier amendment authority is invalid"
+        ) from exc
 
 
 def _runtime_distribution_sha256(attestation: object, label: str) -> str:
@@ -2679,6 +3087,11 @@ def _load_formal_inputs(source_root_value: str | Path) -> dict[str, Any]:
             != source_authority["verifier_git_blob_sha256"]
         ):
             raise ValueError("formal source authority chain drifted")
+        verifier_amendment = _verified_post_run_verifier_amendment(
+            source_root,
+            formal_source_authority=source_authority,
+            formal_completion_sha256=completion_sha256,
+        )
         resource_reference = completion.get("resource_receipt")
         if (
             not isinstance(resource_reference, Mapping)
@@ -2745,6 +3158,7 @@ def _load_formal_inputs(source_root_value: str | Path) -> dict[str, Any]:
         runtime_document = _read_json_object(
             runtime_path,
             "formal runtime verification",
+            document_class="runtime_verification",
         )
         result_bundle = _load_content_addressed_result_bundle(
             run_root,
@@ -2810,6 +3224,7 @@ def _load_formal_inputs(source_root_value: str | Path) -> dict[str, Any]:
             "result_bundle": portable_bundle,
             "formal_runtime_history": formal_history,
             "source_authority": source_authority,
+            "verifier_amendment": verifier_amendment,
             "formal_stdout": formal_stdout,
             "formal_stderr": formal_stderr,
             "file_sha256": {
@@ -3116,7 +3531,11 @@ def _load_replay_bundle(
     )
     if len(entries) != 1:
         raise IndependentVerificationError("replayed runtime verification is not unique")
-    runtime = _read_json_object(entries[0], "replayed runtime verification")
+    runtime = _read_json_object(
+        entries[0],
+        "replayed runtime verification",
+        document_class="runtime_verification",
+    )
     bundle = _load_content_addressed_result_bundle(
         output_dir,
         runtime_verification=runtime,
@@ -3247,6 +3666,8 @@ def _content_addressed_payload(body: Mapping[str, Any]) -> tuple[dict[str, Any],
 
 
 def _formal_chain_fingerprint(inputs: Mapping[str, Any]) -> str:
+    amendment = inputs.get("verifier_amendment")
+    amendment_value = dict(amendment) if isinstance(amendment, Mapping) else {}
     return _sha256(
         {
             "claim": inputs.get("claim"),
@@ -3260,6 +3681,16 @@ def _formal_chain_fingerprint(inputs: Mapping[str, Any]) -> str:
             "result_bundle": inputs.get("result_bundle"),
             "formal_runtime_history": inputs.get("formal_runtime_history"),
             "source_authority": inputs.get("source_authority"),
+            "verifier_amendment": amendment,
+            "verifier_amendment_sha256": amendment_value.get(
+                "artifact_sha256"
+            ),
+            "successor_verifier_git_blob_sha256": amendment_value.get(
+                "successor_verifier_git_blob_sha256"
+            ),
+            "json_document_size_policy_sha256": amendment_value.get(
+                "json_document_size_policy_sha256"
+            ),
             "formal_stdout": inputs.get("formal_stdout"),
             "formal_stderr": inputs.get("formal_stderr"),
             "file_sha256": inputs.get("file_sha256"),
@@ -3286,14 +3717,22 @@ def run(source_root_value: str) -> dict[str, str]:
         raise FileExistsError("independent verification is already claimed")
     source_root = Path(source_root_value).resolve(strict=True)
     python_executable = _assert_project_interpreter(source_root)
+    verifier_amendment = inputs["verifier_amendment"]
     claim = {
         "schema_version": (
             "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
-            "independent-verification-claim/v1"
+            "independent-verification-claim/v2"
         ),
         "pid": os.getpid(),
         "completion_sha256": inputs.get("completion_sha256"),
         "replay_plan_sha256": EXPECTED_REPLAY_PLAN_SHA256,
+        "verifier_amendment_sha256": verifier_amendment["artifact_sha256"],
+        "successor_verifier_git_blob_sha256": verifier_amendment[
+            "successor_verifier_git_blob_sha256"
+        ],
+        "json_document_size_policy_sha256": verifier_amendment[
+            "json_document_size_policy_sha256"
+        ],
         "development_only": True,
         "embargo_consumed": False,
         "final_oos_consumed": False,
@@ -3416,6 +3855,15 @@ def run(source_root_value: str) -> dict[str, str]:
             receipt_body = {
                 **_receipt_body(verification_sha256=verification_sha256),
                 "completion_sha256": inputs["completion_sha256"],
+                "verifier_amendment_sha256": verifier_amendment[
+                    "artifact_sha256"
+                ],
+                "successor_verifier_git_blob_sha256": verifier_amendment[
+                    "successor_verifier_git_blob_sha256"
+                ],
+                "json_document_size_policy_sha256": verifier_amendment[
+                    "json_document_size_policy_sha256"
+                ],
                 "execution_snapshot_sha256": snapshot["snapshot_sha256"],
                 "replay_plan_sha256": EXPECTED_REPLAY_PLAN_SHA256,
                 "frozen_input_copy_root_sha256": frozen_copy["root_sha256"],
@@ -3448,6 +3896,15 @@ def run(source_root_value: str) -> dict[str, str]:
             ),
             "claim_sha256": hashlib.sha256(claim_raw).hexdigest(),
             "completion_sha256": inputs["completion_sha256"],
+            "verifier_amendment_sha256": verifier_amendment[
+                "artifact_sha256"
+            ],
+            "successor_verifier_git_blob_sha256": verifier_amendment[
+                "successor_verifier_git_blob_sha256"
+            ],
+            "json_document_size_policy_sha256": verifier_amendment[
+                "json_document_size_policy_sha256"
+            ],
             "receipt_path": (
                 f"{RECEIPT_ROOT_NAME}/{receipt_sha256}.json"
             ),
@@ -3468,6 +3925,15 @@ def run(source_root_value: str) -> dict[str, str]:
                 ),
                 "claim_sha256": hashlib.sha256(claim_raw).hexdigest(),
                 "completion_sha256": inputs.get("completion_sha256"),
+                "verifier_amendment_sha256": verifier_amendment[
+                    "artifact_sha256"
+                ],
+                "successor_verifier_git_blob_sha256": verifier_amendment[
+                    "successor_verifier_git_blob_sha256"
+                ],
+                "json_document_size_policy_sha256": verifier_amendment[
+                    "json_document_size_policy_sha256"
+                ],
                 "receipt_path": None,
             }
             _write_once(
