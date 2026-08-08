@@ -33,7 +33,7 @@ EXPECTED_PRODUCER_ROOT_SHA256 = (
     "bb833d0bc91720b3bf46b204ffb4d8615a9ec4530b7734d48ee3663bcd1d753f"
 )
 EXPECTED_RUN_SPEC_SHA256 = (
-    "5895e5bff1c53fae96eb27bf403b4af8f23c451d27fa63e9f7105d7aabe24c6d"
+    "6bc468419bacc391db171cd79a5b5e5c1f4e13973a0d708cd8efcd12ac1cc6e7"
 )
 EXPECTED_PROGRESS_SCHEMA = (
     "ranked-liquidity-shallow-gbdt-risk-on-breadth-replay-progress/v1"
@@ -162,6 +162,13 @@ RUN_SPEC: dict[str, Any] = {
         "top_level_interpreter_flags": ["-I", "-S", "-B"],
         "isolated_probe_contract": {
             "interpreter_flags": ["-I", "-S", "-B"],
+            "sys_path": ["workspace", "venv-site-packages"],
+            "pycache_prefix_from_command_line": True,
+        },
+        "formal_child_contract": {
+            "interpreter_flags": ["-I", "-S", "-B"],
+            "entrypoint": "runpy.run_module-app.jobs",
+            "jobs_argument_prefix": ["-m", "app.jobs"],
             "sys_path": ["workspace", "venv-site-packages"],
             "pycache_prefix_from_command_line": True,
         },
@@ -500,6 +507,54 @@ def _isolated_probe_command(
         preamble + code,
         json.dumps(source_paths, ensure_ascii=False),
         *arguments,
+    ]
+
+
+_ISOLATED_APP_JOBS_DRIVER = r'''
+import json
+import runpy
+import sys
+
+sys.path[:0] = json.loads(sys.argv.pop(1))
+if sys.argv[1:3] != ["-m", "app.jobs"]:
+    raise SystemExit(64)
+sys.argv = ["app.jobs", *sys.argv[3:]]
+runpy.run_module("app.jobs", run_name="__main__", alter_sys=True)
+'''
+
+
+def _formal_research_command(
+    python_executable: Path,
+    *,
+    environment: Mapping[str, str],
+) -> list[str]:
+    contract = RUN_SPEC["runtime_contract"]["formal_child_contract"]
+    pycache_prefix = environment.get("PYTHONPYCACHEPREFIX")
+    if (
+        contract
+        != {
+            "interpreter_flags": ["-I", "-S", "-B"],
+            "entrypoint": "runpy.run_module-app.jobs",
+            "jobs_argument_prefix": ["-m", "app.jobs"],
+            "sys_path": ["workspace", "venv-site-packages"],
+            "pycache_prefix_from_command_line": True,
+        }
+        or not isinstance(pycache_prefix, str)
+        or not Path(pycache_prefix).is_absolute()
+        or Path(pycache_prefix).exists()
+    ):
+        raise RuntimeError("formal research child contract is invalid")
+    site_packages = python_executable.resolve().parent.parent / "Lib/site-packages"
+    source_paths = [str(WORKSPACE.resolve()), str(site_packages.resolve())]
+    return [
+        str(python_executable),
+        *contract["interpreter_flags"],
+        "-X",
+        f"pycache_prefix={pycache_prefix}",
+        "-c",
+        _ISOLATED_APP_JOBS_DRIVER,
+        json.dumps(source_paths, ensure_ascii=False),
+        *_command_arguments(),
     ]
 
 
@@ -1378,11 +1433,9 @@ def _completion_payload(
     runtime_verification: Mapping[str, Any] | None,
     runtime_verification_content_addressed: bool,
     launcher_error_type: str | None,
+    command_sha256: str,
 ) -> dict[str, Any]:
     immutable_inputs_unchanged = postflight == preflight
-    command_sha256 = _sha256(
-        {"tokens": [str((WORKSPACE / ".venv/Scripts/python.exe").resolve()), *_command_arguments()]}
-    )
     resource_ok = bool(
         resource_receipt
         and resource_receipt.get("schema_version")
@@ -1572,7 +1625,10 @@ def _main(argv: Sequence[str] | None = None) -> int:
     completion_path = output_dir / "formal_run.completion.json"
     failure_path = output_dir / "formal_run.failure.json"
     preflight_path = output_dir / "formal_run.preflight.json"
-    command = [str(python_executable), *_command_arguments()]
+    command = _formal_research_command(
+        python_executable,
+        environment=environment,
+    )
     command_sha256 = _sha256({"tokens": command})
     resource_receipt: Mapping[str, Any] | None = None
     postflight: Mapping[str, Any] | None = None
@@ -1611,6 +1667,9 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     "executable": str(python_executable),
                     "arguments": _command_arguments(),
                     "command_sha256": command_sha256,
+                    "execution_contract": RUN_SPEC["runtime_contract"][
+                        "formal_child_contract"
+                    ],
                     "runtime_environment_attestation_sha256": preflight[
                         "runtime_attestation"
                     ]["root_sha256"],
@@ -1689,6 +1748,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
             runtime_verification_content_addressed
         ),
         launcher_error_type=launcher_error_type,
+        command_sha256=command_sha256,
     )
     _write_json_once(completion_path, completion)
     if completion["result_available"] is not True:

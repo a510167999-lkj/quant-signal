@@ -67,7 +67,7 @@ def test_formal_risk_on_breadth_run_spec_is_frozen_and_development_only() -> Non
     launcher._assert_frozen_run_spec()
 
     assert launcher.RUN_SPEC_SHA256 == (
-        "5895e5bff1c53fae96eb27bf403b4af8f23c451d27fa63e9f7105d7aabe24c6d"
+        "6bc468419bacc391db171cd79a5b5e5c1f4e13973a0d708cd8efcd12ac1cc6e7"
     )
     assert launcher.EXPECTED_STRATEGY_SHA256 == (
         "9b3df2039a3d39b999fd15856c5e8460fe23212b13217625bd21727018adfd19"
@@ -130,6 +130,13 @@ def test_formal_risk_on_breadth_run_spec_is_frozen_and_development_only() -> Non
         "sys_path": ["workspace", "venv-site-packages"],
         "pycache_prefix_from_command_line": True,
     }
+    assert launcher.RUN_SPEC["runtime_contract"]["formal_child_contract"] == {
+        "interpreter_flags": ["-I", "-S", "-B"],
+        "entrypoint": "runpy.run_module-app.jobs",
+        "jobs_argument_prefix": ["-m", "app.jobs"],
+        "sys_path": ["workspace", "venv-site-packages"],
+        "pycache_prefix_from_command_line": True,
+    }
     assert launcher.RUN_SPEC["runtime_contract"]["launcher_entrypoint"] == (
         "direct-source-file"
     )
@@ -162,6 +169,67 @@ def test_formal_risk_on_breadth_run_spec_is_frozen_and_development_only() -> Non
 
 def test_formal_command_is_exactly_the_frozen_argument_vector() -> None:
     assert launcher._command_arguments() == EXPECTED_ARGUMENTS
+
+
+def test_formal_research_child_uses_isolated_runpy_app_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / "__init__.py").write_text("", encoding="utf-8")
+    (app_dir / "jobs.py").write_text(
+        "import json\n"
+        "import sys\n"
+        "print(json.dumps({\n"
+        "    'argv': sys.argv[1:],\n"
+        "    'site_loaded': 'site' in sys.modules,\n"
+        "    'isolated': sys.flags.isolated,\n"
+        "    'no_site': sys.flags.no_site,\n"
+        "    'dont_write_bytecode': sys.flags.dont_write_bytecode,\n"
+        "}, sort_keys=True))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(launcher, "WORKSPACE", tmp_path)
+    runtime_temp = tmp_path / "runtime-temp"
+    environment = launcher._minimal_child_environment(
+        os.environ,
+        python_executable=Path(sys.executable),
+        temp_dir=runtime_temp,
+    )
+    command = launcher._formal_research_command(
+        Path(sys.executable),
+        environment=environment,
+    )
+
+    assert command[:7] == [
+        sys.executable,
+        "-I",
+        "-S",
+        "-B",
+        "-X",
+        f"pycache_prefix={environment['PYTHONPYCACHEPREFIX']}",
+        "-c",
+    ]
+    assert "runpy.run_module" in command[7]
+    assert command[-len(EXPECTED_ARGUMENTS) :] == EXPECTED_ARGUMENTS
+
+    completed = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    observed = json.loads(completed.stdout)
+    assert observed == {
+        "argv": EXPECTED_ARGUMENTS[2:],
+        "site_loaded": False,
+        "isolated": 1,
+        "no_site": 1,
+        "dont_write_bytecode": 1,
+    }
 
 
 def test_minimal_child_environment_does_not_inherit_secrets(tmp_path: Path) -> None:
