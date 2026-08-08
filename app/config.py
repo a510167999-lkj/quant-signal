@@ -6,6 +6,8 @@ from typing import List
 
 
 def _load_env_file() -> None:
+    if os.getenv("DISABLE_ENV_FILE", "").strip() == "1":
+        return
     if "pytest" in sys.modules and os.getenv("LOAD_ENV_IN_TESTS", "").strip() != "1":
         return
     env_path = Path(".env")

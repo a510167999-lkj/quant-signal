@@ -4564,6 +4564,12 @@ def _shallow_gbdt_risk_on_breadth_producer_binding() -> dict[str, Any]:
         "risk_on_breadth_module_sha256": hashlib.sha256(
             Path(risk_on_breadth.__file__).read_bytes()
         ).hexdigest(),
+        "config_module_sha256": hashlib.sha256(
+            Path(__file__).with_name("config.py").read_bytes()
+        ).hexdigest(),
+        "formal_dispatch_module_sha256": hashlib.sha256(
+            Path(__file__).with_name("jobs.py").read_bytes()
+        ).hexdigest(),
         "risk_on_breadth_strategy_sha256": (
             risk_on_breadth._SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC_SHA256
         ),

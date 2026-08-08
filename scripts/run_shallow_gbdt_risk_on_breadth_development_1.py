@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from contextvars import ContextVar
 import ctypes
 from ctypes import wintypes
 from datetime import datetime, timezone
@@ -29,10 +30,10 @@ EXPECTED_STRATEGY_SHA256 = (
     "9b3df2039a3d39b999fd15856c5e8460fe23212b13217625bd21727018adfd19"
 )
 EXPECTED_PRODUCER_ROOT_SHA256 = (
-    "2c8530853a5d906dae2e6fa9895aa0a620d93a870d3bfd9dabada30444013f22"
+    "bb833d0bc91720b3bf46b204ffb4d8615a9ec4530b7734d48ee3663bcd1d753f"
 )
 EXPECTED_RUN_SPEC_SHA256 = (
-    "30585397473d61fec12e07669ec4edb22f6c4f6b44e1351047d1c4c07b9a62b2"
+    "5895e5bff1c53fae96eb27bf403b4af8f23c451d27fa63e9f7105d7aabe24c6d"
 )
 EXPECTED_PROGRESS_SCHEMA = (
     "ranked-liquidity-shallow-gbdt-risk-on-breadth-replay-progress/v1"
@@ -49,6 +50,10 @@ PROGRESS_FILE_NAME = (
 )
 HEX_ARTIFACT = re.compile(r"^[0-9a-f]{64}\.json$")
 HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_CURRENT_ATTEMPT_OWNERSHIP: ContextVar[tuple[Path, str] | None] = ContextVar(
+    "current_formal_attempt_ownership",
+    default=None,
+)
 
 RUN_SPEC: dict[str, Any] = {
     "schema_version": (
@@ -110,6 +115,16 @@ RUN_SPEC: dict[str, Any] = {
                 },
             ],
         },
+        "transitive_binding": {
+            "schema_version": "formal-transitive-input-binding/v1",
+            "current_pool_audit": {
+                "authority_path_field": "temporal_contract_path",
+                "path_field": "current_pool_development_audit_path",
+                "sha256_field": (
+                    "expected_current_pool_development_audit_sha256"
+                ),
+            },
+        },
     },
     "development_partition": {
         "start_date": "2024-07-05",
@@ -122,6 +137,7 @@ RUN_SPEC: dict[str, Any] = {
         "environment_policy": "minimal-research-environment/v1",
         "inherit_parent_environment": False,
         "required_environment": {
+            "DISABLE_ENV_FILE": "1",
             "PYTHONHASHSEED": "0",
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -134,6 +150,22 @@ RUN_SPEC: dict[str, Any] = {
             "pypdf",
             "xgboost",
         ],
+        "pycache_policy": {
+            "environment_key": "PYTHONPYCACHEPREFIX",
+            "relative_to_runtime_temp": "pycache",
+            "must_not_preexist": True,
+        },
+        "bootstrap_contract": {
+            "interpreter_flags": ["-I", "-S", "-B"],
+            "site_import_before_job_assignment": False,
+        },
+        "top_level_interpreter_flags": ["-I", "-S", "-B"],
+        "isolated_probe_contract": {
+            "interpreter_flags": ["-I", "-S", "-B"],
+            "sys_path": ["workspace", "venv-site-packages"],
+            "pycache_prefix_from_command_line": True,
+        },
+        "launcher_entrypoint": "direct-source-file",
     },
     "resource_contract": {
         "memory_policy": "unbounded",
@@ -144,6 +176,10 @@ RUN_SPEC: dict[str, Any] = {
         "ledger_relative_path": (
             "data/research_attempts/"
             "risk_on_breadth_development_1.formal_attempt.json"
+        ),
+        "terminal_relative_path": (
+            "data/research_attempts/"
+            "risk_on_breadth_development_1.formal_attempt.terminal.json"
         ),
         "max_formal_attempts": 1,
         "ledger_outside_run_root": True,
@@ -248,6 +284,10 @@ def _assert_frozen_run_spec() -> None:
             "data/research_attempts/"
             "risk_on_breadth_development_1.formal_attempt.json"
         ),
+        "terminal_relative_path": (
+            "data/research_attempts/"
+            "risk_on_breadth_development_1.formal_attempt.terminal.json"
+        ),
         "max_formal_attempts": 1,
         "ledger_outside_run_root": True,
     }:
@@ -273,6 +313,42 @@ def _safe_workspace_path(workspace: Path, relative: Any, label: str) -> Path:
     except (OSError, ValueError) as exc:
         raise RuntimeError(f"{label} path is invalid") from exc
     return resolved
+
+
+def _assert_transitive_input_binding(
+    workspace: Path,
+    inputs: Mapping[str, Any],
+) -> None:
+    policy = inputs.get("transitive_binding")
+    if policy != RUN_SPEC["inputs"]["transitive_binding"]:
+        raise RuntimeError("formal transitive input binding differs")
+    binding = policy["current_pool_audit"]
+    temporal_path = _safe_workspace_path(
+        workspace,
+        inputs.get(binding["authority_path_field"]),
+        binding["authority_path_field"],
+    )
+    audit_path = _safe_workspace_path(
+        workspace,
+        inputs.get(binding["path_field"]),
+        binding["path_field"],
+    )
+    try:
+        temporal = json.loads(temporal_path.read_text(encoding="utf-8"))
+        audit = temporal["development_evidence"]["current_pool_coverage_audit"]
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise RuntimeError("formal transitive input binding differs") from exc
+    expected_relative = inputs[binding["path_field"]]
+    expected_sha256 = inputs[binding["sha256_field"]]
+    if (
+        not isinstance(audit, dict)
+        or audit.get("path") != expected_relative
+        or audit.get("canonical_sha256") != expected_sha256
+        or not HEX_SHA256.fullmatch(str(expected_sha256 or ""))
+        or audit_path
+        != _safe_workspace_path(workspace, audit.get("path"), "current-pool audit")
+    ):
+        raise RuntimeError("formal transitive input binding differs")
 
 
 def _is_reparse(path: Path) -> bool:
@@ -360,6 +436,10 @@ def _minimal_child_environment(
         raise RuntimeError("Windows system root is unavailable")
     resolved_python = python_executable.resolve()
     resolved_temp = temp_dir.resolve()
+    pycache_policy = RUN_SPEC["runtime_contract"]["pycache_policy"]
+    pycache_prefix = resolved_temp / pycache_policy["relative_to_runtime_temp"]
+    if pycache_policy["must_not_preexist"] is not True or pycache_prefix.exists():
+        raise RuntimeError("formal runtime pycache prefix is not empty")
     required = dict(RUN_SPEC["runtime_contract"]["required_environment"])
     path_parts = [
         str(resolved_python.parent),
@@ -377,9 +457,50 @@ def _minimal_child_environment(
         "WINDIR": str(Path(system_root)),
         "COMSPEC": str(Path(system_root) / "System32" / "cmd.exe"),
         "PATH": os.pathsep.join(normalized_paths),
+        pycache_policy["environment_key"]: str(pycache_prefix),
         "TEMP": str(resolved_temp),
         "TMP": str(resolved_temp),
     }
+
+
+def _isolated_probe_command(
+    python_executable: Path,
+    *,
+    environment: Mapping[str, str],
+    code: str,
+    arguments: Sequence[str],
+) -> list[str]:
+    contract = RUN_SPEC["runtime_contract"]["isolated_probe_contract"]
+    pycache_prefix = environment.get("PYTHONPYCACHEPREFIX")
+    if (
+        contract
+        != {
+            "interpreter_flags": ["-I", "-S", "-B"],
+            "sys_path": ["workspace", "venv-site-packages"],
+            "pycache_prefix_from_command_line": True,
+        }
+        or not isinstance(pycache_prefix, str)
+        or not Path(pycache_prefix).is_absolute()
+        or Path(pycache_prefix).exists()
+    ):
+        raise RuntimeError("formal isolated probe contract is invalid")
+    site_packages = python_executable.resolve().parent.parent / "Lib/site-packages"
+    source_paths = [str(WORKSPACE.resolve()), str(site_packages.resolve())]
+    preamble = (
+        "import json\n"
+        "import sys\n"
+        "sys.path[:0] = json.loads(sys.argv.pop(1))\n"
+    )
+    return [
+        str(python_executable),
+        *contract["interpreter_flags"],
+        "-X",
+        f"pycache_prefix={pycache_prefix}",
+        "-c",
+        preamble + code,
+        json.dumps(source_paths, ensure_ascii=False),
+        *arguments,
+    ]
 
 
 def risk_on_breadth_producer_binding(
@@ -392,12 +513,18 @@ def risk_on_breadth_producer_binding(
         "from app import audited_pit_continuous_ridge_oof as ridge\n"
         "from app import audited_pit_shallow_gbdt_risk_on_breadth as risk\n"
         "print(json.dumps({\n"
+        "'site_loaded': 'site' in sys.modules,\n"
         "'strategy_sha256': risk._SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC_SHA256,\n"
         "'producer_binding': ridge._shallow_gbdt_risk_on_breadth_producer_binding(),\n"
         "}, ensure_ascii=False, sort_keys=True))\n"
     )
     completed = subprocess.run(
-        [str(python_executable), "-c", code],
+        _isolated_probe_command(
+            python_executable,
+            environment=environment,
+            code="import sys\n" + code,
+            arguments=[],
+        ),
         cwd=WORKSPACE,
         env=dict(environment),
         check=True,
@@ -408,6 +535,7 @@ def risk_on_breadth_producer_binding(
     binding = json.loads(completed.stdout)
     if (
         not isinstance(binding, dict)
+        or binding.get("site_loaded") is not False
         or binding.get("strategy_sha256") != EXPECTED_STRATEGY_SHA256
         or not isinstance(binding.get("producer_binding"), dict)
         or binding["producer_binding"].get("root_sha256")
@@ -467,6 +595,7 @@ print(json.dumps({
     "implementation": platform.python_implementation(),
     "python_version": platform.python_version(),
     "cache_tag": sys.implementation.cache_tag,
+    "site_loaded": "site" in sys.modules,
     "platform": platform.platform(),
     "executable": str(executable),
     "executable_sha256": file_hash(executable),
@@ -476,7 +605,12 @@ print(json.dumps({
 }, sort_keys=True))
 '''
     completed = subprocess.run(
-        [str(python_executable), "-c", probe, json.dumps(distributions)],
+        _isolated_probe_command(
+            python_executable,
+            environment=environment,
+            code=probe,
+            arguments=[json.dumps(distributions)],
+        ),
         cwd=WORKSPACE,
         env=dict(environment),
         check=True,
@@ -489,6 +623,7 @@ print(json.dumps({
     if (
         not isinstance(value, dict)
         or value.get("schema_version") != "formal-python-runtime-attestation/v1"
+        or value.get("site_loaded") is not False
         or not HEX_SHA256.fullmatch(str(value.get("executable_sha256") or ""))
         or not HEX_SHA256.fullmatch(str(value.get("base_executable_sha256") or ""))
         or not isinstance(observed_distributions, list)
@@ -517,7 +652,7 @@ def _reserve_single_attempt(
     ledger_path: Path,
     output_dir: Path,
     claim: Mapping[str, Any],
-) -> None:
+) -> str:
     resolved_ledger = ledger_path.resolve(strict=False)
     resolved_output = output_dir.resolve(strict=False)
     try:
@@ -526,11 +661,55 @@ def _reserve_single_attempt(
         pass
     else:
         raise ValueError("formal attempt ledger must be outside output root")
+    claim_sha256 = hashlib.sha256(
+        _canonical_bytes(dict(claim)) + b"\n"
+    ).hexdigest()
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         _write_json_once(ledger_path, claim)
     except FileExistsError as exc:
         raise FileExistsError("formal risk-on breadth attempt is already claimed") from exc
+    return claim_sha256
+
+
+def _write_attempt_terminal(
+    path: Path,
+    *,
+    status: str,
+    attempt_path: Path,
+    completion_path: Path | None,
+    failure_path: Path | None,
+    error_type: str | None,
+) -> None:
+    if status not in {"completed", "failed"}:
+        raise ValueError("formal attempt terminal status is invalid")
+    _write_json_once(
+        path,
+        {
+            "schema_version": "formal-single-attempt-terminal/v1",
+            "status": status,
+            "finished_at_utc": utc_now(),
+            "attempt_claim_sha256": sha256_file(attempt_path),
+            "completion_sha256": (
+                sha256_file(completion_path)
+                if completion_path is not None and completion_path.is_file()
+                else None
+            ),
+            "failure_sha256": (
+                sha256_file(failure_path)
+                if failure_path is not None and failure_path.is_file()
+                else None
+            ),
+            "error_type": error_type,
+            "development_only": True,
+            "embargo_consumed": False,
+            "final_oos_consumed": False,
+            "profile_registration_authority": False,
+            "production_recommendation_authority": False,
+            "automatic_trading_authority": False,
+            "production_authority": False,
+        },
+    )
 
 
 def _command_arguments() -> list[str]:
@@ -738,21 +917,7 @@ class _WindowsJob:
         self.close()
 
 
-def run_unbounded_command(
-    *,
-    command: list[str],
-    cwd: Path,
-    stdout_path: Path,
-    stderr_path: Path,
-    environment: Mapping[str, str],
-) -> dict[str, Any]:
-    if not command or any(not isinstance(token, str) or not token for token in command):
-        raise ValueError("unbounded research command is invalid")
-    if stdout_path.exists() or stderr_path.exists() or stdout_path == stderr_path:
-        raise ValueError("unbounded research output paths are invalid")
-    started_at = utc_now()
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    bootstrap = r'''
+_GATED_BOOTSTRAP = r'''
 import ctypes
 from ctypes import wintypes
 import json
@@ -768,6 +933,42 @@ if kernel32.WaitForSingleObject(event, 0xFFFFFFFF) != 0:
 command = json.loads(sys.argv[2])
 raise SystemExit(subprocess.call(command, close_fds=True))
 '''
+
+
+def _gated_bootstrap_command(
+    command: list[str],
+    *,
+    event_value: int,
+) -> list[str]:
+    if not command or any(not isinstance(token, str) or not token for token in command):
+        raise ValueError("unbounded research command is invalid")
+    flags = RUN_SPEC["runtime_contract"]["bootstrap_contract"][
+        "interpreter_flags"
+    ]
+    return [
+        command[0],
+        *flags,
+        "-c",
+        _GATED_BOOTSTRAP,
+        str(event_value),
+        json.dumps(command, ensure_ascii=False),
+    ]
+
+
+def run_unbounded_command(
+    *,
+    command: list[str],
+    cwd: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    environment: Mapping[str, str],
+) -> dict[str, Any]:
+    if not command or any(not isinstance(token, str) or not token for token in command):
+        raise ValueError("unbounded research command is invalid")
+    if stdout_path.exists() or stderr_path.exists() or stdout_path == stderr_path:
+        raise ValueError("unbounded research output paths are invalid")
+    started_at = utc_now()
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     process: subprocess.Popen[Any] | None = None
     assigned = False
     event_handle: Any = None
@@ -786,13 +987,7 @@ raise SystemExit(subprocess.call(command, close_fds=True))
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.lpAttributeList = {"handle_list": [event_value]}
             process = subprocess.Popen(
-                [
-                    command[0],
-                    "-c",
-                    bootstrap,
-                    str(event_value),
-                    json.dumps(command, ensure_ascii=False),
-                ],
+                _gated_bootstrap_command(command, event_value=event_value),
                 cwd=str(cwd),
                 env=dict(environment),
                 shell=False,
@@ -1039,6 +1234,90 @@ def _runtime_verification(output_dir: Path) -> tuple[dict[str, Any] | None, bool
     }, True
 
 
+def _result_bundle(
+    output_dir: Path,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool]:
+    main, main_verified = _result_artifact(output_dir)
+    verification, runtime_verified = _runtime_verification(output_dir)
+    if not main_verified or not runtime_verified or main is None or verification is None:
+        return None, None, False
+    try:
+        main_path = output_dir / main["path"]
+        main_envelope = _content_addressed_document(main_path)
+        verification_path = output_dir / "verifications" / verification["path"]
+        verification_envelope = _content_addressed_document(verification_path)
+        if main_envelope is None or verification_envelope is None:
+            return None, None, False
+        main_document = main_envelope["document"]
+        verification_document = verification_envelope["document"]
+        sidecar_refs = main_document.get("sidecars")
+        sidecar_hashes = verification_document.get("sidecar_artifact_sha256")
+        expected_names = {"features", "models", "execution", "selection"}
+        if (
+            not isinstance(sidecar_refs, dict)
+            or set(sidecar_refs) != expected_names
+            or not isinstance(sidecar_hashes, dict)
+            or set(sidecar_hashes) != expected_names
+            or verification_document.get("main_artifact_sha256")
+            != main["canonical_artifact_sha256"]
+        ):
+            return None, None, False
+        sidecar_dir = output_dir / "sidecars"
+        if (
+            not sidecar_dir.is_dir()
+            or _is_reparse(sidecar_dir)
+            or any(_is_reparse(path) for path in sidecar_dir.iterdir())
+        ):
+            return None, None, False
+        expected_files = {f"{sidecar_hashes[name]}.json" for name in expected_names}
+        actual_entries = list(sidecar_dir.iterdir())
+        if (
+            any(not path.is_file() for path in actual_entries)
+            or {path.name for path in actual_entries} != expected_files
+        ):
+            return None, None, False
+        schemas = {
+            name: (
+                "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+                f"{name}-sidecar/v1"
+            )
+            for name in expected_names
+        }
+        verified_hashes: dict[str, str] = {}
+        for name in sorted(expected_names):
+            digest = sidecar_hashes[name]
+            reference = sidecar_refs[name]
+            if (
+                not HEX_SHA256.fullmatch(str(digest or ""))
+                or reference
+                != {
+                    "artifact_sha256": digest,
+                    "relative_path": f"sidecars/{digest}.json",
+                }
+            ):
+                return None, None, False
+            envelope = _content_addressed_document(sidecar_dir / f"{digest}.json")
+            if envelope is None:
+                return None, None, False
+            document = envelope["document"]
+            if (
+                envelope["canonical_artifact_sha256"] != digest
+                or document.get("schema_version") != schemas[name]
+                or document.get("strategy_sha256") != EXPECTED_STRATEGY_SHA256
+                or document.get("source") != main_document.get("source")
+                or document.get("producer_code") != main_document.get("producer_code")
+            ):
+                return None, None, False
+            verified_hashes[name] = digest
+        return (
+            {**main, "sidecar_artifact_sha256": verified_hashes},
+            verification,
+            True,
+        )
+    except (KeyError, OSError, TypeError, ValueError):
+        return None, None, False
+
+
 def _validated_expected_commit(value: str) -> str:
     expected = value.strip().lower()
     if not re.fullmatch(r"[0-9a-f]{40}", expected):
@@ -1053,6 +1332,7 @@ def _preflight(
     environment: Mapping[str, str],
 ) -> dict[str, Any]:
     _assert_frozen_run_spec()
+    _assert_transitive_input_binding(WORKSPACE, RUN_SPEC["inputs"])
     current_commit = git_output("rev-parse", "HEAD").lower()
     if current_commit != expected_commit:
         raise RuntimeError("formal risk-on breadth commit drifted")
@@ -1179,23 +1459,57 @@ def _completion_payload(
     }
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _assert_direct_entrypoint(
+    package: str | None,
+    script_path: Path,
+    workspace: Path,
+) -> None:
+    expected_path = (workspace.resolve() / LAUNCHER_GIT_PATH).resolve()
+    if package not in {None, ""} or script_path.resolve() != expected_path:
+        raise RuntimeError(
+            "formal launcher must run as the direct committed source file"
+        )
+
+
+def _assert_top_level_interpreter(flags: Any) -> None:
+    if RUN_SPEC["runtime_contract"]["top_level_interpreter_flags"] != [
+        "-I",
+        "-S",
+        "-B",
+    ] or any(
+        getattr(flags, name, 0) != 1
+        for name in (
+            "isolated",
+            "no_site",
+            "ignore_environment",
+            "dont_write_bytecode",
+        )
+    ):
+        raise RuntimeError(
+            "formal launcher requires the isolated no-site interpreter"
+        )
+
+
+def _main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     expected_commit = _validated_expected_commit(args.expected_commit)
-    if __package__ != "scripts" or SCRIPT_PATH.parents[1] != WORKSPACE.resolve():
-        raise RuntimeError("formal launcher must run as the committed scripts module")
+    _assert_direct_entrypoint(__package__, SCRIPT_PATH, WORKSPACE)
+    _assert_top_level_interpreter(sys.flags)
     if os.name != "nt":
         raise RuntimeError("formal risk-on breadth launcher requires Windows")
 
     os.chdir(WORKSPACE)
     output_dir = WORKSPACE / RELATIVE_OUTPUT_DIR
     attempt_path = WORKSPACE / RUN_SPEC["attempt_contract"]["ledger_relative_path"]
+    terminal_path = WORKSPACE / RUN_SPEC["attempt_contract"][
+        "terminal_relative_path"
+    ]
     if output_dir.exists():
         raise FileExistsError("formal risk-on breadth output directory already exists")
-    if attempt_path.exists():
+    if attempt_path.exists() or terminal_path.exists():
         raise FileExistsError("formal risk-on breadth attempt is already claimed")
     python_executable = (WORKSPACE / ".venv/Scripts/python.exe").resolve()
     runtime_temp_dir = output_dir / "runtime_tmp"
@@ -1228,13 +1542,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         "production_authority": False,
         "automatic_trading_authority": False,
     }
-    _reserve_single_attempt(
+    claim_sha256 = _reserve_single_attempt(
         ledger_path=attempt_path,
         output_dir=output_dir,
         claim=claim,
     )
-    output_dir.mkdir(parents=False)
-    runtime_temp_dir.mkdir()
+    _CURRENT_ATTEMPT_OWNERSHIP.set(
+        (attempt_path.resolve(strict=False), claim_sha256)
+    )
+    try:
+        output_dir.mkdir(parents=False)
+        runtime_temp_dir.mkdir()
+    except BaseException as exc:
+        _write_attempt_terminal(
+            terminal_path,
+            status="failed",
+            attempt_path=attempt_path,
+            completion_path=None,
+            failure_path=None,
+            error_type=type(exc).__name__,
+        )
+        return 1
 
     progress_path = output_dir / PROGRESS_FILE_NAME
     stdout_path = output_dir / "formal_run.stdout.log"
@@ -1308,6 +1636,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _write_json_once(resource_receipt_path, resource_receipt)
             except BaseException as exc:
                 launcher_error_type = type(exc).__name__
+                resource_receipt = None
             try:
                 postflight = _preflight(
                     expected_commit=expected_commit,
@@ -1322,10 +1651,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         preflight = preliminary
 
     progress = _safe_progress(progress_path)
-    result_artifact, artifact_content_addressed = _result_artifact(output_dir)
-    runtime_verification, runtime_verification_content_addressed = (
-        _runtime_verification(output_dir)
+    result_artifact, runtime_verification, bundle_content_addressed = (
+        _result_bundle(output_dir)
     )
+    artifact_content_addressed = bundle_content_addressed
+    runtime_verification_content_addressed = bundle_content_addressed
     if not launch_path.exists():
         _write_json_once(
             launch_path,
@@ -1383,8 +1713,62 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "production_authority": False,
             },
         )
+        _write_attempt_terminal(
+            terminal_path,
+            status="failed",
+            attempt_path=attempt_path,
+            completion_path=completion_path,
+            failure_path=failure_path,
+            error_type=launcher_error_type,
+        )
         return 1
+    _write_attempt_terminal(
+        terminal_path,
+        status="completed",
+        attempt_path=attempt_path,
+        completion_path=completion_path,
+        failure_path=None,
+        error_type=None,
+    )
     return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    token = _CURRENT_ATTEMPT_OWNERSHIP.set(None)
+    try:
+        return _main(argv)
+    except BaseException as exc:
+        attempt_path = WORKSPACE / RUN_SPEC["attempt_contract"][
+            "ledger_relative_path"
+        ]
+        terminal_path = WORKSPACE / RUN_SPEC["attempt_contract"][
+            "terminal_relative_path"
+        ]
+        ownership = _CURRENT_ATTEMPT_OWNERSHIP.get()
+        if (
+            ownership is not None
+            and ownership[0] == attempt_path.resolve(strict=False)
+            and attempt_path.is_file()
+            and sha256_file(attempt_path) == ownership[1]
+            and not terminal_path.exists()
+        ):
+            output_dir = WORKSPACE / RELATIVE_OUTPUT_DIR
+            completion_path = output_dir / "formal_run.completion.json"
+            failure_path = output_dir / "formal_run.failure.json"
+            _write_attempt_terminal(
+                terminal_path,
+                status="failed",
+                attempt_path=attempt_path,
+                completion_path=(
+                    completion_path if completion_path.is_file() else None
+                ),
+                failure_path=failure_path if failure_path.is_file() else None,
+                error_type=type(exc).__name__,
+            )
+            return 1
+        raise
+    finally:
+        _CURRENT_ATTEMPT_OWNERSHIP.reset(token)
 
 
 def cli(argv: Sequence[str] | None = None) -> int:

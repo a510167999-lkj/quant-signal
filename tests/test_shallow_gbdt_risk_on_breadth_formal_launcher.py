@@ -4,6 +4,8 @@ from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
+import py_compile
+import subprocess
 import sys
 import time
 from types import SimpleNamespace
@@ -65,13 +67,13 @@ def test_formal_risk_on_breadth_run_spec_is_frozen_and_development_only() -> Non
     launcher._assert_frozen_run_spec()
 
     assert launcher.RUN_SPEC_SHA256 == (
-        "51e51fcb51534526d8c8800c7d4f2459c44b011633b150f1d29c0ded7cde236c"
+        "5895e5bff1c53fae96eb27bf403b4af8f23c451d27fa63e9f7105d7aabe24c6d"
     )
     assert launcher.EXPECTED_STRATEGY_SHA256 == (
         "9b3df2039a3d39b999fd15856c5e8460fe23212b13217625bd21727018adfd19"
     )
     assert launcher.EXPECTED_PRODUCER_ROOT_SHA256 == (
-        "2c8530853a5d906dae2e6fa9895aa0a620d93a870d3bfd9dabada30444013f22"
+        "bb833d0bc91720b3bf46b204ffb4d8615a9ec4530b7734d48ee3663bcd1d753f"
     )
     assert launcher.RUN_SPEC["resource_contract"] == {
         "memory_policy": "unbounded",
@@ -117,6 +119,16 @@ def test_formal_risk_on_breadth_run_spec_is_frozen_and_development_only() -> Non
     assert launcher.RUN_SPEC["runtime_contract"]["bootstrap_contract"] == {
         "interpreter_flags": ["-I", "-S", "-B"],
         "site_import_before_job_assignment": False,
+    }
+    assert launcher.RUN_SPEC["runtime_contract"]["top_level_interpreter_flags"] == [
+        "-I",
+        "-S",
+        "-B",
+    ]
+    assert launcher.RUN_SPEC["runtime_contract"]["isolated_probe_contract"] == {
+        "interpreter_flags": ["-I", "-S", "-B"],
+        "sys_path": ["workspace", "venv-site-packages"],
+        "pycache_prefix_from_command_line": True,
     }
     assert launcher.RUN_SPEC["runtime_contract"]["launcher_entrypoint"] == (
         "direct-source-file"
@@ -438,6 +450,81 @@ def test_completed_result_bundle_rejects_missing_sidecar_files(tmp_path: Path) -
     assert verified is False
 
 
+def test_completed_result_bundle_accepts_exact_real_sidecar_set(tmp_path: Path) -> None:
+    sidecar_dir = tmp_path / "sidecars"
+    sidecar_dir.mkdir()
+    source = {"schema_version": "synthetic-source/v1"}
+    producer_code = {"root_sha256": launcher.EXPECTED_PRODUCER_ROOT_SHA256}
+    sidecar_sha256: dict[str, str] = {}
+    for name in ("features", "models", "execution", "selection"):
+        _path, digest = _write_content_addressed_json(
+            sidecar_dir,
+            {
+                "schema_version": (
+                    "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+                    f"{name}-sidecar/v1"
+                ),
+                "strategy_sha256": launcher.EXPECTED_STRATEGY_SHA256,
+                "source": source,
+                "producer_code": producer_code,
+            },
+        )
+        sidecar_sha256[name] = digest
+    main_payload = {
+        "schema_version": launcher.EXPECTED_RESULT_SCHEMA,
+        "strategy_sha256": launcher.EXPECTED_STRATEGY_SHA256,
+        "strategy": {"strategy_sha256": launcher.EXPECTED_STRATEGY_SHA256},
+        "source": source,
+        "producer_code": producer_code,
+        "sidecars": {
+            name: {
+                "artifact_sha256": digest,
+                "relative_path": f"sidecars/{digest}.json",
+            }
+            for name, digest in sidecar_sha256.items()
+        },
+        "scope": {
+            "development_only": True,
+            "embargo_consumed": False,
+            "final_oos_consumed": False,
+        },
+    }
+    _main_path, main_sha256 = _write_content_addressed_json(tmp_path, main_payload)
+    verification_dir = tmp_path / "verifications"
+    verification_dir.mkdir()
+    verification_payload = {
+        "schema_version": launcher.EXPECTED_RESULT_VERIFICATION_SCHEMA,
+        "strategy_sha256": launcher.EXPECTED_STRATEGY_SHA256,
+        "producer_root_sha256": launcher.EXPECTED_PRODUCER_ROOT_SHA256,
+        "main_artifact_sha256": main_sha256,
+        "sidecar_artifact_sha256": sidecar_sha256,
+        "checks": {
+            "independent_rolling_oof_replay": True,
+            "content_addressing_verified": True,
+            "probability_score_contract_verified": True,
+            "shared_positive_candidate_pool_verified": True,
+            "strict_outcome_membership_verified": True,
+            "independent_selection_replay": True,
+            "independent_sweep_and_gate_replay": True,
+            "market_breadth_filter_replayed": True,
+        },
+        "market_breadth_feature_binding_receipt_sha256": "f" * 64,
+        "verified": True,
+    }
+    verification_payload["receipt_sha256"] = launcher._sha256(
+        verification_payload
+    )
+    _write_content_addressed_json(verification_dir, verification_payload)
+
+    main, verification, verified = launcher._result_bundle(tmp_path)
+
+    assert verified is True
+    assert main is not None
+    assert main["sidecar_artifact_sha256"] == sidecar_sha256
+    assert verification is not None
+    assert verification["main_artifact_sha256"] == main_sha256
+
+
 def test_runtime_attestation_binds_minimal_environment_and_distributions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -447,6 +534,7 @@ def test_runtime_attestation_binds_minimal_environment_and_distributions(
         "implementation": "CPython",
         "python_version": "3.11.5",
         "cache_tag": "cpython-311",
+        "site_loaded": False,
         "platform": "synthetic-win32",
         "executable": str(tmp_path / "python.exe"),
         "executable_sha256": "a" * 64,
@@ -472,6 +560,7 @@ def test_runtime_attestation_binds_minimal_environment_and_distributions(
     )
     environment = {
         "PYTHONHASHSEED": "0",
+        "PYTHONPYCACHEPREFIX": str(tmp_path / "fresh-pycache"),
         "VPS_RUNTIME_ROLE": "local_research",
     }
 
@@ -482,7 +571,7 @@ def test_runtime_attestation_binds_minimal_environment_and_distributions(
 
     assert attestation["environment"] == {
         "schema_version": "minimal-research-environment/v1",
-        "keys": ["PYTHONHASHSEED", "VPS_RUNTIME_ROLE"],
+        "keys": ["PYTHONHASHSEED", "PYTHONPYCACHEPREFIX", "VPS_RUNTIME_ROLE"],
         "environment_sha256": launcher._sha256(environment),
         "inherit_parent_environment": False,
     }
@@ -576,6 +665,11 @@ def _sandbox_launcher_main(
     monkeypatch.setattr(launcher, "SCRIPT_PATH", script_path)
     monkeypatch.setattr(launcher, "RELATIVE_OUTPUT_DIR", relative_output)
     monkeypatch.setattr(launcher, "__package__", "")
+    monkeypatch.setattr(
+        launcher,
+        "_assert_top_level_interpreter",
+        lambda _flags: None,
+    )
     monkeypatch.setattr(launcher, "_preflight", lambda **_kwargs: dict(preflight))
     monkeypatch.setattr(
         launcher,
@@ -629,6 +723,15 @@ def test_main_success_stays_pending_independent_verification(
         launcher,
         "_runtime_verification",
         lambda _path: (
+            {"main_artifact_sha256": artifact_sha256},
+            True,
+        ),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_result_bundle",
+        lambda _path: (
+            {"canonical_artifact_sha256": artifact_sha256},
             {"main_artifact_sha256": artifact_sha256},
             True,
         ),
@@ -692,6 +795,11 @@ def test_main_failure_records_only_stable_error_type_and_no_authority(
         "_runtime_verification",
         lambda _path: (None, False),
     )
+    monkeypatch.setattr(
+        launcher,
+        "_result_bundle",
+        lambda _path: (None, None, False),
+    )
 
     def fail_run(**_kwargs: object) -> dict:
         raise RuntimeError("synthetic detail must not enter authority records")
@@ -728,6 +836,126 @@ def test_main_failure_records_only_stable_error_type_and_no_authority(
     assert attempt_terminal["error_type"] == "RuntimeError"
 
 
+@pytest.mark.parametrize("failure_target", ["output", "runtime_tmp"])
+def test_main_directory_creation_failure_writes_external_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure_target: str,
+) -> None:
+    relative_output, _preflight = _sandbox_launcher_main(monkeypatch, tmp_path)
+    output_dir = tmp_path / relative_output
+    target = (
+        output_dir if failure_target == "output" else output_dir / "runtime_tmp"
+    ).resolve(strict=False)
+    original_mkdir = Path.mkdir
+
+    def fail_selected_mkdir(
+        self: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        if self.resolve(strict=False) == target:
+            raise PermissionError("synthetic sensitive mkdir detail")
+        original_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", fail_selected_mkdir)
+
+    original_cwd = Path.cwd()
+    try:
+        result = launcher.main(["--expected-commit", "1" * 40])
+    finally:
+        os.chdir(original_cwd)
+
+    attempt_path = (
+        tmp_path / launcher.RUN_SPEC["attempt_contract"]["ledger_relative_path"]
+    )
+    terminal_path = (
+        tmp_path / launcher.RUN_SPEC["attempt_contract"]["terminal_relative_path"]
+    )
+    terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+    assert result == 1
+    assert attempt_path.is_file()
+    assert terminal["status"] == "failed"
+    assert terminal["attempt_claim_sha256"] == launcher.sha256_file(attempt_path)
+    assert terminal["completion_sha256"] is None
+    assert terminal["failure_sha256"] is None
+    assert terminal["error_type"] == "PermissionError"
+    assert "sensitive mkdir detail" not in json.dumps(terminal)
+    assert terminal["production_authority"] is False
+
+
+@pytest.mark.parametrize(
+    ("failing_name", "completion_exists"),
+    [
+        ("formal_run.resource_receipt.json", True),
+        ("formal_run.completion.json", False),
+        ("formal_run.failure.json", True),
+    ],
+)
+def test_claimed_attempt_write_failure_still_writes_external_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failing_name: str,
+    completion_exists: bool,
+) -> None:
+    relative_output, _preflight = _sandbox_launcher_main(monkeypatch, tmp_path)
+    monkeypatch.setattr(launcher, "_safe_progress", lambda _path: None)
+    monkeypatch.setattr(
+        launcher,
+        "_result_bundle",
+        lambda _path: (None, None, False),
+    )
+
+    def fake_run_unbounded_command(**kwargs: object) -> dict:
+        command = kwargs["command"]
+        Path(kwargs["stdout_path"]).write_bytes(b"")
+        Path(kwargs["stderr_path"]).write_bytes(b"")
+        return {
+            "schema_version": "research-unbounded-job-object-command-receipt/v1",
+            "exit_code": 0,
+            "child_reaped": True,
+            "job_object_assigned": True,
+            "process_tree_drained": True,
+            "memory_limit_enforced": False,
+            "command_sha256": launcher._sha256({"tokens": command}),
+        }
+
+    monkeypatch.setattr(
+        launcher,
+        "run_unbounded_command",
+        fake_run_unbounded_command,
+    )
+    original_write_json_once = launcher._write_json_once
+
+    def fail_selected_write(path: Path, payload: dict) -> None:
+        if path.name == failing_name:
+            raise PermissionError("synthetic sensitive write detail")
+        original_write_json_once(path, payload)
+
+    monkeypatch.setattr(launcher, "_write_json_once", fail_selected_write)
+    original_cwd = Path.cwd()
+    try:
+        result = launcher.main(["--expected-commit", "1" * 40])
+    finally:
+        os.chdir(original_cwd)
+
+    run_root = tmp_path / relative_output
+    terminal_path = (
+        tmp_path / launcher.RUN_SPEC["attempt_contract"]["terminal_relative_path"]
+    )
+    terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+    assert result == 1
+    assert terminal["status"] == "failed"
+    assert terminal["error_type"] == "PermissionError"
+    if completion_exists:
+        assert terminal["completion_sha256"] is not None
+    else:
+        assert terminal["completion_sha256"] is None
+    assert "sensitive write detail" not in json.dumps(terminal)
+    assert (run_root / "formal_run.completion.json").exists() is completion_exists
+    assert terminal["production_authority"] is False
+
+
 def test_cli_masks_preflight_exception_details(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -752,13 +980,14 @@ def test_single_attempt_ledger_is_external_and_write_once(tmp_path: Path) -> Non
         "run_spec_sha256": launcher.RUN_SPEC_SHA256,
     }
 
-    launcher._reserve_single_attempt(
+    claim_sha256 = launcher._reserve_single_attempt(
         ledger_path=ledger_path,
         output_dir=output_dir,
         claim=claim,
     )
 
     assert ledger_path.is_file()
+    assert claim_sha256 == launcher.sha256_file(ledger_path)
     assert not output_dir.exists()
     assert json.loads(ledger_path.read_text(encoding="utf-8")) == claim
     with pytest.raises(FileExistsError, match="already claimed"):
@@ -770,6 +999,39 @@ def test_single_attempt_ledger_is_external_and_write_once(tmp_path: Path) -> Non
 
 
 @pytest.mark.skipif(os.name != "nt", reason="正式 launcher 只允许 Windows")
+def test_preexisting_attempt_is_never_closed_by_a_later_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _sandbox_launcher_main(monkeypatch, tmp_path)
+    attempt_path = (
+        tmp_path / launcher.RUN_SPEC["attempt_contract"]["ledger_relative_path"]
+    )
+    terminal_path = (
+        tmp_path / launcher.RUN_SPEC["attempt_contract"]["terminal_relative_path"]
+    )
+    attempt_path.parent.mkdir(parents=True)
+    launcher._write_json_once(
+        attempt_path,
+        {
+            "schema_version": "formal-single-attempt-claim/v1",
+            "expected_commit": "0" * 40,
+        },
+    )
+    original_bytes = attempt_path.read_bytes()
+
+    original_cwd = Path.cwd()
+    try:
+        with pytest.raises(FileExistsError, match="already claimed"):
+            launcher.main(["--expected-commit", "1" * 40])
+    finally:
+        os.chdir(original_cwd)
+
+    assert attempt_path.read_bytes() == original_bytes
+    assert not terminal_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="formal launcher only supports Windows")
 def test_unbounded_command_requires_assigned_and_drained_job_object(
     tmp_path: Path,
 ) -> None:
@@ -808,6 +1070,52 @@ def test_gated_bootstrap_disables_site_before_job_assignment() -> None:
 
     assert command[:5] == [sys.executable, "-I", "-S", "-B", "-c"]
     assert "import site" not in command[5]
+
+
+def test_top_level_launcher_requires_isolated_no_site_interpreter() -> None:
+    good = SimpleNamespace(
+        isolated=1,
+        no_site=1,
+        ignore_environment=1,
+        dont_write_bytecode=1,
+    )
+    launcher._assert_top_level_interpreter(good)
+
+    for field in (
+        "isolated",
+        "no_site",
+        "ignore_environment",
+        "dont_write_bytecode",
+    ):
+        bad = SimpleNamespace(**vars(good))
+        setattr(bad, field, 0)
+        with pytest.raises(RuntimeError, match="isolated no-site interpreter"):
+            launcher._assert_top_level_interpreter(bad)
+
+
+def test_preflight_probe_uses_isolated_no_site_source_paths(
+    tmp_path: Path,
+) -> None:
+    pycache_prefix = tmp_path / "fresh-pycache"
+    command = launcher._isolated_probe_command(
+        Path(sys.executable),
+        environment={"PYTHONPYCACHEPREFIX": str(pycache_prefix)},
+        code="print('probe')",
+        arguments=["synthetic"],
+    )
+
+    assert command[:7] == [
+        sys.executable,
+        "-I",
+        "-S",
+        "-B",
+        "-X",
+        f"pycache_prefix={pycache_prefix}",
+        "-c",
+    ]
+    assert "sys.path[:0]" in command[7]
+    assert "sys.argv.pop(1)" in command[7]
+    assert command[-1] == "synthetic"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="正式 launcher 只允许 Windows")
@@ -887,6 +1195,7 @@ def test_risk_on_breadth_producer_binding_rejects_valid_format_drift(
     tmp_path: Path,
 ) -> None:
     payload = {
+        "site_loaded": False,
         "strategy_sha256": launcher.EXPECTED_STRATEGY_SHA256,
         "producer_binding": {"root_sha256": "0" * 64},
     }
@@ -899,7 +1208,10 @@ def test_risk_on_breadth_producer_binding_rejects_valid_format_drift(
     with pytest.raises(RuntimeError, match="producer binding drifted"):
         launcher.risk_on_breadth_producer_binding(
             tmp_path / "python.exe",
-            environment={"PYTHONHASHSEED": "0"},
+            environment={
+                "PYTHONHASHSEED": "0",
+                "PYTHONPYCACHEPREFIX": str(tmp_path / "fresh-pycache"),
+            },
         )
 
 
@@ -938,14 +1250,73 @@ def test_path_environment_attempt_and_commit_boundaries_fail_closed(
 
 
 def test_formal_entrypoint_requires_direct_source_execution(tmp_path: Path) -> None:
-    scripts_dir = tmp_path / "scripts"
-    scripts_dir.mkdir()
-    script_path = scripts_dir / "launcher.py"
+    script_path = tmp_path / launcher.LAUNCHER_GIT_PATH
+    script_path.parent.mkdir()
     script_path.write_text("synthetic", encoding="utf-8")
+    rogue_path = script_path.with_name("rogue.py")
+    rogue_path.write_text("synthetic", encoding="utf-8")
 
     launcher._assert_direct_entrypoint("", script_path, tmp_path)
     with pytest.raises(RuntimeError, match="direct committed source file"):
         launcher._assert_direct_entrypoint("scripts", script_path, tmp_path)
+    with pytest.raises(RuntimeError, match="direct committed source file"):
+        launcher._assert_direct_entrypoint("", rogue_path, tmp_path)
+
+
+def test_module_entrypoint_is_rejected_before_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _sandbox_launcher_main(monkeypatch, tmp_path)
+    monkeypatch.setattr(launcher, "__package__", "scripts")
+
+    with pytest.raises(RuntimeError, match="direct committed source file"):
+        launcher.main(["--expected-commit", "1" * 40])
+
+    assert not (
+        tmp_path / launcher.RUN_SPEC["attempt_contract"]["ledger_relative_path"]
+    ).exists()
+
+
+def test_fresh_pycache_prefix_prevents_ignored_legacy_pyc_execution(
+    tmp_path: Path,
+) -> None:
+    module_path = tmp_path / "synthetic_module.py"
+    module_path.write_text("VALUE = 'evil'\n", encoding="utf-8")
+    py_compile.compile(
+        str(module_path),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    )
+    module_path.write_text("VALUE = 'good'\n", encoding="utf-8")
+
+    inherited = dict(os.environ)
+    inherited.pop("PYTHONPYCACHEPREFIX", None)
+    legacy = subprocess.run(
+        [sys.executable, "-c", "import synthetic_module; print(synthetic_module.VALUE)"],
+        cwd=tmp_path,
+        env=inherited,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert legacy.stdout.strip() == "evil"
+
+    runtime_temp = tmp_path / "runtime-temp"
+    environment = launcher._minimal_child_environment(
+        os.environ,
+        python_executable=Path(sys.executable),
+        temp_dir=runtime_temp,
+    )
+    isolated = subprocess.run(
+        [sys.executable, "-c", "import synthetic_module; print(synthetic_module.VALUE)"],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert isolated.stdout.strip() == "good"
 
 
 def test_input_attestation_rejects_empty_tree_and_duplicate_paths(
