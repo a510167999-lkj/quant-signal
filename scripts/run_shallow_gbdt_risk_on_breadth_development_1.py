@@ -21,6 +21,10 @@ from typing import Any, Iterator, Mapping, Sequence
 SCRIPT_PATH = Path(__file__).resolve()
 WORKSPACE = Path(r"E:\AI workspace\quant-signal-lkj")
 LAUNCHER_GIT_PATH = "scripts/run_shallow_gbdt_risk_on_breadth_development_1.py"
+PYCACHE_BLOCKER_RELATIVE = Path("scripts/formal_pycache_blocker_v1")
+EXPECTED_PYCACHE_BLOCKER_SHA256 = (
+    "78c73250a8d2c984878b6dbc5e7775a261be07d81e36af54a0fad8c926d98576"
+)
 RELATIVE_OUTPUT_DIR = Path(
     "data/research_runs/"
     "audited_pit_ranked_liquidity_shallow_gbdt_risk_on_breadth_"
@@ -33,7 +37,7 @@ EXPECTED_PRODUCER_ROOT_SHA256 = (
     "bb833d0bc91720b3bf46b204ffb4d8615a9ec4530b7734d48ee3663bcd1d753f"
 )
 EXPECTED_RUN_SPEC_SHA256 = (
-    "6bc468419bacc391db171cd79a5b5e5c1f4e13973a0d708cd8efcd12ac1cc6e7"
+    "d27c352ff362710ecdbf58791a5aa95b25aae75a2a25e0c351b7901b26212471"
 )
 EXPECTED_PROGRESS_SCHEMA = (
     "ranked-liquidity-shallow-gbdt-risk-on-breadth-replay-progress/v1"
@@ -50,7 +54,7 @@ PROGRESS_FILE_NAME = (
 )
 HEX_ARTIFACT = re.compile(r"^[0-9a-f]{64}\.json$")
 HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_CURRENT_ATTEMPT_OWNERSHIP: ContextVar[tuple[Path, str] | None] = ContextVar(
+_CURRENT_ATTEMPT_OWNERSHIP: ContextVar[tuple[Path, str, Any] | None] = ContextVar(
     "current_formal_attempt_ownership",
     default=None,
 )
@@ -152,21 +156,28 @@ RUN_SPEC: dict[str, Any] = {
         ],
         "pycache_policy": {
             "environment_key": "PYTHONPYCACHEPREFIX",
-            "relative_to_runtime_temp": "pycache",
-            "must_not_preexist": True,
+            "blocker_relative_path": PYCACHE_BLOCKER_RELATIVE.as_posix(),
+            "expected_blocker_sha256": EXPECTED_PYCACHE_BLOCKER_SHA256,
+            "must_be_regular_file": True,
+            "deny_write_during_run": True,
         },
         "bootstrap_contract": {
             "interpreter_flags": ["-I", "-S", "-B"],
             "site_import_before_job_assignment": False,
+            "pycache_prefix_from_command_line": True,
         },
-        "top_level_interpreter_flags": ["-I", "-S", "-B"],
-        "isolated_probe_contract": {
+        "top_level_interpreter_contract": {
             "interpreter_flags": ["-I", "-S", "-B"],
+            "pycache_prefix_from_command_line": True,
+            "blocker_relative_path": PYCACHE_BLOCKER_RELATIVE.as_posix(),
+        },
+        "isolated_probe_contract": {
+            "interpreter_flags": ["-S", "-B", "-P"],
             "sys_path": ["workspace", "venv-site-packages"],
             "pycache_prefix_from_command_line": True,
         },
         "formal_child_contract": {
-            "interpreter_flags": ["-I", "-S", "-B"],
+            "interpreter_flags": ["-S", "-B", "-P"],
             "entrypoint": "runpy.run_module-app.jobs",
             "jobs_argument_prefix": ["-m", "app.jobs"],
             "sys_path": ["workspace", "venv-site-packages"],
@@ -228,12 +239,29 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _write_json_once(path: Path, payload: Mapping[str, Any]) -> None:
+def _write_json_once(path: Path, payload: Mapping[str, Any]) -> str:
     raw = _canonical_bytes(dict(payload)) + b"\n"
-    with path.open("xb") as handle:
-        handle.write(raw)
-        handle.flush()
-        os.fsync(handle.fileno())
+    digest = hashlib.sha256(raw).hexdigest()
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{os.urandom(12).hex()}.tmp"
+    )
+    try:
+        with temporary.open("xb") as handle:
+            written = handle.write(raw)
+            if written != len(raw):
+                raise OSError("write-once JSON short write")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            raise
+        return digest
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def git_output(*args: str) -> str:
@@ -311,12 +339,23 @@ def _safe_workspace_path(workspace: Path, relative: Any, label: str) -> Path:
     if not isinstance(relative, str) or not relative:
         raise RuntimeError(f"{label} path is invalid")
     relative_path = Path(relative)
-    if relative_path.is_absolute():
+    if relative_path.is_absolute() or any(
+        part in {"", ".", ".."} for part in relative_path.parts
+    ):
         raise RuntimeError(f"{label} path is invalid")
     root = workspace.resolve(strict=True)
     try:
+        current = root
+        for part in relative_path.parts:
+            current = current / part
+            details = current.lstat()
+            attributes = getattr(details, "st_file_attributes", 0)
+            if current.is_symlink() or attributes & 0x400:
+                raise RuntimeError(f"{label} path contains a reparse point")
         resolved = (root / relative_path).resolve(strict=True)
         resolved.relative_to(root)
+    except RuntimeError:
+        raise
     except (OSError, ValueError) as exc:
         raise RuntimeError(f"{label} path is invalid") from exc
     return resolved
@@ -430,6 +469,30 @@ def frozen_input_attestation(
     return {**body, "root_sha256": _sha256(body)}
 
 
+def _verified_pycache_blocker(workspace: Path) -> Path:
+    policy = RUN_SPEC["runtime_contract"]["pycache_policy"]
+    expected = {
+        "environment_key": "PYTHONPYCACHEPREFIX",
+        "blocker_relative_path": PYCACHE_BLOCKER_RELATIVE.as_posix(),
+        "expected_blocker_sha256": EXPECTED_PYCACHE_BLOCKER_SHA256,
+        "must_be_regular_file": True,
+        "deny_write_during_run": True,
+    }
+    blocker = _safe_workspace_path(
+        workspace,
+        policy.get("blocker_relative_path"),
+        "pycache blocker",
+    )
+    if (
+        policy != expected
+        or not blocker.is_file()
+        or _is_reparse(blocker)
+        or sha256_file(blocker) != EXPECTED_PYCACHE_BLOCKER_SHA256
+    ):
+        raise RuntimeError("formal runtime pycache blocker differs")
+    return blocker
+
+
 def _minimal_child_environment(
     parent: Mapping[str, str],
     *,
@@ -444,9 +507,7 @@ def _minimal_child_environment(
     resolved_python = python_executable.resolve()
     resolved_temp = temp_dir.resolve()
     pycache_policy = RUN_SPEC["runtime_contract"]["pycache_policy"]
-    pycache_prefix = resolved_temp / pycache_policy["relative_to_runtime_temp"]
-    if pycache_policy["must_not_preexist"] is not True or pycache_prefix.exists():
-        raise RuntimeError("formal runtime pycache prefix is not empty")
+    pycache_prefix = _verified_pycache_blocker(WORKSPACE)
     required = dict(RUN_SPEC["runtime_contract"]["required_environment"])
     path_parts = [
         str(resolved_python.parent),
@@ -482,13 +543,13 @@ def _isolated_probe_command(
     if (
         contract
         != {
-            "interpreter_flags": ["-I", "-S", "-B"],
+            "interpreter_flags": ["-S", "-B", "-P"],
             "sys_path": ["workspace", "venv-site-packages"],
             "pycache_prefix_from_command_line": True,
         }
         or not isinstance(pycache_prefix, str)
-        or not Path(pycache_prefix).is_absolute()
-        or Path(pycache_prefix).exists()
+        or Path(pycache_prefix).resolve(strict=True)
+        != _verified_pycache_blocker(WORKSPACE)
     ):
         raise RuntimeError("formal isolated probe contract is invalid")
     site_packages = python_executable.resolve().parent.parent / "Lib/site-packages"
@@ -496,6 +557,9 @@ def _isolated_probe_command(
     preamble = (
         "import json\n"
         "import sys\n"
+        "if (sys.flags.no_site != 1 or sys.flags.safe_path != 1 "
+        "or sys.flags.ignore_environment != 0 "
+        "or sys.flags.dont_write_bytecode != 1): raise SystemExit(65)\n"
         "sys.path[:0] = json.loads(sys.argv.pop(1))\n"
     )
     return [
@@ -512,9 +576,15 @@ def _isolated_probe_command(
 
 _ISOLATED_APP_JOBS_DRIVER = r'''
 import json
+import os
 import runpy
 import sys
 
+if (sys.flags.no_site != 1 or sys.flags.safe_path != 1
+        or sys.flags.ignore_environment != 0
+        or sys.flags.dont_write_bytecode != 1
+        or os.environ.get("PYTHONHASHSEED") != "0"):
+    raise SystemExit(65)
 sys.path[:0] = json.loads(sys.argv.pop(1))
 if sys.argv[1:3] != ["-m", "app.jobs"]:
     raise SystemExit(64)
@@ -533,15 +603,15 @@ def _formal_research_command(
     if (
         contract
         != {
-            "interpreter_flags": ["-I", "-S", "-B"],
+            "interpreter_flags": ["-S", "-B", "-P"],
             "entrypoint": "runpy.run_module-app.jobs",
             "jobs_argument_prefix": ["-m", "app.jobs"],
             "sys_path": ["workspace", "venv-site-packages"],
             "pycache_prefix_from_command_line": True,
         }
         or not isinstance(pycache_prefix, str)
-        or not Path(pycache_prefix).is_absolute()
-        or Path(pycache_prefix).exists()
+        or Path(pycache_prefix).resolve(strict=True)
+        != _verified_pycache_blocker(WORKSPACE)
     ):
         raise RuntimeError("formal research child contract is invalid")
     site_packages = python_executable.resolve().parent.parent / "Lib/site-packages"
@@ -600,6 +670,51 @@ def risk_on_breadth_producer_binding(
     return binding
 
 
+def current_pool_audit_binding(
+    python_executable: Path,
+    *,
+    environment: Mapping[str, str],
+    audit_path: Path,
+    expected_canonical_sha256: str,
+) -> dict[str, Any]:
+    code = (
+        "import json\n"
+        "from app.current_pool_gate import verify_current_pool_audit\n"
+        "value = verify_current_pool_audit(sys.argv[1])\n"
+        "print(json.dumps({\n"
+        "'canonical_sha256': value['canonical_sha256'],\n"
+        "'allowed_symbol_count': len(value['allowed_symbols']),\n"
+        "}, ensure_ascii=False, sort_keys=True))\n"
+    )
+    try:
+        completed = subprocess.run(
+            _isolated_probe_command(
+                python_executable,
+                environment=environment,
+                code="import sys\n" + code,
+                arguments=[str(audit_path.resolve(strict=True))],
+            ),
+            cwd=WORKSPACE,
+            env=dict(environment),
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        binding = json.loads(completed.stdout)
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError) as exc:
+        raise RuntimeError("formal current-pool audit binding differs") from exc
+    if (
+        not isinstance(binding, dict)
+        or set(binding) != {"canonical_sha256", "allowed_symbol_count"}
+        or binding.get("canonical_sha256") != expected_canonical_sha256
+        or not isinstance(binding.get("allowed_symbol_count"), int)
+        or binding["allowed_symbol_count"] <= 0
+    ):
+        raise RuntimeError("formal current-pool audit binding differs")
+    return binding
+
+
 def _runtime_attestation(
     python_executable: Path,
     *,
@@ -651,6 +766,9 @@ print(json.dumps({
     "python_version": platform.python_version(),
     "cache_tag": sys.implementation.cache_tag,
     "site_loaded": "site" in sys.modules,
+    "hash_seed_probe": hash("formal-hash-seed-probe"),
+    "ignore_environment": sys.flags.ignore_environment,
+    "safe_path": sys.flags.safe_path,
     "platform": platform.platform(),
     "executable": str(executable),
     "executable_sha256": file_hash(executable),
@@ -679,6 +797,9 @@ print(json.dumps({
         not isinstance(value, dict)
         or value.get("schema_version") != "formal-python-runtime-attestation/v1"
         or value.get("site_loaded") is not False
+        or value.get("ignore_environment") != 0
+        or value.get("safe_path") is not True
+        or not isinstance(value.get("hash_seed_probe"), int)
         or not HEX_SHA256.fullmatch(str(value.get("executable_sha256") or ""))
         or not HEX_SHA256.fullmatch(str(value.get("base_executable_sha256") or ""))
         or not isinstance(observed_distributions, list)
@@ -702,11 +823,50 @@ print(json.dumps({
     return {**body, "root_sha256": _sha256(body)}
 
 
+def _open_windows_read_lock(path: Path) -> tuple[Any, Any]:
+    if os.name != "nt":
+        raise RuntimeError("formal risk-on breadth launcher requires Windows")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.CreateFileW(
+        str(path.resolve(strict=True)),
+        0x80000000,
+        0x00000001,
+        None,
+        3,
+        0x00000080,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    handle_value = int(handle) if isinstance(handle, int) else int(handle.value)
+    if handle_value == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return kernel32, handle
+
+
+def _close_windows_handle(lock: tuple[Any, Any] | None) -> None:
+    if lock is not None:
+        kernel32, handle = lock
+        kernel32.CloseHandle(handle)
+
+
 def _reserve_single_attempt(
     *,
     ledger_path: Path,
     output_dir: Path,
     claim: Mapping[str, Any],
+    register_ownership: bool = False,
 ) -> str:
     resolved_ledger = ledger_path.resolve(strict=False)
     resolved_output = output_dir.resolve(strict=False)
@@ -724,6 +884,16 @@ def _reserve_single_attempt(
         _write_json_once(ledger_path, claim)
     except FileExistsError as exc:
         raise FileExistsError("formal risk-on breadth attempt is already claimed") from exc
+    if sha256_file(ledger_path) != claim_sha256:
+        raise RuntimeError("formal risk-on breadth claim publication differs")
+    if register_ownership:
+        resolved = ledger_path.resolve(strict=True)
+        _CURRENT_ATTEMPT_OWNERSHIP.set((resolved, claim_sha256, None))
+        handle = _open_windows_read_lock(resolved)
+        if sha256_file(resolved) != claim_sha256:
+            _close_windows_handle(handle)
+            raise RuntimeError("formal risk-on breadth claim ownership differs")
+        _CURRENT_ATTEMPT_OWNERSHIP.set((resolved, claim_sha256, handle))
     return claim_sha256
 
 
@@ -732,19 +902,26 @@ def _write_attempt_terminal(
     *,
     status: str,
     attempt_path: Path,
+    expected_claim_sha256: str,
     completion_path: Path | None,
     failure_path: Path | None,
     error_type: str | None,
 ) -> None:
     if status not in {"completed", "failed"}:
         raise ValueError("formal attempt terminal status is invalid")
+    if (
+        not HEX_SHA256.fullmatch(expected_claim_sha256)
+        or not attempt_path.is_file()
+        or sha256_file(attempt_path) != expected_claim_sha256
+    ):
+        raise RuntimeError("formal attempt claim ownership differs")
     _write_json_once(
         path,
         {
             "schema_version": "formal-single-attempt-terminal/v1",
             "status": status,
             "finished_at_utc": utc_now(),
-            "attempt_claim_sha256": sha256_file(attempt_path),
+            "attempt_claim_sha256": expected_claim_sha256,
             "completion_sha256": (
                 sha256_file(completion_path)
                 if completion_path is not None and completion_path.is_file()
@@ -994,15 +1171,29 @@ def _gated_bootstrap_command(
     command: list[str],
     *,
     event_value: int,
+    pycache_prefix: Path,
 ) -> list[str]:
     if not command or any(not isinstance(token, str) or not token for token in command):
         raise ValueError("unbounded research command is invalid")
-    flags = RUN_SPEC["runtime_contract"]["bootstrap_contract"][
-        "interpreter_flags"
-    ]
+    contract = RUN_SPEC["runtime_contract"]["bootstrap_contract"]
+    if contract != {
+        "interpreter_flags": ["-I", "-S", "-B"],
+        "site_import_before_job_assignment": False,
+        "pycache_prefix_from_command_line": True,
+    }:
+        raise RuntimeError("formal gated bootstrap contract differs")
+    blocker = pycache_prefix.resolve(strict=True)
+    if (
+        not blocker.is_file()
+        or _is_reparse(blocker)
+        or sha256_file(blocker) != EXPECTED_PYCACHE_BLOCKER_SHA256
+    ):
+        raise RuntimeError("formal gated bootstrap pycache blocker differs")
     return [
         command[0],
-        *flags,
+        *contract["interpreter_flags"],
+        "-X",
+        f"pycache_prefix={blocker}",
         "-c",
         _GATED_BOOTSTRAP,
         str(event_value),
@@ -1022,6 +1213,10 @@ def run_unbounded_command(
         raise ValueError("unbounded research command is invalid")
     if stdout_path.exists() or stderr_path.exists() or stdout_path == stderr_path:
         raise ValueError("unbounded research output paths are invalid")
+    pycache_prefix = environment.get("PYTHONPYCACHEPREFIX")
+    if not isinstance(pycache_prefix, str):
+        raise RuntimeError("formal gated bootstrap pycache blocker differs")
+    blocker = Path(pycache_prefix).resolve(strict=True)
     started_at = utc_now()
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     process: subprocess.Popen[Any] | None = None
@@ -1042,7 +1237,11 @@ def run_unbounded_command(
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.lpAttributeList = {"handle_list": [event_value]}
             process = subprocess.Popen(
-                _gated_bootstrap_command(command, event_value=event_value),
+                _gated_bootstrap_command(
+                    command,
+                    event_value=event_value,
+                    pycache_prefix=blocker,
+                ),
                 cwd=str(cwd),
                 env=dict(environment),
                 shell=False,
@@ -1130,39 +1329,18 @@ def _held_frozen_inputs(
 ) -> Iterator[None]:
     if os.name != "nt":
         raise RuntimeError("formal risk-on breadth launcher requires Windows")
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateFileW.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        wintypes.HANDLE,
-    ]
-    kernel32.CreateFileW.restype = wintypes.HANDLE
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    invalid_handle = ctypes.c_void_p(-1).value
-    handles: list[Any] = []
+    handles: list[tuple[Any, Any]] = []
     try:
-        for path in _attested_file_paths(workspace, inputs):
-            handle = kernel32.CreateFileW(
-                str(path),
-                0x80000000,
-                0x00000001,
-                None,
-                3,
-                0x00000080,
-                None,
-            )
-            if handle == invalid_handle:
-                raise ctypes.WinError(ctypes.get_last_error())
-            handles.append(handle)
+        paths = [
+            *_attested_file_paths(workspace, inputs),
+            _verified_pycache_blocker(workspace),
+        ]
+        for path in paths:
+            handles.append(_open_windows_read_lock(path))
         yield
     finally:
         for handle in reversed(handles):
-            kernel32.CloseHandle(handle)
+            _close_windows_handle(handle)
 
 
 def _safe_progress(path: Path) -> dict[str, Any] | None:
@@ -1400,10 +1578,23 @@ def _preflight(
         python_executable,
         environment=environment,
     )
+    audit_binding = current_pool_audit_binding(
+        python_executable,
+        environment=environment,
+        audit_path=_safe_workspace_path(
+            WORKSPACE,
+            RUN_SPEC["inputs"]["current_pool_development_audit_path"],
+            "current-pool audit",
+        ),
+        expected_canonical_sha256=RUN_SPEC["inputs"][
+            "expected_current_pool_development_audit_sha256"
+        ],
+    )
     return {
         "git_commit": current_commit,
         "strategy_sha256": binding["strategy_sha256"],
         "producer_binding": binding["producer_binding"],
+        "current_pool_audit_binding": audit_binding,
         "formal_launcher_sha256": sha256_file(SCRIPT_PATH),
         "formal_launcher_git_blob_sha256": hashlib.sha256(launcher_blob).hexdigest(),
         "run_spec_sha256": RUN_SPEC_SHA256,
@@ -1425,6 +1616,7 @@ def _completion_payload(
     postflight: Mapping[str, Any] | None,
     launch_path: Path,
     attempt_path: Path,
+    expected_claim_sha256: str,
     resource_receipt_path: Path,
     resource_receipt: Mapping[str, Any] | None,
     progress: Mapping[str, Any] | None,
@@ -1435,6 +1627,12 @@ def _completion_payload(
     launcher_error_type: str | None,
     command_sha256: str,
 ) -> dict[str, Any]:
+    if (
+        not HEX_SHA256.fullmatch(expected_claim_sha256)
+        or not attempt_path.is_file()
+        or sha256_file(attempt_path) != expected_claim_sha256
+    ):
+        raise RuntimeError("formal attempt claim ownership differs")
     immutable_inputs_unchanged = postflight == preflight
     resource_ok = bool(
         resource_receipt
@@ -1476,7 +1674,7 @@ def _completion_payload(
         "post_run_preflight": dict(postflight) if postflight is not None else None,
         "immutable_inputs_unchanged": immutable_inputs_unchanged,
         "launch_receipt_sha256": sha256_file(launch_path),
-        "attempt_claim_sha256": sha256_file(attempt_path),
+        "attempt_claim_sha256": expected_claim_sha256,
         "resource_receipt": (
             {
                 "path": resource_receipt_path.name,
@@ -1524,23 +1722,37 @@ def _assert_direct_entrypoint(
         )
 
 
-def _assert_top_level_interpreter(flags: Any) -> None:
-    if RUN_SPEC["runtime_contract"]["top_level_interpreter_flags"] != [
-        "-I",
-        "-S",
-        "-B",
-    ] or any(
+def _assert_top_level_interpreter(
+    flags: Any,
+    *,
+    pycache_prefix: str | None,
+    workspace: Path,
+) -> None:
+    contract = RUN_SPEC["runtime_contract"]["top_level_interpreter_contract"]
+    if contract != {
+        "interpreter_flags": ["-I", "-S", "-B"],
+        "pycache_prefix_from_command_line": True,
+        "blocker_relative_path": PYCACHE_BLOCKER_RELATIVE.as_posix(),
+    } or any(
         getattr(flags, name, 0) != 1
         for name in (
             "isolated",
             "no_site",
             "ignore_environment",
             "dont_write_bytecode",
+            "safe_path",
         )
     ):
         raise RuntimeError(
             "formal launcher requires the isolated no-site interpreter"
         )
+    expected_blocker = _verified_pycache_blocker(workspace)
+    try:
+        observed_blocker = Path(str(pycache_prefix)).resolve(strict=True)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("formal top-level pycache blocker differs") from exc
+    if observed_blocker != expected_blocker:
+        raise RuntimeError("formal top-level pycache blocker differs")
 
 
 def _main(argv: Sequence[str] | None = None) -> int:
@@ -1550,7 +1762,11 @@ def _main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     expected_commit = _validated_expected_commit(args.expected_commit)
     _assert_direct_entrypoint(__package__, SCRIPT_PATH, WORKSPACE)
-    _assert_top_level_interpreter(sys.flags)
+    _assert_top_level_interpreter(
+        sys.flags,
+        pycache_prefix=sys.pycache_prefix,
+        workspace=WORKSPACE,
+    )
     if os.name != "nt":
         raise RuntimeError("formal risk-on breadth launcher requires Windows")
 
@@ -1599,9 +1815,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
         ledger_path=attempt_path,
         output_dir=output_dir,
         claim=claim,
-    )
-    _CURRENT_ATTEMPT_OWNERSHIP.set(
-        (attempt_path.resolve(strict=False), claim_sha256)
+        register_ownership=True,
     )
     try:
         output_dir.mkdir(parents=False)
@@ -1611,6 +1825,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
             terminal_path,
             status="failed",
             attempt_path=attempt_path,
+            expected_claim_sha256=claim_sha256,
             completion_path=None,
             failure_path=None,
             error_type=type(exc).__name__,
@@ -1652,7 +1867,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     "observed_at_utc": started_at,
                     **preflight,
                     "run_spec": RUN_SPEC,
-                    "attempt_claim_sha256": sha256_file(attempt_path),
+                    "attempt_claim_sha256": claim_sha256,
                     "statistical_result_available": False,
                 },
             )
@@ -1738,6 +1953,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
         postflight=postflight,
         launch_path=launch_path,
         attempt_path=attempt_path,
+        expected_claim_sha256=claim_sha256,
         resource_receipt_path=resource_receipt_path,
         resource_receipt=resource_receipt,
         progress=progress,
@@ -1777,6 +1993,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
             terminal_path,
             status="failed",
             attempt_path=attempt_path,
+            expected_claim_sha256=claim_sha256,
             completion_path=completion_path,
             failure_path=failure_path,
             error_type=launcher_error_type,
@@ -1786,6 +2003,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
         terminal_path,
         status="completed",
         attempt_path=attempt_path,
+        expected_claim_sha256=claim_sha256,
         completion_path=completion_path,
         failure_path=None,
         error_type=None,
@@ -1819,6 +2037,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 terminal_path,
                 status="failed",
                 attempt_path=attempt_path,
+                expected_claim_sha256=ownership[1],
                 completion_path=(
                     completion_path if completion_path.is_file() else None
                 ),
@@ -1828,6 +2047,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         raise
     finally:
+        ownership = _CURRENT_ATTEMPT_OWNERSHIP.get()
+        if ownership is not None:
+            _close_windows_handle(ownership[2])
         _CURRENT_ATTEMPT_OWNERSHIP.reset(token)
 
 

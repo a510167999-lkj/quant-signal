@@ -63,11 +63,18 @@ def _write_content_addressed_json(directory: Path, payload: dict) -> tuple[Path,
     return path, digest
 
 
+def _write_pycache_blocker(workspace: Path) -> Path:
+    blocker = workspace / launcher.PYCACHE_BLOCKER_RELATIVE
+    blocker.parent.mkdir(parents=True, exist_ok=True)
+    blocker.write_bytes(b"formal-pycache-prefix-blocker-v1\n")
+    return blocker
+
+
 def test_formal_risk_on_breadth_run_spec_is_frozen_and_development_only() -> None:
     launcher._assert_frozen_run_spec()
 
     assert launcher.RUN_SPEC_SHA256 == (
-        "6bc468419bacc391db171cd79a5b5e5c1f4e13973a0d708cd8efcd12ac1cc6e7"
+        "d27c352ff362710ecdbf58791a5aa95b25aae75a2a25e0c351b7901b26212471"
     )
     assert launcher.EXPECTED_STRATEGY_SHA256 == (
         "9b3df2039a3d39b999fd15856c5e8460fe23212b13217625bd21727018adfd19"
@@ -113,25 +120,28 @@ def test_formal_risk_on_breadth_run_spec_is_frozen_and_development_only() -> Non
     ]
     assert launcher.RUN_SPEC["runtime_contract"]["pycache_policy"] == {
         "environment_key": "PYTHONPYCACHEPREFIX",
-        "relative_to_runtime_temp": "pycache",
-        "must_not_preexist": True,
+        "blocker_relative_path": "scripts/formal_pycache_blocker_v1",
+        "expected_blocker_sha256": launcher.EXPECTED_PYCACHE_BLOCKER_SHA256,
+        "must_be_regular_file": True,
+        "deny_write_during_run": True,
     }
     assert launcher.RUN_SPEC["runtime_contract"]["bootstrap_contract"] == {
         "interpreter_flags": ["-I", "-S", "-B"],
         "site_import_before_job_assignment": False,
+        "pycache_prefix_from_command_line": True,
     }
-    assert launcher.RUN_SPEC["runtime_contract"]["top_level_interpreter_flags"] == [
-        "-I",
-        "-S",
-        "-B",
-    ]
-    assert launcher.RUN_SPEC["runtime_contract"]["isolated_probe_contract"] == {
+    assert launcher.RUN_SPEC["runtime_contract"]["top_level_interpreter_contract"] == {
         "interpreter_flags": ["-I", "-S", "-B"],
+        "pycache_prefix_from_command_line": True,
+        "blocker_relative_path": "scripts/formal_pycache_blocker_v1",
+    }
+    assert launcher.RUN_SPEC["runtime_contract"]["isolated_probe_contract"] == {
+        "interpreter_flags": ["-S", "-B", "-P"],
         "sys_path": ["workspace", "venv-site-packages"],
         "pycache_prefix_from_command_line": True,
     }
     assert launcher.RUN_SPEC["runtime_contract"]["formal_child_contract"] == {
-        "interpreter_flags": ["-I", "-S", "-B"],
+        "interpreter_flags": ["-S", "-B", "-P"],
         "entrypoint": "runpy.run_module-app.jobs",
         "jobs_argument_prefix": ["-m", "app.jobs"],
         "sys_path": ["workspace", "venv-site-packages"],
@@ -194,6 +204,7 @@ def test_formal_research_child_uses_isolated_runpy_app_jobs(
         encoding="utf-8",
     )
     monkeypatch.setattr(launcher, "WORKSPACE", tmp_path)
+    _write_pycache_blocker(tmp_path)
     runtime_temp = tmp_path / "runtime-temp"
     environment = launcher._minimal_child_environment(
         os.environ,
@@ -246,7 +257,10 @@ def test_formal_research_child_uses_isolated_runpy_app_jobs(
     assert observed["hash_probe"] == repeated["hash_probe"]
 
 
-def test_minimal_child_environment_does_not_inherit_secrets(tmp_path: Path) -> None:
+def test_minimal_child_environment_does_not_inherit_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     parent = {
         "SystemRoot": r"C:\Windows",
         "WINDIR": r"C:\Windows",
@@ -256,6 +270,8 @@ def test_minimal_child_environment_does_not_inherit_secrets(tmp_path: Path) -> N
         "UNRELATED_SETTING": "must-not-be-inherited",
     }
 
+    monkeypatch.setattr(launcher, "WORKSPACE", tmp_path)
+    blocker = _write_pycache_blocker(tmp_path)
     environment = launcher._minimal_child_environment(
         parent,
         python_executable=Path(sys.executable),
@@ -268,9 +284,7 @@ def test_minimal_child_environment_does_not_inherit_secrets(tmp_path: Path) -> N
     assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
     assert environment["PYTHONUTF8"] == "1"
     assert environment["DISABLE_ENV_FILE"] == "1"
-    assert environment["PYTHONPYCACHEPREFIX"] == str(
-        (tmp_path / "pycache").resolve()
-    )
+    assert environment["PYTHONPYCACHEPREFIX"] == str(blocker.resolve())
     assert environment["TEMP"] == str(tmp_path.resolve())
     assert environment["TMP"] == str(tmp_path.resolve())
     assert "JIAOCH_TOKEN" not in environment
@@ -410,6 +424,7 @@ def test_held_frozen_inputs_deny_midflight_write(tmp_path: Path) -> None:
     temporal.write_bytes(b"temporal")
     current_pool_audit.write_bytes(b"current-pool")
     (transition / "receipt.json").write_bytes(b"transition")
+    blocker = _write_pycache_blocker(tmp_path)
     inputs = {
         "audited_pit_universe_path": universe.name,
         "temporal_contract_path": temporal.name,
@@ -422,6 +437,8 @@ def test_held_frozen_inputs_deny_midflight_write(tmp_path: Path) -> None:
         assert universe.read_bytes() == b"universe"
         with pytest.raises(PermissionError):
             universe.write_bytes(b"tampered")
+        with pytest.raises(PermissionError):
+            blocker.write_bytes(b"tampered")
 
     universe.write_bytes(b"after-release")
     assert universe.read_bytes() == b"after-release"
@@ -637,6 +654,9 @@ def test_runtime_attestation_binds_minimal_environment_and_distributions(
         "python_version": "3.11.5",
         "cache_tag": "cpython-311",
         "site_loaded": False,
+        "hash_seed_probe": 12345,
+        "ignore_environment": 0,
+        "safe_path": True,
         "platform": "synthetic-win32",
         "executable": str(tmp_path / "python.exe"),
         "executable_sha256": "a" * 64,
@@ -660,9 +680,11 @@ def test_runtime_attestation_binds_minimal_environment_and_distributions(
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(stdout=json.dumps(payload)),
     )
+    monkeypatch.setattr(launcher, "WORKSPACE", tmp_path)
+    blocker = _write_pycache_blocker(tmp_path)
     environment = {
         "PYTHONHASHSEED": "0",
-        "PYTHONPYCACHEPREFIX": str(tmp_path / "fresh-pycache"),
+        "PYTHONPYCACHEPREFIX": str(blocker),
         "VPS_RUNTIME_ROLE": "local_research",
     }
 
@@ -728,6 +750,17 @@ def test_preflight_binds_source_input_runtime_and_producer(
         "_runtime_attestation",
         lambda *_args, **_kwargs: runtime_attestation,
     )
+    audit_binding = {
+        "canonical_sha256": launcher.RUN_SPEC["inputs"][
+            "expected_current_pool_development_audit_sha256"
+        ],
+        "allowed_symbol_count": 1,
+    }
+    monkeypatch.setattr(
+        launcher,
+        "current_pool_audit_binding",
+        lambda *_args, **_kwargs: audit_binding,
+    )
 
     preflight = launcher._preflight(
         expected_commit=expected_commit,
@@ -738,6 +771,7 @@ def test_preflight_binds_source_input_runtime_and_producer(
     assert preflight["git_commit"] == expected_commit
     assert preflight["frozen_input_attestation"] == input_attestation
     assert preflight["runtime_attestation"] == runtime_attestation
+    assert preflight["current_pool_audit_binding"] == audit_binding
     assert preflight["producer_binding"]["root_sha256"] == (
         launcher.EXPECTED_PRODUCER_ROOT_SHA256
     )
@@ -751,6 +785,7 @@ def _sandbox_launcher_main(
     scripts_dir.mkdir()
     script_path = scripts_dir / launcher.LAUNCHER_GIT_PATH.rsplit("/", 1)[-1]
     script_path.write_text("synthetic launcher", encoding="utf-8")
+    _write_pycache_blocker(tmp_path)
     (tmp_path / "data" / "research_runs").mkdir(parents=True)
     relative_output = Path("data/research_runs/formal-risk-run")
     preflight = {
@@ -762,6 +797,12 @@ def _sandbox_launcher_main(
         "run_spec_sha256": launcher.RUN_SPEC_SHA256,
         "frozen_input_attestation": {"root_sha256": "2" * 64},
         "runtime_attestation": {"root_sha256": "3" * 64},
+        "current_pool_audit_binding": {
+            "canonical_sha256": launcher.RUN_SPEC["inputs"][
+                "expected_current_pool_development_audit_sha256"
+            ],
+            "allowed_symbol_count": 1,
+        },
     }
     monkeypatch.setattr(launcher, "WORKSPACE", tmp_path)
     monkeypatch.setattr(launcher, "SCRIPT_PATH", script_path)
@@ -1029,10 +1070,10 @@ def test_claimed_attempt_write_failure_still_writes_external_terminal(
     )
     original_write_json_once = launcher._write_json_once
 
-    def fail_selected_write(path: Path, payload: dict) -> None:
+    def fail_selected_write(path: Path, payload: dict) -> str:
         if path.name == failing_name:
             raise PermissionError("synthetic sensitive write detail")
-        original_write_json_once(path, payload)
+        return original_write_json_once(path, payload)
 
     monkeypatch.setattr(launcher, "_write_json_once", fail_selected_write)
     original_cwd = Path.cwd()
@@ -1212,8 +1253,7 @@ def test_unbounded_command_requires_assigned_and_drained_job_object(
 def test_gated_bootstrap_disables_site_and_legacy_pyc_before_job_assignment(
     tmp_path: Path,
 ) -> None:
-    blocker = tmp_path / "formal-pycache-blocker"
-    blocker.write_bytes(b"formal-pycache-prefix-blocker-v1\n")
+    blocker = _write_pycache_blocker(tmp_path)
     command = launcher._gated_bootstrap_command(
         [sys.executable, "-c", "print('actual')"],
         event_value=123,
@@ -1243,6 +1283,7 @@ def test_top_level_launcher_requires_isolated_no_site_interpreter(
         no_site=1,
         ignore_environment=1,
         dont_write_bytecode=1,
+        safe_path=1,
     )
     launcher._assert_top_level_interpreter(
         good,
@@ -1255,6 +1296,7 @@ def test_top_level_launcher_requires_isolated_no_site_interpreter(
         "no_site",
         "ignore_environment",
         "dont_write_bytecode",
+        "safe_path",
     ):
         bad = SimpleNamespace(**vars(good))
         setattr(bad, field, 0)
@@ -1273,9 +1315,11 @@ def test_top_level_launcher_requires_isolated_no_site_interpreter(
 
 
 def test_preflight_probe_uses_isolated_no_site_source_paths(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    pycache_prefix = tmp_path / "fresh-pycache"
+    monkeypatch.setattr(launcher, "WORKSPACE", tmp_path)
+    pycache_prefix = _write_pycache_blocker(tmp_path)
     command = launcher._isolated_probe_command(
         Path(sys.executable),
         environment={"PYTHONPYCACHEPREFIX": str(pycache_prefix)},
@@ -1285,9 +1329,9 @@ def test_preflight_probe_uses_isolated_no_site_source_paths(
 
     assert command[:7] == [
         sys.executable,
-        "-I",
         "-S",
         "-B",
+        "-P",
         "-X",
         f"pycache_prefix={pycache_prefix}",
         "-c",
@@ -1383,13 +1427,15 @@ def test_risk_on_breadth_producer_binding_rejects_valid_format_drift(
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(stdout=json.dumps(payload)),
     )
+    monkeypatch.setattr(launcher, "WORKSPACE", tmp_path)
+    blocker = _write_pycache_blocker(tmp_path)
 
     with pytest.raises(RuntimeError, match="producer binding drifted"):
         launcher.risk_on_breadth_producer_binding(
             tmp_path / "python.exe",
             environment={
                 "PYTHONHASHSEED": "0",
-                "PYTHONPYCACHEPREFIX": str(tmp_path / "fresh-pycache"),
+                "PYTHONPYCACHEPREFIX": str(blocker),
             },
         )
 
