@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -205,6 +206,34 @@ def test_frozen_input_attestation_rejects_unexpected_file_type(tmp_path: Path) -
         launcher.frozen_input_attestation(tmp_path, inputs)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="正式 launcher 只允许 Windows")
+def test_held_frozen_inputs_deny_midflight_write(tmp_path: Path) -> None:
+    universe = tmp_path / "universe.sqlite3"
+    temporal = tmp_path / "frozen.json"
+    current_pool_audit = tmp_path / "current-pool-audit.json"
+    transition = tmp_path / "transition"
+    transition.mkdir()
+    universe.write_bytes(b"universe")
+    temporal.write_bytes(b"temporal")
+    current_pool_audit.write_bytes(b"current-pool")
+    (transition / "receipt.json").write_bytes(b"transition")
+    inputs = {
+        "audited_pit_universe_path": universe.name,
+        "temporal_contract_path": temporal.name,
+        "current_pool_development_audit_path": current_pool_audit.name,
+        "security_code_transition_evidence_root": transition.name,
+        "observed_attestation": launcher.RUN_SPEC["inputs"]["observed_attestation"],
+    }
+
+    with launcher._held_frozen_inputs(tmp_path, inputs):
+        assert universe.read_bytes() == b"universe"
+        with pytest.raises(PermissionError):
+            universe.write_bytes(b"tampered")
+
+    universe.write_bytes(b"after-release")
+    assert universe.read_bytes() == b"after-release"
+
+
 def test_result_artifact_accepts_the_real_nested_strategy_binding(tmp_path: Path) -> None:
     payload = {
         "schema_version": launcher.EXPECTED_RESULT_SCHEMA,
@@ -268,6 +297,277 @@ def test_runtime_verification_requires_the_risk_breadth_replay_receipts(
     assert verified is True
     assert verification is not None
     assert verification["main_artifact_sha256"] == "a" * 64
+
+
+def test_runtime_attestation_binds_minimal_environment_and_distributions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "schema_version": "formal-python-runtime-attestation/v1",
+        "implementation": "CPython",
+        "python_version": "3.11.5",
+        "cache_tag": "cpython-311",
+        "platform": "synthetic-win32",
+        "executable": str(tmp_path / "python.exe"),
+        "executable_sha256": "a" * 64,
+        "base_executable": str(tmp_path / "base-python.exe"),
+        "base_executable_sha256": "b" * 64,
+        "distributions": [
+            {
+                "name": name,
+                "version": "1.0",
+                "file_count": 1,
+                "files_sha256": str(index) * 64,
+            }
+            for index, name in enumerate(
+                launcher.RUN_SPEC["runtime_contract"]["critical_distributions"],
+                start=1,
+            )
+        ],
+    }
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=json.dumps(payload)),
+    )
+    environment = {
+        "PYTHONHASHSEED": "0",
+        "VPS_RUNTIME_ROLE": "local_research",
+    }
+
+    attestation = launcher._runtime_attestation(
+        tmp_path / "python.exe",
+        environment=environment,
+    )
+
+    assert attestation["environment"] == {
+        "schema_version": "minimal-research-environment/v1",
+        "keys": ["PYTHONHASHSEED", "VPS_RUNTIME_ROLE"],
+        "environment_sha256": launcher._sha256(environment),
+        "inherit_parent_environment": False,
+    }
+    unsigned = dict(attestation)
+    embedded = unsigned.pop("root_sha256")
+    assert embedded == launcher._sha256(unsigned)
+
+
+def test_preflight_binds_source_input_runtime_and_producer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_commit = "1" * 40
+    input_attestation = {
+        "schema_version": "formal-frozen-input-attestation/v1",
+        "root_sha256": "2" * 64,
+    }
+    runtime_attestation = {
+        "schema_version": "formal-python-runtime-attestation/v1",
+        "root_sha256": "3" * 64,
+    }
+
+    def fake_git_output(*args: str) -> str:
+        if args == ("rev-parse", "HEAD"):
+            return expected_commit
+        if args == ("status", "--porcelain", "--untracked-files=all"):
+            return ""
+        raise AssertionError(args)
+
+    monkeypatch.setattr(launcher, "git_output", fake_git_output)
+    monkeypatch.setattr(
+        launcher,
+        "git_bytes",
+        lambda *_args: launcher.normalized_source_bytes(launcher.SCRIPT_PATH),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "risk_on_breadth_producer_binding",
+        lambda *_args, **_kwargs: {
+            "strategy_sha256": launcher.EXPECTED_STRATEGY_SHA256,
+            "producer_binding": {
+                "root_sha256": launcher.EXPECTED_PRODUCER_ROOT_SHA256
+            },
+        },
+    )
+    monkeypatch.setattr(
+        launcher,
+        "frozen_input_attestation",
+        lambda *_args, **_kwargs: input_attestation,
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_runtime_attestation",
+        lambda *_args, **_kwargs: runtime_attestation,
+    )
+
+    preflight = launcher._preflight(
+        expected_commit=expected_commit,
+        python_executable=Path(sys.executable),
+        environment={"PYTHONHASHSEED": "0"},
+    )
+
+    assert preflight["git_commit"] == expected_commit
+    assert preflight["frozen_input_attestation"] == input_attestation
+    assert preflight["runtime_attestation"] == runtime_attestation
+    assert preflight["producer_binding"]["root_sha256"] == (
+        launcher.EXPECTED_PRODUCER_ROOT_SHA256
+    )
+
+
+def _sandbox_launcher_main(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> tuple[Path, dict]:
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    script_path = scripts_dir / launcher.LAUNCHER_GIT_PATH.rsplit("/", 1)[-1]
+    script_path.write_text("synthetic launcher", encoding="utf-8")
+    (tmp_path / "data" / "research_runs").mkdir(parents=True)
+    relative_output = Path("data/research_runs/formal-risk-run")
+    preflight = {
+        "git_commit": "1" * 40,
+        "strategy_sha256": launcher.EXPECTED_STRATEGY_SHA256,
+        "producer_binding": {
+            "root_sha256": launcher.EXPECTED_PRODUCER_ROOT_SHA256
+        },
+        "run_spec_sha256": launcher.RUN_SPEC_SHA256,
+        "frozen_input_attestation": {"root_sha256": "2" * 64},
+        "runtime_attestation": {"root_sha256": "3" * 64},
+    }
+    monkeypatch.setattr(launcher, "WORKSPACE", tmp_path)
+    monkeypatch.setattr(launcher, "SCRIPT_PATH", script_path)
+    monkeypatch.setattr(launcher, "RELATIVE_OUTPUT_DIR", relative_output)
+    monkeypatch.setattr(launcher, "_preflight", lambda **_kwargs: dict(preflight))
+    monkeypatch.setattr(
+        launcher,
+        "_held_frozen_inputs",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+    return relative_output, preflight
+
+
+def test_main_dry_run_does_not_claim_the_formal_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _relative_output, _preflight = _sandbox_launcher_main(monkeypatch, tmp_path)
+    original_cwd = Path.cwd()
+    try:
+        result = launcher.main(["--expected-commit", "1" * 40, "--dry-run"])
+    finally:
+        os.chdir(original_cwd)
+
+    assert result == 0
+    assert not (
+        tmp_path / launcher.RUN_SPEC["attempt_contract"]["ledger_relative_path"]
+    ).exists()
+
+
+def test_main_success_stays_pending_independent_verification(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    relative_output, _preflight = _sandbox_launcher_main(monkeypatch, tmp_path)
+    artifact_sha256 = "a" * 64
+    monkeypatch.setattr(
+        launcher,
+        "_safe_progress",
+        lambda _path: {
+            "schema_version": launcher.EXPECTED_PROGRESS_SCHEMA,
+            "stage": "completed",
+            "artifact_sha256": artifact_sha256,
+        },
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_result_artifact",
+        lambda _path: (
+            {"canonical_artifact_sha256": artifact_sha256},
+            True,
+        ),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_runtime_verification",
+        lambda _path: (
+            {"main_artifact_sha256": artifact_sha256},
+            True,
+        ),
+    )
+
+    def fake_run_unbounded_command(**kwargs: object) -> dict:
+        command = kwargs["command"]
+        Path(kwargs["stdout_path"]).write_bytes(b"")
+        Path(kwargs["stderr_path"]).write_bytes(b"")
+        return {
+            "schema_version": "research-unbounded-job-object-command-receipt/v1",
+            "exit_code": 0,
+            "child_reaped": True,
+            "job_object_assigned": True,
+            "process_tree_drained": True,
+            "memory_limit_enforced": False,
+            "command_sha256": launcher._sha256({"tokens": command}),
+        }
+
+    monkeypatch.setattr(
+        launcher,
+        "run_unbounded_command",
+        fake_run_unbounded_command,
+    )
+    original_cwd = Path.cwd()
+    try:
+        result = launcher.main(["--expected-commit", "1" * 40])
+    finally:
+        os.chdir(original_cwd)
+
+    completion_path = tmp_path / relative_output / "formal_run.completion.json"
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    assert result == 0
+    assert completion["result_available"] is True
+    assert completion["independent_verification_complete"] is False
+    assert completion["statistical_interpretation_allowed"] is False
+    assert completion["profile_registration_authority"] is False
+    assert completion["production_recommendation_authority"] is False
+    assert completion["automatic_trading_authority"] is False
+
+
+def test_main_failure_records_only_stable_error_type_and_no_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    relative_output, _preflight = _sandbox_launcher_main(monkeypatch, tmp_path)
+    monkeypatch.setattr(launcher, "_safe_progress", lambda _path: None)
+    monkeypatch.setattr(launcher, "_result_artifact", lambda _path: (None, False))
+    monkeypatch.setattr(
+        launcher,
+        "_runtime_verification",
+        lambda _path: (None, False),
+    )
+
+    def fail_run(**_kwargs: object) -> dict:
+        raise RuntimeError("synthetic detail must not enter authority records")
+
+    monkeypatch.setattr(launcher, "run_unbounded_command", fail_run)
+    original_cwd = Path.cwd()
+    try:
+        result = launcher.main(["--expected-commit", "1" * 40])
+    finally:
+        os.chdir(original_cwd)
+
+    run_root = tmp_path / relative_output
+    completion = json.loads(
+        (run_root / "formal_run.completion.json").read_text(encoding="utf-8")
+    )
+    failure = json.loads(
+        (run_root / "formal_run.failure.json").read_text(encoding="utf-8")
+    )
+    assert result == 1
+    assert completion["result_available"] is False
+    assert completion["launcher_error_type"] == "RuntimeError"
+    assert failure["launcher_error_type"] == "RuntimeError"
+    assert "synthetic detail" not in json.dumps(completion)
+    assert failure["profile_registration_authority"] is False
+    assert failure["production_recommendation_authority"] is False
+    assert failure["automatic_trading_authority"] is False
 
 
 def test_single_attempt_ledger_is_external_and_write_once(tmp_path: Path) -> None:
@@ -424,3 +724,112 @@ def test_formal_run_spec_rejects_mutation(monkeypatch: pytest.MonkeyPatch) -> No
 
     with pytest.raises(RuntimeError, match="run spec drifted"):
         launcher._assert_frozen_run_spec()
+
+
+def test_path_environment_attempt_and_commit_boundaries_fail_closed(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(RuntimeError, match="path is invalid"):
+        launcher._safe_workspace_path(tmp_path, "", "synthetic")
+    with pytest.raises(RuntimeError, match="path is invalid"):
+        launcher._safe_workspace_path(tmp_path, str(tmp_path), "synthetic")
+    with pytest.raises(RuntimeError, match="path is invalid"):
+        launcher._safe_workspace_path(tmp_path, "missing.json", "synthetic")
+    with pytest.raises(RuntimeError, match="system root is unavailable"):
+        launcher._minimal_child_environment(
+            {},
+            python_executable=Path(sys.executable),
+            temp_dir=tmp_path,
+        )
+    output_dir = tmp_path / "formal-run"
+    output_dir.mkdir()
+    with pytest.raises(ValueError, match="outside output root"):
+        launcher._reserve_single_attempt(
+            ledger_path=output_dir / "attempt.json",
+            output_dir=output_dir,
+            claim={"schema_version": "synthetic/v1"},
+        )
+    with pytest.raises(ValueError, match="full lowercase SHA-1"):
+        launcher._validated_expected_commit("ABC")
+
+
+def test_input_attestation_rejects_empty_tree_and_duplicate_paths(
+    tmp_path: Path,
+) -> None:
+    universe = tmp_path / "universe.sqlite3"
+    temporal = tmp_path / "frozen.json"
+    current_pool = tmp_path / "current-pool.json"
+    transition = tmp_path / "transition"
+    transition.mkdir()
+    universe.write_bytes(b"universe")
+    temporal.write_bytes(b"temporal")
+    current_pool.write_bytes(b"current-pool")
+    inputs = {
+        "audited_pit_universe_path": universe.name,
+        "temporal_contract_path": temporal.name,
+        "current_pool_development_audit_path": current_pool.name,
+        "security_code_transition_evidence_root": transition.name,
+        "observed_attestation": launcher.RUN_SPEC["inputs"]["observed_attestation"],
+    }
+
+    with pytest.raises(RuntimeError, match="input tree is empty"):
+        launcher.frozen_input_attestation(tmp_path, inputs)
+
+    (transition / "receipt.json").write_bytes(b"transition")
+    inputs["current_pool_development_audit_path"] = universe.name
+    with pytest.raises(RuntimeError, match="path is duplicated"):
+        launcher.frozen_input_attestation(tmp_path, inputs)
+
+
+def test_progress_and_content_address_boundaries_fail_closed(tmp_path: Path) -> None:
+    assert launcher._safe_progress(tmp_path / "missing.json") is None
+    invalid_progress = tmp_path / "progress.json"
+    invalid_progress.write_text("not-json", encoding="utf-8")
+    assert launcher._safe_progress(invalid_progress) is None
+    invalid_progress.write_text("[]", encoding="utf-8")
+    assert launcher._safe_progress(invalid_progress) is None
+
+    wrong_name = tmp_path / "wrong-name.json"
+    wrong_name.write_text("{}", encoding="utf-8")
+    assert launcher._content_addressed_document(wrong_name) is None
+    bad_json = tmp_path / ("0" * 64 + ".json")
+    bad_json.write_text("not-json", encoding="utf-8")
+    assert launcher._content_addressed_document(bad_json) is None
+    bad_json.write_text(
+        json.dumps({"schema_version": "synthetic/v1", "artifact_sha256": "0" * 64}),
+        encoding="utf-8",
+    )
+    assert launcher._content_addressed_document(bad_json) is None
+
+
+@pytest.mark.parametrize("mode", ["wrong_commit", "dirty", "blob_drift"])
+def test_preflight_source_identity_drift_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    expected_commit = "1" * 40
+
+    def fake_git_output(*args: str) -> str:
+        if args == ("rev-parse", "HEAD"):
+            return "2" * 40 if mode == "wrong_commit" else expected_commit
+        if args == ("status", "--porcelain", "--untracked-files=all"):
+            return " M tracked.py" if mode == "dirty" else ""
+        raise AssertionError(args)
+
+    monkeypatch.setattr(launcher, "git_output", fake_git_output)
+    monkeypatch.setattr(
+        launcher,
+        "git_bytes",
+        lambda *_args: (
+            b"drifted"
+            if mode == "blob_drift"
+            else launcher.normalized_source_bytes(launcher.SCRIPT_PATH)
+        ),
+    )
+
+    with pytest.raises(RuntimeError):
+        launcher._preflight(
+            expected_commit=expected_commit,
+            python_executable=Path(sys.executable),
+            environment={"PYTHONHASHSEED": "0"},
+        )
