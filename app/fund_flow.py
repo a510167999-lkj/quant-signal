@@ -37,7 +37,7 @@ def _market_for_symbol(symbol: str) -> str:
 
 
 class FundFlowContextProvider:
-    def __init__(self, cache_path: str, enabled: bool = True) -> None:
+    def __init__(self, cache_path: str, enabled: bool = False) -> None:
         self.cache_path = cache_path
         self.enabled = enabled
 

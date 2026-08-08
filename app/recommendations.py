@@ -20,7 +20,9 @@ from app.fund_flow import FundFlowContextProvider
 from app.industry_history import IndustryHistoryProvider
 from app.industry_strength import IndustryStrengthProvider
 from app.indicators import add_indicators
+from app.jiaoch_live_market import JIAOCH_MARKET_SNAPSHOT_METHOD, JiaochMarketDataProvider
 from app.margin_eligibility import MarginEligibilityProvider
+from app.market_data import is_jiaoch_runtime_provider
 from app.market_regime import evaluate_market_regime
 from app.mootdx_l1 import MootdxL1QuoteProvider
 from app.news_context import NewsContextProvider
@@ -54,6 +56,7 @@ from app.signal_tags import (
     build_proxy_market_tags,
     build_signal_tags,
 )
+
 from app.storage import (
     append_jsonl,
     append_jsonl_durable,
@@ -1034,6 +1037,67 @@ class RecommendationService:
             enabled=settings.enable_mootdx_l1_context,
         )
 
+    def _market_input_gate(self) -> Dict[str, Any]:
+        """Reject any runtime that could read non-Jiaoch market or minute data."""
+        reasons: List[str] = []
+        if str(self.settings.market_data_provider or "").strip().lower() != "jiaoch":
+            reasons.append("market_data_provider_not_jiaoch")
+        if self.settings.tushare_fallback_to_akshare:
+            reasons.append("market_data_fallback_not_allowed")
+        if self.settings.enable_mootdx_daily_fallback:
+            reasons.append("mootdx_daily_fallback_not_allowed")
+        if self.settings.enable_mootdx_l1_context:
+            reasons.append("mootdx_l1_not_allowed")
+        if not is_jiaoch_runtime_provider(self.data_provider):
+            reasons.append("market_data_provider_identity_not_jiaoch")
+        return {
+            "required": "jiaoch",
+            "passed": not reasons,
+            "observed": [],
+            "reasons": reasons,
+        }
+
+    def _recommendation_input_gate(self) -> Dict[str, Any]:
+        gate = self._market_input_gate()
+        reasons = list(gate["reasons"])
+        if not self._has_jiaoch_universe_context():
+            reasons.append("universe_source_not_jiaoch")
+        reasons.extend(
+            [
+                "industry_strength_source_not_jiaoch",
+                "industry_history_source_not_jiaoch",
+            ]
+        )
+        if self.settings.enable_fund_flow_context:
+            reasons.append("fund_flow_source_not_jiaoch")
+        return {
+            **gate,
+            "passed": not reasons,
+            "reasons": reasons,
+        }
+
+    def _monitor_snapshot_input_gate(self) -> Dict[str, Any]:
+        gate = self._market_input_gate()
+        reasons = list(gate["reasons"])
+        if not self._has_jiaoch_universe_context():
+            reasons.append("universe_source_not_jiaoch")
+        return {
+            **gate,
+            "passed": not reasons,
+            "reasons": reasons,
+        }
+
+    def _has_jiaoch_universe_context(self) -> bool:
+        if type(self.data_provider) is not JiaochMarketDataProvider:
+            return False
+        if type(self.universe) is not AShareUniverseProvider:
+            return False
+        snapshot_loader = self.universe.snapshot_loader
+        return (
+            getattr(snapshot_loader, "__self__", None) is self.data_provider
+            and getattr(snapshot_loader, "__func__", None) is JIAOCH_MARKET_SNAPSHOT_METHOD
+        )
+
     def _profile_gate(self) -> Dict[str, Any]:
         if not self.settings.recommendation_profile_id:
             return {
@@ -1940,6 +2004,65 @@ class RecommendationService:
             return payload
         profile_gate = self._profile_gate()
         strategy_profile = profile_gate.get("strategy_profile")
+        market_input_gate = self._recommendation_input_gate()
+        if not market_input_gate["passed"]:
+            blocked_funnel = self._empty_selection_funnel("market_source_gate_failed")
+            payload = {
+                "generated_at": started.isoformat(),
+                "trade_date": started.date().isoformat(),
+                "signal_date": started.date().isoformat(),
+                "target_trade_date": target_text,
+                "target_trade_date_semantics": target_semantics,
+                "data_as_of": None,
+                "run_slot": slot_context["slot"],
+                "run_slot_label": slot_context["label"],
+                "items": [],
+                "errors": [
+                    {
+                        "stage": "market_source_gate",
+                        "reasons": market_input_gate["reasons"],
+                    }
+                ],
+                "recommendation_status": "blocked_market_source_gate",
+                "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+                "live_proof": False,
+                "auto_order": False,
+                "current_pool_audit_sha256": current_pool_gate.get("canonical_sha256"),
+                "publication_gate": {
+                    "status": "blocked",
+                    "reason": "market_data_source_not_jiaoch",
+                },
+                "current_pool_gate": current_pool_gate_public,
+                "market_source_gate": market_input_gate,
+                "profile_gate": profile_gate,
+                "strategy_profile": strategy_profile,
+                "summary": {
+                    "running": False,
+                    "signal_date": started.date().isoformat(),
+                    "target_trade_date": target_text,
+                    "target_trade_date_semantics": target_semantics,
+                    "data_as_of": None,
+                    "recommendation_status": "blocked_market_source_gate",
+                    "evidence_scope": EVIDENCE_SCOPE_DEVELOPMENT_ONLY,
+                    "live_proof": False,
+                    "auto_order": False,
+                    "current_pool_audit_sha256": current_pool_gate.get("canonical_sha256"),
+                    "publication_gate": {
+                        "status": "blocked",
+                        "reason": "market_data_source_not_jiaoch",
+                    },
+                    "run_slot": slot_context,
+                    "current_pool_gate": current_pool_gate_public,
+                    "market_source_gate": market_input_gate,
+                    "profile_gate": profile_gate,
+                    "strategy_profile": strategy_profile,
+                    "selection_funnel": blocked_funnel,
+                },
+                "disclaimer": self.disclaimer,
+            }
+            write_json(self.settings.latest_recommendations_path, payload)
+            self._append_recommendation_audit(payload)
+            return payload
         if self.profile and not profile_gate.get("development_ready"):
             blocked_funnel = self._empty_selection_funnel("profile_gate_failed")
             payload = {
@@ -2490,6 +2613,16 @@ class RecommendationService:
 
     def monitor_recommendations(self, force: bool = False) -> Dict[str, Any]:
         moment = now_cn()
+        market_input_gate = self._monitor_snapshot_input_gate()
+        if not market_input_gate["passed"]:
+            return {
+                "checked_at": moment.isoformat(),
+                "skipped": True,
+                "reason": "market_data_source_not_jiaoch",
+                "market_source_gate": market_input_gate,
+                "alerts": [],
+                "errors": [],
+            }
         if not force and not is_a_share_trading_time(moment):
             return {
                 "checked_at": moment.isoformat(),
@@ -2575,6 +2708,16 @@ class RecommendationService:
         - 前日高点 trailing 留后续刀。
         """
         moment = now_cn()
+        market_input_gate = self._market_input_gate()
+        if not market_input_gate["passed"]:
+            return {
+                "checked_at": moment.isoformat(),
+                "skipped": True,
+                "reason": "market_data_source_not_jiaoch",
+                "market_source_gate": market_input_gate,
+                "alerts": [],
+                "errors": [],
+            }
         monitored = self._recent_recommended_items(moment)
         errors: List[Dict[str, Any]] = []
         existing_ids = {item.get("id") for item in read_jsonl(self.settings.alerts_path, limit=3000)}

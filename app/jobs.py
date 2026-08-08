@@ -3517,6 +3517,8 @@ def _warm_market_cache(args) -> dict:
     settings = get_settings()
     provider = _get_data_provider()
     service = RecommendationService(settings, provider, DISCLAIMER)
+    if not service._recommendation_input_gate()["passed"]:
+        raise ValueError("Jiaoch-only market runtime gate failed")
     industry_payload = service.industry.build_map(use_cache_on_error=True)
     industry_map = industry_payload.get("symbol_map", {})
     snapshot = service.universe.snapshot(use_cache_on_error=True)
@@ -4747,7 +4749,6 @@ def main(argv=None) -> int:
         if args.command
         in {
             "generate-recommendations",
-            "mootdx-l1-check",
             "monitor-recommendations",
             "monitor-planned-exits",
         }
@@ -4785,22 +4786,10 @@ def main(argv=None) -> int:
         return 0
 
     if args.command == "mootdx-l1-check":
-        symbols = _split_csv_arg(args.symbols) or []
-        provider = service.l1_quotes
-        if args.servers is not None or args.timeout_seconds is not None:
-            from app.mootdx_l1 import MootdxL1QuoteProvider
+        raise ValueError("Jiaoch-only market runtime disables Mootdx L1 checks")
 
-            provider = MootdxL1QuoteProvider(
-                servers=args.servers if args.servers is not None else settings.mootdx_servers,
-                timeout_seconds=args.timeout_seconds
-                if args.timeout_seconds is not None
-                else settings.mootdx_timeout_seconds,
-                enabled=True,
-            )
-        payload = provider.quotes(symbols)
-        payload["symbols"] = symbols
-        _print_json(payload)
-        return 0
+    if args.command == "industry-history-check":
+        raise ValueError("Jiaoch-only market runtime disables industry history checks")
 
     if args.command == "jiaoch-connectivity-check":
         payload = _probe_jiaoch_connectivity(timeout_seconds=args.timeout_seconds)

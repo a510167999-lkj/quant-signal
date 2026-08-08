@@ -1,7 +1,16 @@
+from types import MethodType
+
 import pandas as pd
 import pytest
 
-from app.market_data import AkshareDataProvider, MarketDataError, TushareDataProvider, build_market_data_provider
+from app.jiaoch_live_market import JiaochMarketDataProvider
+from app.market_data import (
+    AkshareDataProvider,
+    MarketDataError,
+    TushareDataProvider,
+    build_market_data_provider,
+    is_jiaoch_runtime_provider,
+)
 
 
 def _raw_daily_frame(days=80):
@@ -144,13 +153,48 @@ def test_tushare_history_can_fallback_to_akshare(monkeypatch):
     assert len(frame) >= 60
 
 
-def test_market_data_provider_factory_rejects_unknown_provider():
-    try:
-        build_market_data_provider("unknown", 1800, "")
-    except MarketDataError as exc:
-        assert "Unsupported MARKET_DATA_PROVIDER" in str(exc)
-    else:
-        raise AssertionError("Expected MarketDataError")
+@pytest.mark.parametrize("provider_name", ["akshare", "tushare", "official", "unknown"])
+def test_market_data_provider_factory_rejects_non_jiaoch_provider(provider_name):
+    with pytest.raises(MarketDataError, match="Jiaoch-only"):
+        build_market_data_provider(provider_name, 1800, "")
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"tushare_fallback_to_akshare": True},
+        {"enable_mootdx_daily_fallback": True},
+    ],
+)
+def test_market_data_provider_factory_rejects_fallback_flags(kwargs):
+    with pytest.raises(MarketDataError, match="Jiaoch-only"):
+        build_market_data_provider("jiaoch", 1800, "", **kwargs)
+
+
+def test_registered_jiaoch_provider_rejects_rebound_market_methods():
+    provider = build_market_data_provider("jiaoch", 1800, "")
+
+    def foreign_history(*args, **kwargs):
+        raise AssertionError("rebound history must not be trusted")
+
+    provider.history = MethodType(foreign_history, provider)
+
+    assert is_jiaoch_runtime_provider(provider) is False
+
+
+@pytest.mark.parametrize("method_name", ["history", "snapshot"])
+def test_jiaoch_factory_rejects_class_level_method_replacement(monkeypatch, method_name):
+    monkeypatch.setattr(JiaochMarketDataProvider, method_name, lambda *_args, **_kwargs: None)
+
+    with pytest.raises(MarketDataError, match="implementation was modified"):
+        build_market_data_provider("jiaoch", 1800, "")
+
+
+def test_jiaoch_factory_rejects_provider_type_replacement(monkeypatch):
+    monkeypatch.setattr("app.jiaoch_live_market.JiaochMarketDataProvider", object)
+
+    with pytest.raises(MarketDataError, match="implementation was modified"):
+        build_market_data_provider("jiaoch", 1800, "")
 
 
 class FakeMootdxDaily:

@@ -67,7 +67,13 @@ def require_basic_auth(credentials: Optional[HTTPBasicCredentials] = Depends(SEC
 
 
 def _build_analysis(request: AnalyzeRequest) -> AnalyzeResponse:
+    _require_jiaoch_market_runtime()
     return build_analysis(request, DATA_PROVIDER, DISCLAIMER)
+
+
+def _require_jiaoch_market_runtime() -> None:
+    if not RECOMMENDATIONS._market_input_gate()["passed"]:
+        raise MarketDataError("Jiaoch-only market runtime gate is not satisfied")
 
 
 def create_app() -> FastAPI:
@@ -158,11 +164,12 @@ def create_app() -> FastAPI:
 
     @app.get("/api/holdings", dependencies=[Depends(require_basic_auth)])
     def get_holdings():
+        _require_jiaoch_market_runtime()
         return build_holdings_snapshot(
             SETTINGS.holdings_path,
             DATA_PROVIDER,
             DISCLAIMER,
-            RECOMMENDATIONS.l1_quotes,
+            None,
         )
 
     @app.put("/api/holdings", dependencies=[Depends(require_basic_auth)])
@@ -181,6 +188,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/performance/recommendations", dependencies=[Depends(require_basic_auth)])
     def recommendation_performance(limit: int = Query(500, ge=10, le=2000)):
+        _require_jiaoch_market_runtime()
         return evaluate_recommendation_performance(
             SETTINGS.recommendation_history_path,
             DATA_PROVIDER,

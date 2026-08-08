@@ -4,6 +4,7 @@ import socket
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import MethodType
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -12,6 +13,9 @@ import pytest
 import app.recommendations as recommendations_module
 from app.config import Settings
 from app.current_pool import POLICY_ID
+from app.industry_history import IndustryHistoryProvider as RealIndustryHistoryProvider
+from app.jiaoch_live_market import JiaochMarketDataProvider
+from app.market_data import build_market_data_provider
 from app.recommendations import (
     RecommendationService,
     _selection_funnel_explanation,
@@ -30,18 +34,53 @@ from app.storage import append_jsonl, read_jsonl, write_json
 from tests.test_signals import sample_frame
 
 
-class FakeProvider:
-    def history(self, symbol, market, lookback_days=360, adjust="qfq"):
-        return sample_frame("up"), "fake-provider"
+_fixture_jiaoch_providers = []
 
 
-class FakeJiaochProvider(FakeProvider):
-    def history(self, symbol, market, lookback_days=360, adjust="qfq"):
-        return sample_frame("up"), "Jiaoch fixture"
+def _fake_jiaoch_provider(source="fake-provider"):
+    provider = build_market_data_provider("jiaoch", 1800, "")
+
+    def history(_provider, symbol, market, lookback_days=360, adjust="qfq"):
+        return sample_frame("up"), source
+
+    provider.history = MethodType(history, provider)
+    provider.snapshot = None
+    _fixture_jiaoch_providers.append(provider)
+    return provider
 
 
-class GapProvider:
-    def history(self, symbol, market, lookback_days=360, adjust="qfq"):
+def FakeProvider():
+    return _fake_jiaoch_provider()
+
+
+class MustNotReadMarketProvider:
+    def history(self, *args, **kwargs):
+        raise AssertionError("market history must not be read before the source gate")
+
+
+class ImposterJiaochProvider(JiaochMarketDataProvider):
+    def __init__(self):
+        pass
+
+
+class MustNotReadIndustry:
+    def build_map(self, *args, **kwargs):
+        raise AssertionError("industry data must not be read before the source gate")
+
+
+class MustNotReadUniverse:
+    def snapshot(self, *args, **kwargs):
+        raise AssertionError("market snapshot must not be read before the source gate")
+
+
+def FakeJiaochProvider():
+    return _fake_jiaoch_provider("Jiaoch fixture")
+
+
+def GapProvider():
+    provider = _fake_jiaoch_provider()
+
+    def history(_provider, symbol, market, lookback_days=360, adjust="qfq"):
         frame = sample_frame("up")
         if market == "a":
             last = frame.index[-1]
@@ -51,6 +90,9 @@ class GapProvider:
             frame.loc[last, "high"] = previous_close * 1.06
             frame.loc[last, "close"] = previous_close * 1.045
         return frame, "fake-provider"
+
+    provider.history = MethodType(history, provider)
+    return provider
 
 
 class FakeUniverse:
@@ -146,6 +188,36 @@ def fake_industry_history_provider(monkeypatch, tmp_path):
             AssertionError("recommendation tests must not load the global calendar")
         ),
     )
+    original_recommendation_gate = RecommendationService._recommendation_input_gate
+    original_monitor_gate = RecommendationService._monitor_snapshot_input_gate
+    original_runtime_provider = recommendations_module.is_jiaoch_runtime_provider
+
+    def fixture_runtime_provider(provider):
+        if any(provider is fixture for fixture in _fixture_jiaoch_providers):
+            return True
+        return original_runtime_provider(provider)
+
+    def fixture_recommendation_gate(service):
+        if (
+            type(service.universe) is FakeUniverse
+            and type(service.industry) is FakeIndustry
+            and type(service.industry_history) is FakeIndustryHistory
+            and (
+                not service.settings.enable_fund_flow_context
+                or type(service.fund_flow) is FakeFundFlow
+            )
+        ):
+            return service._market_input_gate()
+        return original_recommendation_gate(service)
+
+    def fixture_monitor_gate(service):
+        if type(service.universe) is FakeUniverse:
+            return service._market_input_gate()
+        return original_monitor_gate(service)
+
+    monkeypatch.setattr(RecommendationService, "_recommendation_input_gate", fixture_recommendation_gate)
+    monkeypatch.setattr(RecommendationService, "_monitor_snapshot_input_gate", fixture_monitor_gate)
+    monkeypatch.setattr(recommendations_module, "is_jiaoch_runtime_provider", fixture_runtime_provider)
     yield
     assert network_attempts == []
 
@@ -1274,7 +1346,7 @@ def test_post_close_generation_defaults_to_next_trade_date(tmp_path, monkeypatch
     assert result["target_trade_date_semantics"] == "next_trading_session"
 
 
-def test_failed_run_still_writes_failure_funnel_and_audit(tmp_path):
+def test_failed_run_still_writes_failure_funnel_and_audit(tmp_path, monkeypatch):
     service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
     service.industry = FakeIndustry()
     service.industry_history = FakeIndustryHistory()
@@ -1285,6 +1357,7 @@ def test_failed_run_still_writes_failure_funnel_and_audit(tmp_path):
             raise RuntimeError("snapshot failed")
 
     service.universe = BrokenUniverse()
+    monkeypatch.setattr(service, "_recommendation_input_gate", service._market_input_gate)
     result = service.generate_daily_recommendations(force=True)
 
     assert result["summary"]["failed"] is True
@@ -1473,16 +1546,16 @@ def test_live_snapshot_can_only_shrink_audited_current_pool(tmp_path):
     settings = make_settings(tmp_path)
     _write_current_pool_audit(Path(settings.current_pool_audit_path), ["600519"])
 
-    class TrackingProvider(FakeProvider):
-        def __init__(self):
-            self.a_share_symbols = []
+    provider = FakeProvider()
+    provider.a_share_symbols = []
+    fake_history = provider.history
 
-        def history(self, symbol, market, lookback_days=360, adjust="qfq"):
-            if market == "a":
-                self.a_share_symbols.append(symbol)
-            return super().history(symbol, market, lookback_days, adjust)
+    def tracking_history(symbol, market, lookback_days=360, adjust="qfq"):
+        if market == "a":
+            provider.a_share_symbols.append(symbol)
+        return fake_history(symbol, market, lookback_days, adjust)
 
-    provider = TrackingProvider()
+    provider.history = tracking_history
     service = RecommendationService(settings, provider, "risk")
     service.industry = FakeIndustry()
     service.industry_history = FakeIndustryHistory()
@@ -1595,15 +1668,17 @@ def test_recommendation_data_as_of_includes_current_pool_source_date(
         source_as_of="2026-07-10",
     )
 
-    class CurrentDataProvider(FakeProvider):
-        def history(self, symbol, market, lookback_days=360, adjust="qfq"):
-            frame = sample_frame("up")
-            frame["date"] = pd.bdate_range(
-                end="2026-07-13", periods=len(frame)
-            ).strftime("%Y-%m-%d")
-            return frame, "current-data-provider"
+    provider = FakeProvider()
 
-    service = RecommendationService(settings, CurrentDataProvider(), "risk")
+    def current_history(symbol, market, lookback_days=360, adjust="qfq"):
+        frame = sample_frame("up")
+        frame["date"] = pd.bdate_range(
+            end="2026-07-13", periods=len(frame)
+        ).strftime("%Y-%m-%d")
+        return frame, "current-data-provider"
+
+    provider.history = current_history
+    service = RecommendationService(settings, provider, "risk")
     service.industry = FakeIndustry()
     service.industry_history = FakeIndustryHistory()
     service.news = FakeNews()
@@ -2066,6 +2141,201 @@ def test_live_profile_cannot_publish_non_jiaoch_market_source(tmp_path, monkeypa
     assert result["market_source_gate"]["passed"] is False
     assert result["items"] == []
     assert result["auto_order"] is False
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"market_data_provider": "akshare"}, "market_data_provider_not_jiaoch"),
+        ({"tushare_fallback_to_akshare": True}, "market_data_fallback_not_allowed"),
+        ({"enable_mootdx_daily_fallback": True}, "mootdx_daily_fallback_not_allowed"),
+        ({"enable_mootdx_l1_context": True}, "mootdx_l1_not_allowed"),
+    ],
+)
+def test_generation_blocks_non_jiaoch_runtime_before_any_market_access(
+    tmp_path, overrides, reason
+):
+    settings = replace(make_settings(tmp_path), **overrides)
+    service = RecommendationService(settings, MustNotReadMarketProvider(), "risk")
+    service.industry = MustNotReadIndustry()
+    service.universe = MustNotReadUniverse()
+
+    result = service.generate_daily_recommendations(force=True)
+
+    assert result["recommendation_status"] == "blocked_market_source_gate"
+    assert result["items"] == []
+    assert result["market_source_gate"]["passed"] is False
+    assert reason in result["market_source_gate"]["reasons"]
+    assert result["errors"] == [
+        {"stage": "market_source_gate", "reasons": result["market_source_gate"]["reasons"]}
+    ]
+
+
+def test_generation_blocks_untrusted_provider_before_any_market_access(tmp_path):
+    service = RecommendationService(
+        make_settings(tmp_path), MustNotReadMarketProvider(), "risk"
+    )
+    service.industry = MustNotReadIndustry()
+    service.universe = MustNotReadUniverse()
+
+    result = service.generate_daily_recommendations(force=True)
+
+    assert result["recommendation_status"] == "blocked_market_source_gate"
+    assert result["items"] == []
+    assert result["market_source_gate"]["passed"] is False
+    assert "market_data_provider_identity_not_jiaoch" in result["market_source_gate"]["reasons"]
+
+
+def test_generation_blocks_unregistered_jiaoch_subclass_before_any_market_access(tmp_path):
+    service = RecommendationService(
+        make_settings(tmp_path), ImposterJiaochProvider(), "risk"
+    )
+    service.industry = MustNotReadIndustry()
+    service.universe = MustNotReadUniverse()
+
+    result = service.generate_daily_recommendations(force=True)
+
+    assert result["recommendation_status"] == "blocked_market_source_gate"
+    assert result["items"] == []
+    assert result["market_source_gate"]["passed"] is False
+    assert "market_data_provider_identity_not_jiaoch" in result["market_source_gate"]["reasons"]
+
+
+def test_generation_blocks_non_jiaoch_industry_context_before_any_market_access(tmp_path):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    service.universe = MustNotReadUniverse()
+
+    result = service.generate_daily_recommendations(force=True)
+
+    assert result["recommendation_status"] == "blocked_market_source_gate"
+    assert result["items"] == []
+    assert "industry_strength_source_not_jiaoch" in result["market_source_gate"]["reasons"]
+
+
+def test_generation_blocks_non_jiaoch_industry_history_before_any_market_access(tmp_path):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    service.industry = FakeIndustry()
+    service.industry_history = RealIndustryHistoryProvider(str(tmp_path / "industry-history"))
+    service.universe = MustNotReadUniverse()
+
+    result = service.generate_daily_recommendations(force=True)
+
+    assert result["recommendation_status"] == "blocked_market_source_gate"
+    assert result["items"] == []
+    assert "industry_history_source_not_jiaoch" in result["market_source_gate"]["reasons"]
+
+
+def test_generation_blocks_enabled_non_jiaoch_fund_flow_before_any_market_access(tmp_path):
+    settings = replace(make_settings(tmp_path), enable_fund_flow_context=True)
+    service = RecommendationService(settings, FakeProvider(), "risk")
+    service.industry = FakeIndustry()
+    service.industry_history = FakeIndustryHistory()
+    service.universe = MustNotReadUniverse()
+
+    result = service.generate_daily_recommendations(force=True)
+
+    assert result["recommendation_status"] == "blocked_market_source_gate"
+    assert result["items"] == []
+    assert "fund_flow_source_not_jiaoch" in result["market_source_gate"]["reasons"]
+
+
+def test_generation_blocks_unattested_context_wrapper_before_any_market_access(tmp_path):
+    class UnattestedIndustry(FakeIndustry):
+        def __init__(self):
+            pass
+
+        def build_map(self, *args, **kwargs):
+            raise AssertionError("unattested context must not be read")
+
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    service.universe = FakeUniverse([])
+    service.industry = UnattestedIndustry()
+    service.industry_history = FakeIndustryHistory()
+
+    result = service.generate_daily_recommendations(force=True)
+
+    assert result["recommendation_status"] == "blocked_market_source_gate"
+    assert result["items"] == []
+    assert "industry_strength_source_not_jiaoch" in result["market_source_gate"]["reasons"]
+
+
+def test_generation_blocks_jiaoch_provider_without_bound_snapshot_context(tmp_path):
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    service.industry = FakeIndustry()
+    service.industry_history = FakeIndustryHistory()
+
+    result = service.generate_daily_recommendations(force=True)
+
+    assert result["recommendation_status"] == "blocked_market_source_gate"
+    assert result["items"] == []
+    assert "universe_source_not_jiaoch" in result["market_source_gate"]["reasons"]
+
+
+def test_factory_jiaoch_provider_binds_default_snapshot_context(tmp_path):
+    service = RecommendationService(
+        make_settings(tmp_path), build_market_data_provider("jiaoch", 1800, ""), "risk"
+    )
+
+    assert service._monitor_snapshot_input_gate()["passed"] is True
+
+
+def test_factory_jiaoch_provider_rejects_rebound_snapshot_context(tmp_path):
+    provider = build_market_data_provider("jiaoch", 1800, "")
+
+    def foreign_snapshot(_provider, use_cache_on_error=True):
+        raise AssertionError("rebound snapshot must not be trusted")
+
+    provider.snapshot = MethodType(foreign_snapshot, provider)
+    service = RecommendationService(make_settings(tmp_path), provider, "risk")
+
+    assert set(service._monitor_snapshot_input_gate()["reasons"]) == {
+        "market_data_provider_identity_not_jiaoch",
+        "universe_source_not_jiaoch",
+    }
+
+
+def test_monitoring_blocks_unattested_snapshot_before_any_market_access(tmp_path, monkeypatch):
+    class MustNotReadL1:
+        def quotes(self, *args, **kwargs):
+            raise AssertionError("L1 source must not be read before the source gate")
+
+    service = RecommendationService(make_settings(tmp_path), FakeProvider(), "risk")
+    service.universe = MustNotReadUniverse()
+    service.l1_quotes = MustNotReadL1()
+    monkeypatch.setattr(
+        service,
+        "_recent_recommended_items",
+        lambda *_args, **_kwargs: pytest.fail("recommendation history must not be read before source gate"),
+    )
+
+    result = service.monitor_recommendations(force=True)
+
+    assert result["skipped"] is True
+    assert result["reason"] == "market_data_source_not_jiaoch"
+    assert result["market_source_gate"]["reasons"] == ["universe_source_not_jiaoch"]
+
+
+@pytest.mark.parametrize(
+    "method_name", ["monitor_recommendations", "monitor_planned_exits"]
+)
+def test_monitoring_blocks_untrusted_provider_before_any_market_access(
+    tmp_path, monkeypatch, method_name
+):
+    service = RecommendationService(
+        make_settings(tmp_path), MustNotReadMarketProvider(), "risk"
+    )
+    monkeypatch.setattr(
+        service,
+        "_recent_recommended_items",
+        lambda *_args, **_kwargs: pytest.fail("monitoring must not read recommendations before source gate"),
+    )
+
+    result = getattr(service, method_name)(force=True)
+
+    assert result["skipped"] is True
+    assert result["reason"] == "market_data_source_not_jiaoch"
+    assert result["market_source_gate"]["passed"] is False
+    assert "market_data_provider_identity_not_jiaoch" in result["market_source_gate"]["reasons"]
 
 
 def test_pre_open_run_slot_skips_l1_context(tmp_path):

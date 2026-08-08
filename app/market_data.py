@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import weakref
 from datetime import datetime, time as day_time, timedelta
 from pathlib import Path
 from threading import RLock
@@ -14,6 +15,9 @@ from app.trading_calendar import is_trade_day, latest_trade_date_on_or_before, p
 
 class MarketDataError(RuntimeError):
     pass
+
+
+_JIAOCH_RUNTIME_PROVIDERS = weakref.WeakSet()
 
 
 class CachedFrame:
@@ -587,7 +591,7 @@ def build_market_data_provider(
     provider_name: str,
     cache_ttl_seconds: int,
     disk_cache_path: str,
-    tushare_fallback_to_akshare: bool = True,
+    tushare_fallback_to_akshare: bool = False,
     tushare_token: str = "",
     enable_mootdx_daily_fallback: bool = False,
     mootdx_servers: str = "",
@@ -595,32 +599,59 @@ def build_market_data_provider(
     mootdx_daily_max_pages: int = 3,
     mootdx_daily_max_elapsed_seconds: float = 12.0,
 ):
-    normalized = (provider_name or "akshare").strip().lower()
-    if normalized == "akshare":
-        return AkshareDataProvider(
-            cache_ttl_seconds=cache_ttl_seconds,
-            disk_cache_path=disk_cache_path,
-            enable_mootdx_daily_fallback=enable_mootdx_daily_fallback,
-            mootdx_servers=mootdx_servers,
-            mootdx_timeout_seconds=mootdx_timeout_seconds,
-            mootdx_daily_max_pages=mootdx_daily_max_pages,
-            mootdx_daily_max_elapsed_seconds=mootdx_daily_max_elapsed_seconds,
-        )
-    if normalized == "tushare":
-        return TushareDataProvider(
-            cache_ttl_seconds=cache_ttl_seconds,
-            disk_cache_path=disk_cache_path,
-            fallback_to_akshare=tushare_fallback_to_akshare,
-            token=tushare_token,
-        )
-    if normalized == "jiaoch":
-        from app.jiaoch_live_market import JiaochMarketDataProvider
+    normalized = (provider_name or "jiaoch").strip().lower()
+    if normalized != "jiaoch":
+        raise MarketDataError("Jiaoch-only market runtime requires MARKET_DATA_PROVIDER=jiaoch")
+    if tushare_fallback_to_akshare or enable_mootdx_daily_fallback:
+        raise MarketDataError("Jiaoch-only market runtime forbids fallback providers")
+    from app.jiaoch_live_market import (
+        JIAOCH_MARKET_HISTORY_METHOD,
+        JIAOCH_MARKET_PROVIDER_TYPE,
+        JIAOCH_MARKET_SNAPSHOT_METHOD,
+        JiaochMarketDataProvider,
+    )
 
-        return JiaochMarketDataProvider(
-            cache_ttl_seconds=cache_ttl_seconds,
-            disk_cache_path=disk_cache_path,
-        )
-    raise MarketDataError("Unsupported MARKET_DATA_PROVIDER: %s" % provider_name)
+    if (
+        JiaochMarketDataProvider is not JIAOCH_MARKET_PROVIDER_TYPE
+        or JiaochMarketDataProvider.history is not JIAOCH_MARKET_HISTORY_METHOD
+        or JiaochMarketDataProvider.snapshot is not JIAOCH_MARKET_SNAPSHOT_METHOD
+    ):
+        raise MarketDataError("Jiaoch market provider implementation was modified")
+
+    provider = JiaochMarketDataProvider(
+        cache_ttl_seconds=cache_ttl_seconds,
+        disk_cache_path=disk_cache_path,
+    )
+    _JIAOCH_RUNTIME_PROVIDERS.add(provider)
+    return provider
+
+
+def is_jiaoch_runtime_provider(provider) -> bool:
+    from app.jiaoch_live_market import (
+        JIAOCH_MARKET_HISTORY_METHOD,
+        JIAOCH_MARKET_PROVIDER_TYPE,
+        JIAOCH_MARKET_SNAPSHOT_METHOD,
+        JiaochMarketDataProvider,
+    )
+
+    if (
+        JiaochMarketDataProvider is not JIAOCH_MARKET_PROVIDER_TYPE
+        or type(provider) is not JIAOCH_MARKET_PROVIDER_TYPE
+    ):
+        return False
+    history = getattr(provider, "history", None)
+    snapshot = getattr(provider, "snapshot", None)
+    if (
+        getattr(history, "__self__", None) is not provider
+        or getattr(history, "__func__", None) is not JIAOCH_MARKET_HISTORY_METHOD
+        or getattr(snapshot, "__self__", None) is not provider
+        or getattr(snapshot, "__func__", None) is not JIAOCH_MARKET_SNAPSHOT_METHOD
+    ):
+        return False
+    try:
+        return provider in _JIAOCH_RUNTIME_PROVIDERS
+    except TypeError:
+        return False
 
 
 def frame_to_points(frame: pd.DataFrame, limit: Optional[int] = None):

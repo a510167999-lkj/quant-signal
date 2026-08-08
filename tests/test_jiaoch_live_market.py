@@ -15,7 +15,7 @@ from app.jiaoch_live_market import (
     JiaochMarketDataProvider,
     _daily_frame,
 )
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.market_data import build_market_data_provider
 from app.research_pit_transport import HttpEntityResponse
 
@@ -144,6 +144,12 @@ def test_factory_exposes_explicit_jiaoch_provider_without_network_call():
     assert isinstance(provider, JiaochMarketDataProvider)
 
 
+def test_factory_defaults_to_jiaoch_provider_without_network_call():
+    provider = build_market_data_provider("", 1800, "")
+
+    assert isinstance(provider, JiaochMarketDataProvider)
+
+
 def test_runtime_settings_default_to_jiaoch_without_a_fallback(monkeypatch):
     monkeypatch.delenv("MARKET_DATA_PROVIDER", raising=False)
     monkeypatch.delenv("TUSHARE_FALLBACK_TO_AKSHARE", raising=False)
@@ -152,6 +158,14 @@ def test_runtime_settings_default_to_jiaoch_without_a_fallback(monkeypatch):
 
     assert settings.market_data_provider == "jiaoch"
     assert settings.tushare_fallback_to_akshare is False
+
+
+def test_direct_settings_default_to_jiaoch_without_a_fallback():
+    settings = Settings()
+
+    assert settings.market_data_provider == "jiaoch"
+    assert settings.tushare_fallback_to_akshare is False
+    assert settings.enable_fund_flow_context is False
 
 
 def test_non_jiaoch_disk_cache_is_not_a_runtime_fallback(tmp_path, monkeypatch):

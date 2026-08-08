@@ -98,6 +98,7 @@ def test_analyze_endpoint_with_fake_provider(monkeypatch):
     def fake_history(symbol, market, lookback_days=360, adjust="qfq"):
         return sample_frame("up"), "test-provider"
 
+    monkeypatch.setattr(main, "_require_jiaoch_market_runtime", lambda: None)
     monkeypatch.setattr(main.DATA_PROVIDER, "history", fake_history)
     client = TestClient(main.create_app())
 
@@ -176,6 +177,7 @@ def test_recommendation_performance_endpoint(monkeypatch, tmp_path):
         return sample_frame("up"), "test-provider"
 
     monkeypatch.setattr(main, "SETTINGS", replace(main.SETTINGS, recommendation_history_path=str(history_path)))
+    monkeypatch.setattr(main, "_require_jiaoch_market_runtime", lambda: None)
     monkeypatch.setattr(main.DATA_PROVIDER, "history", fake_history)
     client = TestClient(main.create_app())
 
@@ -223,19 +225,14 @@ def test_holdings_endpoint_tracks_default_positions(monkeypatch, tmp_path):
     def fake_history(symbol, market, lookback_days=360, adjust="qfq"):
         return sample_frame("up"), "test-provider"
 
-    class FakeL1:
+    class MustNotReadL1:
         def quotes(self, symbols):
-            return {
-                "enabled": True,
-                "available": True,
-                "quotes": {symbol: {"price": 120, "change_pct": 1.2} for symbol in symbols},
-                "errors": [],
-                "elapsed_seconds": 0.01,
-            }
+            raise AssertionError("holdings endpoint must not read a non-Jiaoch L1 provider")
 
     monkeypatch.setattr(main, "SETTINGS", replace(main.SETTINGS, holdings_path=str(tmp_path / "holdings.json")))
+    monkeypatch.setattr(main, "_require_jiaoch_market_runtime", lambda: None)
     monkeypatch.setattr(main.DATA_PROVIDER, "history", fake_history)
-    monkeypatch.setattr(main.RECOMMENDATIONS, "l1_quotes", FakeL1())
+    monkeypatch.setattr(main.RECOMMENDATIONS, "l1_quotes", MustNotReadL1())
     client = TestClient(main.create_app())
 
     response = client.get("/api/holdings")
@@ -243,4 +240,4 @@ def test_holdings_endpoint_tracks_default_positions(monkeypatch, tmp_path):
     assert response.status_code == 200
     data = response.json()
     assert [item["symbol"] for item in data["items"]] == ["159567", "520700"]
-    assert data["l1_quote"]["quote_count"] == 2
+    assert data["l1_quote"]["quote_count"] == 0

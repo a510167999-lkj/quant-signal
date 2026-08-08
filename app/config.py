@@ -28,12 +28,12 @@ class Settings:
     api_version: str = "0.1.0"
     cors_origins: List[str] = field(default_factory=list)
     cache_ttl_seconds: int = 1800
-    # Unit-test fixtures may construct Settings() directly; production defaults
-    # are pinned in get_settings() below.
-    market_data_provider: str = "akshare"
+    # Direct construction and get_settings() must share the Jiaoch-only
+    # runtime default. Tests that need a different source must opt in explicitly.
+    market_data_provider: str = "jiaoch"
     market_data_cache_path: str = "data/market_data_cache.sqlite"
     tushare_token: str = ""
-    tushare_fallback_to_akshare: bool = True
+    tushare_fallback_to_akshare: bool = False
     enable_mootdx_l1_context: bool = False
     mootdx_servers: str = ""
     mootdx_timeout_seconds: float = 3.0
@@ -99,7 +99,7 @@ class Settings:
     recommendation_allowed_market_levels: List[str] = field(default_factory=lambda: ["favorable", "neutral"])
     recommendation_symbol_cooldown_days: int = 5
     fund_flow_cache_path: str = "data/fund_flow_context.json"
-    enable_fund_flow_context: bool = True
+    enable_fund_flow_context: bool = False
     enable_news_context: bool = True
     enable_announcement_context: bool = True
     enable_margin_eligibility_context: bool = True
@@ -235,7 +235,7 @@ def get_settings() -> Settings:
         ),
         recommendation_symbol_cooldown_days=int_setting("RECOMMENDATION_SYMBOL_COOLDOWN_DAYS", 5, 0, 60),
         fund_flow_cache_path=os.getenv("FUND_FLOW_CACHE_PATH", "data/fund_flow_context.json"),
-        enable_fund_flow_context=os.getenv("ENABLE_FUND_FLOW_CONTEXT", "1").strip() != "0",
+        enable_fund_flow_context=os.getenv("ENABLE_FUND_FLOW_CONTEXT", "0").strip() != "0",
         enable_news_context=os.getenv("ENABLE_NEWS_CONTEXT", "1").strip() != "0",
         enable_announcement_context=os.getenv("ENABLE_ANNOUNCEMENT_CONTEXT", "1").strip() != "0",
         enable_margin_eligibility_context=os.getenv("ENABLE_MARGIN_ELIGIBILITY_CONTEXT", "1").strip() != "0",

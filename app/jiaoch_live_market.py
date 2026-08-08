@@ -616,6 +616,11 @@ class JiaochMarketDataProvider:
             finally:
                 connection.close()
 
+JIAOCH_MARKET_HISTORY_METHOD = JiaochMarketDataProvider.history
+JIAOCH_MARKET_SNAPSHOT_METHOD = JiaochMarketDataProvider.snapshot
+JIAOCH_MARKET_PROVIDER_TYPE = JiaochMarketDataProvider
+
+
 __all__ = (
     "ADJ_FACTOR_FIELDS",
     "BAK_BASIC_FIELDS",
@@ -623,4 +628,7 @@ __all__ = (
     "JiaochHttpClient",
     "JiaochLiveMarketError",
     "JiaochMarketDataProvider",
+    "JIAOCH_MARKET_HISTORY_METHOD",
+    "JIAOCH_MARKET_PROVIDER_TYPE",
+    "JIAOCH_MARKET_SNAPSHOT_METHOD",
 )
