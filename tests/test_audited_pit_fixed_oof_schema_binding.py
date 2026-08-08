@@ -4,6 +4,8 @@ from datetime import date, timedelta
 import pytest
 
 from app import audited_pit_continuous_ridge_oof as ridge
+from app import audited_pit_shallow_gbdt as shallow_gbdt
+from app import audited_pit_shallow_gbdt_risk_on_breadth as risk_on_breadth
 from app.audited_pit_score_contract import (
     RIDGE_SCORE_CONTRACT,
     SHALLOW_GBDT_SCORE_CONTRACT,
@@ -115,6 +117,53 @@ def test_fixed_oof_sweep_schema_is_bound_to_the_frozen_score_contract(
                 sweep_schema_version=invalid_schema,
                 score_contract=SHALLOW_GBDT_SCORE_CONTRACT,
             )
+
+
+def test_risk_on_breadth_sweep_schema_is_bound_only_to_its_frozen_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ridge,
+        "_trade_metrics",
+        lambda *args, **kwargs: _passing_metrics(),
+    )
+    candidate = _candidate(probability=True)
+    candidate["cross_section_above_ma20_fraction"] = 0.75
+    risk_schema = (
+        "strict-ranked-liquidity-shallow-gbdt-risk-on-breadth-fixed-oof/v1"
+    )
+    base_schema = "strict-ranked-liquidity-shallow-gbdt-fixed-oof/v1"
+
+    sweep, _ = ridge._evaluate_fixed_oof(
+        [candidate],
+        rank_mode="positive_utility_probability",
+        evaluation_session_dates=_evaluation_sessions(),
+        strategy_spec=risk_on_breadth.SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC,
+        sweep_schema_version=risk_schema,
+        score_contract=SHALLOW_GBDT_SCORE_CONTRACT,
+    )
+    assert sweep["schema_version"] == risk_schema
+
+    with pytest.raises(ValueError, match="sweep schema"):
+        ridge._evaluate_fixed_oof(
+            [candidate],
+            rank_mode="positive_utility_probability",
+            evaluation_session_dates=_evaluation_sessions(),
+            strategy_spec=shallow_gbdt.SHALLOW_GBDT_OOF_SPEC,
+            sweep_schema_version=risk_schema,
+            score_contract=SHALLOW_GBDT_SCORE_CONTRACT,
+        )
+    with pytest.raises(ValueError, match="sweep schema"):
+        ridge._evaluate_fixed_oof(
+            [candidate],
+            rank_mode="positive_utility_probability",
+            evaluation_session_dates=_evaluation_sessions(),
+            strategy_spec=(
+                risk_on_breadth.SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC
+            ),
+            sweep_schema_version=base_schema,
+            score_contract=SHALLOW_GBDT_SCORE_CONTRACT,
+        )
 
 
 @pytest.mark.parametrize(

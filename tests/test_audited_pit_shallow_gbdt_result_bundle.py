@@ -12,6 +12,7 @@ import pytest
 from app import audited_pit_continuous_ridge_oof as ridge
 from app import audited_pit_shallow_gbdt as shallow_gbdt
 from app import audited_pit_shallow_gbdt_probability_budget as probability_budget
+from app import audited_pit_shallow_gbdt_risk_on_breadth as risk_on_breadth
 
 
 _SESSIONS = pd.bdate_range(
@@ -342,6 +343,142 @@ def _build_probability_budget_payloads(
             sessions=sessions,
         ),
     )
+
+
+def _risk_on_breadth_candidates() -> list[dict]:
+    candidates = _scored_candidates()
+    candidates[2]["predicted_positive_utility_probability"] = 0.80
+    candidates[2]["score"] = 0.80
+    candidates[2]["rank_score"] = 0.80
+    breadth_by_key = {
+        "candidate-1": 0.25,
+        "candidate-2": 0.25,
+        "candidate-3": 0.75,
+        "candidate-4": 0.75,
+    }
+    for candidate in candidates:
+        candidate["cross_section_above_ma20_fraction"] = breadth_by_key[
+            candidate["candidate_key"]
+        ]
+    return candidates
+
+
+def _risk_on_breadth_shared_receipts(
+    candidates: list[dict] | None = None,
+) -> dict:
+    candidates = candidates or _risk_on_breadth_candidates()
+    shared = deepcopy(_shared_receipts(candidates))
+    evaluated = ridge._evaluate_scored_oof_variant(
+        scored_execution_candidates=candidates,
+        sessions=_SESSIONS,
+        strategy_spec=risk_on_breadth.SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC,
+    )
+    control_sweep = evaluated.pop("baseline_sweep")
+    control_receipt = evaluated.pop("baseline_selection_receipt")
+    shared["selection"] = {
+        **evaluated,
+        "amount_baseline_sweep": control_sweep,
+        "amount_baseline_selection_receipt": control_receipt,
+    }
+    outcome_receipt = shared["execution"]["outcome_receipt"]
+    outcome_receipt["schema_version"] = (
+        "ranked-liquidity-shallow-gbdt-risk-on-breadth-strict-outcome/v1"
+    )
+    unsigned_outcome_receipt = {
+        key: value
+        for key, value in outcome_receipt.items()
+        if key != "receipt_sha256"
+    }
+    outcome_receipt["receipt_sha256"] = ridge._sha256(
+        unsigned_outcome_receipt
+    )
+    shared["scope"]["advancement_gate_passed"] = shared["selection"][
+        "advancement_gate_passed"
+    ]
+    return shared
+
+
+def _risk_on_breadth_bundle_with_fake_oof_replay(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    candidates: list[dict] | None = None,
+    tail_feature_candidates: list[dict] | None = None,
+) -> tuple[dict, dict]:
+    candidates = candidates or _risk_on_breadth_candidates()
+    tail_feature_candidates = tail_feature_candidates or candidates
+    shared = _risk_on_breadth_shared_receipts(candidates)
+    payloads = ridge.build_ranked_liquidity_result_payloads(
+        strategy_spec=(
+            risk_on_breadth.SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC
+        ),
+        shared_receipts=shared,
+    )
+    bundle = ridge._write_result_bundle(
+        tmp_path / "risk-on-breadth-bundle",
+        main_payload=payloads["main_payload"],
+        sidecar_payloads=payloads["sidecar_payloads"],
+        expected_producer_code=payloads["producer_code"],
+    )
+
+    def fake_independent_replay(
+        tail_features,
+        outcome_candidates,
+        sessions,
+        scored_oof,
+        receipt,
+        **kwargs,
+    ):
+        return {
+            "verified": True,
+            "receipt_sha256": receipt["receipt_sha256"],
+            "fold_count": receipt["fold_count"],
+            "oof_candidate_count": 4,
+        }
+
+    monkeypatch.setattr(
+        ridge,
+        "_verify_shallow_gbdt_result_bundle_oof_replay",
+        fake_independent_replay,
+    )
+    return bundle, {
+        "tail_features": pd.DataFrame(
+            [
+                {
+                    "candidate_key": candidate["candidate_key"],
+                    "signal_date": candidate["signal_date"],
+                    "cross_section_above_ma20_fraction": candidate[
+                        "cross_section_above_ma20_fraction"
+                    ],
+                }
+                for candidate in tail_feature_candidates
+            ]
+        ),
+        "outcome_candidates": [
+            ridge._outcome_payload_from_scored_candidate(
+                candidate,
+                score_contract=shallow_gbdt.SHALLOW_GBDT_SCORE_CONTRACT,
+            )
+            for candidate in candidates
+        ],
+        "sessions": _SESSIONS,
+        "scored_oof": pd.DataFrame(
+            [
+                {
+                    "candidate_key": candidate["candidate_key"],
+                    "signal_date": candidate["signal_date"],
+                    "predicted_positive_utility_probability": candidate[
+                        "predicted_positive_utility_probability"
+                    ],
+                }
+                for candidate in candidates
+            ]
+        ),
+        "expected_source": shared["source"],
+        "expected_outcome_receipt": shared["execution"][
+            "outcome_receipt"
+        ],
+    }
 
 
 def _probability_budget_bundle_with_fake_oof_replay(
@@ -695,6 +832,137 @@ def test_probability_budget_payload_builder_preserves_role_separated_selection_e
     assert comparison["control_evidence_completeness_is_advancement_gate"] is True
     assert "baseline_performance_is_advancement_gate" not in comparison
     assert "baseline_evidence_completeness_is_advancement_gate" not in comparison
+
+
+def test_risk_on_breadth_filters_before_positive_pool_and_binds_receipt():
+    candidates = _risk_on_breadth_candidates()
+
+    evaluated = ridge._evaluate_scored_oof_variant(
+        scored_execution_candidates=candidates,
+        sessions=_SESSIONS,
+        strategy_spec=risk_on_breadth.SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC,
+    )
+    payloads = ridge.build_ranked_liquidity_result_payloads(
+        strategy_spec=(
+            risk_on_breadth.SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC
+        ),
+        shared_receipts=_risk_on_breadth_shared_receipts(),
+    )
+
+    assert [
+        candidate["candidate_key"]
+        for candidate in evaluated["scored_execution_candidates"]
+    ] == ["candidate-3", "candidate-4"]
+    assert [
+        candidate["candidate_key"]
+        for candidate in evaluated["positive_candidates"]
+    ] == ["candidate-3"]
+    receipt = evaluated["market_breadth_filter_receipt"]
+    assert receipt["input_candidate_count"] == 4
+    assert receipt["eligible_candidate_count"] == 2
+    assert receipt["excluded_candidate_count"] == 2
+    selection = payloads["sidecar_payloads"]["selection"]
+    assert selection["market_breadth_filter_receipt"] == receipt
+    assert payloads["main_payload"][
+        "market_breadth_filter_receipt_sha256"
+    ] == receipt["receipt_sha256"]
+    assert payloads["main_payload"]["comparison"][
+        "market_breadth_filter_applied"
+    ] is True
+
+
+def test_existing_gbdt_variants_reject_market_breadth_filter_receipt():
+    _, receipt = ridge.filter_scored_candidates_for_frozen_selection(
+        _risk_on_breadth_candidates(),
+        strategy_spec=risk_on_breadth.SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC,
+    )
+    cases = [
+        (shallow_gbdt.SHALLOW_GBDT_OOF_SPEC, _shared_receipts()),
+        (
+            probability_budget.SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC,
+            _probability_budget_shared_receipts(),
+        ),
+    ]
+    for strategy_spec, shared in cases:
+        shared["selection"]["market_breadth_filter_receipt"] = receipt
+        with pytest.raises(ValueError, match="market breadth filter"):
+            ridge.build_ranked_liquidity_result_payloads(
+                strategy_spec=strategy_spec,
+                shared_receipts=shared,
+            )
+
+
+def test_risk_on_breadth_result_bundle_replays_filter_and_rejects_rehashed_tamper(
+    monkeypatch,
+    tmp_path: Path,
+):
+    bundle, replay_inputs = _risk_on_breadth_bundle_with_fake_oof_replay(
+        monkeypatch,
+        tmp_path,
+    )
+
+    verified = ridge.verify_shallow_gbdt_risk_on_breadth_result_bundle(
+        bundle,
+        **replay_inputs,
+    )
+    assert verified["verified"] is True
+    assert verified["checks"]["market_breadth_filter_replayed"] is True
+
+    def mutate_selection(selection: dict) -> None:
+        receipt = selection["market_breadth_filter_receipt"]
+        receipt["eligible_candidate_keys_sha256"] = "e" * 64
+        unsigned = {
+            key: value
+            for key, value in receipt.items()
+            if key != "receipt_sha256"
+        }
+        receipt["receipt_sha256"] = ridge._sha256(unsigned)
+
+    def mutate_main(main: dict, selection: dict) -> None:
+        main["market_breadth_filter_receipt_sha256"] = selection[
+            "market_breadth_filter_receipt"
+        ]["receipt_sha256"]
+
+    tampered = _tamper_selection_bundle(
+        bundle,
+        tmp_path,
+        mutate_selection=mutate_selection,
+        mutate_main=mutate_main,
+    )
+    with pytest.raises(
+        ValueError,
+        match="shallow GBDT result bundle verification failed",
+    ):
+        ridge.verify_shallow_gbdt_risk_on_breadth_result_bundle(
+            tampered,
+            **replay_inputs,
+        )
+
+
+def test_risk_on_breadth_result_bundle_rejects_resigned_outcome_feature_drift(
+    monkeypatch,
+    tmp_path: Path,
+):
+    original_candidates = _risk_on_breadth_candidates()
+    rewritten_candidates = deepcopy(original_candidates)
+    for candidate in rewritten_candidates:
+        if candidate["signal_date"] == "2025-01-02":
+            candidate["cross_section_above_ma20_fraction"] = 0.75
+    bundle, replay_inputs = _risk_on_breadth_bundle_with_fake_oof_replay(
+        monkeypatch,
+        tmp_path,
+        candidates=rewritten_candidates,
+        tail_feature_candidates=original_candidates,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="shallow GBDT result bundle verification failed",
+    ):
+        ridge.verify_shallow_gbdt_risk_on_breadth_result_bundle(
+            bundle,
+            **replay_inputs,
+        )
 
 
 def test_probability_budget_result_bundle_replays_role_separated_allocations(

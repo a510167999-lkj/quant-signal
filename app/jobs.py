@@ -34,6 +34,7 @@ from app.audited_pit_continuous_ridge_oof import (
     run_audited_pit_ranked_liquidity_ridge_oof,
     run_audited_pit_ranked_liquidity_ridge_rolling_oof,
     run_audited_pit_ranked_liquidity_shallow_gbdt_probability_budget_rolling_oof,
+    run_audited_pit_ranked_liquidity_shallow_gbdt_risk_on_breadth_rolling_oof,
     run_audited_pit_ranked_liquidity_shallow_gbdt_rolling_oof,
 )
 from app.audited_pit_walk_forward_rank import run_audited_pit_walk_forward_rank
@@ -4489,6 +4490,44 @@ def main(argv=None) -> int:
         "--output-dir", required=True
     )
 
+    audited_pit_ranked_liquidity_shallow_gbdt_risk_on_breadth = (
+        subparsers.add_parser(
+            "research-audited-pit-ranked-liquidity-"
+            "shallow-gbdt-risk-on-breadth-rolling-oof"
+        )
+    )
+    audited_pit_ranked_liquidity_shallow_gbdt_risk_on_breadth.add_argument(
+        "--audited-pit-universe-path", required=True
+    )
+    audited_pit_ranked_liquidity_shallow_gbdt_risk_on_breadth.add_argument(
+        "--expected-coverage-audit-sha256", required=True
+    )
+    audited_pit_ranked_liquidity_shallow_gbdt_risk_on_breadth.add_argument(
+        "--expected-artifact-root-sha256", required=True
+    )
+    audited_pit_ranked_liquidity_shallow_gbdt_risk_on_breadth.add_argument(
+        "--temporal-contract-path", required=True
+    )
+    audited_pit_ranked_liquidity_shallow_gbdt_risk_on_breadth.add_argument(
+        "--expected-temporal-contract-sha256", required=True
+    )
+    audited_pit_ranked_liquidity_shallow_gbdt_risk_on_breadth.add_argument(
+        "--security-code-transition-evidence-root", required=True
+    )
+    audited_pit_ranked_liquidity_shallow_gbdt_risk_on_breadth.add_argument(
+        "--expected-security-code-transition-contract-sha256",
+        required=True,
+    )
+    audited_pit_ranked_liquidity_shallow_gbdt_risk_on_breadth.add_argument(
+        "--start-date", required=True
+    )
+    audited_pit_ranked_liquidity_shallow_gbdt_risk_on_breadth.add_argument(
+        "--end-date", required=True
+    )
+    audited_pit_ranked_liquidity_shallow_gbdt_risk_on_breadth.add_argument(
+        "--output-dir", required=True
+    )
+
     audited_pit_ranked_liquidity_shallow_gbdt_probability_budget = (
         subparsers.add_parser(
             "research-audited-pit-ranked-liquidity-"
@@ -5107,6 +5146,43 @@ def main(argv=None) -> int:
     ):
         report = (
             run_audited_pit_ranked_liquidity_shallow_gbdt_rolling_oof(
+                settings=settings or get_settings(),
+                audited_pit_universe_path=(
+                    args.audited_pit_universe_path
+                ),
+                expected_coverage_audit_sha256=(
+                    args.expected_coverage_audit_sha256
+                ),
+                expected_artifact_root_sha256=(
+                    args.expected_artifact_root_sha256
+                ),
+                temporal_contract_path=args.temporal_contract_path,
+                expected_temporal_contract_sha256=(
+                    args.expected_temporal_contract_sha256
+                ),
+                security_code_transition_evidence_root=(
+                    args.security_code_transition_evidence_root
+                ),
+                expected_security_code_transition_contract_sha256=(
+                    args.expected_security_code_transition_contract_sha256
+                ),
+                start_date=args.start_date,
+                end_date=args.end_date,
+                output_dir=args.output_dir,
+            )
+        )
+        _print_json(report)
+        return 0
+
+    if (
+        args.command
+        == (
+            "research-audited-pit-ranked-liquidity-"
+            "shallow-gbdt-risk-on-breadth-rolling-oof"
+        )
+    ):
+        report = (
+            run_audited_pit_ranked_liquidity_shallow_gbdt_risk_on_breadth_rolling_oof(
                 settings=settings or get_settings(),
                 audited_pit_universe_path=(
                     args.audited_pit_universe_path

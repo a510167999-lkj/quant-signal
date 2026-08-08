@@ -280,6 +280,33 @@ def resolve_model_oof_adapter(
                 shallow_gbdt.verify_shallow_gbdt_rolling_oof_receipt
             ),
         )
+    from app import audited_pit_shallow_gbdt_risk_on_breadth as risk_on_breadth
+
+    risk_on_breadth_spec_sha256 = (
+        risk_on_breadth._SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC_SHA256
+    )
+    if (
+        _sha256(risk_on_breadth.SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC)
+        == risk_on_breadth_spec_sha256
+        and _sha256(strategy_spec) == risk_on_breadth_spec_sha256
+        and dict(strategy_spec)
+        == risk_on_breadth.SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC
+        and frozen_score_contract(
+            strategy_spec["selection"]["score_contract"]
+        )
+        is SHALLOW_GBDT_SCORE_CONTRACT
+    ):
+        return ModelOOFAdapter(
+            model_id="shallow_gbdt_risk_on_breadth",
+            score_contract=SHALLOW_GBDT_SCORE_CONTRACT,
+            score_field="predicted_positive_utility_probability",
+            build_scores=(
+                shallow_gbdt.build_shallow_gbdt_rolling_oof_scores
+            ),
+            verify_receipt=(
+                shallow_gbdt.verify_shallow_gbdt_rolling_oof_receipt
+            ),
+        )
     from app import audited_pit_shallow_gbdt_probability_budget as probability_budget
 
     probability_budget_spec_sha256 = (
@@ -2691,6 +2718,257 @@ def _positive_score_pool(
     return positive, receipt
 
 
+def filter_scored_candidates_for_frozen_selection(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    strategy_spec: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    from app import audited_pit_shallow_gbdt_risk_on_breadth as risk_on_breadth
+
+    adapter = resolve_model_oof_adapter(strategy_spec)
+    if adapter.model_id != "shallow_gbdt_risk_on_breadth":
+        raise ValueError("market breadth filter requires its frozen strategy")
+    risk_on_breadth.assert_frozen_risk_on_breadth_strategy(strategy_spec)
+    gate = dict(strategy_spec["selection"]["market_breadth_gate"])
+    feature = str(gate["feature"])
+    minimum = gate["minimum"]
+    if (
+        gate != risk_on_breadth.MARKET_BREADTH_GATE
+        or not isinstance(minimum, float)
+        or not math.isfinite(minimum)
+    ):
+        raise ValueError("market breadth gate is invalid")
+    ordered = sorted(
+        (dict(candidate) for candidate in candidates),
+        key=lambda item: (
+            str(item.get("signal_date") or ""),
+            str(item.get("security_id") or ""),
+            str(item.get("candidate_key") or ""),
+        ),
+    )
+    input_keys: list[str] = []
+    eligible: list[dict[str, Any]] = []
+    excluded_keys: list[str] = []
+    breadth_hex_by_signal_date: dict[str, str] = {}
+    for candidate in ordered:
+        key = str(candidate.get("candidate_key") or "")
+        signal_date = str(candidate.get("signal_date") or "")
+        if not key or not signal_date:
+            raise ValueError("market breadth candidate key is invalid")
+        breadth = candidate.get(feature)
+        if (
+            type(breadth) not in {float, np.float64}
+            or not math.isfinite(float(breadth))
+            or not 0.0 <= float(breadth) <= 1.0
+        ):
+            raise ValueError("market breadth is invalid")
+        breadth_hex = float(breadth).hex()
+        prior_breadth_hex = breadth_hex_by_signal_date.setdefault(
+            signal_date,
+            breadth_hex,
+        )
+        if prior_breadth_hex != breadth_hex:
+            raise ValueError("market breadth differs within signal date")
+        input_keys.append(key)
+        if float(breadth) >= minimum:
+            eligible.append(candidate)
+        else:
+            excluded_keys.append(key)
+    if len(input_keys) != len(set(input_keys)):
+        raise ValueError("market breadth candidate keys are duplicated")
+    receipt = {
+        "schema_version": "ranked-liquidity-market-breadth-filter-receipt/v1",
+        "filter": gate,
+        "input_candidate_count": len(input_keys),
+        "input_candidate_keys_sha256": _sha256(input_keys),
+        "eligible_candidate_count": len(eligible),
+        "eligible_candidate_keys_sha256": _sha256(
+            [str(item["candidate_key"]) for item in eligible]
+        ),
+        "excluded_candidate_count": len(excluded_keys),
+        "excluded_candidate_keys_sha256": _sha256(excluded_keys),
+    }
+    receipt["receipt_sha256"] = _sha256(receipt)
+    return eligible, receipt
+
+
+def _verify_market_breadth_filter_receipt_structure(
+    receipt: Mapping[str, Any],
+    *,
+    strategy_spec: Mapping[str, Any],
+) -> dict[str, Any]:
+    from app import audited_pit_shallow_gbdt_risk_on_breadth as risk_on_breadth
+
+    expected_fields = {
+        "schema_version",
+        "filter",
+        "input_candidate_count",
+        "input_candidate_keys_sha256",
+        "eligible_candidate_count",
+        "eligible_candidate_keys_sha256",
+        "excluded_candidate_count",
+        "excluded_candidate_keys_sha256",
+        "receipt_sha256",
+    }
+    try:
+        adapter = resolve_model_oof_adapter(strategy_spec)
+        if adapter.model_id != "shallow_gbdt_risk_on_breadth":
+            raise ValueError
+        risk_on_breadth.assert_frozen_risk_on_breadth_strategy(
+            strategy_spec
+        )
+        value = dict(receipt)
+        receipt_sha256 = value.pop("receipt_sha256")
+        counts = [
+            value["input_candidate_count"],
+            value["eligible_candidate_count"],
+            value["excluded_candidate_count"],
+        ]
+        hashes = [
+            value["input_candidate_keys_sha256"],
+            value["eligible_candidate_keys_sha256"],
+            value["excluded_candidate_keys_sha256"],
+        ]
+        if (
+            set(value) | {"receipt_sha256"} != expected_fields
+            or value["schema_version"]
+            != "ranked-liquidity-market-breadth-filter-receipt/v1"
+            or value["filter"] != risk_on_breadth.MARKET_BREADTH_GATE
+            or any(
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 0
+                for count in counts
+            )
+            or counts[0] != counts[1] + counts[2]
+            or any(
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+                for value in hashes
+            )
+            or not isinstance(receipt_sha256, str)
+            or len(receipt_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in receipt_sha256
+            )
+            or _sha256(value) != receipt_sha256
+        ):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("market breadth filter receipt is invalid") from None
+    return {"verified": True, "receipt_sha256": receipt_sha256}
+
+
+def verify_market_breadth_filter_receipt(
+    receipt: Mapping[str, Any],
+    *,
+    strategy_spec: Mapping[str, Any],
+    input_candidates: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    structural = _verify_market_breadth_filter_receipt_structure(
+        receipt,
+        strategy_spec=strategy_spec,
+    )
+    _, replayed_receipt = filter_scored_candidates_for_frozen_selection(
+        input_candidates,
+        strategy_spec=strategy_spec,
+    )
+    if dict(receipt) != replayed_receipt:
+        raise ValueError(
+            "market breadth filter receipt differs from input candidates"
+        )
+    return structural
+
+
+def verify_market_breadth_feature_binding(
+    tail_features: pd.DataFrame,
+    outcome_candidates: Sequence[Mapping[str, Any]],
+    *,
+    strategy_spec: Mapping[str, Any],
+) -> dict[str, Any]:
+    from app import audited_pit_shallow_gbdt_risk_on_breadth as risk_on_breadth
+
+    risk_on_breadth.assert_frozen_risk_on_breadth_strategy(strategy_spec)
+    feature = str(
+        strategy_spec["selection"]["market_breadth_gate"]["feature"]
+    )
+    required_columns = {"candidate_key", "signal_date", feature}
+    if (
+        not isinstance(tail_features, pd.DataFrame)
+        or not required_columns.issubset(tail_features.columns)
+        or tail_features[feature].dtype != np.dtype("float64")
+    ):
+        raise ValueError("market breadth feature binding input is invalid")
+
+    feature_lookup: dict[str, tuple[str, str]] = {}
+    feature_breadth_by_signal_date: dict[str, str] = {}
+    for row in tail_features[
+        ["candidate_key", "signal_date", feature]
+    ].itertuples(index=False, name=None):
+        candidate_key = str(row[0] or "")
+        signal_date = str(row[1] or "")
+        breadth = row[2]
+        if (
+            not candidate_key
+            or candidate_key in feature_lookup
+            or not signal_date
+            or type(breadth) not in {float, np.float64}
+            or not math.isfinite(float(breadth))
+            or not 0.0 <= float(breadth) <= 1.0
+        ):
+            raise ValueError("market breadth feature binding input is invalid")
+        breadth_hex = float(breadth).hex()
+        prior_breadth_hex = feature_breadth_by_signal_date.setdefault(
+            signal_date,
+            breadth_hex,
+        )
+        if prior_breadth_hex != breadth_hex:
+            raise ValueError("market breadth feature differs within signal date")
+        feature_lookup[candidate_key] = (signal_date, breadth_hex)
+
+    bound_rows: list[list[str]] = []
+    outcome_keys: set[str] = set()
+    outcome_breadth_by_signal_date: dict[str, str] = {}
+    for raw_candidate in outcome_candidates:
+        candidate = dict(raw_candidate)
+        candidate_key = str(candidate.get("candidate_key") or "")
+        signal_date = str(candidate.get("signal_date") or "")
+        breadth = candidate.get(feature)
+        if (
+            not candidate_key
+            or candidate_key in outcome_keys
+            or candidate_key not in feature_lookup
+            or not signal_date
+            or type(breadth) not in {float, np.float64}
+            or not math.isfinite(float(breadth))
+            or not 0.0 <= float(breadth) <= 1.0
+        ):
+            raise ValueError("market breadth outcome binding input is invalid")
+        breadth_hex = float(breadth).hex()
+        if feature_lookup[candidate_key] != (signal_date, breadth_hex):
+            raise ValueError("market breadth outcome differs from PIT feature")
+        prior_breadth_hex = outcome_breadth_by_signal_date.setdefault(
+            signal_date,
+            breadth_hex,
+        )
+        if prior_breadth_hex != breadth_hex:
+            raise ValueError("market breadth outcome differs within signal date")
+        outcome_keys.add(candidate_key)
+        bound_rows.append([candidate_key, signal_date, breadth_hex])
+    bound_rows.sort(key=lambda row: (row[1], row[0]))
+    receipt = {
+        "schema_version": "market-breadth-feature-binding-receipt/v1",
+        "feature": feature,
+        "comparison": "exact_float64_hex",
+        "outcome_candidate_count": len(bound_rows),
+        "bound_rows_sha256": _sha256(bound_rows),
+    }
+    receipt["receipt_sha256"] = _sha256(receipt)
+    return receipt
+
+
 def _selection_candidate_table(
     candidates: Sequence[Mapping[str, Any]],
     *,
@@ -3344,15 +3622,29 @@ def _evaluate_fixed_oof(
             "strict-ranked-liquidity-ridge-fixed-oof/v2",
             "strict-ranked-liquidity-ridge-fixed-oof/v3",
         }
-    elif strategy_spec["selection"].get("position_budget_allocation") is None:
-        allowed_sweep_schemas = {
-            "strict-ranked-liquidity-shallow-gbdt-fixed-oof/v1"
-        }
     else:
-        allowed_sweep_schemas = {
-            "strict-ranked-liquidity-shallow-gbdt-probability-budget-"
-            "fixed-oof/v1"
-        }
+        selection_spec = strategy_spec["selection"]
+        if "market_breadth_gate" in selection_spec:
+            from app import (
+                audited_pit_shallow_gbdt_risk_on_breadth as risk_on_breadth,
+            )
+
+            risk_on_breadth.assert_frozen_risk_on_breadth_strategy(
+                strategy_spec
+            )
+            allowed_sweep_schemas = {
+                "strict-ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+                "fixed-oof/v1"
+            }
+        elif selection_spec.get("position_budget_allocation") is None:
+            allowed_sweep_schemas = {
+                "strict-ranked-liquidity-shallow-gbdt-fixed-oof/v1"
+            }
+        else:
+            allowed_sweep_schemas = {
+                "strict-ranked-liquidity-shallow-gbdt-probability-budget-"
+                "fixed-oof/v1"
+            }
     if sweep_schema_version not in allowed_sweep_schemas:
         raise ValueError(
             "fixed OOF sweep schema differs from score contract"
@@ -3718,13 +4010,29 @@ def _recompute_fixed_oof_gate(
     )
     if frozen_contract is RIDGE_SCORE_CONTRACT:
         expected_sweep_schema = "strict-ranked-liquidity-ridge-fixed-oof/v3"
-    elif strategy_spec["selection"].get("position_budget_allocation") is None:
-        expected_sweep_schema = "strict-ranked-liquidity-shallow-gbdt-fixed-oof/v1"
     else:
-        expected_sweep_schema = (
-            "strict-ranked-liquidity-shallow-gbdt-probability-budget-"
-            "fixed-oof/v1"
-        )
+        selection_spec = strategy_spec["selection"]
+        if "market_breadth_gate" in selection_spec:
+            from app import (
+                audited_pit_shallow_gbdt_risk_on_breadth as risk_on_breadth,
+            )
+
+            risk_on_breadth.assert_frozen_risk_on_breadth_strategy(
+                strategy_spec
+            )
+            expected_sweep_schema = (
+                "strict-ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+                "fixed-oof/v1"
+            )
+        elif selection_spec.get("position_budget_allocation") is None:
+            expected_sweep_schema = (
+                "strict-ranked-liquidity-shallow-gbdt-fixed-oof/v1"
+            )
+        else:
+            expected_sweep_schema = (
+                "strict-ranked-liquidity-shallow-gbdt-probability-budget-"
+                "fixed-oof/v1"
+            )
     if (
         selection_receipt.get("schema_version")
         != metadata["selection_schema"]
@@ -4235,6 +4543,37 @@ def _shallow_gbdt_producer_binding() -> dict[str, Any]:
     }
 
 
+def _shallow_gbdt_risk_on_breadth_producer_binding() -> dict[str, Any]:
+    from app import audited_pit_shallow_gbdt_risk_on_breadth as risk_on_breadth
+
+    risk_on_breadth.assert_frozen_risk_on_breadth_strategy(
+        risk_on_breadth.SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC
+    )
+    shallow_binding = _shallow_gbdt_producer_binding()
+    identity = {
+        "schema_version": (
+            "audited-pit-ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+            "producer/v1"
+        ),
+        "base_shallow_gbdt_producer_root_sha256": shallow_binding[
+            "root_sha256"
+        ],
+        "shared_ranked_liquidity_module_sha256": hashlib.sha256(
+            Path(__file__).read_bytes()
+        ).hexdigest(),
+        "risk_on_breadth_module_sha256": hashlib.sha256(
+            Path(risk_on_breadth.__file__).read_bytes()
+        ).hexdigest(),
+        "risk_on_breadth_strategy_sha256": (
+            risk_on_breadth._SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC_SHA256
+        ),
+    }
+    return {
+        **identity,
+        "root_sha256": _sha256(identity),
+    }
+
+
 def _shallow_gbdt_probability_budget_producer_binding() -> dict[str, Any]:
     from app import audited_pit_shallow_gbdt_probability_budget as probability_budget
 
@@ -4364,6 +4703,57 @@ def resolve_ranked_liquidity_run_variant(
             "producer_binding": _shallow_gbdt_producer_binding,
             "artifact_semantics_version": 3,
         }
+    if model_adapter.model_id == "shallow_gbdt_risk_on_breadth":
+        _assert_shallow_gbdt_entrypoints_frozen()
+        return {
+            "strategy_schema_version": (
+                "development-pit-cross-sectional-shallow-gbdt-risk-on-breadth-"
+                "utility-logit-rolling-126-oof/v1"
+            ),
+            "progress_file_name": (
+                ".ranked_liquidity_shallow_gbdt_risk_on_breadth_v1_progress.json"
+            ),
+            "progress_schema_version": (
+                "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+                "replay-progress/v1"
+            ),
+            "producer_schema_version": (
+                "audited-pit-ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+                "producer/v1"
+            ),
+            "result_schema_version": (
+                "ranked-liquidity-shallow-gbdt-risk-on-breadth-result/v1"
+            ),
+            "sidecar_schema_versions": {
+                name: (
+                    "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+                    f"{name}-sidecar/v1"
+                )
+                for name in (
+                    "features",
+                    "models",
+                    "execution",
+                    "selection",
+                )
+            },
+            "strict_outcome_schema_version": (
+                "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+                "strict-outcome/v1"
+            ),
+            "sweep_schema_version": (
+                "strict-ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+                "fixed-oof/v1"
+            ),
+            "model_adapter": model_adapter,
+            "main_rank_mode": "positive_utility_probability",
+            "baseline_rank_mode": "signal_date_amount",
+            "control_name": "amount_baseline",
+            "control_selected_input_key": "baseline_selected",
+            "market_breadth_filter": True,
+            "score_contract": dict(SHALLOW_GBDT_SCORE_CONTRACT),
+            "producer_binding": _shallow_gbdt_risk_on_breadth_producer_binding,
+            "artifact_semantics_version": 3,
+        }
     if model_adapter.model_id == "shallow_gbdt_probability_budget":
         _assert_shallow_gbdt_entrypoints_frozen()
         return {
@@ -4432,6 +4822,11 @@ def _assert_producer_binding_unchanged(
         "audited-pit-ranked-liquidity-shallow-gbdt-producer/v1"
     ):
         actual = _shallow_gbdt_producer_binding()
+    elif schema_version == (
+        "audited-pit-ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+        "producer/v1"
+    ):
+        actual = _shallow_gbdt_risk_on_breadth_producer_binding()
     elif schema_version == (
         "audited-pit-ranked-liquidity-shallow-gbdt-probability-"
         "budget-producer/v1"
@@ -4561,6 +4956,47 @@ def build_ranked_liquidity_result_payloads(
             "scored_execution_candidates"
         )
     )
+    market_breadth_filter_enabled = (
+        variant.get("market_breadth_filter") is True
+    )
+    market_breadth_filter_receipt: dict[str, Any] | None = None
+    if market_breadth_filter_enabled:
+        try:
+            market_breadth_filter_receipt = dict(
+                selection_values.pop("market_breadth_filter_receipt")
+            )
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(
+                "ranked-liquidity market breadth filter receipt is missing"
+            ) from None
+        _verify_market_breadth_filter_receipt_structure(
+            market_breadth_filter_receipt,
+            strategy_spec=frozen_strategy,
+        )
+        eligible_keys = [
+            str(candidate.get("candidate_key") or "")
+            for candidate in scored_candidates
+        ]
+        if (
+            not all(eligible_keys)
+            or len(eligible_keys) != len(set(eligible_keys))
+            or market_breadth_filter_receipt[
+                "eligible_candidate_count"
+            ]
+            != len(eligible_keys)
+            or market_breadth_filter_receipt[
+                "eligible_candidate_keys_sha256"
+            ]
+            != _sha256(eligible_keys)
+        ):
+            raise ValueError(
+                "ranked-liquidity market breadth filter receipt differs "
+                "from eligible candidates"
+            )
+    elif "market_breadth_filter_receipt" in selection_values:
+        raise ValueError(
+            "ranked-liquidity market breadth filter receipt is not allowed"
+        )
     positive_candidates = list(
         selection_values.pop("positive_candidates")
     )
@@ -4694,6 +5130,10 @@ def build_ranked_liquidity_result_payloads(
             "positive_candidate_keys_sha256"
         ],
     }
+    if market_breadth_filter_receipt is not None:
+        selection_sidecar["market_breadth_filter_receipt"] = (
+            market_breadth_filter_receipt
+        )
     main_row = (
         dict(main_sweep["top"][0])
         if isinstance(main_sweep.get("top"), list)
@@ -4733,6 +5173,8 @@ def build_ranked_liquidity_result_payloads(
                 "baseline_evidence_completeness_is_advancement_gate": True,
             }
         )
+    if market_breadth_filter_enabled:
+        comparison["market_breadth_filter_applied"] = True
     main_payload = {
         "schema_version": variant["result_schema_version"],
         "strategy_sha256": strategy_sha256,
@@ -4798,6 +5240,10 @@ def build_ranked_liquidity_result_payloads(
         },
         "comparison": comparison,
     }
+    if market_breadth_filter_receipt is not None:
+        main_payload["market_breadth_filter_receipt_sha256"] = (
+            market_breadth_filter_receipt["receipt_sha256"]
+        )
     return {
         "main_payload": main_payload,
         "sidecar_payloads": {
@@ -4858,6 +5304,10 @@ def _verify_shallow_gbdt_family_result_bundle(
         role_separated = (
             variant.get("selection_evidence_mode") == "role_separated"
         )
+        market_breadth_filter_enabled = (
+            variant.get("market_breadth_filter") is True
+        )
+        market_breadth_feature_binding_receipt: dict[str, Any] | None = None
         runtime_result = dict(result)
         artifact = dict(runtime_result["artifact"])
         main_path = Path(str(artifact["path"]))
@@ -5010,6 +5460,14 @@ def _verify_shallow_gbdt_family_result_bundle(
             != len(frozen_sessions)
         ):
             raise ValueError
+        if market_breadth_filter_enabled:
+            market_breadth_feature_binding_receipt = (
+                verify_market_breadth_feature_binding(
+                    tail_features,
+                    outcome_candidates,
+                    strategy_spec=expected_strategy,
+                )
+            )
         replay_verification = (
             _verify_shallow_gbdt_result_bundle_oof_replay(
                 tail_features,
@@ -5056,9 +5514,12 @@ def _verify_shallow_gbdt_family_result_bundle(
             sessions=sessions,
             strategy_spec=expected_strategy,
         )
+        replayed_filtered_scored_candidates = replayed_selection[
+            "scored_execution_candidates"
+        ]
         replayed_scored_evidence = (
             _compact_scored_execution_evidence(
-                replayed_scored_candidates,
+                replayed_filtered_scored_candidates,
                 score_contract=score_contract,
             )
         )
@@ -5229,6 +5690,41 @@ def _verify_shallow_gbdt_family_result_bundle(
         positive_pool_sha256 = str(
             positive_pool_receipt.pop("receipt_sha256")
         )
+        replayed_market_breadth_filter_receipt = (
+            replayed_selection.get("market_breadth_filter_receipt")
+        )
+        if market_breadth_filter_enabled:
+            market_breadth_filter_receipt = dict(
+                selection["market_breadth_filter_receipt"]
+            )
+            market_breadth_verification = (
+                verify_market_breadth_filter_receipt(
+                    market_breadth_filter_receipt,
+                    strategy_spec=expected_strategy,
+                    input_candidates=replayed_scored_candidates,
+                )
+            )
+            if (
+                market_breadth_filter_receipt
+                != replayed_market_breadth_filter_receipt
+                or main_document.get(
+                    "market_breadth_filter_receipt_sha256"
+                )
+                != market_breadth_verification["receipt_sha256"]
+                or main_document.get("comparison", {}).get(
+                    "market_breadth_filter_applied"
+                )
+                is not True
+            ):
+                raise ValueError
+        elif (
+            replayed_market_breadth_filter_receipt is not None
+            or "market_breadth_filter_receipt" in selection
+            or "market_breadth_filter_receipt_sha256" in main_document
+            or "market_breadth_filter_applied"
+            in main_document.get("comparison", {})
+        ):
+            raise ValueError
         if (
             scored_evidence.get("schema_version")
             != "ranked-liquidity-shallow-gbdt-score-evidence/v1"
@@ -5363,7 +5859,7 @@ def _verify_shallow_gbdt_family_result_bundle(
             or selection["advancement_gate_passed"]
             is not replayed_advancement
             or main_document.get("scored_execution_candidate_count")
-            != len(replayed_scored_candidates)
+            != len(replayed_filtered_scored_candidates)
             or main_document.get(
                 "scored_execution_candidate_evidence_rows_sha256"
             )
@@ -5439,6 +5935,17 @@ def _verify_shallow_gbdt_family_result_bundle(
             )
         ):
             raise ValueError
+        verification_checks = {
+            "independent_rolling_oof_replay": True,
+            "content_addressing_verified": True,
+            "probability_score_contract_verified": True,
+            "shared_positive_candidate_pool_verified": True,
+            "strict_outcome_membership_verified": True,
+            "independent_selection_replay": True,
+            "independent_sweep_and_gate_replay": True,
+        }
+        if market_breadth_filter_enabled:
+            verification_checks["market_breadth_filter_replayed"] = True
         verification = {
             "schema_version": verification_schema_version,
             "strategy_sha256": embedded_strategy_sha256,
@@ -5447,17 +5954,13 @@ def _verify_shallow_gbdt_family_result_bundle(
             ],
             "main_artifact_sha256": main_digest,
             "sidecar_artifact_sha256": sidecar_digests,
-            "checks": {
-                "independent_rolling_oof_replay": True,
-                "content_addressing_verified": True,
-                "probability_score_contract_verified": True,
-                "shared_positive_candidate_pool_verified": True,
-                "strict_outcome_membership_verified": True,
-                "independent_selection_replay": True,
-                "independent_sweep_and_gate_replay": True,
-            },
+            "checks": verification_checks,
             "verified": True,
         }
+        if market_breadth_feature_binding_receipt is not None:
+            verification[
+                "market_breadth_feature_binding_receipt_sha256"
+            ] = market_breadth_feature_binding_receipt["receipt_sha256"]
         verification["receipt_sha256"] = _sha256(verification)
         return verification
     except (
@@ -5527,6 +6030,39 @@ def verify_shallow_gbdt_probability_budget_result_bundle(
         ),
         verification_schema_version=(
             "ranked-liquidity-shallow-gbdt-probability-budget-"
+            "result-bundle-verification/v1"
+        ),
+    )
+
+
+def verify_shallow_gbdt_risk_on_breadth_result_bundle(
+    result: Mapping[str, Any],
+    *,
+    tail_features: pd.DataFrame,
+    outcome_candidates: Sequence[Mapping[str, Any]],
+    sessions: Sequence[str],
+    scored_oof: pd.DataFrame,
+    expected_source: Mapping[str, Any],
+    expected_outcome_receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    from app import audited_pit_shallow_gbdt_risk_on_breadth as risk_on_breadth
+
+    return _verify_shallow_gbdt_family_result_bundle(
+        result,
+        tail_features=tail_features,
+        outcome_candidates=outcome_candidates,
+        sessions=sessions,
+        scored_oof=scored_oof,
+        expected_source=expected_source,
+        expected_outcome_receipt=expected_outcome_receipt,
+        expected_strategy=(
+            risk_on_breadth.SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC
+        ),
+        expected_strategy_sha256=(
+            risk_on_breadth._SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC_SHA256
+        ),
+        verification_schema_version=(
+            "ranked-liquidity-shallow-gbdt-risk-on-breadth-"
             "result-bundle-verification/v1"
         ),
     )
@@ -6409,6 +6945,15 @@ def _frozen_variant_strategy_spec(
 
         frozen_strategy = deepcopy(shallow_gbdt.SHALLOW_GBDT_OOF_SPEC)
         expected_sha256 = shallow_gbdt._SHALLOW_GBDT_OOF_SPEC_SHA256
+    elif adapter.model_id == "shallow_gbdt_risk_on_breadth":
+        from app import audited_pit_shallow_gbdt_risk_on_breadth as risk_on_breadth
+
+        frozen_strategy = deepcopy(
+            risk_on_breadth.SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC
+        )
+        expected_sha256 = (
+            risk_on_breadth._SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC_SHA256
+        )
     elif adapter.model_id == "shallow_gbdt_probability_budget":
         from app import audited_pit_shallow_gbdt_probability_budget as probability_budget
 
@@ -6509,6 +7054,14 @@ def _evaluate_scored_oof_variant(
     scored_candidates = list(scored_execution_candidates)
     for candidate in scored_candidates:
         candidate_score(candidate, contract=score_contract)
+    market_breadth_filter_receipt: dict[str, Any] | None = None
+    if variant.get("market_breadth_filter") is True:
+        scored_candidates, market_breadth_filter_receipt = (
+            filter_scored_candidates_for_frozen_selection(
+                scored_candidates,
+                strategy_spec=frozen_strategy,
+            )
+        )
     positive_candidates, positive_pool_receipt = _positive_score_pool(
         scored_candidates,
         score_contract=score_contract,
@@ -6606,7 +7159,7 @@ def _evaluate_scored_oof_variant(
         raise AuditedPITDevelopmentReplayError(
             "ranked-liquidity selection replay differs from evaluation"
         )
-    return {
+    result = {
         "scored_execution_candidates": scored_candidates,
         "positive_candidates": positive_candidates,
         "positive_pool_receipt": positive_pool_receipt,
@@ -6621,6 +7174,11 @@ def _evaluate_scored_oof_variant(
             baseline_sweep["top"][0],
         ),
     }
+    if market_breadth_filter_receipt is not None:
+        result["market_breadth_filter_receipt"] = (
+            market_breadth_filter_receipt
+        )
+    return result
 
 
 def _score_and_evaluate_oof_variant(
@@ -6766,6 +7324,7 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
     )
     is_shallow_gbdt = model_id in {
         "shallow_gbdt_utility_logit",
+        "shallow_gbdt_risk_on_breadth",
         "shallow_gbdt_probability_budget",
     }
     expected_strategy_schema = (
@@ -7213,6 +7772,24 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
         ]
         positive_candidates = evaluated["positive_candidates"]
         positive_pool_receipt = evaluated["positive_pool_receipt"]
+        market_breadth_filter_receipt = evaluated.get(
+            "market_breadth_filter_receipt"
+        )
+        expects_market_breadth_filter = (
+            run_variant.get("market_breadth_filter") is True
+        )
+        has_market_breadth_filter_receipt = isinstance(
+            market_breadth_filter_receipt,
+            Mapping,
+        )
+        if (
+            expects_market_breadth_filter
+            != has_market_breadth_filter_receipt
+        ):
+            raise AuditedPITDevelopmentReplayError(
+                "ranked-liquidity market breadth filter receipt differs "
+                "from run variant"
+            )
         main_sweep = evaluated["main_sweep"]
         baseline_sweep = evaluated["baseline_sweep"]
         main_selection_receipt = evaluated[
@@ -7294,6 +7871,15 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
                     "main_selected": main_selected,
                     control_selected_key: baseline_selected,
                     "advancement_gate_passed": advancement_gate,
+                    **(
+                        {
+                            "market_breadth_filter_receipt": (
+                                market_breadth_filter_receipt
+                            )
+                        }
+                        if market_breadth_filter_receipt is not None
+                        else {}
+                    ),
                 },
                 "scope": {
                     "point_in_time": True,
@@ -7323,6 +7909,7 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
             main_selected,
             main_selection_receipt,
             main_sweep,
+            market_breadth_filter_receipt,
             oof_receipt,
             oof_replay_verification,
             payloads,
@@ -7331,12 +7918,16 @@ def _run_audited_pit_ranked_liquidity_ridge_oof(
             scored_execution_candidates,
         )
         gc.collect()
-        verifier = (
-            verify_shallow_gbdt_probability_budget_result_bundle
-            if run_variant["model_adapter"].model_id
-            == "shallow_gbdt_probability_budget"
-            else verify_shallow_gbdt_result_bundle
-        )
+        verifier_by_model_id = {
+            "shallow_gbdt_utility_logit": verify_shallow_gbdt_result_bundle,
+            "shallow_gbdt_risk_on_breadth": (
+                verify_shallow_gbdt_risk_on_breadth_result_bundle
+            ),
+            "shallow_gbdt_probability_budget": (
+                verify_shallow_gbdt_probability_budget_result_bundle
+            ),
+        }
+        verifier = verifier_by_model_id[run_variant["model_adapter"].model_id]
         verification = verifier(
             result,
             tail_features=tail_features,
@@ -7974,6 +8565,58 @@ def run_audited_pit_ranked_liquidity_shallow_gbdt_rolling_oof(
         end_date=end_date,
         output_dir=output_dir,
         strategy_spec=shallow_gbdt.SHALLOW_GBDT_OOF_SPEC,
+        artifact_version=3,
+        training_window_sessions=training_window_sessions,
+    )
+
+
+def run_audited_pit_ranked_liquidity_shallow_gbdt_risk_on_breadth_rolling_oof(
+    *,
+    settings: Settings,
+    audited_pit_universe_path: str | Path,
+    expected_coverage_audit_sha256: str,
+    expected_artifact_root_sha256: str,
+    temporal_contract_path: str | Path,
+    expected_temporal_contract_sha256: str,
+    security_code_transition_evidence_root: str | Path,
+    expected_security_code_transition_contract_sha256: str,
+    start_date: str,
+    end_date: str,
+    output_dir: str | Path,
+) -> dict[str, Any]:
+    from app import audited_pit_shallow_gbdt_risk_on_breadth as risk_on_breadth
+
+    strategy_spec = risk_on_breadth.SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC
+    if (
+        _sha256(strategy_spec)
+        != risk_on_breadth._SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC_SHA256
+    ):
+        raise AuditedPITDevelopmentReplayError(
+            "shallow GBDT risk-on breadth strategy differs from "
+            "preregistered canonical hash"
+        )
+    training_window_sessions = int(
+        strategy_spec["walk_forward"]["training_window_sessions"]
+    )
+    return _run_audited_pit_ranked_liquidity_ridge_oof(
+        settings=settings,
+        audited_pit_universe_path=audited_pit_universe_path,
+        expected_coverage_audit_sha256=expected_coverage_audit_sha256,
+        expected_artifact_root_sha256=expected_artifact_root_sha256,
+        temporal_contract_path=temporal_contract_path,
+        expected_temporal_contract_sha256=(
+            expected_temporal_contract_sha256
+        ),
+        security_code_transition_evidence_root=(
+            security_code_transition_evidence_root
+        ),
+        expected_security_code_transition_contract_sha256=(
+            expected_security_code_transition_contract_sha256
+        ),
+        start_date=start_date,
+        end_date=end_date,
+        output_dir=output_dir,
+        strategy_spec=strategy_spec,
         artifact_version=3,
         training_window_sessions=training_window_sessions,
     )

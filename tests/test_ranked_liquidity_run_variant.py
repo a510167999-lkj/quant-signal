@@ -12,6 +12,7 @@ import pytest
 from app import audited_pit_continuous_ridge_oof as ridge
 from app import audited_pit_shallow_gbdt as shallow_gbdt
 from app import audited_pit_shallow_gbdt_probability_budget as probability_budget
+from app import audited_pit_shallow_gbdt_risk_on_breadth as risk_on_breadth
 from app.audited_pit_score_contract import (
     RIDGE_SCORE_CONTRACT,
     SHALLOW_GBDT_SCORE_CONTRACT,
@@ -155,6 +156,43 @@ def test_probability_budget_variant_has_a_separate_role_bound_contract():
     assert binding["probability_budget_strategy_sha256"] == (
         probability_budget._SHALLOW_GBDT_PROBABILITY_BUDGET_OOF_SPEC_SHA256
     )
+
+
+def test_risk_on_breadth_variant_and_producer_binding_are_content_bound():
+    variant = ridge.resolve_ranked_liquidity_run_variant(
+        risk_on_breadth.SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC
+    )
+    binding = variant["producer_binding"]()
+    identity = {
+        key: value for key, value in binding.items() if key != "root_sha256"
+    }
+
+    assert variant["model_adapter"].model_id == (
+        "shallow_gbdt_risk_on_breadth"
+    )
+    assert variant["market_breadth_filter"] is True
+    assert variant["sweep_schema_version"] == (
+        "strict-ranked-liquidity-shallow-gbdt-risk-on-breadth-fixed-oof/v1"
+    )
+    assert binding["schema_version"] == (
+        "audited-pit-ranked-liquidity-shallow-gbdt-risk-on-breadth-"
+        "producer/v1"
+    )
+    assert binding["base_shallow_gbdt_producer_root_sha256"] == (
+        ridge._shallow_gbdt_producer_binding()["root_sha256"]
+    )
+    assert binding["risk_on_breadth_module_sha256"] == hashlib.sha256(
+        Path(risk_on_breadth.__file__).read_bytes()
+    ).hexdigest()
+    assert binding["risk_on_breadth_strategy_sha256"] == (
+        risk_on_breadth._SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC_SHA256
+    )
+    assert binding["root_sha256"] == ridge._sha256(identity)
+
+    tampered = dict(binding)
+    tampered["risk_on_breadth_module_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="producer code changed"):
+        ridge._assert_producer_binding_unchanged(tampered)
 
 
 @pytest.mark.parametrize(
