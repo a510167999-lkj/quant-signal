@@ -30,11 +30,20 @@ from app.research_pit_transport import UrllibTushareTransport
 
 
 SCHEMA_VERSION = "current-pool-universe-input/v1"
+CURRENT_POOL_UNIVERSE_SCHEMA_V2 = "current-pool-universe-input/v2"
+CURRENT_POOL_UNIVERSE_SCHEMAS = frozenset(
+    {SCHEMA_VERSION, CURRENT_POOL_UNIVERSE_SCHEMA_V2}
+)
 _EXCHANGES = ("SSE", "SZSE")
+_V2_EXCHANGES = ("SSE", "SZSE", "BSE")
+_SCHEMA_EXCHANGES = {
+    SCHEMA_VERSION: _EXCHANGES,
+    CURRENT_POOL_UNIVERSE_SCHEMA_V2: _V2_EXCHANGES,
+}
+_EXCHANGE_SUFFIXES = {"SSE": ".SH", "SZSE": ".SZ", "BSE": ".BJ"}
 _LIST_STATUSES = ("L", "D", "P", "G")
 _MAX_BODY_BYTES = 5 * 1024 * 1024
 _PARTITION_ROW_CAP = 6_000
-_TOTAL_ROW_CAP = len(_EXCHANGES) * len(_LIST_STATUSES) * _PARTITION_ROW_CAP
 _MARKET_PREFIXES = {
     "主板": {
         "SSE": ("600", "601", "603", "605"),
@@ -46,6 +55,24 @@ _MARKET_PREFIXES = {
 
 PartitionFetcher = Callable[[str, str, tuple[str, ...]], Mapping[str, Any]]
 _HEX = frozenset("0123456789abcdef")
+
+
+def _exchanges_for_schema(schema: Any) -> tuple[str, ...]:
+    if not isinstance(schema, str):
+        raise ValueError("current-pool universe descriptor rejected")
+    exchanges = _SCHEMA_EXCHANGES.get(schema)
+    if exchanges is None:
+        raise ValueError("current-pool universe descriptor rejected")
+    return exchanges
+
+
+def current_pool_universe_partition_coverage(schema: Any) -> dict[str, Any]:
+    exchanges = _exchanges_for_schema(schema)
+    return {
+        "exchanges": list(exchanges),
+        "list_statuses": list(_LIST_STATUSES),
+        "partition_count": len(exchanges) * len(_LIST_STATUSES),
+    }
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -141,6 +168,8 @@ def _rows_from_envelope(
 
 
 def _market_from_exchange_and_symbol(exchange: str, symbol: str) -> str | None:
+    if exchange == "BSE":
+        return "北交所" if symbol.startswith(("4", "8", "9")) else None
     matches = [
         market
         for market, exchange_prefixes in _MARKET_PREFIXES.items()
@@ -194,7 +223,7 @@ def _canonical_excluded_identity_row(
         or text["list_status"] != list_status
     ):
         raise ValueError("stock_basic item identity is inconsistent")
-    expected_suffix = {"SSE": ".SH", "SZSE": ".SZ"}[exchange]
+    expected_suffix = _EXCHANGE_SUFFIXES[exchange]
     if (
         not text["ts_code"].endswith(expected_suffix)
         or text["ts_code"][: -len(expected_suffix)] != text["symbol"]
@@ -223,14 +252,16 @@ def _excludable_nonlisted_identity(
     )
 
 
-def _normalize_item(row: Mapping[str, Any]) -> dict[str, Any]:
+def _normalize_item(
+    row: Mapping[str, Any], *, exchanges: tuple[str, ...] = _EXCHANGES
+) -> dict[str, Any]:
     text = {key: str(row.get(key) or "").strip() for key in STOCK_BASIC_FIELDS}
     required = ("ts_code", "symbol", "name", "exchange", "list_status")
     if any(not text[key] for key in required):
         raise ValueError("stock_basic item is missing identity or status fields")
-    if text["exchange"] not in _EXCHANGES or text["list_status"] not in _LIST_STATUSES:
+    if text["exchange"] not in exchanges or text["list_status"] not in _LIST_STATUSES:
         raise ValueError("stock_basic item has an unexpected exchange or list status")
-    expected_suffix = {"SSE": ".SH", "SZSE": ".SZ"}[text["exchange"]]
+    expected_suffix = _EXCHANGE_SUFFIXES[text["exchange"]]
     if (
         not _is_six_ascii_digits(text["symbol"])
         or not text["ts_code"].endswith(expected_suffix)
@@ -259,7 +290,9 @@ def _normalize_item(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _normalize_descriptor_item(item: Mapping[str, Any]) -> dict[str, Any]:
+def _normalize_descriptor_item(
+    item: Mapping[str, Any], *, exchanges: tuple[str, ...]
+) -> dict[str, Any]:
     if set(item) != set(CURRENT_POOL_UNIVERSE_ITEM_FIELDS):
         raise ValueError("current-pool universe descriptor rejected")
     evidence = item.get("market_evidence")
@@ -269,7 +302,7 @@ def _normalize_descriptor_item(item: Mapping[str, Any]) -> dict[str, Any]:
     if evidence == "inferred_nonlisted_code":
         provider_view["market"] = ""
     try:
-        normalized = _normalize_item(provider_view)
+        normalized = _normalize_item(provider_view, exchanges=exchanges)
     except (TypeError, ValueError) as exc:
         raise ValueError("current-pool universe descriptor rejected") from exc
     if normalized != dict(item):
@@ -278,11 +311,15 @@ def _normalize_descriptor_item(item: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def verify_current_pool_universe_descriptor(payload: Mapping[str, Any]) -> dict[str, Any]:
+    schema = payload.get("schema") if isinstance(payload, Mapping) else None
+    try:
+        exchanges = _exchanges_for_schema(schema)
+    except ValueError:
+        raise ValueError("current-pool universe descriptor rejected") from None
     if (
         not isinstance(payload, Mapping)
         or set(payload)
         != {*CURRENT_POOL_UNIVERSE_UNSIGNED_FIELDS, "descriptor_sha256"}
-        or payload.get("schema") != SCHEMA_VERSION
         or payload.get("source_id") != "jiaoch"
     ):
         raise ValueError("current-pool universe descriptor rejected")
@@ -291,9 +328,9 @@ def verify_current_pool_universe_descriptor(payload: Mapping[str, Any]) -> dict[
     digest = hashlib.sha256(_canonical_json(unsigned)).hexdigest()
     if embedded != digest:
         raise ValueError("current-pool universe descriptor rejected")
-    if payload.get("partition_coverage") != {"exchanges": list(_EXCHANGES), "list_statuses": list(_LIST_STATUSES), "partition_count": 8}:
+    if payload.get("partition_coverage") != current_pool_universe_partition_coverage(schema):
         raise ValueError("current-pool universe descriptor rejected")
-    expected = [(exchange, status) for exchange in _EXCHANGES for status in _LIST_STATUSES]
+    expected = [(exchange, status) for exchange in exchanges for status in _LIST_STATUSES]
     receipts = payload.get("partition_receipts")
     if not isinstance(receipts, list) or len(receipts) != len(expected):
         raise ValueError("current-pool universe descriptor rejected")
@@ -360,13 +397,19 @@ def verify_current_pool_universe_descriptor(payload: Mapping[str, Any]) -> dict[
     for item in items:
         if not isinstance(item, Mapping):
             raise ValueError("current-pool universe descriptor rejected")
-        normalized = _normalize_descriptor_item(item)
+        normalized = _normalize_descriptor_item(item, exchanges=exchanges)
         if normalized["ts_code"] in seen:
             raise ValueError("current-pool universe descriptor rejected")
         seen.add(normalized["ts_code"])
         normalized_items.append(normalized)
         symbol, exchange, market = normalized["symbol"], normalized["exchange"], normalized["market"]
-        if (exchange == "SSE" and not symbol.startswith("6")) or (exchange == "SZSE" and not symbol.startswith(("0", "3"))):
+        if (
+            (exchange == "SSE" and not symbol.startswith("6"))
+            or (exchange == "SZSE" and not symbol.startswith(("0", "3")))
+            or (exchange == "BSE" and not symbol.startswith(("4", "8", "9")))
+        ):
+            raise ValueError("current-pool universe descriptor rejected")
+        if exchange == "BSE" and market != "北交所":
             raise ValueError("current-pool universe descriptor rejected")
         board_prefixes = {
             market_name: tuple(
@@ -432,12 +475,14 @@ def _write_content_addressed(output_dir: str | Path, payload: dict[str, Any]) ->
     return {"path": str(destination), "descriptor_sha256": digest, "created": created}
 
 
-def build_current_pool_descriptor(
+def _build_current_pool_descriptor(
     *,
     as_of: str,
     retrieved_at: str,
     output_dir: str | Path,
     fetch_partition: PartitionFetcher,
+    schema: str,
+    exchanges: tuple[str, ...],
 ) -> dict[str, Any]:
     if not isinstance(as_of, str) or len(as_of) != 10:
         raise ValueError("as_of must be a canonical ISO date")
@@ -453,7 +498,7 @@ def build_current_pool_descriptor(
         raise ValueError("retrieved_at must belong to the as_of collection day")
     rows: list[dict[str, Any]] = []
     receipts = []
-    for exchange in _EXCHANGES:
+    for exchange in exchanges:
         for list_status in _LIST_STATUSES:
             envelope = fetch_partition(exchange, list_status, STOCK_BASIC_FIELDS)
             partition_rows = _rows_from_envelope(envelope, STOCK_BASIC_FIELDS)
@@ -466,7 +511,7 @@ def build_current_pool_descriptor(
                 if excluded is not None:
                     excluded_partition.append(excluded)
                     continue
-                normalized = _normalize_item(row)
+                normalized = _normalize_item(row, exchanges=exchanges)
                 if normalized["exchange"] != exchange or normalized["list_status"] != list_status:
                     raise ValueError("stock_basic item does not match its requested partition")
                 rows.append(normalized)
@@ -489,7 +534,7 @@ def build_current_pool_descriptor(
                     ).hexdigest(),
                 }
             )
-    if len(rows) > _TOTAL_ROW_CAP:
+    if len(rows) > len(exchanges) * len(_LIST_STATUSES) * _PARTITION_ROW_CAP:
         raise ValueError("stock_basic collection exceeded its total row cap")
     items: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -498,7 +543,7 @@ def build_current_pool_descriptor(
             raise ValueError(f"duplicate stock_basic ts_code across partitions: {ts_code}")
         items[ts_code] = row
     payload = {
-        "schema": SCHEMA_VERSION,
+        "schema": schema,
         "source_id": "jiaoch",
         "as_of": canonical_as_of,
         "retrieved_at": canonical_retrieved_at,
@@ -507,11 +552,7 @@ def build_current_pool_descriptor(
         "excluded_invalid_identity_count": sum(
             receipt["excluded_invalid_identity_count"] for receipt in receipts
         ),
-        "partition_coverage": {
-            "exchanges": list(_EXCHANGES),
-            "list_statuses": list(_LIST_STATUSES),
-            "partition_count": len(_EXCHANGES) * len(_LIST_STATUSES),
-        },
+        "partition_coverage": current_pool_universe_partition_coverage(schema),
         "risk_snapshot_complete": False,
         "risk_coverage": {
             "stock_st": "not_collected",
@@ -523,12 +564,47 @@ def build_current_pool_descriptor(
     return _write_content_addressed(output_dir, payload)
 
 
-def fetch_jiaoch_current_pool_descriptor(
+def build_current_pool_descriptor(
+    *,
+    as_of: str,
+    retrieved_at: str,
+    output_dir: str | Path,
+    fetch_partition: PartitionFetcher,
+) -> dict[str, Any]:
+    return _build_current_pool_descriptor(
+        as_of=as_of,
+        retrieved_at=retrieved_at,
+        output_dir=output_dir,
+        fetch_partition=fetch_partition,
+        schema=SCHEMA_VERSION,
+        exchanges=_EXCHANGES,
+    )
+
+
+def build_current_pool_descriptor_v2(
+    *,
+    as_of: str,
+    retrieved_at: str,
+    output_dir: str | Path,
+    fetch_partition: PartitionFetcher,
+) -> dict[str, Any]:
+    return _build_current_pool_descriptor(
+        as_of=as_of,
+        retrieved_at=retrieved_at,
+        output_dir=output_dir,
+        fetch_partition=fetch_partition,
+        schema=CURRENT_POOL_UNIVERSE_SCHEMA_V2,
+        exchanges=_V2_EXCHANGES,
+    )
+
+
+def _fetch_jiaoch_current_pool_descriptor(
     *,
     as_of: str,
     output_dir: str | Path,
     timeout_seconds: float = 30.0,
     now_provider: Callable[[], datetime] | None = None,
+    build_descriptor: Callable[..., dict[str, Any]],
 ) -> dict[str, Any]:
     now = (now_provider or (lambda: datetime.now(ZoneInfo("Asia/Shanghai"))))()
     if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
@@ -575,9 +651,41 @@ def fetch_jiaoch_current_pool_descriptor(
             raise ValueError("Jiaoch stock_basic response envelope was invalid")
         return envelope
 
-    return build_current_pool_descriptor(
+    return build_descriptor(
         as_of=collection_day,
         retrieved_at=retrieved.isoformat(),
         output_dir=output_dir,
         fetch_partition=fetch_partition,
+    )
+
+
+def fetch_jiaoch_current_pool_descriptor(
+    *,
+    as_of: str,
+    output_dir: str | Path,
+    timeout_seconds: float = 30.0,
+    now_provider: Callable[[], datetime] | None = None,
+) -> dict[str, Any]:
+    return _fetch_jiaoch_current_pool_descriptor(
+        as_of=as_of,
+        output_dir=output_dir,
+        timeout_seconds=timeout_seconds,
+        now_provider=now_provider,
+        build_descriptor=build_current_pool_descriptor,
+    )
+
+
+def fetch_jiaoch_current_pool_descriptor_v2(
+    *,
+    as_of: str,
+    output_dir: str | Path,
+    timeout_seconds: float = 30.0,
+    now_provider: Callable[[], datetime] | None = None,
+) -> dict[str, Any]:
+    return _fetch_jiaoch_current_pool_descriptor(
+        as_of=as_of,
+        output_dir=output_dir,
+        timeout_seconds=timeout_seconds,
+        now_provider=now_provider,
+        build_descriptor=build_current_pool_descriptor_v2,
     )

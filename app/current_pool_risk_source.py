@@ -11,7 +11,10 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.current_pool_source import verify_current_pool_universe_descriptor
+from app.current_pool_source import (
+    current_pool_universe_partition_coverage,
+    verify_current_pool_universe_descriptor,
+)
 from app.durable_io import fsync_directory
 from app.research_pit_sources import resolve_tushare_source
 from app.research_pit_transport import UrllibTushareTransport
@@ -80,8 +83,12 @@ def _date(value: Any, field: str, *, optional: bool = False) -> str | None:
 def _load_universe(path: str | Path, as_of: str) -> tuple[str, set[str], dict[str, Any]]:
     descriptor_path = Path(path)
     payload = _strict_json_loads(descriptor_path.read_bytes())
-    if not isinstance(payload, dict) or payload.get("schema") != "current-pool-universe-input/v1":
+    if not isinstance(payload, dict):
         raise ValueError("verified universe descriptor required")
+    try:
+        expected_coverage = current_pool_universe_partition_coverage(payload.get("schema"))
+    except ValueError:
+        raise ValueError("verified universe descriptor required") from None
     verified = verify_current_pool_universe_descriptor(payload)
     digest = verified["descriptor_sha256"]
     if len(descriptor_path.stem) == 64 and descriptor_path.stem != digest:
@@ -97,12 +104,7 @@ def _load_universe(path: str | Path, as_of: str) -> tuple[str, set[str], dict[st
         or retrieved.utcoffset() is None
         or retrieved.utcoffset().total_seconds() != 8 * 3600
         or retrieved.date().isoformat() != as_of
-        or payload.get("partition_coverage")
-        != {
-            "exchanges": ["SSE", "SZSE"],
-            "list_statuses": ["L", "D", "P", "G"],
-            "partition_count": 8,
-        }
+        or payload.get("partition_coverage") != expected_coverage
         or payload.get("risk_snapshot_complete") is not False
         or payload.get("production_recommendation_eligible") is not False
     ):

@@ -51,8 +51,11 @@ from app.current_pool_history_source import (
 )
 from app.current_pool_development_replay import run_current_pool_development_replay
 from app.current_pool_source import (
+    CURRENT_POOL_UNIVERSE_SCHEMAS,
+    CURRENT_POOL_UNIVERSE_SCHEMA_V2,
     _strict_json_loads,
-    fetch_jiaoch_current_pool_descriptor,
+    current_pool_universe_partition_coverage,
+    fetch_jiaoch_current_pool_descriptor_v2,
     verify_current_pool_universe_descriptor,
 )
 from app.durable_io import fsync_directory
@@ -3206,6 +3209,7 @@ def _load_current_pool_descriptor(path: str, expected_schema: str) -> dict:
             source_date = instant.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
         if expected_schema in {
             "current-pool-universe-input/v1",
+            CURRENT_POOL_UNIVERSE_SCHEMA_V2,
             "current-pool-risk-input/v1",
         }:
             embedded_sha256 = payload.get("descriptor_sha256")
@@ -3233,13 +3237,14 @@ def _load_current_pool_descriptor(path: str, expected_schema: str) -> dict:
                 != source_date
             ):
                 raise ValueError
-            if expected_schema == "current-pool-universe-input/v1":
+            if expected_schema in {
+                "current-pool-universe-input/v1",
+                CURRENT_POOL_UNIVERSE_SCHEMA_V2,
+            }:
                 verify_current_pool_universe_descriptor(payload)
-                if payload.get("partition_coverage") != {
-                    "exchanges": ["SSE", "SZSE"],
-                    "list_statuses": ["L", "D", "P", "G"],
-                    "partition_count": 8,
-                }:
+                if payload.get("partition_coverage") != current_pool_universe_partition_coverage(
+                    expected_schema
+                ):
                     raise ValueError
                 if payload.get("risk_snapshot_complete") is not False:
                     raise ValueError
@@ -4837,7 +4842,7 @@ def main(argv=None) -> int:
         return 0
 
     if args.command == "research-current-pool-fetch-jiaoch":
-        report = fetch_jiaoch_current_pool_descriptor(
+        report = fetch_jiaoch_current_pool_descriptor_v2(
             as_of=args.as_of,
             output_dir=args.output_dir,
             timeout_seconds=args.timeout_seconds,
@@ -5179,8 +5184,19 @@ def main(argv=None) -> int:
         return 0
 
     if args.command == "research-current-pool-audit":
+        try:
+            universe_candidate = _strict_json_loads(Path(args.universe_path).read_bytes())
+            universe_schema = (
+                universe_candidate.get("schema")
+                if isinstance(universe_candidate, dict)
+                else None
+            )
+            if universe_schema not in CURRENT_POOL_UNIVERSE_SCHEMAS:
+                raise ValueError
+        except (OSError, TypeError, ValueError):
+            raise ValueError("current-pool input descriptor rejected") from None
         universe_descriptor = _load_current_pool_descriptor(
-            args.universe_path, "current-pool-universe-input/v1"
+            args.universe_path, universe_schema
         )
         history_descriptor = _load_current_pool_descriptor(
             args.history_summary_path, "current-pool-history-summary/v1"

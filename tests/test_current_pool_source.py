@@ -838,7 +838,7 @@ def test_jobs_exposes_jiaoch_current_pool_fetch_without_printing_credentials(
         calls.append(kwargs)
         return {"path": str(tmp_path / "artifact.json"), "created": True}
 
-    monkeypatch.setattr(jobs, "fetch_jiaoch_current_pool_descriptor", fake_fetch)
+    monkeypatch.setattr(jobs, "fetch_jiaoch_current_pool_descriptor_v2", fake_fetch)
     assert (
         jobs.main(
             [
