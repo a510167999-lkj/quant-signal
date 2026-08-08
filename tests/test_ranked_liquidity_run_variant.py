@@ -184,6 +184,12 @@ def test_risk_on_breadth_variant_and_producer_binding_are_content_bound():
     assert binding["risk_on_breadth_module_sha256"] == hashlib.sha256(
         Path(risk_on_breadth.__file__).read_bytes()
     ).hexdigest()
+    assert binding["config_module_sha256"] == hashlib.sha256(
+        Path(ridge.__file__).with_name("config.py").read_bytes()
+    ).hexdigest()
+    assert binding["formal_dispatch_module_sha256"] == hashlib.sha256(
+        Path(ridge.__file__).with_name("jobs.py").read_bytes()
+    ).hexdigest()
     assert binding["risk_on_breadth_strategy_sha256"] == (
         risk_on_breadth._SHALLOW_GBDT_RISK_ON_BREADTH_OOF_SPEC_SHA256
     )
