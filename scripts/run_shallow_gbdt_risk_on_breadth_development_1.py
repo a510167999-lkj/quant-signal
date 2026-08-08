@@ -32,7 +32,7 @@ EXPECTED_PRODUCER_ROOT_SHA256 = (
     "2c8530853a5d906dae2e6fa9895aa0a620d93a870d3bfd9dabada30444013f22"
 )
 EXPECTED_RUN_SPEC_SHA256 = (
-    "5152b35fd399e15f036205c330c5a5765624faf784b2030c87669d7b04a71068"
+    "30585397473d61fec12e07669ec4edb22f6c4f6b44e1351047d1c4c07b9a62b2"
 )
 EXPECTED_PROGRESS_SCHEMA = (
     "ranked-liquidity-shallow-gbdt-risk-on-breadth-replay-progress/v1"
@@ -131,7 +131,7 @@ RUN_SPEC: dict[str, Any] = {
         "critical_distributions": [
             "numpy",
             "pandas",
-            "scikit-learn",
+            "pypdf",
             "xgboost",
         ],
     },
