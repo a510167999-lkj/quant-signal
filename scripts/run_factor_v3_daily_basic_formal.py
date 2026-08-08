@@ -18,7 +18,7 @@ _PYTHON_EXECUTABLE = Path(
     r"E:\AI workspace\quant-signal-lkj\.venv\Scripts\python.exe"
 )
 _WORKTREE_ROOT = Path(
-    r"E:\AI workspace\quant-signal-lkj-factor-v3-daily-basic-formal-run-v3"
+    r"E:\AI workspace\quant-signal-lkj-factor-v3-daily-basic-formal-run-v4"
 )
 _BUILDER_MODULE_NAME = "scripts.build_factor_v3_daily_basic_formal_run_spec"
 _BUILDER_RELATIVE_PATH = "scripts/build_factor_v3_daily_basic_formal_run_spec.py"

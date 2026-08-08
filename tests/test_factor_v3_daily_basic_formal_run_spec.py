@@ -393,18 +393,19 @@ def _required_existing_package_initializers(
 def test_formal_paths_and_authority_inputs_are_frozen_exactly() -> None:
     main = Path(r"E:\AI workspace\quant-signal-lkj")
     assert formal.FORMAL_WORKTREE_ROOT == (
-        Path(r"E:\AI workspace\quant-signal-lkj-factor-v3-daily-basic-formal-run-v3")
+        Path(r"E:\AI workspace\quant-signal-lkj-factor-v3-daily-basic-formal-run-v4")
     )
-    assert formal.EXPECTED_BRANCH == "codex/factor-v3-daily-basic-formal-run-v3"
+    assert formal.EXPECTED_BRANCH == "codex/factor-v3-daily-basic-formal-run-v4"
+    assert formal_shim._WORKTREE_ROOT == formal.FORMAL_WORKTREE_ROOT
     assert formal.SPEC_OUTPUT_ROOT == (
         main
-        / "data/research_runs/audited_pit_factor_v3_daily_basic_run_spec_v2"
+        / "data/research_runs/audited_pit_factor_v3_daily_basic_run_spec_v3"
         / "run_specs/sha256"
     )
     assert formal.PLANNED_RUN_ROOT == (
         main
         / "data/research_runs"
-        / "audited_pit_factor_v3_daily_basic_collection_v3_development_733"
+        / "audited_pit_factor_v3_daily_basic_collection_v4_development_733"
     )
     assert formal.EXACT_SET_AUTHORITY_INPUTS == {
         "feature_history_frozen_source_attestation_path": str(
@@ -412,11 +413,11 @@ def test_formal_paths_and_authority_inputs_are_frozen_exactly() -> None:
             / "data/research_artifacts"
             / "factor_v3_feature_history_frozen_source_attestation_v5"
             / "factor_v3_feature_history_frozen_source_attestations"
-            / "sha256/83"
-            / "830dfd19373accfca7358e09f2a2084a42ab517ca518f436713bb9926be07d11.json"
+            / "sha256/86"
+            / "865617ade317a440a4b7ce8889da51a865ad6ed065b8f2a9ceee2931e4571632.json"
         ),
         "expected_feature_history_frozen_source_attestation_sha256": (
-            "830dfd19373accfca7358e09f2a2084a42ab517ca518f436713bb9926be07d11"
+            "865617ade317a440a4b7ce8889da51a865ad6ed065b8f2a9ceee2931e4571632"
         ),
         "feature_history_frozen_source_root": (
             r"E:\AI workspace\quant-signal-lkj-factor-v3-feature-history-formal-run"
@@ -476,7 +477,7 @@ def test_formal_review_manifest_covers_the_complete_runtime_import_closure() -> 
     assert "app/__init__.py" in relative_paths
 
 
-def test_formal_runner_hash_binds_the_reviewed_v3_worktree() -> None:
+def test_formal_runner_hash_binds_the_reviewed_v4_worktree() -> None:
     runner_path = formal.FORMAL_WORKTREE_ROOT / "app/factor_v3_daily_basic_runner.py"
 
     assert runner_path.is_file()
@@ -832,8 +833,13 @@ def test_formal_worktree_requires_external_content_addressed_anchor() -> None:
     assert not hasattr(formal, "FORMAL_REVIEW_RECEIPT_SHA256")
     assert formal.FORMAL_REVIEW_RECEIPT_ROOT == (
         formal.MAIN_REPO_ROOT
-        / "data/research_artifacts/factor_v3_daily_basic_formal_review_v3"
+        / "data/research_artifacts/factor_v3_daily_basic_formal_review_v4"
         / "review_receipts/sha256"
+    )
+    assert formal.FORMAL_BOOTSTRAP_CLAIM_ROOT == (
+        formal.MAIN_REPO_ROOT
+        / "data/research_artifacts/factor_v3_daily_basic_formal_review_v4"
+        / "bootstrap_claims/sha256"
     )
     assert formal.FORMAL_REVIEW_PUBLIC_KEY_PATH == (
         formal.MAIN_REPO_ROOT

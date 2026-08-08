@@ -23,9 +23,9 @@ class FormalRunSpecError(RuntimeError):
 
 
 FORMAL_WORKTREE_ROOT = Path(
-    r"E:\AI workspace\quant-signal-lkj-factor-v3-daily-basic-formal-run-v3"
+    r"E:\AI workspace\quant-signal-lkj-factor-v3-daily-basic-formal-run-v4"
 )
-EXPECTED_BRANCH = "codex/factor-v3-daily-basic-formal-run-v3"
+EXPECTED_BRANCH = "codex/factor-v3-daily-basic-formal-run-v4"
 FORMAL_REVIEW_SOURCE_RELATIVE_PATHS = (
     "scripts/build_factor_v3_daily_basic_formal_run_spec.py",
     "scripts/run_factor_v3_daily_basic_formal.py",
@@ -126,12 +126,12 @@ FORMAL_REVIEW_SOURCE_RELATIVE_PATHS = (
 )
 FORMAL_REVIEW_RECEIPT_ROOT = (
     MAIN_REPO_ROOT
-    / "data/research_artifacts/factor_v3_daily_basic_formal_review_v3"
+    / "data/research_artifacts/factor_v3_daily_basic_formal_review_v4"
     / "review_receipts/sha256"
 )
 FORMAL_BOOTSTRAP_CLAIM_ROOT = (
     MAIN_REPO_ROOT
-    / "data/research_artifacts/factor_v3_daily_basic_formal_review_v3"
+    / "data/research_artifacts/factor_v3_daily_basic_formal_review_v4"
     / "bootstrap_claims/sha256"
 )
 FORMAL_REVIEW_PUBLIC_KEY_PATH = (
@@ -148,7 +148,7 @@ SPEC_OUTPUT_ROOT = (
     MAIN_REPO_ROOT
     / "data"
     / "research_runs"
-    / "audited_pit_factor_v3_daily_basic_run_spec_v2"
+    / "audited_pit_factor_v3_daily_basic_run_spec_v3"
     / "run_specs"
     / "sha256"
 )
@@ -156,10 +156,10 @@ PLANNED_RUN_ROOT = (
     MAIN_REPO_ROOT
     / "data"
     / "research_runs"
-    / "audited_pit_factor_v3_daily_basic_collection_v3_development_733"
+    / "audited_pit_factor_v3_daily_basic_collection_v4_development_733"
 )
 FEATURE_HISTORY_ATTESTATION_SHA256 = (
-    "830dfd19373accfca7358e09f2a2084a42ab517ca518f436713bb9926be07d11"
+    "865617ade317a440a4b7ce8889da51a865ad6ed065b8f2a9ceee2931e4571632"
 )
 EXACT_SET_AUTHORITY_INPUTS = {
     "feature_history_frozen_source_attestation_path": str(
@@ -169,11 +169,11 @@ EXACT_SET_AUTHORITY_INPUTS = {
         / "factor_v3_feature_history_frozen_source_attestation_v5"
         / "factor_v3_feature_history_frozen_source_attestations"
         / "sha256"
-        / "83"
-        / "830dfd19373accfca7358e09f2a2084a42ab517ca518f436713bb9926be07d11.json"
+        / FEATURE_HISTORY_ATTESTATION_SHA256[:2]
+        / f"{FEATURE_HISTORY_ATTESTATION_SHA256}.json"
     ),
     "expected_feature_history_frozen_source_attestation_sha256": (
-        "830dfd19373accfca7358e09f2a2084a42ab517ca518f436713bb9926be07d11"
+        FEATURE_HISTORY_ATTESTATION_SHA256
     ),
     "feature_history_frozen_source_root": (
         r"E:\AI workspace\quant-signal-lkj-factor-v3-feature-history-formal-run"
