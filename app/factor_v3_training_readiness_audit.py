@@ -30,7 +30,7 @@ STAGE_GOAL_SUMMARY = (
 )
 
 DEFAULT_DAILY_RUN = Path(
-    "data/research_runs/audited_pit_factor_v3_daily_basic_collection_v2_development_733_http_live"
+    "data/research_runs/audited_pit_factor_v3_daily_basic_collection_v2_development_733_http_publish"
 )
 DEFAULT_FEATURE_RUN = Path(
     "data/research_runs/audited_pit_factor_v3_feature_history_collection_v1_development_prewindow_250"

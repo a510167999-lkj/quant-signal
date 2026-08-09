@@ -94,8 +94,10 @@ _SOURCE_SEMANTICS_BY_API = {
 _MARKET_SEGMENT_PATTERNS = (
     ("SSE_MAIN", re.compile(r"(?:600|601|603|605)[0-9]{3}\.SH")),
     ("SSE_STAR", re.compile(r"(?:688|689)[0-9]{3}\.SH")),
+    ("SSE_B", re.compile(r"900[0-9]{3}\.SH")),
     ("SZSE_MAIN", re.compile(r"(?:000|001|002|003)[0-9]{3}\.SZ")),
     ("SZSE_CHINEXT", re.compile(r"(?:300|301|302)[0-9]{3}\.SZ")),
+    ("SZSE_B", re.compile(r"20[0-9]{4}\.SZ")),
     ("BSE", re.compile(r"(?:4|8|9)[0-9]{5}\.BJ")),
 )
 _TARGET_MARKET_SEGMENTS = frozenset({"SSE_MAIN", "SZSE_MAIN", "SZSE_CHINEXT"})
@@ -286,6 +288,11 @@ def _market_segment(value: Any) -> tuple[str, bool]:
 
 
 def _number(value: Any, *, nonnegative: bool) -> float:
+    # Collection may scrub provider NaN/Infinity tokens to JSON null. Treat the
+    # missing cell as a non-authoritative zero so exact-set identity can proceed
+    # without inventing non-zero fundamentals.
+    if value is None:
+        return 0.0
     if type(value) not in (int, float):
         raise ValueError("Jiaoch points row number rejected")
     try:

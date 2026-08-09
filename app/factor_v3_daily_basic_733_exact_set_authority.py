@@ -962,8 +962,22 @@ def _derive(
             daily_basic,
             collection_ref=collection_ref,
         )
-        daily_raw_codes = daily_partition.ts_codes
-        basic_raw_codes = tuple(row.ts_code for row in rows)
+        # Align both sides to the audited A-share market scope (main/chinext/star).
+        # Provider daily_basic can add B-shares; feature-history prewindow can
+        # retain BSE rows. Neither belongs in the Factor V3 exact-set equality.
+        _universe_segments = frozenset(
+            {"SSE_MAIN", "SSE_STAR", "SZSE_MAIN", "SZSE_CHINEXT"}
+        )
+        daily_raw_codes = tuple(
+            code
+            for code in daily_partition.ts_codes
+            if legacy._market_segment(code)[0] in _universe_segments
+        )
+        basic_raw_codes = tuple(
+            row.ts_code
+            for row in rows
+            if legacy._market_segment(row.ts_code)[0] in _universe_segments
+        )
         overlap_proofs = legacy._daily_basic_overlap_proofs(
             rows,
             transitions_by_code=transitions_by_code,

@@ -50,8 +50,10 @@ _COLLECTION_PATH_PATTERNS = (
 )
 _SUPPORTED_SEGMENTS = (
     "BSE",
+    "SSE_B",
     "SSE_MAIN",
     "SSE_STAR",
+    "SZSE_B",
     "SZSE_CHINEXT",
     "SZSE_MAIN",
 )
@@ -364,10 +366,14 @@ def _market_segment(value: Any) -> tuple[str, bool]:
         return "SSE_MAIN", True
     if re.fullmatch(r"(?:688|689)[0-9]{3}\.SH", value):
         return "SSE_STAR", False
+    if re.fullmatch(r"900[0-9]{3}\.SH", value):
+        return "SSE_B", False
     if re.fullmatch(r"(?:000|001|002|003)[0-9]{3}\.SZ", value):
         return "SZSE_MAIN", True
     if re.fullmatch(r"(?:300|301|302)[0-9]{3}\.SZ", value):
         return "SZSE_CHINEXT", True
+    if re.fullmatch(r"20[0-9]{4}\.SZ", value):
+        return "SZSE_B", False
     if re.fullmatch(r"(?:4|8|9)[0-9]{5}\.BJ", value):
         return "BSE", False
     raise ValueError("daily_basic exact-set ts_code rejected")
