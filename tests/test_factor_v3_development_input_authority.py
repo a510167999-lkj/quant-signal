@@ -166,25 +166,86 @@ def _parent_snapshot(
     return path, hashlib.sha256(raw).hexdigest(), rows
 
 
+def _complete_daily_statistic(trade_date: str) -> dict[str, Any]:
+    counts = {name: 1 for name in activation.UPSTREAM_SOURCE_SEGMENTS}
+    codes = ["000001.SZ", "300001.SZ", "430001.BJ", "600001.SH", "688001.SH"]
+    collection_sha = _sha(["collection", trade_date])
+    attempt_sha = _sha(["attempt", trade_date])
+    raw_sha = _sha(["raw-body", trade_date])
+    return {
+        "authoritative_daily_filtered_codes_sha256": _sha(codes),
+        "authoritative_daily_generation_id": _sha(["generation", trade_date]),
+        "authoritative_daily_generation_lineage_sha256": _sha(
+            ["lineage", trade_date]
+        ),
+        "authoritative_daily_generation_manifest_sha256": _sha(
+            ["manifest", trade_date]
+        ),
+        "authoritative_daily_raw_codes_sha256": _sha(["daily", trade_date]),
+        "authoritative_daily_raw_row_count": len(codes),
+        "authoritative_daily_raw_segment_counts": dict(counts),
+        "authoritative_daily_resolved_identities_sha256": _sha(codes),
+        "authoritative_daily_transition_excluded_codes_sha256": _sha([]),
+        "authoritative_daily_transition_excluded_row_count": 0,
+        "authoritative_daily_vintage": f"{trade_date}T16:00:00+08:00",
+        "collection_set_relative_path": (
+            f"daily_basic_collection_sets/sha256/{collection_sha[:2]}/"
+            f"{collection_sha}.json"
+        ),
+        "collection_set_sha256": collection_sha,
+        "daily_basic_attempt_relative_path": (
+            f"daily_basic_attempts/sha256/{attempt_sha[:2]}/{attempt_sha}.json"
+        ),
+        "daily_basic_attempt_sha256": attempt_sha,
+        "daily_basic_canonical_rows_sha256": _sha(["basic", trade_date]),
+        "daily_basic_filtered_codes_sha256": _sha(codes),
+        "daily_basic_normalization_receipt_sha256": _sha(
+            ["normalization", trade_date]
+        ),
+        "daily_basic_raw_codes_sha256": _sha(codes),
+        "daily_basic_raw_relative_path": (
+            f"daily_basic_raw/sha256/{raw_sha[:2]}/{raw_sha}.body"
+        ),
+        "daily_basic_raw_row_count": len(codes),
+        "daily_basic_raw_segment_counts": dict(counts),
+        "daily_basic_raw_sha256": raw_sha,
+        "daily_basic_resolved_identities_sha256": _sha(codes),
+        "daily_basic_source_normalization_rows_sha256": _sha(
+            ["source-normalization", trade_date]
+        ),
+        "daily_basic_transition_excluded_codes_sha256": _sha([]),
+        "daily_basic_transition_excluded_row_count": 0,
+        "daily_basic_transition_overlap_comparison_fields": [
+            "turnover_rate",
+            "turnover_rate_f",
+            "free_share",
+            "float_share",
+            "total_mv",
+            "circ_mv",
+        ],
+        "daily_basic_transition_overlap_pair_count": 0,
+        "daily_basic_transition_overlap_root_sha256": _sha([]),
+        "extra_daily_basic_code_count": 0,
+        "missing_authoritative_daily_code_count": 0,
+        "source_ts_code_exact_set_verified_after_transition_filter": True,
+        "target_scope_codes_sha256": _sha(
+            ["000001.SZ", "300001.SZ", "600001.SH"]
+        ),
+        "target_scope_resolved_identities_sha256": _sha(
+            ["000001.SZ", "300001.SZ", "600001.SH"]
+        ),
+        "target_scope_row_count": 3,
+        "trade_date": trade_date,
+        "transition_filtered_row_count": len(codes),
+        "transition_resolved_identity_exact_set_verified": True,
+    }
+
+
 def _daily_receipt(
     tmp_path: Path,
     sessions: list[str],
 ) -> tuple[Path, dict[str, Any], dict[str, Any]]:
-    per_date = [
-        {
-            "trade_date": trade_date,
-            "authoritative_daily_raw_codes_sha256": _sha(["daily", trade_date]),
-            "daily_basic_canonical_rows_sha256": _sha(["basic", trade_date]),
-            "daily_basic_raw_segment_counts": {
-                "BSE": 1,
-                "SSE_MAIN": 1,
-                "SSE_STAR": 1,
-                "SZSE_CHINEXT": 1,
-                "SZSE_MAIN": 1,
-            },
-        }
-        for trade_date in sessions
-    ]
+    per_date = [_complete_daily_statistic(trade_date) for trade_date in sessions]
     unsigned = {
         "all_supported_segments_compared_before_scope_filter": True,
         "arbitrary_row_drops_permitted": False,

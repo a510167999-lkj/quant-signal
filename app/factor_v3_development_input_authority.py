@@ -586,27 +586,13 @@ def validate_factor_v3_public_source_receipt_projection(
         ):
             raise ValueError("feature history v3 exact authority receipt rejected")
     else:
-        if formal_schema_required:
-            daily_authority._validate_v2_receipt(dict(source_receipt))
-        else:
-            receipt = dict(source_receipt)
-            unsigned = dict(receipt)
-            authority_root = _strict_sha256(
-                unsigned.pop("authority_root_sha256", None),
-                label="daily basic 733 authority root",
-            )
-            if authority_root != _canonical_sha256(unsigned):
-                raise ValueError("daily basic 733 authority self hash rejected")
-            if (
-                receipt.get("schema")
-                != "factor-v3-daily-basic-733-exact-set-receipt/v2"
-                or receipt.get("authority_status")
-                != "VERIFIED_FACTOR_V3_733_DAILY_BASIC_EXACT_SET"
-                or receipt.get("trade_date_count") != len(sessions)
-                or receipt.get("trade_dates") != list(sessions)
-                or receipt.get("trade_dates_sha256") != _canonical_sha256(sessions)
-            ):
-                raise ValueError("daily basic 733 receipt semantics rejected")
+        receipt = daily_authority._validate_v2_receipt(dict(source_receipt))
+        if (
+            receipt.get("trade_date_count") != len(sessions)
+            or receipt.get("trade_dates") != list(sessions)
+            or receipt.get("trade_dates_sha256") != _canonical_sha256(sessions)
+        ):
+            raise ValueError("daily basic 733 receipt semantics rejected")
     return json.loads(_canonical_bytes(expected).decode("utf-8"))
 
 

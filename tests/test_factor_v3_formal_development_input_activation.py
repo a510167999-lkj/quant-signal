@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from datetime import date, timedelta
 import hashlib
 import json
@@ -12,10 +13,15 @@ from typing import Any, Callable
 import pytest
 
 from app import factor_v3_development_input_authority as candidate_authority
+from app import factor_v3_daily_basic_733_exact_set_authority as daily_authority
 from app import factor_v2_decision_branch_selector as factor_v2_branch_selector
 from app import factor_v3_formal_development_input_activation as activation
 from app import factor_v3_formal_development_input_activation_independent_core as independent_core
 from app import factor_v3_feature_history_frozen_source_attestation as frozen_history
+from app import jiaoch_daily_basic_exact_set_authority as legacy_daily
+from tests import test_factor_v2_decision_branch_selector as branch_test_support
+from tests import test_factor_v3_daily_basic_733_exact_set_authority as daily_test_support
+from tests import test_factor_v3_development_input_authority as candidate_test_support
 
 
 @pytest.fixture(autouse=True)
@@ -174,6 +180,87 @@ def _parent_projection() -> tuple[dict[str, Any], dict[str, str]]:
         **roots,
     }
     return {"rows": rows, "rows_sha256": _sha(rows)}, projection
+
+
+def _complete_daily_statistic(trade_date: str) -> dict[str, Any]:
+    segment_counts = {
+        "BSE": 1,
+        "SSE_MAIN": 1,
+        "SSE_STAR": 1,
+        "SZSE_CHINEXT": 1,
+        "SZSE_MAIN": 1,
+    }
+    codes = ["000001.SZ", "300001.SZ", "430001.BJ", "600001.SH", "688001.SH"]
+    collection_sha = _sha(["collection", trade_date])
+    attempt_sha = _sha(["attempt", trade_date])
+    raw_sha = _sha(["raw-body", trade_date])
+    return {
+        "authoritative_daily_filtered_codes_sha256": _sha(codes),
+        "authoritative_daily_generation_id": _sha(["generation", trade_date]),
+        "authoritative_daily_generation_lineage_sha256": _sha(
+            ["lineage", trade_date]
+        ),
+        "authoritative_daily_generation_manifest_sha256": _sha(
+            ["manifest", trade_date]
+        ),
+        "authoritative_daily_raw_codes_sha256": _sha(["raw", trade_date]),
+        "authoritative_daily_raw_row_count": len(codes),
+        "authoritative_daily_raw_segment_counts": dict(segment_counts),
+        "authoritative_daily_resolved_identities_sha256": _sha(codes),
+        "authoritative_daily_transition_excluded_codes_sha256": _sha([]),
+        "authoritative_daily_transition_excluded_row_count": 0,
+        "authoritative_daily_vintage": f"{trade_date}T16:00:00+08:00",
+        "collection_set_relative_path": (
+            f"daily_basic_collection_sets/sha256/{collection_sha[:2]}/"
+            f"{collection_sha}.json"
+        ),
+        "collection_set_sha256": collection_sha,
+        "daily_basic_attempt_relative_path": (
+            f"daily_basic_attempts/sha256/{attempt_sha[:2]}/{attempt_sha}.json"
+        ),
+        "daily_basic_attempt_sha256": attempt_sha,
+        "daily_basic_canonical_rows_sha256": _sha(["normalized", trade_date]),
+        "daily_basic_filtered_codes_sha256": _sha(codes),
+        "daily_basic_normalization_receipt_sha256": _sha(
+            ["normalization", trade_date]
+        ),
+        "daily_basic_raw_codes_sha256": _sha(codes),
+        "daily_basic_raw_relative_path": (
+            f"daily_basic_raw/sha256/{raw_sha[:2]}/{raw_sha}.body"
+        ),
+        "daily_basic_raw_row_count": len(codes),
+        "daily_basic_raw_segment_counts": dict(segment_counts),
+        "daily_basic_raw_sha256": raw_sha,
+        "daily_basic_resolved_identities_sha256": _sha(codes),
+        "daily_basic_source_normalization_rows_sha256": _sha(
+            ["source-normalization", trade_date]
+        ),
+        "daily_basic_transition_excluded_codes_sha256": _sha([]),
+        "daily_basic_transition_excluded_row_count": 0,
+        "daily_basic_transition_overlap_comparison_fields": [
+            "turnover_rate",
+            "turnover_rate_f",
+            "free_share",
+            "float_share",
+            "total_mv",
+            "circ_mv",
+        ],
+        "daily_basic_transition_overlap_pair_count": 0,
+        "daily_basic_transition_overlap_root_sha256": _sha([]),
+        "extra_daily_basic_code_count": 0,
+        "missing_authoritative_daily_code_count": 0,
+        "source_ts_code_exact_set_verified_after_transition_filter": True,
+        "target_scope_codes_sha256": _sha(
+            ["000001.SZ", "300001.SZ", "600001.SH"]
+        ),
+        "target_scope_resolved_identities_sha256": _sha(
+            ["000001.SZ", "300001.SZ", "600001.SH"]
+        ),
+        "target_scope_row_count": 3,
+        "trade_date": trade_date,
+        "transition_filtered_row_count": len(codes),
+        "transition_resolved_identity_exact_set_verified": True,
+    }
 
 
 def _candidate_publication(
@@ -409,15 +496,7 @@ def _candidate_publication(
         "receipt_sha256": history_source_receipt_sha,
     }
     daily_statistics = [
-        {
-            "authoritative_daily_raw_codes_sha256": _sha(["raw", trade_date]),
-            "daily_basic_canonical_rows_sha256": _sha(["normalized", trade_date]),
-            "daily_basic_raw_segment_counts": {
-                name: 1 for name in activation.UPSTREAM_SOURCE_SEGMENTS
-            },
-            "trade_date": trade_date,
-        }
-        for trade_date in sessions
+        _complete_daily_statistic(trade_date) for trade_date in sessions
     ]
     daily_source_projection = {
         "all_supported_segments_compared_before_scope_filter": True,
@@ -766,7 +845,619 @@ def _self_hashed(payload: dict[str, Any], field: str) -> dict[str, Any]:
     return {**unsigned, field: _sha(unsigned)}
 
 
-def _fixture(tmp_path: Path) -> dict[str, Any]:
+def _real_audited_daily_authority(
+    sessions: list[str],
+    *,
+    label: str,
+) -> legacy_daily.AuditedDailyAuthority:
+    partitions = tuple(
+        replace(
+            partition,
+            vintage=f"{partition.trade_date}T16:00:00+08:00",
+        )
+        for partition in candidate_test_support._partitions(sessions)
+    )
+    partition_refs = [
+        {
+            "generation_id": item.generation_id,
+            "lineage_sha256": item.generation_lineage_sha256,
+            "manifest_sha256": item.generation_manifest_sha256,
+            "trade_date": item.trade_date,
+            "vintage": item.vintage,
+        }
+        for item in partitions
+    ]
+    daily_rows = [
+        {"trade_date": item.trade_date, "ts_codes": list(item.ts_codes)}
+        for item in partitions
+    ]
+    return legacy_daily.AuditedDailyAuthority(
+        manifest_file_sha256=_sha([label, "manifest-file"]),
+        manifest_sha256=_sha([label, "manifest"]),
+        bundle_sha256=_sha([label, "bundle"]),
+        artifact_root_sha256=_sha([label, "artifact"]),
+        sqlite_sha256=_sha([label, "sqlite"]),
+        coverage_audit_sha256=_sha([label, "coverage"]),
+        temporal_contract_sha256=_sha([label, "temporal"]),
+        temporal_role="development",
+        daily_table_rows=len(partitions) * len(activation.UPSTREAM_SOURCE_SEGMENTS),
+        daily_table_sha256=_sha(daily_rows),
+        market_generation_count=len(partitions),
+        market_generation_root_sha256=_sha(partition_refs),
+        partitions=partitions,
+    )
+
+
+def _real_feature_history_receipt(prewindow: list[str]) -> dict[str, Any]:
+    unsigned = {
+        "authority_status": "VERIFIED_FEATURE_HISTORY_ONLY",
+        "collection_plan_sha256": _sha("real-e2e-history-plan"),
+        "collection_publication_manifest_sha256": _sha(
+            "real-e2e-history-manifest"
+        ),
+        "daily_generation_session_count": 250,
+        "embargo_consumed": False,
+        "exact_nonempty_bak_basic_session_count": 250,
+        "experiment_launch_eligible": False,
+        "factor_materialization_eligible": False,
+        "factor_v3_feature_history_authority_contract_sha256": _sha(
+            "real-e2e-history-contract"
+        ),
+        "factor_v3_points_contract_sha256": (
+            candidate_authority.points.FACTOR_V3_POINTS_CONTRACT_SHA256
+        ),
+        "feature_history_only": True,
+        "final_oos_consumed": False,
+        "pit_store_database_bytes": 1,
+        "pit_store_database_sha256": _sha("real-e2e-history-database"),
+        "pit_store_raw_artifact_set_sha256": _sha(
+            "real-e2e-history-raw-artifacts"
+        ),
+        "pit_store_receipt_manifest_sha256": _sha(
+            "real-e2e-history-receipt-manifest"
+        ),
+        "producer_code_root_sha256": _sha("real-e2e-history-producer"),
+        "production_profile_registered": False,
+        "production_recommendation_eligible": False,
+        "schema_version": (
+            "audited-pit-factor-v3-feature-history-authority-receipt/v3"
+        ),
+        "security_code_transition_contract_sha256": _sha(
+            "real-e2e-transition-contract"
+        ),
+        "session_authority_refs_sha256": _sha(
+            ["real-e2e-history-session-ref", *prewindow]
+        ),
+        "session_count": 250,
+        "sessions_sha256": _sha(prewindow),
+        "snapshot_index_sha256": _sha("real-e2e-history-snapshot-index"),
+        "source_authority_root_sha256": _sha("real-e2e-history-source"),
+        "suspend_d_authority_session_count": 250,
+        "upstream_beijing_preserved_session_count": 250,
+        "upstream_scope_root_sha256": _sha("real-e2e-history-upstream-scope"),
+        "upstream_star_preserved_session_count": 250,
+        "verified": True,
+    }
+    return {**unsigned, "receipt_sha256": _sha(unsigned)}
+
+
+def _write_real_feature_history_fixture(
+    root: Path,
+    *,
+    prewindow: list[str],
+) -> dict[str, Any]:
+    history_receipt = _real_feature_history_receipt(prewindow)
+    authority_root = (root / "source-authorities").resolve()
+    feature_run_root = (root / "feature-history-run").resolve()
+    feature_run_root.mkdir(parents=True)
+    feature_run_spec_path = (root / "feature-history-run-spec.json").resolve()
+    feature_run_spec_file_sha256 = _write(
+        feature_run_spec_path,
+        {"schema": "disposable-real-chain-feature-run-spec/v1"},
+    )
+    collection_publication_root = (
+        root / "feature-history-collection-publication"
+    ).resolve()
+    collection_publication_root.mkdir()
+    frozen_source_root = (root / "feature-history-frozen-source").resolve()
+    frozen_source_root.mkdir()
+    issuance = {
+        "authority_manifest_sha256": history_receipt[
+            "collection_publication_manifest_sha256"
+        ],
+        "publication_capability_sha256": _sha(
+            "real-e2e-history-publication-capability"
+        ),
+        "publication_schema": (
+            "audited-pit-factor-v3-feature-history-collection-publication/v1"
+        ),
+        "publication_status": "DURABLE_POSTVERIFIED_AND_RETURNED",
+        "schema": (
+            "audited-pit-factor-v3-feature-history-publication-issuance/v1"
+        ),
+    }
+    issuance_sha256 = _sha(issuance)
+    issuance_path = (
+        authority_root
+        / "feature_history_collection_publication_receipts"
+        / "sha256"
+        / issuance_sha256[:2]
+        / f"{issuance_sha256}.json"
+    )
+    assert _write(issuance_path, issuance) == issuance_sha256
+    manifest_sha256 = history_receipt["collection_publication_manifest_sha256"]
+    attestation = {
+        "attestor_producer": frozen_history._attestor_producer_binding(),
+        "feature_history": {
+            "authority_manifest_relative_path": (
+                "factor_v3_feature_history_authority_manifests/sha256/"
+                f"{manifest_sha256[:2]}/{manifest_sha256}.json"
+            ),
+            "authority_manifest_sha256": manifest_sha256,
+            "feature_run_root": str(feature_run_root),
+            "feature_run_spec_file_sha256": feature_run_spec_file_sha256,
+            "feature_run_spec_path": str(feature_run_spec_path),
+            "feature_run_spec_sha256": _sha("real-e2e-history-logical-run-spec"),
+            "pit_store_database_sha256": history_receipt[
+                "pit_store_database_sha256"
+            ],
+            "publication_capability_sha256": issuance[
+                "publication_capability_sha256"
+            ],
+            "publication_issuance_relative_path": "/".join(
+                issuance_path.parts[-4:]
+            ),
+            "publication_issuance_sha256": issuance_sha256,
+            "receipt_sha256": history_receipt["receipt_sha256"],
+            "session_count": 250,
+            "sessions_sha256": history_receipt["sessions_sha256"],
+            "snapshot_index_sha256": history_receipt["snapshot_index_sha256"],
+            "source_authority_root_sha256": history_receipt[
+                "source_authority_root_sha256"
+            ],
+        },
+        "frozen_source": {
+            "commit": "a" * 40,
+            "checkout_policy": deepcopy(
+                frozen_history.FROZEN_SOURCE_CHECKOUT_POLICY
+            ),
+            "physical_files": [],
+            "physical_files_root_sha256": _sha([]),
+            "producer_binding": {},
+            "root": str(frozen_source_root),
+        },
+        "schema": frozen_history.ATTESTATION_SCHEMA,
+        "verified": True,
+    }
+    attestation_sha256 = _sha(attestation)
+    attestation_path = (
+        authority_root
+        / "factor_v3_feature_history_frozen_source_attestations"
+        / "sha256"
+        / attestation_sha256[:2]
+        / f"{attestation_sha256}.json"
+    )
+    assert _write(attestation_path, attestation) == attestation_sha256
+    assert (
+        frozen_history._validated_attestation(
+            attestation_path=attestation_path.resolve(),
+            expected_attestation_sha256=attestation_sha256,
+        )
+        == attestation
+    )
+    return {
+        "attestation_path": attestation_path,
+        "attestation_sha256": attestation_sha256,
+        "collection_publication_root": collection_publication_root,
+        "feature_run_root": feature_run_root,
+        "feature_run_spec_path": feature_run_spec_path,
+        "frozen_source_root": frozen_source_root,
+        "history_receipt": history_receipt,
+        "issuance_path": issuance_path,
+        "issuance_sha256": issuance_sha256,
+    }
+
+
+def _real_daily_candidate_chain_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Any]:
+    prewindow, development = daily_test_support._sessions()
+    sessions = [*prewindow, *development]
+    parent_path, parent_sha256, _parent_rows = candidate_test_support._parent_snapshot(
+        tmp_path,
+        monkeypatch,
+        development,
+    )
+    points_contract = candidate_authority.points.FACTOR_V3_POINTS_CONTRACT
+    monkeypatch.setattr(
+        candidate_authority.points,
+        "_FACTOR_V3_POINTS_PARENT_EXPECTATION",
+        deepcopy(points_contract["preregistered_parent_expectation"]),
+    )
+    monkeypatch.setattr(
+        candidate_authority.points,
+        "FACTOR_V3_POINTS_ARM_STRATEGY_SHA256",
+        {
+            arm: candidate_authority.points.canonical_sha256(
+                candidate_authority.points._arm_strategy_payload(arm)
+            )
+            for arm in candidate_authority.points.FACTOR_V3_POINTS_ARMS
+        },
+    )
+    candidate_authority.points.assert_frozen_factor_v3_points_contract()
+    history = _write_real_feature_history_fixture(
+        tmp_path,
+        prewindow=prewindow,
+    )
+    prewindow_authority = _real_audited_daily_authority(
+        prewindow,
+        label="prewindow",
+    )
+    development_authority = _real_audited_daily_authority(
+        development,
+        label="development",
+    )
+    monkeypatch.setattr(
+        daily_authority,
+        "_load_feature_history_prewindow_authority",
+        lambda **_kwargs: prewindow_authority,
+    )
+    monkeypatch.setattr(
+        daily_authority,
+        "_load_development_authority",
+        lambda **_kwargs: development_authority,
+    )
+    monkeypatch.setattr(
+        legacy_daily,
+        "_load_daily_basic_partition",
+        lambda *, collection_ref, **_kwargs: candidate_test_support._daily_partition(
+            dict(collection_ref)
+        ),
+    )
+    transition = daily_test_support._transition_authority()
+    transition_contract_sha256 = transition.contract_sha256
+    monkeypatch.setattr(
+        daily_authority,
+        "_load_transition_authority",
+        lambda **_kwargs: transition,
+    )
+    points_output_root = (tmp_path / "points").resolve()
+    daily_output_root = (tmp_path / "daily-authority").resolve()
+    transition_root = (tmp_path / "transition").resolve()
+    development_database = (tmp_path / "development.sqlite3").resolve()
+    for directory in (points_output_root, daily_output_root, transition_root):
+        directory.mkdir()
+    development_database.write_bytes(b"disposable-development-database")
+    refs = []
+    for trade_date in sessions:
+        digest = _sha(["real-e2e-collection", trade_date])
+        refs.append(
+            {
+                "collection_set_relative_path": (
+                    f"daily_basic_collection_sets/sha256/{digest[:2]}/"
+                    f"{digest}.json"
+                ),
+                "collection_set_sha256": digest,
+                "trade_date": trade_date,
+            }
+        )
+    daily_kwargs = {
+        "feature_history_run_spec_path": history["feature_run_spec_path"],
+        "feature_history_run_root": history["feature_run_root"],
+        "feature_history_frozen_source_attestation_path": history[
+            "attestation_path"
+        ],
+        "expected_feature_history_frozen_source_attestation_sha256": history[
+            "attestation_sha256"
+        ],
+        "feature_history_frozen_source_root": history["frozen_source_root"],
+        "expected_feature_history_frozen_source_commit": "a" * 40,
+        "audited_development_universe_sqlite_path": development_database,
+        "expected_development_coverage_audit_sha256": (
+            development_authority.coverage_audit_sha256
+        ),
+        "expected_development_artifact_root_sha256": (
+            development_authority.artifact_root_sha256
+        ),
+        "expected_development_temporal_contract_sha256": (
+            development_authority.temporal_contract_sha256
+        ),
+        "expected_development_temporal_role": "development_4",
+        "points_output_root": points_output_root,
+        "collection_set_refs": refs,
+        "security_code_transition_evidence_root": transition_root,
+        "expected_security_code_transition_contract_sha256": (
+            transition_contract_sha256
+        ),
+        "output_root": daily_output_root,
+    }
+    _source, source_identity = daily_authority._load_733_authority(**daily_kwargs)
+    daily_kwargs["expected_source_authority_root_sha256"] = source_identity[
+        "root_sha256"
+    ]
+
+    history_receipt = history["history_receipt"]
+    monkeypatch.setattr(
+        candidate_authority.history_runner,
+        "load_factor_v3_feature_history_run_spec",
+        lambda _path: {
+            "collection_plan": {},
+            "development_session_refs": [],
+            "temporal_partition_contract": {},
+            "trade_cal_output_root": str(tmp_path.resolve()),
+            "trade_cal_publication": {},
+        },
+    )
+    monkeypatch.setattr(
+        candidate_authority.history_authority,
+        "verify_factor_v3_feature_history_collection_plan",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        candidate_authority.frozen_attestation,
+        "verify_factor_v3_feature_history_frozen_source_attestation",
+        lambda **_kwargs: {
+            "authority_binding": {
+                "collection_publication_output_root": str(
+                    history["collection_publication_root"]
+                ),
+                "manifest_relative_path": "manifest.json",
+                "manifest_sha256": history_receipt[
+                    "collection_publication_manifest_sha256"
+                ],
+                "receipt": deepcopy(history_receipt),
+            },
+            "receipt_sha256": history_receipt["receipt_sha256"],
+            "session_count": 250,
+            "sessions_sha256": history_receipt["sessions_sha256"],
+            "verified": True,
+        },
+    )
+
+    decision_receipt = branch_test_support._receipt(
+        {
+            "v2_control": "GREEN",
+            "overnight_20": "RED",
+            "intraday_20": "RED",
+        }
+    )
+    decision_path, decision_file_sha256 = branch_test_support._write_receipt(
+        tmp_path,
+        decision_receipt,
+    )
+    membership = [
+        {
+            "list_date": "2020-01-01",
+            "trade_date": trade_date,
+            "ts_code": code,
+        }
+        for trade_date in sessions
+        for code in ("000001.SZ", "300001.SZ", "600001.SH")
+    ]
+    monkeypatch.setattr(
+        candidate_authority,
+        "_read_membership_and_suspension_rows",
+        lambda **_kwargs: {"membership": membership, "suspensions": []},
+    )
+
+    pinned_root = (tmp_path / "factor-v2-frozen-source").resolve()
+    pinned_root.mkdir()
+    pinned_files = {
+        "parent_materialization_manifest_path": (
+            tmp_path / "factor-v2-parent-manifest.json"
+        ).resolve(),
+        "overlay_manifest_path": (
+            tmp_path / "factor-v2-overlay-manifest.json"
+        ).resolve(),
+        "suspension_metadata_path": (
+            tmp_path / "factor-v2-suspension.sqlite3"
+        ).resolve(),
+    }
+    for path in pinned_files.values():
+        path.write_bytes(b"disposable-fixture")
+    return {
+        "candidate_output_root": (tmp_path / "candidate-output").resolve(),
+        "daily_kwargs": daily_kwargs,
+        "decision_file_sha256": decision_file_sha256,
+        "decision_path": decision_path,
+        "development": development,
+        "development_database": development_database,
+        "evaluation_projection": {
+            "schema": activation.FACTOR_V2_EVALUATION_PROJECTION_SCHEMA,
+            "terminal_decision_descriptor_sha256": _sha(
+                "real-e2e-terminal-decision"
+            ),
+            "evaluator_descriptor_sha256": _sha("real-e2e-evaluator"),
+            "cost_slippage_execution_descriptor_sha256": _sha(
+                "real-e2e-cost-slippage"
+            ),
+        },
+        "history": history,
+        "parent_path": parent_path.resolve(),
+        "parent_sha256": parent_sha256,
+        "pinned_files": pinned_files,
+        "pinned_root": pinned_root,
+        "prewindow": prewindow,
+        "sessions": sessions,
+        "source_authority_root_sha256": source_identity["root_sha256"],
+    }
+
+
+def _write_real_candidate_source_spec(
+    chain: dict[str, Any],
+    daily_publication: dict[str, Any],
+) -> tuple[Path, str]:
+    daily_kwargs = chain["daily_kwargs"]
+    history = chain["history"]
+    spec = {
+        "schema": "factor-v3-development-input-source-spec/v2",
+        "feature_history": {
+            "run_spec_path": str(history["feature_run_spec_path"]),
+            "run_root": str(history["feature_run_root"]),
+            "frozen_source_attestation_path": str(history["attestation_path"]),
+            "expected_frozen_source_attestation_sha256": history[
+                "attestation_sha256"
+            ],
+            "frozen_source_root": str(history["frozen_source_root"]),
+            "expected_frozen_source_commit": "a" * 40,
+        },
+        "daily_basic": {
+            "audited_development_universe_sqlite_path": str(
+                chain["development_database"]
+            ),
+            "expected_development_coverage_audit_sha256": daily_kwargs[
+                "expected_development_coverage_audit_sha256"
+            ],
+            "expected_development_artifact_root_sha256": daily_kwargs[
+                "expected_development_artifact_root_sha256"
+            ],
+            "expected_development_temporal_contract_sha256": daily_kwargs[
+                "expected_development_temporal_contract_sha256"
+            ],
+            "expected_development_temporal_role": "development_4",
+            "expected_source_authority_root_sha256": chain[
+                "source_authority_root_sha256"
+            ],
+            "points_output_root": str(daily_kwargs["points_output_root"]),
+            "collection_set_refs": deepcopy(daily_kwargs["collection_set_refs"]),
+            "security_code_transition_evidence_root": str(
+                daily_kwargs["security_code_transition_evidence_root"]
+            ),
+            "expected_security_code_transition_contract_sha256": daily_kwargs[
+                "expected_security_code_transition_contract_sha256"
+            ],
+            "authority_output_root": str(daily_kwargs["output_root"]),
+            "publication": deepcopy(daily_publication),
+        },
+        "factor_v2": {
+            "decision_receipt_path": str(chain["decision_path"]),
+            "expected_decision_receipt_raw_file_sha256": chain[
+                "decision_file_sha256"
+            ],
+            "parent_snapshot_path": str(chain["parent_path"]),
+            "expected_parent_snapshot_file_sha256": chain["parent_sha256"],
+            "parent_payload_fields": ["features"],
+            "pinned_parent_adapter": {
+                "schema": "factor-v3-pinned-factor-v2-parent-adapter-source/v1",
+                "frozen_source_root": str(chain["pinned_root"]),
+                "expected_frozen_source_commit": (
+                    candidate_authority.FACTOR_V2_FROZEN_SOURCE_COMMIT
+                ),
+                "expected_frozen_source_tree_oid": (
+                    candidate_authority.FACTOR_V2_FROZEN_SOURCE_TREE_OID
+                ),
+                "expected_frozen_source_blob_sha256": dict(
+                    candidate_authority.FACTOR_V2_FROZEN_SOURCE_BLOB_SHA256
+                ),
+                **{
+                    key: str(value)
+                    for key, value in chain["pinned_files"].items()
+                },
+                "subprocess_contract": deepcopy(
+                    candidate_authority.FACTOR_V2_PARENT_SUBPROCESS_CONTRACT
+                ),
+                "public_verifier_replay_performed": False,
+            },
+        },
+    }
+    path = (chain["candidate_output_root"].parent / "source-spec.json").resolve()
+    return path, _write(path, spec)
+
+
+def _real_candidate_activation_bundle(
+    chain: dict[str, Any],
+    *,
+    daily_publication: dict[str, Any],
+    candidate_publication: dict[str, Any],
+) -> tuple[Any, ...]:
+    candidate_root = Path(chain["candidate_output_root"])
+    manifest_path = candidate_root.joinpath(
+        *candidate_publication["publication_relative_path"].split("/")
+    )
+    descriptor_path = candidate_root.joinpath(
+        *candidate_publication["descriptor_relative_path"].split("/")
+    )
+    snapshot_root = descriptor_path.parent
+    parent = _read(snapshot_root / "factor_v2_parent.json")
+    rows = parent["rows"]
+    parent_projection = {
+        "schema": activation.PARENT_PROJECTION_SCHEMA,
+        "contract": deepcopy(activation.PARENT_PROJECTION_CONTRACT),
+        "candidate_keys_sha256": _sha(
+            sorted(row["candidate_key"] for row in rows)
+        ),
+        "source_feature_projection_rows_sha256": _sha(
+            [
+                {
+                    "candidate_key": row["candidate_key"],
+                    "signal_date": row["signal_date"],
+                    "features": row["features"],
+                }
+                for row in rows
+            ]
+        ),
+        "full_export_rows_sha256": _sha(rows),
+    }
+    evaluation = _read(snapshot_root / "factor_v2_evaluation.json")
+    evaluation_source_binding = {
+        "branch_receipt_sha256": evaluation["branch_receipt_sha256"],
+        "decision_receipt_sha256": evaluation["decision_receipt_sha256"],
+        "decision_receipt_raw_file_sha256": evaluation[
+            "decision_receipt_raw_file_sha256"
+        ],
+        "evaluation_artifact_sha256": evaluation["evaluation_artifact_sha256"],
+        "selected_branch": evaluation["selected_branch"],
+        "snapshot_schema": evaluation["schema"],
+    }
+    calendar = _read(snapshot_root / "calendar.json")
+    board = _read(snapshot_root / "upstream_board_ledger.json")
+    daily_receipt_path = Path(chain["daily_kwargs"]["output_root"]).joinpath(
+        *daily_publication["receipt_relative_path"].split("/")
+    )
+    history = chain["history"]
+    candidate_paths = {
+        "descriptor": descriptor_path,
+        "manifest": manifest_path,
+        "output_root": candidate_root,
+        "snapshot_root": snapshot_root,
+        "feature_history_collection_issuance": history["issuance_path"],
+        "feature_history_collection_issuance_sha256": history["issuance_sha256"],
+        "feature_history_frozen_attestation": history["attestation_path"],
+        "feature_history_frozen_attestation_sha256": history[
+            "attestation_sha256"
+        ],
+        "daily_basic_receipt": daily_receipt_path,
+        "daily_basic_receipt_sha256": daily_publication["receipt_sha256"],
+    }
+    return (
+        manifest_path,
+        candidate_publication["publication_sha256"],
+        parent_projection,
+        chain["evaluation_projection"],
+        evaluation_source_binding,
+        {
+            "all_market_sessions_sha256": calendar[
+                "all_market_sessions_sha256"
+            ],
+            "prewindow_sessions_sha256": calendar[
+                "prewindow_sessions_sha256"
+            ],
+            "development_sessions_sha256": calendar[
+                "development_sessions_sha256"
+            ],
+            "source_dates_sha256": calendar["source_dates_sha256"],
+        },
+        board["per_date_board_ledger_root_sha256"],
+        candidate_paths,
+    )
+
+
+def _fixture(
+    tmp_path: Path,
+    *,
+    candidate_bundle: tuple[Any, ...] | None = None,
+) -> dict[str, Any]:
     candidate_root = tmp_path / "candidate"
     (
         candidate_publication_path,
@@ -777,7 +1468,12 @@ def _fixture(tmp_path: Path) -> dict[str, Any]:
         calendar_roots,
         upstream_board_ledger_root,
         candidate_paths,
-    ) = _candidate_publication(candidate_root)
+    ) = (
+        _candidate_publication(candidate_root)
+        if candidate_bundle is None
+        else candidate_bundle
+    )
+    candidate_root = Path(candidate_paths.get("output_root", candidate_root))
     semantic_root = _sha("parent-semantic-input")
     attempt_key = _sha(
         {
@@ -3383,3 +4079,200 @@ def test_independent_verifier_identity_binds_core_source_bytes() -> None:
     finally:
         source.write_bytes(original)
     assert independent._producer_identity() == before
+
+
+def test_real_daily_candidate_to_disposable_differential_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chain = _real_daily_candidate_chain_inputs(tmp_path, monkeypatch)
+    daily_publication = daily_authority.publish_factor_v3_daily_basic_733_exact_set_coverage(
+        **chain["daily_kwargs"]
+    )
+    daily_verified = daily_authority.verify_factor_v3_daily_basic_733_exact_set_coverage(
+        **chain["daily_kwargs"],
+        publication=daily_publication,
+    )
+    candidate_spec_path, candidate_spec_sha256 = _write_real_candidate_source_spec(
+        chain,
+        daily_publication,
+    )
+    candidate_publication = candidate_authority.publish_factor_v3_development_input_authority(
+        source_spec_path=candidate_spec_path,
+        expected_source_spec_sha256=candidate_spec_sha256,
+        output_root=chain["candidate_output_root"],
+    )
+    candidate_verified = candidate_authority.verify_factor_v3_development_input_authority(
+        source_spec_path=candidate_spec_path,
+        expected_source_spec_sha256=candidate_spec_sha256,
+        output_root=chain["candidate_output_root"],
+        publication=candidate_publication,
+    )
+    candidate_bundle = _real_candidate_activation_bundle(
+        chain,
+        daily_publication=daily_publication,
+        candidate_publication=candidate_publication,
+    )
+    fixture = _fixture(
+        tmp_path / "activation",
+        candidate_bundle=candidate_bundle,
+    )
+    activation_publication = activation._publish_disposable_test_factor_v3_formal_development_input_activation(
+        **fixture["kwargs"]
+    )
+    activation_publication_path = _publication_path(
+        Path(fixture["kwargs"]["output_root"]),
+        activation_publication,
+    )
+    verifier_kwargs = {
+        key: value
+        for key, value in fixture["kwargs"].items()
+        if key != "output_root"
+    }
+    independent = activation._verify_disposable_test_factor_v3_formal_development_input_activation(
+        **verifier_kwargs,
+        activation_publication_path=activation_publication_path,
+        expected_activation_publication_sha256=activation_publication[
+            "publication_sha256"
+        ],
+        verifier_output_root=(tmp_path / "differential-replay").resolve(),
+    )
+
+    sessions = chain["sessions"]
+    assert daily_verified["verified"] is True
+    assert daily_verified["trade_dates"] == sessions
+    assert len(sessions[:250]) == 250
+    assert len(sessions[250:]) == 483
+    daily_receipt_path = Path(chain["daily_kwargs"]["output_root"]).joinpath(
+        *daily_publication["receipt_relative_path"].split("/")
+    )
+    daily_receipt = _read(daily_receipt_path)
+    assert _sha(daily_receipt) == daily_publication["receipt_sha256"]
+    daily_unsigned = dict(daily_receipt)
+    assert daily_unsigned.pop("authority_root_sha256") == _sha(daily_unsigned)
+    assert daily_receipt["trade_date_count"] == 733
+    assert daily_receipt["trade_dates"] == sessions
+    assert daily_receipt["per_date_statistics"][-1]["trade_date"] == sessions[-1]
+    for statistic in daily_receipt["per_date_statistics"]:
+        assert statistic["daily_basic_raw_segment_counts"] == {
+            "BSE": 1,
+            "SSE_MAIN": 1,
+            "SSE_STAR": 1,
+            "SZSE_CHINEXT": 1,
+            "SZSE_MAIN": 1,
+        }
+
+    candidate_descriptor = _read(candidate_bundle[7]["descriptor"])
+    candidate_calendar = _read(
+        candidate_bundle[7]["snapshot_root"] / "calendar.json"
+    )
+    candidate_board = _read(
+        candidate_bundle[7]["snapshot_root"] / "upstream_board_ledger.json"
+    )
+    assert candidate_verified["verified"] is False
+    assert candidate_calendar["all_market_session_count"] == 733
+    assert candidate_calendar["prewindow_session_count"] == 250
+    assert candidate_calendar["development_session_count"] == 483
+    assert candidate_calendar["source_date_count"] == 732
+    assert candidate_calendar["source_dates"] == sessions[:-1]
+    assert candidate_board["source_segments"] == list(
+        activation.UPSTREAM_SOURCE_SEGMENTS
+    )
+    assert len(candidate_board["per_date"]) == 732
+    assert all(
+        entry["segment_counts"]
+        == {
+            "BSE": 1,
+            "SSE_MAIN": 1,
+            "SSE_STAR": 1,
+            "SZSE_CHINEXT": 1,
+            "SZSE_MAIN": 1,
+        }
+        for entry in candidate_board["per_date"]
+    )
+    assert candidate_descriptor["source_authority_complete"] is False
+    assert candidate_descriptor["formal_materialization_eligible"] is False
+    assert all(
+        candidate_descriptor[field] is False
+        for field in candidate_authority.SAFETY_FALSE_FIELDS
+    )
+
+    activation_manifest = _read(activation_publication_path)
+    activation_descriptor = _read(
+        Path(fixture["kwargs"]["output_root"]).joinpath(
+            *activation_manifest["descriptor_relative_path"].split("/")
+        )
+    )
+    assert activation_descriptor["authority_scope"] == "DISPOSABLE_TEST_FIXTURE_ONLY"
+    assert activation_descriptor["test_fixture_only"] is True
+    assert activation_descriptor["activation_verified"] is False
+    assert activation_descriptor["source_authority_complete"] is False
+    assert activation_descriptor["formal_materialization_eligible"] is False
+    assert activation_descriptor["verified"] is False
+    assert independent["differential_contract_replay_performed"] is True
+    assert independent["independent_public_replay_performed"] is False
+    assert independent["verified"] is False
+    independent_receipt = _read(
+        (tmp_path / "differential-replay")
+        .resolve()
+        .joinpath(*independent["receipt_relative_path"].split("/"))
+    )
+    assert independent_receipt["test_fixture_only"] is True
+    assert independent_receipt["replayed_input_bindings"][
+        "daily_basic_authority_receipt_file_sha256"
+    ] == daily_publication["receipt_sha256"]
+    assert independent_receipt["replayed_input_bindings"][
+        "candidate_publication_file_sha256"
+    ] == candidate_publication["publication_sha256"]
+
+
+def test_disposable_public_projection_rejects_real_daily_receipt_schema_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chain = _real_daily_candidate_chain_inputs(tmp_path, monkeypatch)
+    publication = daily_authority.publish_factor_v3_daily_basic_733_exact_set_coverage(
+        **chain["daily_kwargs"]
+    )
+    receipt_path = Path(chain["daily_kwargs"]["output_root"]).joinpath(
+        *publication["receipt_relative_path"].split("/")
+    )
+    receipt = _read(receipt_path)
+
+    def missing_field(value: dict[str, Any]) -> None:
+        value["per_date_statistics"][0].pop("daily_basic_attempt_sha256")
+
+    def extra_field(value: dict[str, Any]) -> None:
+        value["per_date_statistics"][0]["unbound"] = "drift"
+
+    def semantic_drift(value: dict[str, Any]) -> None:
+        value["per_date_statistics"][0][
+            "source_ts_code_exact_set_verified_after_transition_filter"
+        ] = False
+
+    for mutate in (missing_field, extra_field, semantic_drift):
+        drifted = deepcopy(receipt)
+        mutate(drifted)
+        drifted["per_date_statistics_sha256"] = _sha(
+            drifted["per_date_statistics"]
+        )
+        unsigned = dict(drifted)
+        unsigned.pop("authority_root_sha256")
+        drifted["authority_root_sha256"] = _sha(unsigned)
+        projection = candidate_authority.build_factor_v3_public_source_receipt_projection(
+            drifted,
+            kind="daily_basic_733_v2",
+        )
+        snapshot = {
+            "derived_adapter": {},
+            "schema": "factor-v3-development-daily-basic-receipt-snapshot/v2",
+            **projection,
+        }
+        with pytest.raises(ValueError):
+            candidate_authority.validate_factor_v3_public_source_receipt_projection(
+                source_receipt=drifted,
+                projected_snapshot=snapshot,
+                kind="daily_basic_733_v2",
+                sessions=chain["sessions"],
+                formal_schema_required=False,
+            )

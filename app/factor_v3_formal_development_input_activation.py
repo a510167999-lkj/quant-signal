@@ -25,6 +25,7 @@ from app import factor_v3_development_input_authority as candidate_authority
 from app import factor_v3_feature_history_frozen_source_attestation as frozen_history
 from app import factor_v3_formal_trusted_supervisor as trusted_supervisor
 from app import factor_v3_parent_source_development_authority as parent_authority
+from app import jiaoch_daily_basic_exact_set_authority as daily_exact_set_authority
 
 
 ACTIVATION_SCHEMA = "factor-v3-formal-development-input-activation/v1"
@@ -1659,14 +1660,9 @@ def _validate_candidate_receipt_snapshots(snapshots: Mapping[str, dict[str, Any]
         _fail("candidate daily-basic per-date statistics rejected")
     board_entries = snapshots["upstream_board_ledger"]["per_date"]
     for index, statistic in enumerate(statistics):
-        _assert_fields(
+        statistic = _assert_fields(
             statistic,
-            {
-                "authoritative_daily_raw_codes_sha256",
-                "daily_basic_canonical_rows_sha256",
-                "daily_basic_raw_segment_counts",
-                "trade_date",
-            },
+            set(daily_exact_set_authority._PER_DATE_FIELDS),
             label="candidate daily-basic per-date statistic",
         )
         counts = _assert_fields(
@@ -1676,7 +1672,17 @@ def _validate_candidate_receipt_snapshots(snapshots: Mapping[str, dict[str, Any]
         )
         if any(type(counts[name]) is not int or counts[name] <= 0 for name in UPSTREAM_SOURCE_SEGMENTS):
             _fail("candidate daily-basic raw segment counts rejected")
-        if statistic["trade_date"] != source_daily["trade_dates"][index]:
+        if (
+            statistic["trade_date"] != source_daily["trade_dates"][index]
+            or statistic[
+                "source_ts_code_exact_set_verified_after_transition_filter"
+            ]
+            is not True
+            or statistic["transition_resolved_identity_exact_set_verified"]
+            is not True
+            or statistic["missing_authoritative_daily_code_count"] != 0
+            or statistic["extra_daily_basic_code_count"] != 0
+        ):
             _fail("candidate daily-basic per-date session sequence rejected")
         _sha256(
             statistic["authoritative_daily_raw_codes_sha256"],

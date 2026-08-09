@@ -120,6 +120,47 @@ _DAILY_BASIC_V2_RECEIPT_FIELDS = {
     "transition_overlap_authority_root_sha256",
     "transition_resolved_identity_exact_set_verified",
 }
+_DAILY_BASIC_V2_PER_DATE_FIELDS = {
+    "authoritative_daily_filtered_codes_sha256",
+    "authoritative_daily_generation_id",
+    "authoritative_daily_generation_lineage_sha256",
+    "authoritative_daily_generation_manifest_sha256",
+    "authoritative_daily_raw_codes_sha256",
+    "authoritative_daily_raw_row_count",
+    "authoritative_daily_raw_segment_counts",
+    "authoritative_daily_resolved_identities_sha256",
+    "authoritative_daily_transition_excluded_codes_sha256",
+    "authoritative_daily_transition_excluded_row_count",
+    "authoritative_daily_vintage",
+    "collection_set_relative_path",
+    "collection_set_sha256",
+    "daily_basic_attempt_relative_path",
+    "daily_basic_attempt_sha256",
+    "daily_basic_canonical_rows_sha256",
+    "daily_basic_filtered_codes_sha256",
+    "daily_basic_normalization_receipt_sha256",
+    "daily_basic_raw_codes_sha256",
+    "daily_basic_raw_relative_path",
+    "daily_basic_raw_row_count",
+    "daily_basic_raw_segment_counts",
+    "daily_basic_raw_sha256",
+    "daily_basic_resolved_identities_sha256",
+    "daily_basic_source_normalization_rows_sha256",
+    "daily_basic_transition_excluded_codes_sha256",
+    "daily_basic_transition_excluded_row_count",
+    "daily_basic_transition_overlap_comparison_fields",
+    "daily_basic_transition_overlap_pair_count",
+    "daily_basic_transition_overlap_root_sha256",
+    "extra_daily_basic_code_count",
+    "missing_authoritative_daily_code_count",
+    "source_ts_code_exact_set_verified_after_transition_filter",
+    "target_scope_codes_sha256",
+    "target_scope_resolved_identities_sha256",
+    "target_scope_row_count",
+    "trade_date",
+    "transition_filtered_row_count",
+    "transition_resolved_identity_exact_set_verified",
+}
 PARENT_PROJECTION_SCHEMA = "factor-v3-parent-row-projection-roots/v1"
 PARENT_PROJECTION_FIELDS = (
     "candidate_keys_sha256",
@@ -602,6 +643,48 @@ def _validate_public_projection(
         ):
             if source_receipt.get(field) is not True:
                 _fail("daily-basic receipt eligibility binding rejected")
+        statistics = source_receipt.get("per_date_statistics")
+        if (
+            type(statistics) is not list
+            or len(statistics) != len(sessions)
+            or source_receipt.get("per_date_statistics_sha256")
+            != _sha(statistics)
+        ):
+            _fail("daily-basic receipt per-date statistics rejected")
+        for session, statistic in zip(sessions, statistics, strict=True):
+            if (
+                type(statistic) is not dict
+                or set(statistic) != _DAILY_BASIC_V2_PER_DATE_FIELDS
+                or statistic.get("trade_date") != session
+                or statistic.get(
+                    "source_ts_code_exact_set_verified_after_transition_filter"
+                )
+                is not True
+                or statistic.get(
+                    "transition_resolved_identity_exact_set_verified"
+                )
+                is not True
+                or statistic.get("missing_authoritative_daily_code_count") != 0
+                or statistic.get("extra_daily_basic_code_count") != 0
+            ):
+                _fail("daily-basic receipt per-date descriptor rejected")
+            counts = _fields(
+                statistic["daily_basic_raw_segment_counts"],
+                set(UPSTREAM_SOURCE_SEGMENTS),
+                label="daily-basic receipt per-date segment counts",
+            )
+            if any(
+                type(counts[name]) is not int or counts[name] <= 0
+                for name in UPSTREAM_SOURCE_SEGMENTS
+            ):
+                _fail("daily-basic receipt per-date segment counts rejected")
+        if source_receipt.get("source_missingness") != {
+            "extra_daily_basic_code_count": 0,
+            "missing_authoritative_daily_code_count": 0,
+            "status": "NONE_AFTER_AUTHORIZED_TRANSITION_FILTER",
+            "unproven_source_missingness_count": 0,
+        }:
+            _fail("daily-basic receipt source missingness rejected")
 
 
 def _is_mainboard_chinext_symbol(value: Any) -> bool:
@@ -1308,12 +1391,7 @@ def _load_candidate_sources(
         )
         _fields(
             statistic,
-            {
-                "authoritative_daily_raw_codes_sha256",
-                "daily_basic_canonical_rows_sha256",
-                "daily_basic_raw_segment_counts",
-                "trade_date",
-            },
+            set(_DAILY_BASIC_V2_PER_DATE_FIELDS),
             label="candidate daily-basic per-date statistic",
         )
         board_counts = _fields(
