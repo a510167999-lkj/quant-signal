@@ -13,6 +13,7 @@ from app import audited_pit_shallow_gbdt as shallow_gbdt
 from app import audited_pit_score_contract as score_contract
 from app import factor_v2_decision_branch_selector as branch_selector
 from app.factor_v2_terminal_evaluator_authority import (
+    FACTOR_V2_TERMINAL_DECISION_BINDING_SCHEMA,
     FACTOR_V2_TERMINAL_EVALUATOR_ADAPTER_SCHEMA,
     validate_factor_v2_terminal_evaluator_development_adapter,
 )
@@ -404,6 +405,13 @@ def test_authority_binds_selected_branch_and_all_terminal_contracts(
     assert result["authority_status"] == "UNVERIFIED_DEVELOPMENT_ADAPTER"
     assert result["contract_binding_validated"] is True
     assert result["verified"] is False
+    assert (
+        result["terminal_decision"]["schema_version"]
+        == FACTOR_V2_TERMINAL_DECISION_BINDING_SCHEMA
+    )
+    assert result["terminal_decision"]["schema_version"] != (
+        branch_selector.BRANCH_RECEIPT_SCHEMA_VERSION
+    )
     assert result["selected_branch"] == selected
     assert result["base_feature_contract"]["feature_names"] == list(
         shallow_gbdt.FEATURE_NAMES

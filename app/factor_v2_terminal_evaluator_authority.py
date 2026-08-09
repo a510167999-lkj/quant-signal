@@ -21,6 +21,9 @@ from app import factor_v2_decision_branch_selector as branch_selector
 FACTOR_V2_TERMINAL_EVALUATOR_ADAPTER_SCHEMA = (
     "factor-v2-terminal-evaluator-unverified-development-adapter/v1"
 )
+FACTOR_V2_TERMINAL_DECISION_BINDING_SCHEMA = (
+    "factor-v2-terminal-decision-binding/v1"
+)
 FACTOR_V2_DEVELOPMENT_EVALUATION_SCHEMA = (
     "audited-pit-factor-v2-development-evaluation/v1"
 )
@@ -1066,7 +1069,7 @@ def validate_factor_v2_terminal_evaluator_development_adapter(
     }
     outcome_contract = {**outcome_unsigned, "root_sha256": _sha256(outcome_unsigned)}
     terminal_decision = {
-        "schema_version": branch_selector.BRANCH_RECEIPT_SCHEMA_VERSION,
+        "schema_version": FACTOR_V2_TERMINAL_DECISION_BINDING_SCHEMA,
         "source_decision_receipt_raw_file_sha256": (
             expected_decision_receipt_raw_file_sha256
         ),
