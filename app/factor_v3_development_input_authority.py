@@ -437,6 +437,179 @@ def _redacted_receipt_projection(
     }
 
 
+PUBLIC_SOURCE_RECEIPT_PROJECTION_SCHEMA = (
+    "factor-v3-public-receipt-redacted-projection/v1"
+)
+PUBLIC_SOURCE_RECEIPT_KINDS = ("daily_basic_733_v2", "feature_history_v3")
+_FEATURE_HISTORY_V3_RECEIPT_FIELDS = frozenset(
+    {
+        "authority_status",
+        "collection_plan_sha256",
+        "collection_publication_manifest_sha256",
+        "daily_generation_session_count",
+        "embargo_consumed",
+        "exact_nonempty_bak_basic_session_count",
+        "experiment_launch_eligible",
+        "factor_materialization_eligible",
+        "factor_v3_feature_history_authority_contract_sha256",
+        "factor_v3_points_contract_sha256",
+        "feature_history_only",
+        "final_oos_consumed",
+        "pit_store_database_bytes",
+        "pit_store_database_sha256",
+        "pit_store_raw_artifact_set_sha256",
+        "pit_store_receipt_manifest_sha256",
+        "producer_code_root_sha256",
+        "production_profile_registered",
+        "production_recommendation_eligible",
+        "receipt_sha256",
+        "schema_version",
+        "security_code_transition_contract_sha256",
+        "session_authority_refs_sha256",
+        "session_count",
+        "sessions_sha256",
+        "snapshot_index_sha256",
+        "source_authority_root_sha256",
+        "suspend_d_authority_session_count",
+        "upstream_beijing_preserved_session_count",
+        "upstream_scope_root_sha256",
+        "upstream_star_preserved_session_count",
+        "verified",
+    }
+)
+
+
+def build_factor_v3_public_source_receipt_projection(
+    source_receipt: Mapping[str, Any], *, kind: str
+) -> dict[str, Any]:
+    if kind == "feature_history_v3":
+        return _redacted_receipt_projection(
+            source_receipt,
+            self_hash_field="receipt_sha256",
+            source_hash_field="source_receipt_sha256",
+        )
+    if kind == "daily_basic_733_v2":
+        return _redacted_receipt_projection(
+            source_receipt,
+            self_hash_field="authority_root_sha256",
+            source_hash_field="source_authority_root_sha256",
+        )
+    raise ValueError("factor-v3 public source receipt kind rejected")
+
+
+def validate_factor_v3_public_source_receipt_projection(
+    *,
+    source_receipt: Mapping[str, Any],
+    projected_snapshot: Mapping[str, Any],
+    kind: str,
+    sessions: Sequence[str],
+    formal_schema_required: bool,
+) -> dict[str, Any]:
+    expected = build_factor_v3_public_source_receipt_projection(
+        source_receipt, kind=kind
+    )
+    snapshot_schema = {
+        "feature_history_v3": (
+            "factor-v3-development-feature-history-receipt-snapshot/v2"
+        ),
+        "daily_basic_733_v2": (
+            "factor-v3-development-daily-basic-receipt-snapshot/v2"
+        ),
+    }.get(kind)
+    if snapshot_schema is None:
+        raise ValueError("factor-v3 public source receipt kind rejected")
+    projected_fields = {
+        "projection_schema",
+        "redacted_field_count",
+        "schema",
+        "source_receipt_projection",
+        "source_receipt_projection_sha256",
+        (
+            "source_receipt_sha256"
+            if kind == "feature_history_v3"
+            else "source_authority_root_sha256"
+        ),
+    }
+    if kind == "daily_basic_733_v2":
+        projected_fields.add("derived_adapter")
+    if type(projected_snapshot) is not dict or set(projected_snapshot) != projected_fields:
+        raise ValueError("factor-v3 public source receipt projection fields rejected")
+    if projected_snapshot.get("schema") != snapshot_schema:
+        raise ValueError("factor-v3 public source receipt projection schema rejected")
+    actual_projection = {
+        key: value
+        for key, value in projected_snapshot.items()
+        if key not in {"schema", "derived_adapter"}
+    }
+    if actual_projection != expected:
+        raise ValueError("factor-v3 public source receipt projection mismatch")
+
+    if kind == "feature_history_v3":
+        receipt = dict(source_receipt)
+        if formal_schema_required and set(receipt) != _FEATURE_HISTORY_V3_RECEIPT_FIELDS:
+            raise ValueError("feature history v3 receipt fields rejected")
+        unsigned = dict(receipt)
+        receipt_sha = _strict_sha256(
+            unsigned.pop("receipt_sha256", None),
+            label="feature history v3 receipt SHA",
+        )
+        if receipt_sha != _canonical_sha256(unsigned):
+            raise ValueError("feature history v3 receipt self hash rejected")
+        if (
+            receipt.get("schema_version")
+            != "audited-pit-factor-v3-feature-history-authority-receipt/v3"
+            or receipt.get("verified") is not True
+            or receipt.get("authority_status") != "VERIFIED_FEATURE_HISTORY_ONLY"
+            or receipt.get("feature_history_only") is not True
+            or receipt.get("session_count") != len(sessions)
+            or receipt.get("sessions_sha256") != _canonical_sha256(sessions)
+        ):
+            raise ValueError("feature history v3 receipt semantics rejected")
+        for field in (
+            "embargo_consumed",
+            "experiment_launch_eligible",
+            "factor_materialization_eligible",
+            "final_oos_consumed",
+            "production_profile_registered",
+            "production_recommendation_eligible",
+        ):
+            if receipt.get(field) is not False:
+                raise ValueError("feature history v3 receipt scope rejected")
+        if formal_schema_required and (
+            receipt.get("factor_v3_points_contract_sha256")
+            != points.FACTOR_V3_POINTS_CONTRACT_SHA256
+            or receipt.get("exact_nonempty_bak_basic_session_count") != len(sessions)
+            or receipt.get("daily_generation_session_count") != len(sessions)
+            or receipt.get("suspend_d_authority_session_count") != len(sessions)
+            or receipt.get("upstream_star_preserved_session_count") != len(sessions)
+            or receipt.get("upstream_beijing_preserved_session_count") != len(sessions)
+        ):
+            raise ValueError("feature history v3 exact authority receipt rejected")
+    else:
+        if formal_schema_required:
+            daily_authority._validate_v2_receipt(dict(source_receipt))
+        else:
+            receipt = dict(source_receipt)
+            unsigned = dict(receipt)
+            authority_root = _strict_sha256(
+                unsigned.pop("authority_root_sha256", None),
+                label="daily basic 733 authority root",
+            )
+            if authority_root != _canonical_sha256(unsigned):
+                raise ValueError("daily basic 733 authority self hash rejected")
+            if (
+                receipt.get("schema")
+                != "factor-v3-daily-basic-733-exact-set-receipt/v2"
+                or receipt.get("authority_status")
+                != "VERIFIED_FACTOR_V3_733_DAILY_BASIC_EXACT_SET"
+                or receipt.get("trade_date_count") != len(sessions)
+                or receipt.get("trade_dates") != list(sessions)
+                or receipt.get("trade_dates_sha256") != _canonical_sha256(sessions)
+            ):
+                raise ValueError("daily basic 733 receipt semantics rejected")
+    return json.loads(_canonical_bytes(expected).decode("utf-8"))
+
+
 def _safe_relative_path(root: Path, relative: Any, *, label: str) -> Path:
     if type(relative) is not str or not relative or "\\" in relative:
         raise ValueError(f"{label} path rejected")
@@ -1640,15 +1813,13 @@ def _build_snapshots(
         "source_dates": source_dates,
         "source_dates_sha256": _canonical_sha256(source_dates),
     }
-    history_projection = _redacted_receipt_projection(
+    history_projection = build_factor_v3_public_source_receipt_projection(
         feature_history_source_binding["receipt"],
-        self_hash_field="receipt_sha256",
-        source_hash_field="source_receipt_sha256",
+        kind="feature_history_v3",
     )
-    daily_projection = _redacted_receipt_projection(
+    daily_projection = build_factor_v3_public_source_receipt_projection(
         daily_receipt_raw_value,
-        self_hash_field="authority_root_sha256",
-        source_hash_field="source_authority_root_sha256",
+        kind="daily_basic_733_v2",
     )
     snapshots: dict[str, dict[str, Any]] = {
         "calendar": calendar,
@@ -2067,9 +2238,13 @@ __all__ = (
     "FACTOR_V2_PARENT_SUBPROCESS_CONTRACT",
     "PRODUCER_SNAPSHOT_SCHEMA",
     "PROVENANCE_FALSE_FIELDS",
+    "PUBLIC_SOURCE_RECEIPT_KINDS",
+    "PUBLIC_SOURCE_RECEIPT_PROJECTION_SCHEMA",
     "PUBLICATION_SCHEMA",
     "SAFETY_FALSE_FIELDS",
     "publish_factor_v3_development_input_authority",
+    "build_factor_v3_public_source_receipt_projection",
     "validate_factor_v2_common_eligible_parent_hash_binding",
+    "validate_factor_v3_public_source_receipt_projection",
     "verify_factor_v3_development_input_authority",
 )

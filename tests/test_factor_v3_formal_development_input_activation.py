@@ -12,26 +12,90 @@ from typing import Any, Callable
 import pytest
 
 from app import factor_v3_development_input_authority as candidate_authority
+from app import factor_v2_decision_branch_selector as factor_v2_branch_selector
 from app import factor_v3_formal_development_input_activation as activation
-from app import factor_v3_parent_source_development_authority as parent_authority
+from app import factor_v3_formal_development_input_activation_independent_core as independent_core
+from app import factor_v3_feature_history_frozen_source_attestation as frozen_history
 
 
 @pytest.fixture(autouse=True)
 def _explicit_native_parent_source_test_authority(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    authority = object()
+    def points_verifier(**evidence: Any) -> dict[str, Any]:
+        return {
+            **evidence,
+            "authority_scope": "DISPOSABLE_TEST_FIXTURE_ONLY",
+            "contract_binding_validated": True,
+            "schema": activation.POINTS_CONTRACT_AUTHORITY_VERDICT_SCHEMA,
+            "test_fixture_only": True,
+            "verified": False,
+        }
+
+    def parent_verifier(**evidence: Any) -> dict[str, Any]:
+        return {
+            **evidence,
+            "authority_scope": "DISPOSABLE_TEST_FIXTURE_ONLY",
+            "contract_binding_validated": True,
+            "schema": activation.PARENT_SOURCE_NATIVE_AUTHORITY_VERDICT_SCHEMA,
+            "test_fixture_only": True,
+            "verified": False,
+        }
+
+    def evaluation_verifier(**evidence: Any) -> dict[str, Any]:
+        return {
+            **evidence,
+            "authority_scope": "DISPOSABLE_TEST_FIXTURE_ONLY",
+            "contract_binding_validated": True,
+            "schema": activation.FACTOR_V2_EVALUATION_NATIVE_AUTHORITY_VERDICT_SCHEMA,
+            "test_fixture_only": True,
+            "verified": False,
+        }
+
+    def history_verifier(**evidence: Any) -> dict[str, Any]:
+        return {
+            **evidence,
+            "authority_scope": "DISPOSABLE_TEST_FIXTURE_ONLY",
+            "contract_binding_validated": True,
+            "schema": activation.FEATURE_HISTORY_NATIVE_AUTHORITY_VERDICT_SCHEMA,
+            "test_fixture_only": True,
+            "verified": False,
+        }
+
+    def daily_verifier(**evidence: Any) -> dict[str, Any]:
+        return {
+            **evidence,
+            "authority_scope": "DISPOSABLE_TEST_FIXTURE_ONLY",
+            "contract_binding_validated": True,
+            "schema": activation.DAILY_BASIC_NATIVE_AUTHORITY_VERDICT_SCHEMA,
+            "test_fixture_only": True,
+            "verified": False,
+        }
+
     monkeypatch.setattr(
         activation,
-        "_DISPOSABLE_TESTING_NATIVE_PARENT_SOURCE_AUTHORITY",
-        authority,
-        raising=False,
+        "_verify_points_contract_authority_evidence",
+        points_verifier,
     )
     monkeypatch.setattr(
         activation,
-        "_REGISTERED_NATIVE_PARENT_SOURCE_AUTHORITY",
-        authority,
-        raising=False,
+        "_verify_native_parent_source_authority_evidence",
+        parent_verifier,
+    )
+    monkeypatch.setattr(
+        activation,
+        "_verify_factor_v2_evaluation_authority_evidence",
+        evaluation_verifier,
+    )
+    monkeypatch.setattr(
+        activation,
+        "_verify_feature_history_authority_evidence",
+        history_verifier,
+    )
+    monkeypatch.setattr(
+        activation,
+        "_verify_daily_basic_authority_evidence",
+        daily_verifier,
     )
 
 
@@ -65,18 +129,28 @@ def _false_scope(fields: tuple[str, ...]) -> dict[str, bool]:
     return {field: False for field in fields}
 
 
+def _assert_no_capability_keys(value: Any) -> None:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            assert "capability" not in key.lower().replace("-", "").replace("_", "")
+            _assert_no_capability_keys(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _assert_no_capability_keys(nested)
+
+
 def _parent_projection() -> tuple[dict[str, Any], dict[str, str]]:
     rows = [
         {
-            "candidate_key": "cn-a-share:000001|2025-01-02",
+            "candidate_key": "cn-a-share:000001.SZ|2024-07-08",
             "features": [0.1] * 10,
-            "signal_date": "2025-01-02",
+            "signal_date": "2024-07-08",
             "ts_code": "000001.SZ",
         },
         {
-            "candidate_key": "cn-a-share:600001|2025-01-03",
+            "candidate_key": "cn-a-share:600001.SH|2024-07-09",
             "features": [0.2] * 10,
-            "signal_date": "2025-01-03",
+            "signal_date": "2024-07-09",
             "ts_code": "600001.SH",
         },
     ]
@@ -122,18 +196,55 @@ def _candidate_publication(
     development = sessions[250:]
     source_dates = [*prewindow, *development[:-1]]
     parent_rows, parent_projection = _parent_projection()
+    producer_snapshot = candidate_authority._candidate_producer_snapshot()
+    daily_adapter = {
+        "candidate_producer_snapshot_root_sha256": producer_snapshot["root_sha256"],
+        "schema": candidate_authority.DERIVED_ADAPTER_SCHEMA,
+        "source_authority_root_sha256": _sha("daily-source-authority"),
+        "source_publication_sha256": _sha("daily-source-publication"),
+        "source_receipt_sha256": _sha("daily-source-receipt"),
+        **_false_scope(candidate_authority.PROVENANCE_FALSE_FIELDS),
+    }
     evaluation_projection = {
         "schema": activation.FACTOR_V2_EVALUATION_PROJECTION_SCHEMA,
         "terminal_decision_descriptor_sha256": _sha("terminal-decision"),
         "evaluator_descriptor_sha256": _sha("evaluator"),
         "cost_slippage_execution_descriptor_sha256": _sha("cost-slippage"),
     }
+    branch_unsigned = {
+        "arm_decisions": {
+            "v2_control": "GREEN",
+            "overnight_20": "RED",
+            "intraday_20": "RED",
+        },
+        "arm_order": list(factor_v2_branch_selector.ARM_ORDER),
+        "contract_binding_validated": True,
+        "embargo_consumed": False,
+        "evaluation_artifact_sha256": _sha("candidate-evaluation-artifact"),
+        "final_oos_consumed": False,
+        "formal_materialization_eligible": False,
+        "low_rvol_overlay_status": "VOID",
+        "production_recommendation_eligible": False,
+        "publisher_terminal_chain_verified": False,
+        "schema_version": "factor-v2-decision-branch-structural-adapter/v2",
+        "selected_arm": "v2_control",
+        "selected_branch": "v2_control",
+        "selection_rule": factor_v2_branch_selector.SELECTION_RULE,
+        "source_decision_receipt_raw_file_sha256": _sha("candidate-decision-file"),
+        "source_decision_receipt_sha256": _sha("candidate-decision-receipt"),
+        "source_authority_complete": False,
+        "verified": False,
+    }
+    branch_receipt = {
+        **branch_unsigned,
+        "receipt_sha256": _sha(branch_unsigned),
+    }
     evaluation_source_binding = {
-        "branch_receipt_sha256": _sha("candidate-branch-receipt"),
+        "branch_receipt_sha256": branch_receipt["receipt_sha256"],
         "decision_receipt_sha256": _sha("candidate-decision-receipt"),
         "decision_receipt_raw_file_sha256": _sha("candidate-decision-file"),
         "evaluation_artifact_sha256": _sha("candidate-evaluation-artifact"),
-        "selected_branch": "shallow_gbdt",
+        "selected_branch": "v2_control",
         "snapshot_schema": "factor-v3-development-factor-v2-evaluation-snapshot/v2",
     }
     calendar = {
@@ -161,6 +272,7 @@ def _candidate_publication(
         for trade_date in source_dates
     ]
     board = {
+        "derived_adapter": daily_adapter,
         "downstream_scope_filter": "mainboard_chinext_candidate_join_only",
         "per_date": per_date,
         "per_date_board_ledger_root_sha256": _sha(per_date),
@@ -171,39 +283,232 @@ def _candidate_publication(
         "schema": "factor-v3-development-upstream-board-ledger/v2",
         "source_segments": list(activation.UPSTREAM_SOURCE_SEGMENTS),
     }
+    parent_expectation = candidate_authority.points.FACTOR_V3_POINTS_CONTRACT[
+        "preregistered_parent_expectation"
+    ]
+    pinned_parent_adapter_sha = _sha("pinned-parent-adapter")
+    parent_source_file_sha = _sha("parent-source-file")
+    parent_derived_adapter = {
+        "added_identity_field": "ts_code_from_candidate_key",
+        "candidate_key_order": ["candidate_key"],
+        "candidate_key_projection_fields": ["candidate_key"],
+        "materializer_v1_hash_compatible": False,
+        "pinned_parent_adapter_source_spec_sha256": pinned_parent_adapter_sha,
+        "schema": "factor-v3-factor-v2-parent-row-derived-adapter/v1",
+        "source_feature_order": ["signal_date", "candidate_key"],
+        "source_feature_projection_fields": [
+            "candidate_key",
+            "signal_date",
+            "features",
+        ],
+        "full_export_fields": [
+            "candidate_key",
+            "features",
+            "signal_date",
+            "ts_code",
+        ],
+        "full_export_order": ["signal_date", "candidate_key"],
+        **{
+            field: parent_projection[field]
+            for field in activation.PARENT_PROJECTION_FIELDS
+        },
+    }
+    parent_binding_unsigned = {
+        "authority_status": "PINNED_HASH_MATCH_ONLY_SOURCE_PRODUCER_UNVERIFIED",
+        "candidate_keys_sha256": parent_projection["candidate_keys_sha256"],
+        "content_hash_bound": True,
+        "development_only": True,
+        "factor_v2_common_eligible_overlay_artifact_sha256": parent_expectation[
+            "factor_v2_common_eligible_overlay_artifact_sha256"
+        ],
+        "factor_v2_common_eligible_overlay_manifest_file_sha256": parent_expectation[
+            "factor_v2_common_eligible_overlay_manifest_file_sha256"
+        ],
+        "factor_v2_common_eligible_receipt_sha256": parent_expectation[
+            "factor_v2_common_eligible_receipt_sha256"
+        ],
+        "factor_v2_parent_artifact_sha256": parent_expectation[
+            "factor_v2_parent_artifact_sha256"
+        ],
+        "factor_v2_parent_manifest_file_sha256": parent_expectation[
+            "factor_v2_parent_manifest_file_sha256"
+        ],
+        "file_sha256": parent_source_file_sha,
+        "full_export_rows_sha256": parent_projection["full_export_rows_sha256"],
+        "formal_materialization_eligible": False,
+        "pinned_frozen_source_commit": candidate_authority.FACTOR_V2_FROZEN_SOURCE_COMMIT,
+        "pinned_frozen_source_tree_oid": candidate_authority.FACTOR_V2_FROZEN_SOURCE_TREE_OID,
+        "pinned_parent_adapter_source_spec_sha256": pinned_parent_adapter_sha,
+        "points_contract_sha256": candidate_authority.points.FACTOR_V3_POINTS_CONTRACT_SHA256,
+        "public_verifier_replay_performed": False,
+        "row_count": len(parent_rows["rows"]),
+        "rows_sha256": parent_projection["full_export_rows_sha256"],
+        "schema": "factor-v2-common-eligible-parent-pinned-candidate/v1",
+        "source_feature_projection_rows_sha256": parent_projection[
+            "source_feature_projection_rows_sha256"
+        ],
+        "source_provenance_verified": False,
+        **_false_scope(candidate_authority.SAFETY_FALSE_FIELDS),
+    }
+    parent_binding = {
+        **parent_binding_unsigned,
+        "receipt_sha256": _sha(parent_binding_unsigned),
+    }
     parent_snapshot = {
-        "derived_adapter": {
-            "schema": "factor-v3-factor-v2-parent-row-derived-adapter/v1",
-            "candidate_key_projection_fields": ["candidate_key"],
-            "candidate_key_order": ["candidate_key"],
-            "source_feature_projection_fields": [
-                "candidate_key",
-                "signal_date",
-                "features",
-            ],
-            "source_feature_order": ["signal_date", "candidate_key"],
-            "full_export_fields": [
-                "candidate_key",
-                "features",
-                "signal_date",
-                "ts_code",
-            ],
-            "full_export_order": ["signal_date", "candidate_key"],
-            **{field: parent_projection[field] for field in activation.PARENT_PROJECTION_FIELDS},
-        },
-        "parent_hash_binding_receipt": {
-            "authority_status": "PINNED_HASH_MATCH_ONLY_SOURCE_PRODUCER_UNVERIFIED",
-            "formal_materialization_eligible": False,
-            "source_provenance_verified": False,
-            **{field: parent_projection[field] for field in activation.PARENT_PROJECTION_FIELDS},
-        },
+        "derived_adapter": parent_derived_adapter,
+        "parent_hash_binding_receipt": parent_binding,
         "schema": "factor-v3-development-factor-v2-parent-snapshot/v2",
+        **parent_expectation,
+        "candidate_identity_root_sha256": _sha(
+            [
+                {
+                    "candidate_key": row["candidate_key"],
+                    "signal_date": row["signal_date"],
+                }
+                for row in parent_rows["rows"]
+            ]
+        ),
         **parent_rows,
+        "source_file_sha256": parent_source_file_sha,
+        "validator": "validate_factor_v2_common_eligible_parent_hash_binding",
+    }
+    history_source_projection = {
+        "authority_status": "VERIFIED_FEATURE_HISTORY_ONLY",
+        "collection_publication_manifest_sha256": _sha(
+            "feature-history-collection-manifest"
+        ),
+        "embargo_consumed": False,
+        "experiment_launch_eligible": False,
+        "factor_materialization_eligible": False,
+        "feature_history_only": True,
+        "final_oos_consumed": False,
+        "production_profile_registered": False,
+        "production_recommendation_eligible": False,
+        "pit_store_database_sha256": _sha("feature-history-pit-store"),
+        "schema_version": "audited-pit-factor-v3-feature-history-authority-receipt/v3",
+        "session_count": 250,
+        "sessions_sha256": _sha(prewindow),
+        "snapshot_index_sha256": _sha("feature-history-snapshot-index"),
+        "source_authority_root_sha256": _sha("feature-history-source-authority"),
+        "verified": True,
+    }
+    history_source_receipt_sha = _sha(history_source_projection)
+    history_summary = {
+        **{
+            key: history_source_projection[key]
+            for key in (
+                "authority_status",
+                "feature_history_only",
+                "schema_version",
+                "session_count",
+                "sessions_sha256",
+                "source_authority_root_sha256",
+                "verified",
+            )
+        },
+        "receipt_sha256": history_source_receipt_sha,
+    }
+    daily_statistics = [
+        {
+            "authoritative_daily_raw_codes_sha256": _sha(["raw", trade_date]),
+            "daily_basic_canonical_rows_sha256": _sha(["normalized", trade_date]),
+            "daily_basic_raw_segment_counts": {
+                name: 1 for name in activation.UPSTREAM_SOURCE_SEGMENTS
+            },
+            "trade_date": trade_date,
+        }
+        for trade_date in sessions
+    ]
+    daily_source_projection = {
+        "all_supported_segments_compared_before_scope_filter": True,
+        "arbitrary_row_drops_permitted": False,
+        "audited_daily_authority": {
+            "artifact_root_sha256": _sha("audited-daily-artifact"),
+            "daily_identity_root_sha256": _sha("daily-identity"),
+            "schema": "audited-daily-authority-descriptor/v1",
+        },
+        "authority_scope": "FACTOR_V3_250_PREWINDOW_PLUS_483_DEVELOPMENT_INPUT_ONLY",
+        "authority_status": "VERIFIED_FACTOR_V3_733_DAILY_BASIC_EXACT_SET",
+        "embargo_consumed": False,
+        "exact_set_verified": True,
+        "factor_v3_development_materialization_input_eligible": True,
+        "factor_v3_target_identity_root_sha256": _sha("target-identity"),
+        "factor_v3_target_scope": {
+            "excluded_segments": ["SSE_STAR", "BSE"],
+            "included_segments": ["SSE_MAIN", "SZSE_MAIN", "SZSE_CHINEXT"],
+            "policy_id": "factor-v3-mainboard-chinext-only/v1",
+            "target_identity_row_count": 0,
+        },
+        "final_oos_consumed": False,
+        "formal_factor_v3_materialization_performed": False,
+        "normalized_daily_basic_row_authority_root_sha256": _sha(
+            "normalized-daily-basic-rows"
+        ),
+        "per_date_statistics": daily_statistics,
+        "per_date_statistics_sha256": _sha(daily_statistics),
+        "producer_binding": {
+            "root_sha256": _sha("daily-producer"),
+            "schema": "factor-v3-daily-basic-producer/v1",
+        },
+        "production_profile_registered": False,
+        "production_recommendation_eligible": False,
+        "publication_capability_sha256": _sha("daily-publication-capability"),
+        "raw_source_rows_bound": True,
+        "row_authority_status": "GRANTED_FOR_BOUND_FACTOR_V3_733_COVERAGE_ONLY",
+        "rows_published": False,
+        "schema": "factor-v3-daily-basic-733-exact-set-receipt/v2",
+        "security_code_transition_authority": {
+            "artifact_root_sha256": _sha("transition-authority"),
+            "schema": "security-code-transition-authority/v1",
+        },
+        "silent_row_drops_permitted": False,
+        "source_binding_root_sha256": _sha("source-binding"),
+        "source_missingness": {
+            "extra_daily_basic_code_count": 0,
+            "missing_authoritative_daily_code_count": 0,
+            "status": "NONE_AFTER_AUTHORIZED_TRANSITION_FILTER",
+            "unproven_source_missingness_count": 0,
+        },
+        "source_ts_code_exact_set_verified_after_transition_filter": True,
+        "trade_date_count": 733,
+        "trade_dates": sessions,
+        "trade_dates_sha256": _sha(sessions),
+        "transition_boundary_authority_root_sha256": _sha("transition-boundary"),
+        "transition_boundary_count": 0,
+        "transition_overlap_authority_root_sha256": _sha("transition-overlap"),
+        "transition_resolved_identity_exact_set_verified": True,
+    }
+    daily_source_authority_root = _sha(daily_source_projection)
+    daily_source_receipt = {
+        **daily_source_projection,
+        "authority_root_sha256": daily_source_authority_root,
+    }
+    daily_public_projection = (
+        candidate_authority.build_factor_v3_public_source_receipt_projection(
+            daily_source_receipt,
+            kind="daily_basic_733_v2",
+        )
+    )
+    daily_summary = {
+        "authority_root_sha256": daily_source_authority_root,
+        **{
+            key: daily_source_projection[key]
+            for key in (
+                "authority_scope",
+                "authority_status",
+                "normalized_daily_basic_row_authority_root_sha256",
+                "row_authority_status",
+                "schema",
+                "trade_date_count",
+                "trade_dates_sha256",
+            )
+        },
     }
     snapshots: dict[str, dict[str, Any]] = {
         "calendar": calendar,
         "factor_v2_parent": parent_snapshot,
         "daily_basic": {
+            "derived_adapter": daily_adapter,
             "rows": [],
             "rows_sha256": _sha([]),
             "schema": "factor-v3-development-daily-basic-snapshot/v2",
@@ -242,16 +547,16 @@ def _candidate_publication(
         },
         "feature_history_receipt": {
             "schema": "factor-v3-development-feature-history-receipt-snapshot/v2",
-            "verified": True,
-            "prewindow_session_count": 250,
-            "prewindow_sessions_sha256": _sha(prewindow),
+            "projection_schema": "factor-v3-public-receipt-redacted-projection/v1",
+            "redacted_field_count": 0,
+            "source_receipt_sha256": history_source_receipt_sha,
+            "source_receipt_projection": history_source_projection,
+            "source_receipt_projection_sha256": _sha(history_source_projection),
         },
         "daily_basic_exact_set_receipt": {
+            "derived_adapter": daily_adapter,
             "schema": "factor-v3-development-daily-basic-receipt-snapshot/v2",
-            "verified": True,
-            "trade_date_count": 733,
-            "source_date_count": 732,
-            "source_dates_sha256": _sha(source_dates),
+            **daily_public_projection,
         },
     }
     snapshot_descriptors: dict[str, dict[str, Any]] = {}
@@ -283,23 +588,18 @@ def _candidate_publication(
             )
         },
         "development_only": True,
-        "factor_v2_branch": {
-            "authority_status": "STRUCTURAL_ADAPTER_ONLY",
-            "formal_materialization_eligible": False,
-            "verified": False,
-        },
+        "factor_v2_branch": branch_receipt,
         "formal_materialization_eligible": False,
         "parent_source_authority_verified": False,
-        "points_contract_sha256": _sha("points-contract"),
-        "producer_snapshot": {
-            "candidate_snapshot_only": True,
-            "root_sha256": _sha("candidate-producer"),
-        },
+        "points_contract_sha256": (
+            candidate_authority.points.FACTOR_V3_POINTS_CONTRACT_SHA256
+        ),
+        "producer_snapshot": producer_snapshot,
         "schema": candidate_authority.DESCRIPTOR_SCHEMA,
         "snapshots": snapshot_descriptors,
         "source_receipts": {
-            "daily_basic": {"verified": True},
-            "feature_history": {"verified": True},
+            "daily_basic": daily_summary,
+            "feature_history": history_summary,
         },
         "source_spec_sha256": _sha("source-spec"),
         "source_authority_complete": False,
@@ -336,6 +636,103 @@ def _candidate_publication(
     manifest_relative = candidate_authority._publication_relative_path(manifest_sha)
     manifest_path = root.joinpath(*manifest_relative.split("/"))
     assert _write(manifest_path, manifest) == manifest_sha
+    source_authority_root = root.parent / "source-authorities"
+    history_issuance = {
+        "authority_manifest_sha256": history_source_projection[
+            "collection_publication_manifest_sha256"
+        ],
+        "publication_capability_sha256": _sha("history-publication-capability"),
+        "publication_schema": "audited-pit-factor-v3-feature-history-collection-publication/v1",
+        "publication_status": "DURABLE_POSTVERIFIED_AND_RETURNED",
+        "schema": "audited-pit-factor-v3-feature-history-publication-issuance/v1",
+    }
+    history_issuance_sha = _sha(history_issuance)
+    history_issuance_path = (
+        source_authority_root
+        / "feature_history_collection_publication_receipts"
+        / "sha256"
+        / history_issuance_sha[:2]
+        / f"{history_issuance_sha}.json"
+    )
+    assert _write(history_issuance_path, history_issuance) == history_issuance_sha
+    feature_run_root = (root.parent / "feature-history-run").resolve()
+    feature_run_spec_path = (root.parent / "feature-history-run-spec.json").resolve()
+    authority_manifest_sha = history_source_projection[
+        "collection_publication_manifest_sha256"
+    ]
+    history_attestation = {
+        "attestor_producer": frozen_history._attestor_producer_binding(),
+        "feature_history": {
+            "authority_manifest_relative_path": (
+                "factor_v3_feature_history_authority_manifests/sha256/"
+                f"{authority_manifest_sha[:2]}/{authority_manifest_sha}.json"
+            ),
+            "authority_manifest_sha256": authority_manifest_sha,
+            "feature_run_root": str(feature_run_root),
+            "feature_run_spec_file_sha256": _sha("feature-run-spec-file"),
+            "feature_run_spec_path": str(feature_run_spec_path),
+            "feature_run_spec_sha256": _sha("feature-run-spec-logical"),
+            "pit_store_database_sha256": history_source_projection[
+                "pit_store_database_sha256"
+            ],
+            "publication_capability_sha256": history_issuance[
+                "publication_capability_sha256"
+            ],
+            "publication_issuance_relative_path": "/".join(
+                history_issuance_path.parts[-4:]
+            ),
+            "publication_issuance_sha256": history_issuance_sha,
+            "receipt_sha256": history_source_receipt_sha,
+            "session_count": 250,
+            "sessions_sha256": history_source_projection["sessions_sha256"],
+            "snapshot_index_sha256": history_source_projection[
+                "snapshot_index_sha256"
+            ],
+            "source_authority_root_sha256": history_source_projection[
+                "source_authority_root_sha256"
+            ],
+        },
+        "frozen_source": {
+            "commit": "a" * 40,
+            "checkout_policy": deepcopy(
+                frozen_history.FROZEN_SOURCE_CHECKOUT_POLICY
+            ),
+            "physical_files": [],
+            "physical_files_root_sha256": _sha([]),
+            "producer_binding": {},
+            "root": str(root.parent.resolve()),
+        },
+        "schema": frozen_history.ATTESTATION_SCHEMA,
+        "verified": True,
+    }
+    history_attestation_sha = _sha(history_attestation)
+    history_attestation_path = (
+        source_authority_root
+        / "factor_v3_feature_history_frozen_source_attestations"
+        / "sha256"
+        / history_attestation_sha[:2]
+        / f"{history_attestation_sha}.json"
+    )
+    assert (
+        _write(history_attestation_path, history_attestation)
+        == history_attestation_sha
+    )
+    assert (
+        frozen_history._validated_attestation(
+            attestation_path=history_attestation_path.resolve(),
+            expected_attestation_sha256=history_attestation_sha,
+        )
+        == history_attestation
+    )
+    daily_file_sha = _sha(daily_source_receipt)
+    daily_receipt_path = (
+        source_authority_root
+        / "factor_v3_daily_basic_733_receipts"
+        / "sha256"
+        / daily_file_sha[:2]
+        / f"{daily_file_sha}.json"
+    )
+    assert _write(daily_receipt_path, daily_source_receipt) == daily_file_sha
     return (
         manifest_path,
         manifest_sha,
@@ -353,6 +750,12 @@ def _candidate_publication(
             "descriptor": descriptor_path,
             "manifest": manifest_path,
             "snapshot_root": descriptor_path.parent,
+            "feature_history_collection_issuance": history_issuance_path,
+            "feature_history_collection_issuance_sha256": history_issuance_sha,
+            "feature_history_frozen_attestation": history_attestation_path,
+            "feature_history_frozen_attestation_sha256": history_attestation_sha,
+            "daily_basic_receipt": daily_receipt_path,
+            "daily_basic_receipt_sha256": daily_file_sha,
         },
     )
 
@@ -436,28 +839,28 @@ def _fixture(tmp_path: Path) -> dict[str, Any]:
     parent_receipt = _self_hashed(
         {
             "attempt_key_sha256": attempt_key,
-            "authority_status": "VERIFIED_DEVELOPMENT_PARENT_SOURCE_AUTHORITY",
+            "authority_status": "DISPOSABLE_TEST_PARENT_SOURCE_CONTRACT_ONLY",
             "calendar_projection": {
                 **activation.EXACT_CALENDAR_COUNTS,
                 **calendar_roots,
             },
             "development_only": True,
-            "formal_materialization_eligible": True,
+            "formal_materialization_eligible": False,
             "global_attempt_identity_sha256": global_identity,
             "global_attempt_ledger_root": str(ledger_root),
             "global_run_claim_path": str(run_claim_path),
             "global_run_receipt_path": str(run_receipt_path),
             "global_terminal_receipt_path": str(terminal_epoch_path),
             "global_verify_claim_path": str(verify_claim_path),
-            "independent_public_replay_performed": True,
-            "machine_global_root_lease_verified": True,
+            "independent_public_replay_performed": False,
+            "machine_global_root_lease_verified": False,
             "native_lease_identity_sha256": _sha("native-root-lease"),
             "native_lease_policy_version": (
                 activation.PARENT_SOURCE_NATIVE_LEASE_POLICY_VERSION
             ),
             "observed_root_state": activation.PARENT_SOURCE_ROOT_STATE_RUN_COMPLETED,
             "parent_projection": parent_projection,
-            "parent_source_authority_verified": True,
+            "parent_source_authority_verified": False,
             "points_contract_common_eligible_projection": {
                 "common_eligible_candidate_keys_sha256": parent_projection[
                     "candidate_keys_sha256"
@@ -467,15 +870,15 @@ def _fixture(tmp_path: Path) -> dict[str, Any]:
                 ],
             },
             "requested_action": activation.PARENT_SOURCE_ROOT_ACTION_VERIFY,
-            "root_epoch_terminal_verified": True,
+            "root_epoch_terminal_verified": False,
             "run_claim_sha256": run_claim_sha256,
             "run_receipt_sha256": run_receipt_sha256,
             "run_spec_sha256": run_spec_sha256,
-            "schema": parent_authority.AUTHORITY_RECEIPT_SCHEMA,
+            "schema": activation.DISPOSABLE_PARENT_SOURCE_RECEIPT_SCHEMA,
             "semantic_input_root_sha256": semantic_root,
-            "single_attempt_verified": True,
-            "source_authority_complete": True,
-            "source_authority_verified": True,
+            "single_attempt_verified": False,
+            "source_authority_complete": False,
+            "source_authority_verified": False,
             "terminal_receipt_file_sha256": terminal_epoch_file_sha,
             "terminal_root_state": activation.PARENT_SOURCE_ROOT_STATE_TERMINAL,
             "approved_transition": activation.PARENT_SOURCE_ROOT_TRANSITION_START_VERIFY,
@@ -486,7 +889,9 @@ def _fixture(tmp_path: Path) -> dict[str, Any]:
                 "source_segments": list(activation.UPSTREAM_SOURCE_SEGMENTS),
                 "upstream_board_ledger_root_sha256": upstream_board_ledger_root,
             },
-            "verified": True,
+            "contract_binding_validated": True,
+            "test_fixture_only": True,
+            "verified": False,
             "verify_claim_sha256": verify_claim_sha256,
             **_false_scope(activation.SAFETY_FALSE_FIELDS),
         },
@@ -496,7 +901,7 @@ def _fixture(tmp_path: Path) -> dict[str, Any]:
     parent_receipt_path = (
         tmp_path
         / "authority"
-        / "parent-source-receipts"
+        / "disposable-parent-source-contract-receipts"
         / "sha256"
         / parent_receipt_file_sha[:2]
         / f"{parent_receipt_file_sha}.json"
@@ -504,16 +909,18 @@ def _fixture(tmp_path: Path) -> dict[str, Any]:
     parent_receipt_file_sha = _write(parent_receipt_path, parent_receipt)
     evaluation_receipt = _self_hashed(
         {
-            "authority_status": "VERIFIED_FORMAL_DEVELOPMENT_EVALUATOR_AUTHORITY",
+            "authority_status": "DISPOSABLE_TEST_FACTOR_V2_EVALUATION_CONTRACT_ONLY",
+            "contract_binding_validated": True,
             "development_only": True,
             "evaluation_projection": evaluation_projection,
             "candidate_evaluation_binding": evaluation_source_binding,
-            "formal_materialization_eligible": True,
-            "independent_public_replay_performed": True,
-            "publisher_terminal_chain_verified": True,
-            "schema": activation.FACTOR_V2_EVALUATION_AUTHORITY_RECEIPT_SCHEMA,
-            "source_authority_complete": True,
-            "verified": True,
+            "formal_materialization_eligible": False,
+            "independent_public_replay_performed": False,
+            "publisher_terminal_chain_verified": False,
+            "schema": activation.DISPOSABLE_EVALUATION_RECEIPT_SCHEMA,
+            "source_authority_complete": False,
+            "test_fixture_only": True,
+            "verified": False,
             **_false_scope(activation.SAFETY_FALSE_FIELDS),
         },
         "receipt_root_sha256",
@@ -522,7 +929,7 @@ def _fixture(tmp_path: Path) -> dict[str, Any]:
     evaluation_receipt_path = (
         tmp_path
         / "authority"
-        / "evaluation-receipts"
+        / "disposable-evaluation-contract-receipts"
         / "sha256"
         / evaluation_receipt_file_sha[:2]
         / f"{evaluation_receipt_file_sha}.json"
@@ -543,6 +950,24 @@ def _fixture(tmp_path: Path) -> dict[str, Any]:
         "expected_factor_v2_evaluation_authority_receipt_sha256": (
             evaluation_receipt_file_sha
         ),
+        "feature_history_collection_issuance_path": candidate_paths[
+            "feature_history_collection_issuance"
+        ].resolve(),
+        "expected_feature_history_collection_issuance_sha256": candidate_paths[
+            "feature_history_collection_issuance_sha256"
+        ],
+        "feature_history_frozen_attestation_path": candidate_paths[
+            "feature_history_frozen_attestation"
+        ].resolve(),
+        "expected_feature_history_frozen_attestation_sha256": candidate_paths[
+            "feature_history_frozen_attestation_sha256"
+        ],
+        "daily_basic_authority_receipt_path": candidate_paths[
+            "daily_basic_receipt"
+        ].resolve(),
+        "expected_daily_basic_authority_receipt_sha256": candidate_paths[
+            "daily_basic_receipt_sha256"
+        ],
         "output_root": (tmp_path / "activation-output").resolve(),
     }
     return {
@@ -565,6 +990,13 @@ def _fixture(tmp_path: Path) -> dict[str, Any]:
             "candidate_descriptor": candidate_paths["descriptor"],
             "candidate_manifest": candidate_paths["manifest"],
             "candidate_snapshot_root": candidate_paths["snapshot_root"],
+            "feature_history_collection_issuance": candidate_paths[
+                "feature_history_collection_issuance"
+            ],
+            "feature_history_frozen_attestation": candidate_paths[
+                "feature_history_frozen_attestation"
+            ],
+            "daily_basic_receipt": candidate_paths["daily_basic_receipt"],
         },
     }
 
@@ -876,12 +1308,30 @@ def _expected_activation_input_bindings(
         "candidate_publication_file_sha256": fixture["kwargs"][
             "expected_candidate_publication_sha256"
         ],
+        "daily_basic_authority_receipt_file_sha256": fixture["kwargs"][
+            "expected_daily_basic_authority_receipt_sha256"
+        ],
+        "daily_basic_authority_receipt_path": str(
+            fixture["kwargs"]["daily_basic_authority_receipt_path"]
+        ),
         "factor_v2_evaluation_authority_receipt_file_sha256": fixture["kwargs"][
             "expected_factor_v2_evaluation_authority_receipt_sha256"
         ],
         "factor_v2_evaluation_authority_receipt_root_sha256": evaluation[
             "receipt_root_sha256"
         ],
+        "feature_history_collection_issuance_file_sha256": fixture["kwargs"][
+            "expected_feature_history_collection_issuance_sha256"
+        ],
+        "feature_history_collection_issuance_path": str(
+            fixture["kwargs"]["feature_history_collection_issuance_path"]
+        ),
+        "feature_history_frozen_attestation_file_sha256": fixture["kwargs"][
+            "expected_feature_history_frozen_attestation_sha256"
+        ],
+        "feature_history_frozen_attestation_path": str(
+            fixture["kwargs"]["feature_history_frozen_attestation_path"]
+        ),
         "global_attempt_identity_sha256": parent[
             "global_attempt_identity_sha256"
         ],
@@ -943,7 +1393,7 @@ def test_valid_activation_projects_only_verified_formal_development_input(
     assert set(fixture["evaluation_source_binding"]) == set(
         activation.FACTOR_V2_EVALUATION_SOURCE_BINDING_FIELDS
     )
-    publication = activation.publish_factor_v3_formal_development_input_activation(
+    publication = activation._publish_disposable_test_factor_v3_formal_development_input_activation(
         **fixture["kwargs"]
     )
     assert publication["schema"] == activation.PUBLICATION_SCHEMA
@@ -955,14 +1405,19 @@ def test_valid_activation_projects_only_verified_formal_development_input(
     assert _sha(publication_path.read_bytes()) == publication["publication_sha256"]
     publication_raw = publication_path.read_bytes()
     assert (
-        activation.publish_factor_v3_formal_development_input_activation(
+        activation._publish_disposable_test_factor_v3_formal_development_input_activation(
             **fixture["kwargs"]
         )
         == publication
     )
     assert publication_path.read_bytes() == publication_raw
     manifest = _read(publication_path)
-    assert manifest["formal_materialization_eligible"] is True
+    assert manifest["schema"] == activation.PUBLICATION_SCHEMA
+    assert manifest["test_fixture_only"] is True
+    assert manifest["contract_binding_validated"] is True
+    assert manifest["activation_verified"] is False
+    assert manifest["source_authority_complete"] is False
+    assert manifest["formal_materialization_eligible"] is False
     assert all(manifest[field] is False for field in activation.SAFETY_FALSE_FIELDS)
     descriptor_path = output_root.joinpath(
         *manifest["descriptor_relative_path"].split("/")
@@ -972,17 +1427,45 @@ def test_valid_activation_projects_only_verified_formal_development_input(
     assert descriptor_path.parent.name == manifest["activation_root_sha256"]
     assert descriptor_path.parent.parent.name == manifest["activation_root_sha256"][:2]
     descriptor = _read(descriptor_path)
+    assert descriptor["authority_scope"] == "DISPOSABLE_TEST_FIXTURE_ONLY"
+    assert descriptor["test_fixture_only"] is True
     assert descriptor["schema_version"] == activation.MATERIALIZER_INPUT_AUTHORITY_SCHEMA
-    assert descriptor["authority_status"] == "VERIFIED_CONCRETE_IMMUTABLE_INPUT_SNAPSHOT"
-    assert descriptor["verified"] is True
-    assert descriptor["formal_materialization_eligible"] is True
+    assert descriptor["authority_status"] == "DISPOSABLE_TEST_FIXTURE_CONTRACT_REPLAY_ONLY"
+    assert descriptor["contract_binding_validated"] is True
+    assert descriptor["activation_verified"] is False
+    assert descriptor["verified"] is False
+    assert descriptor["source_authority_complete"] is False
+    assert descriptor["formal_materialization_eligible"] is False
     assert descriptor["formal_materialization_performed"] is False
-    assert descriptor["parent_source_authority_verified"] is True
-    assert descriptor["machine_global_root_lease_verified"] is True
-    assert descriptor["root_epoch_terminal_verified"] is True
+    assert descriptor["parent_source_authority_verified"] is False
+    assert descriptor["machine_global_root_lease_verified"] is False
+    assert descriptor["root_epoch_terminal_verified"] is False
     assert descriptor["input_bindings"] == _expected_activation_input_bindings(
         fixture
     )
+    assert set(descriptor["authority_verifier_bindings"]) == {
+        "daily_basic",
+        "factor_v2_evaluation",
+        "feature_history",
+        "parent_source",
+        "points_contract",
+    }
+    for binding in descriptor["authority_verifier_bindings"].values():
+        assert set(binding) == {
+            "file_sha256",
+            "relative_path",
+            "schema",
+            "verdict_root_sha256",
+        }
+        verdict_path = output_root.joinpath(*binding["relative_path"].split("/"))
+        verdict_raw = verdict_path.read_bytes()
+        assert verdict_path.name == f"{binding['file_sha256']}.json"
+        assert _sha(verdict_raw) == binding["file_sha256"]
+        verdict = _read(verdict_path)
+        assert _sha(verdict) == binding["verdict_root_sha256"]
+        assert verdict["test_fixture_only"] is True
+        assert verdict["contract_binding_validated"] is True
+        assert verdict["verified"] is False
     assert descriptor["parent_projection"] == fixture["parent_projection"]
     assert descriptor["factor_v2_evaluation_projection"] == fixture[
         "evaluation_projection"
@@ -1012,24 +1495,61 @@ def test_valid_activation_projects_only_verified_formal_development_input(
         for key, value in fixture["kwargs"].items()
         if key != "output_root"
     }
-    independent = activation.verify_factor_v3_formal_development_input_activation(
+    independent = activation._verify_disposable_test_factor_v3_formal_development_input_activation(
         **verifier_kwargs,
         activation_publication_path=publication_path,
         expected_activation_publication_sha256=publication["publication_sha256"],
         verifier_output_root=(tmp_path / "independent-replay").resolve(),
     )
-    assert independent["verified"] is True
-    assert independent["independent_public_replay_performed"] is True
+    assert independent["verified"] is False
+    assert independent["independent_public_replay_performed"] is False
+    assert independent["differential_contract_replay_performed"] is True
+    verifier_receipt = _read(
+        (tmp_path / "independent-replay")
+        .resolve()
+        .joinpath(*independent["receipt_relative_path"].split("/"))
+    )
+    assert verifier_receipt["authority_scope"] == "DISPOSABLE_TEST_FIXTURE_ONLY"
+    assert verifier_receipt["test_fixture_only"] is True
+    assert verifier_receipt["contract_binding_validated"] is True
+    assert verifier_receipt["activation_verified"] is False
+    assert verifier_receipt["source_authority_complete"] is False
+    assert verifier_receipt["formal_materialization_eligible"] is False
+    assert verifier_receipt["differential_contract_replay_performed"] is True
+    assert verifier_receipt["independent_public_replay_performed"] is False
+    assert verifier_receipt["verified"] is False
+    producer_identity = verifier_receipt[
+        "independent_verifier_producer_identity"
+    ]
+    assert set(producer_identity["dependencies"]) == {
+        "factor_v2_branch_contract",
+        "independent_core",
+        "independent_verifier",
+        "points_contract",
+    }
+    unsigned_identity = deepcopy(producer_identity)
+    identity_root = unsigned_identity.pop("root_sha256")
+    assert _sha(unsigned_identity) == identity_root
+    assert (
+        verifier_receipt["independent_verifier_producer_identity_sha256"]
+        == identity_root
+    )
+    for published_root in (
+        output_root,
+        (tmp_path / "independent-replay").resolve(),
+    ):
+        for published_path in published_root.rglob("*.json"):
+            _assert_no_capability_keys(_read(published_path))
     publication_path.write_bytes(b'{"drifted":true}')
     with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-        activation.publish_factor_v3_formal_development_input_activation(
+        activation._publish_disposable_test_factor_v3_formal_development_input_activation(
             **fixture["kwargs"]
         )
     assert publication_path.read_bytes() == b'{"drifted":true}'
     publication_path.write_bytes(publication_raw)
     descriptor_path.write_bytes(b'{"drifted":true}')
     with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-        activation.publish_factor_v3_formal_development_input_activation(
+        activation._publish_disposable_test_factor_v3_formal_development_input_activation(
             **fixture["kwargs"]
         )
     assert descriptor_path.read_bytes() == b'{"drifted":true}'
@@ -1042,16 +1562,390 @@ def test_native_parent_source_authority_absence_fails_closed(
     fixture = _fixture(tmp_path)
     monkeypatch.setattr(
         activation,
-        "_REGISTERED_NATIVE_PARENT_SOURCE_AUTHORITY",
+        "_verify_native_parent_source_authority_evidence",
         None,
     )
     with pytest.raises(
         activation.FactorV3FormalDevelopmentInputActivationError,
         match="native.*authority|authority.*unavailable",
     ):
+        activation._publish_disposable_test_factor_v3_formal_development_input_activation(
+            **fixture["kwargs"]
+        )
+
+
+def test_public_formal_entrypoints_reject_disposable_scope_before_any_write(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    output_root = Path(fixture["kwargs"]["output_root"])
+    with pytest.raises(
+        activation.FactorV3FormalDevelopmentInputActivationError,
+        match="public formal activation rejects disposable",
+    ):
         activation.publish_factor_v3_formal_development_input_activation(
             **fixture["kwargs"]
         )
+    assert not output_root.exists()
+
+    publication = (
+        activation._publish_disposable_test_factor_v3_formal_development_input_activation(
+            **fixture["kwargs"]
+        )
+    )
+    verifier_root = (tmp_path / "formal-verifier-output-must-not-exist").resolve()
+    verifier_kwargs = {
+        key: value
+        for key, value in fixture["kwargs"].items()
+        if key != "output_root"
+    }
+    verifier_kwargs["candidate_publication_path"] = (
+        tmp_path / "must-not-be-read.json"
+    ).resolve()
+    with pytest.raises(
+        activation.FactorV3FormalDevelopmentInputActivationError,
+        match="formal independent TCB unavailable",
+    ):
+        activation.verify_factor_v3_formal_development_input_activation(
+            **verifier_kwargs,
+            activation_publication_path=_publication_path(
+                output_root, publication
+            ),
+            expected_activation_publication_sha256=publication[
+                "publication_sha256"
+            ],
+            verifier_output_root=verifier_root,
+        )
+    assert not verifier_root.exists()
+
+
+def test_public_formal_default_authority_verifiers_fail_before_any_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+    for name in (
+        "_verify_daily_basic_authority_evidence",
+        "_verify_factor_v2_evaluation_authority_evidence",
+        "_verify_feature_history_authority_evidence",
+        "_verify_native_parent_source_authority_evidence",
+        "_verify_points_contract_authority_evidence",
+    ):
+        monkeypatch.setattr(activation, name, None)
+    output_root = Path(fixture["kwargs"]["output_root"])
+    with pytest.raises(
+        activation.FactorV3FormalDevelopmentInputActivationError,
+        match="authority.*unavailable|unavailable.*authority",
+    ):
+        activation.publish_factor_v3_formal_development_input_activation(
+            **fixture["kwargs"]
+        )
+    assert not output_root.exists()
+
+
+def test_points_contract_runtime_hash_and_exact_session_binding_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+    drifted = deepcopy(candidate_authority.points.FACTOR_V3_POINTS_CONTRACT)
+    drifted["temporal_role"] = "drifted"
+    monkeypatch.setattr(
+        candidate_authority.points,
+        "FACTOR_V3_POINTS_CONTRACT",
+        drifted,
+    )
+    with pytest.raises(
+        activation.FactorV3FormalDevelopmentInputActivationError,
+        match="points contract|frozen|drift",
+    ):
+        activation._publish_disposable_test_factor_v3_formal_development_input_activation(
+            **fixture["kwargs"]
+        )
+
+    monkeypatch.setattr(
+        candidate_authority.points,
+        "FACTOR_V3_POINTS_CONTRACT",
+        deepcopy(candidate_authority.points.FACTOR_V3_POINTS_CONTRACT),
+    )
+
+
+def test_formal_points_verifier_binds_483_start_end_hash_and_parent_roots() -> None:
+    expectation = candidate_authority.points.FACTOR_V3_POINTS_CONTRACT[
+        "preregistered_parent_expectation"
+    ]
+    sessions = expectation["sessions"]
+    evidence = {
+        "candidate_keys_sha256": expectation[
+            "common_eligible_candidate_keys_sha256"
+        ],
+        "development_session_count": sessions["count"],
+        "development_session_end": sessions["end"],
+        "development_session_sha256": sessions["sha256"],
+        "development_session_start": sessions["start"],
+        "factor_v3_points_contract_sha256": (
+            candidate_authority.points.FACTOR_V3_POINTS_CONTRACT_SHA256
+        ),
+        "full_export_rows_sha256": expectation[
+            "original_parent_feature_rows_sha256"
+        ],
+        "parent_row_count": expectation["common_eligible_candidate_count"],
+        "preregistered_parent_expectation_sha256": (
+            candidate_authority.points.FACTOR_V3_POINTS_PARENT_EXPECTATION_SHA256
+        ),
+        "source_feature_projection_rows_sha256": expectation[
+            "common_eligible_source_feature_rows_sha256"
+        ],
+    }
+    verdict = activation._verify_formal_points_contract_authority_evidence(
+        **evidence
+    )
+    assert verdict["authority_scope"] == activation.FORMAL_AUTHORITY_SCOPE
+    for field in (
+        "development_session_count",
+        "development_session_start",
+        "development_session_end",
+        "development_session_sha256",
+        "candidate_keys_sha256",
+        "source_feature_projection_rows_sha256",
+        "full_export_rows_sha256",
+        "parent_row_count",
+    ):
+        mutated = deepcopy(evidence)
+        mutated[field] = 0 if field.endswith("count") else "0" * 64
+        with pytest.raises(
+            activation.FactorV3FormalDevelopmentInputActivationError
+        ):
+            activation._verify_formal_points_contract_authority_evidence(
+                **mutated
+            )
+
+
+def test_parent_signal_date_must_belong_to_exact_483_session_set(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    calendar = _read(
+        fixture["paths"]["candidate_snapshot_root"] / "calendar.json"
+    )
+    parent = _read(
+        fixture["paths"]["candidate_snapshot_root"] / "factor_v2_parent.json"
+    )
+    parent["rows"][0]["signal_date"] = "2026-01-05"
+    parent["rows"][0]["candidate_key"] = "cn-a-share:000001.SZ|2026-01-05"
+    with pytest.raises(
+        activation.FactorV3FormalDevelopmentInputActivationError,
+        match="key/date/code|session",
+    ):
+        activation._validate_candidate_parent(
+            parent,
+            development_sessions=calendar["development_sessions"],
+        )
+
+
+def test_factor_v2_branch_adapter_contract_is_frozen_exactly(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    descriptor = _read(fixture["paths"]["candidate_descriptor"])
+    evaluation_binding = _read(
+        fixture["paths"]["candidate_snapshot_root"] / "factor_v2_evaluation.json"
+    )
+    activation._validate_candidate_branch(
+        descriptor["factor_v2_branch"], evaluation_binding
+    )
+
+    cases: tuple[Callable[[dict[str, Any]], None], ...] = (
+        lambda value: value.update(
+            {"arm_order": list(reversed(factor_v2_branch_selector.ARM_ORDER))}
+        ),
+        lambda value: value.update({"selection_rule": "first-green-arm"}),
+        lambda value: value.update({"selected_arm": None}),
+        lambda value: value.update({"low_rvol_overlay_status": "ELIGIBLE"}),
+    )
+    for mutate in cases:
+        branch = deepcopy(descriptor["factor_v2_branch"])
+        mutate(branch)
+        unsigned = dict(branch)
+        unsigned.pop("receipt_sha256")
+        branch["receipt_sha256"] = _sha(unsigned)
+        rebound_evaluation = deepcopy(evaluation_binding)
+        rebound_evaluation["branch_receipt_sha256"] = branch["receipt_sha256"]
+        with pytest.raises(
+            activation.FactorV3FormalDevelopmentInputActivationError
+        ):
+            activation._validate_candidate_branch(branch, rebound_evaluation)
+
+
+def test_daily_basic_733_last_session_statistic_is_replayed(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def mutate(payload: dict[str, Any]) -> None:
+        source = payload["source_receipt_projection"]
+        source["per_date_statistics"][-1]["trade_date"] = "2099-12-31"
+        source["per_date_statistics_sha256"] = _sha(
+            source["per_date_statistics"]
+        )
+        payload["source_receipt_projection_sha256"] = _sha(source)
+
+    _rewrite_candidate_snapshot(fixture, "daily_basic_exact_set_receipt", mutate)
+    with pytest.raises(
+        activation.FactorV3FormalDevelopmentInputActivationError,
+        match="daily-basic|per-date|session|projection",
+    ):
+        activation._publish_disposable_test_factor_v3_formal_development_input_activation(
+            **fixture["kwargs"]
+        )
+
+
+@pytest.mark.parametrize(
+    ("registry", "replacement"),
+    [
+        (
+            "_verify_native_parent_source_authority_evidence",
+            lambda **_evidence: {"verified": True},
+        ),
+        (
+            "_verify_factor_v2_evaluation_authority_evidence",
+            lambda **_evidence: (_ for _ in ()).throw(
+                activation.FactorV3FormalDevelopmentInputActivationError(
+                    "native evaluation authority unavailable"
+                )
+            ),
+        ),
+    ],
+)
+def test_registered_authority_verdicts_must_bind_exact_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    registry: str,
+    replacement: Any,
+) -> None:
+    fixture = _fixture(tmp_path)
+    monkeypatch.setattr(activation, registry, replacement)
+    with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
+        activation._publish_disposable_test_factor_v3_formal_development_input_activation(
+            **fixture["kwargs"]
+        )
+
+
+def test_feature_history_issuance_and_attestation_exact_bindings_fail_closed(
+    tmp_path: Path,
+) -> None:
+    cases: tuple[tuple[str, str, Callable[[dict[str, Any]], None]], ...] = (
+        (
+            "issuance-status",
+            "feature_history_collection_issuance",
+            lambda value: value.update({"publication_status": "SEALED"}),
+        ),
+        (
+            "issuance-publication-schema",
+            "feature_history_collection_issuance",
+            lambda value: value.update({"publication_schema": "wrong"}),
+        ),
+        (
+            "issuance-manifest",
+            "feature_history_collection_issuance",
+            lambda value: value.update({"authority_manifest_sha256": "0" * 64}),
+        ),
+        (
+            "attestation-receipt",
+            "feature_history_frozen_attestation",
+            lambda value: value["feature_history"].update(
+                {"receipt_sha256": "0" * 64}
+            ),
+        ),
+        (
+            "attestation-issuance-sha",
+            "feature_history_frozen_attestation",
+            lambda value: value["feature_history"].update(
+                {"publication_issuance_sha256": "0" * 64}
+            ),
+        ),
+        (
+            "attestation-issuance-relative-path",
+            "feature_history_frozen_attestation",
+            lambda value: value["feature_history"].update(
+                {"publication_issuance_relative_path": "wrong/path.json"}
+            ),
+        ),
+        (
+            "attestation-manifest",
+            "feature_history_frozen_attestation",
+            lambda value: value["feature_history"].update(
+                {"authority_manifest_sha256": "0" * 64}
+            ),
+        ),
+        (
+            "attestation-manifest-path",
+            "feature_history_frozen_attestation",
+            lambda value: value["feature_history"].update(
+                {"authority_manifest_relative_path": "wrong/path.json"}
+            ),
+        ),
+        (
+            "attestation-feature-run-root",
+            "feature_history_frozen_attestation",
+            lambda value: value["feature_history"].update(
+                {"feature_run_root": "relative"}
+            ),
+        ),
+        (
+            "attestation-feature-fields-missing",
+            "feature_history_frozen_attestation",
+            lambda value: value["feature_history"].pop(
+                "feature_run_spec_file_sha256"
+            ),
+        ),
+        (
+            "attestation-feature-run-spec-path",
+            "feature_history_frozen_attestation",
+            lambda value: value["feature_history"].update(
+                {"feature_run_spec_path": "relative"}
+            ),
+        ),
+        (
+            "attestation-feature-fields-extra",
+            "feature_history_frozen_attestation",
+            lambda value: value["feature_history"].update(
+                {"unexpected": False}
+            ),
+        ),
+        (
+            "attestation-publication-capability",
+            "feature_history_frozen_attestation",
+            lambda value: value["feature_history"].update(
+                {"publication_capability_sha256": "0" * 64}
+            ),
+        ),
+    )
+    kw_fields = {
+        "feature_history_collection_issuance": (
+            "feature_history_collection_issuance_path",
+            "expected_feature_history_collection_issuance_sha256",
+        ),
+        "feature_history_frozen_attestation": (
+            "feature_history_frozen_attestation_path",
+            "expected_feature_history_frozen_attestation_sha256",
+        ),
+    }
+    for name, artifact, mutate in cases:
+        fixture = _fixture(tmp_path / name)
+        path = fixture["paths"][artifact]
+        payload = _read(path)
+        mutate(payload)
+        digest = _sha(payload)
+        replacement = path.parents[2] / "sha256" / digest[:2] / f"{digest}.json"
+        assert _write(replacement, payload) == digest
+        path_field, sha_field = kw_fields[artifact]
+        fixture["kwargs"][path_field] = replacement.resolve()
+        fixture["kwargs"][sha_field] = digest
+        with pytest.raises(
+            activation.FactorV3FormalDevelopmentInputActivationError
+        ):
+            activation._publish_disposable_test_factor_v3_formal_development_input_activation(
+                **fixture["kwargs"]
+            )
 
 
 def test_candidate_unverified_or_nonterminal_authority_cannot_promote(
@@ -1067,9 +1961,9 @@ def test_candidate_unverified_or_nonterminal_authority_cannot_promote(
         ),
         *[
             (
-                f"parent-{field}-false",
-                "parent",
-                lambda value, field=field: value.update({field: False}),
+                    f"parent-{field}-self-promoted",
+                    "parent",
+                    lambda value, field=field: value.update({field: True}),
             )
             for field in (
                 "formal_materialization_eligible",
@@ -1080,9 +1974,9 @@ def test_candidate_unverified_or_nonterminal_authority_cannot_promote(
             )
         ],
         (
-            "caller-all-true-without-independent-replay",
-            "parent",
-            lambda value: value.update({"independent_public_replay_performed": False}),
+                "caller-self-promotes-independent-replay",
+                "parent",
+                lambda value: value.update({"independent_public_replay_performed": True}),
         ),
         (
             "parent-authority-schema-drift",
@@ -1090,14 +1984,14 @@ def test_candidate_unverified_or_nonterminal_authority_cannot_promote(
             lambda value: value.update({"schema": "wrong"}),
         ),
         (
-            "machine-global-lease-not-verified",
-            "parent",
-            lambda value: value.update({"machine_global_root_lease_verified": False}),
+                "machine-global-lease-self-promoted",
+                "parent",
+                lambda value: value.update({"machine_global_root_lease_verified": True}),
         ),
         (
-            "root-epoch-terminal-boolean-false",
-            "parent",
-            lambda value: value.update({"root_epoch_terminal_verified": False}),
+                "root-epoch-terminal-self-promoted",
+                "parent",
+                lambda value: value.update({"root_epoch_terminal_verified": True}),
         ),
         (
             "terminal-root-state-not-terminal",
@@ -1112,9 +2006,9 @@ def test_candidate_unverified_or_nonterminal_authority_cannot_promote(
             lambda value: value.update({"development_only": False}),
         ),
         (
-            "parent-verified-false",
-            "parent",
-            lambda value: value.update({"verified": False}),
+                "parent-verified-self-promoted",
+                "parent",
+                lambda value: value.update({"verified": True}),
         ),
         (
             "parent-global-ledger-root-drift",
@@ -1139,9 +2033,9 @@ def test_candidate_unverified_or_nonterminal_authority_cannot_promote(
             ),
         ),
         (
-            "parent-single-attempt-false",
-            "parent",
-            lambda value: value.update({"single_attempt_verified": False}),
+                "parent-single-attempt-self-promoted",
+                "parent",
+                lambda value: value.update({"single_attempt_verified": True}),
         ),
         *[
             (
@@ -1201,9 +2095,9 @@ def test_candidate_unverified_or_nonterminal_authority_cannot_promote(
         ),
         *[
             (
-                f"evaluation-{field}-false",
-                "evaluation",
-                lambda value, field=field: value.update({field: False}),
+                    f"evaluation-{field}-self-promoted",
+                    "evaluation",
+                    lambda value, field=field: value.update({field: True}),
             )
             for field in (
                 "formal_materialization_eligible",
@@ -1276,7 +2170,7 @@ def test_candidate_unverified_or_nonterminal_authority_cannot_promote(
         fixture = _fixture(tmp_path / name)
         _rewrite_receipt(fixture, artifact, mutate)
         with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-            activation.publish_factor_v3_formal_development_input_activation(
+            activation._publish_disposable_test_factor_v3_formal_development_input_activation(
                 **fixture["kwargs"]
             )
 
@@ -1423,7 +2317,7 @@ def test_machine_global_epoch_is_exact_four_file_terminal_chain(
             mirror_terminal_state=mirror_terminal_state,
         )
         with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-            activation.publish_factor_v3_formal_development_input_activation(
+            activation._publish_disposable_test_factor_v3_formal_development_input_activation(
                 **fixture["kwargs"]
             )
 
@@ -1431,7 +2325,7 @@ def test_machine_global_epoch_is_exact_four_file_terminal_chain(
         fixture = _fixture(tmp_path / f"missing-{name}")
         fixture["paths"]["epoch_chain"][name].unlink()
         with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-            activation.publish_factor_v3_formal_development_input_activation(
+            activation._publish_disposable_test_factor_v3_formal_development_input_activation(
                 **fixture["kwargs"]
             )
 
@@ -1442,7 +2336,7 @@ def test_machine_global_epoch_is_exact_four_file_terminal_chain(
         "0" * 64,
     )
     with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-        activation.publish_factor_v3_formal_development_input_activation(
+        activation._publish_disposable_test_factor_v3_formal_development_input_activation(
             **fixture["kwargs"]
         )
 
@@ -1450,7 +2344,7 @@ def test_machine_global_epoch_is_exact_four_file_terminal_chain(
     extra = fixture["paths"]["epoch"].parent / "unexpected.json"
     _write(extra, {"schema": "unbound"})
     with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-        activation.publish_factor_v3_formal_development_input_activation(
+        activation._publish_disposable_test_factor_v3_formal_development_input_activation(
             **fixture["kwargs"]
         )
 
@@ -1473,7 +2367,7 @@ def test_candidate_and_unverified_adapters_cannot_self_promote(
                 lambda value, field=field: value.update({field: True}),
             )
             with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-                activation.publish_factor_v3_formal_development_input_activation(
+                activation._publish_disposable_test_factor_v3_formal_development_input_activation(
                     **fixture["kwargs"]
                 )
 
@@ -1492,7 +2386,7 @@ def test_candidate_and_unverified_adapters_cannot_self_promote(
         fixture = _fixture(tmp_path / name)
         _rewrite_candidate_descriptor(fixture, mutate)
         with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-            activation.publish_factor_v3_formal_development_input_activation(
+            activation._publish_disposable_test_factor_v3_formal_development_input_activation(
                 **fixture["kwargs"]
             )
 
@@ -1506,7 +2400,7 @@ def test_candidate_and_unverified_adapters_cannot_self_promote(
             ].update({field: True}),
         )
         with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-            activation.publish_factor_v3_formal_development_input_activation(
+            activation._publish_disposable_test_factor_v3_formal_development_input_activation(
                 **fixture["kwargs"]
             )
 
@@ -1646,7 +2540,7 @@ def test_three_parent_projections_calendar_and_upstream_board_are_exact(
         fixture = _fixture(tmp_path / name)
         _rewrite_receipt(fixture, "parent", mutate)
         with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-            activation.publish_factor_v3_formal_development_input_activation(
+            activation._publish_disposable_test_factor_v3_formal_development_input_activation(
                 **fixture["kwargs"]
             )
 
@@ -1723,6 +2617,11 @@ def test_actual_candidate_calendar_board_parent_and_evaluation_snapshots_are_rep
             "candidate-board-prefilter-count-drift",
             "upstream_board_ledger",
             lambda value: value["pre_filter_segment_counts"].update({"BSE": 0}),
+        ),
+        (
+            "candidate-daily-rows-stale-root",
+            "daily_basic",
+            lambda value: value["rows"].append({"unbound": True}),
         ),
         (
             "candidate-parent-key-row-drift",
@@ -1818,8 +2717,170 @@ def test_actual_candidate_calendar_board_parent_and_evaluation_snapshots_are_rep
         fixture = _fixture(tmp_path / name)
         _rewrite_candidate_snapshot(fixture, snapshot, mutate)
         with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-            activation.publish_factor_v3_formal_development_input_activation(
+            activation._publish_disposable_test_factor_v3_formal_development_input_activation(
                 **fixture["kwargs"]
+            )
+
+
+def test_independent_core_replays_calendar_and_board_daily_cross_binding(
+    tmp_path: Path,
+) -> None:
+    def drift_board_daily_pair(value: dict[str, Any]) -> None:
+        value["per_date"][0]["raw_source_rows_sha256"] = _sha("drifted-raw")
+        value["per_date_board_ledger_root_sha256"] = _sha(value["per_date"])
+
+    def invalid_calendar_date(value: dict[str, Any]) -> None:
+        old = value["all_market_sessions"][0]
+        for rows_field, sha_field in (
+            ("all_market_sessions", "all_market_sessions_sha256"),
+            ("prewindow_sessions", "prewindow_sessions_sha256"),
+            ("source_dates", "source_dates_sha256"),
+        ):
+            rows = value[rows_field]
+            rows[rows.index(old)] = "2023-01-00"
+            value[sha_field] = _sha(rows)
+
+    cases: tuple[
+        tuple[str, str, Callable[[dict[str, Any]], None]], ...
+    ] = (
+        (
+            "board-daily-cross-binding",
+            "upstream_board_ledger",
+            drift_board_daily_pair,
+        ),
+        (
+            "calendar-schema",
+            "calendar",
+            lambda value: value.update({"schema": "wrong"}),
+        ),
+        (
+            "calendar-extra-field",
+            "calendar",
+            lambda value: value.update({"unexpected": False}),
+        ),
+        ("calendar-invalid-date", "calendar", invalid_calendar_date),
+    )
+    for name, snapshot, mutate in cases:
+        fixture = _fixture(tmp_path / name)
+        _rewrite_candidate_snapshot(fixture, snapshot, mutate)
+        if name == "board-daily-cross-binding":
+            board = _read(
+                fixture["paths"]["candidate_snapshot_root"]
+                / "upstream_board_ledger.json"
+            )
+            _rewrite_receipt(
+                fixture,
+                "parent",
+                lambda parent: parent["upstream_board_projection"].update(
+                    {
+                        "upstream_board_ledger_root_sha256": board[
+                            "per_date_board_ledger_root_sha256"
+                        ]
+                    }
+                ),
+            )
+        with pytest.raises(
+            activation.FactorV3FormalDevelopmentInputActivationError
+        ):
+            activation._publish_disposable_test_factor_v3_formal_development_input_activation(
+                **fixture["kwargs"]
+            )
+        replay_kwargs = {
+            key: value
+            for key, value in fixture["kwargs"].items()
+            if key != "output_root"
+        }
+        expected_error = (
+            "candidate board/daily receipt per-date binding rejected"
+            if name == "board-daily-cross-binding"
+            else None
+        )
+        with pytest.raises(
+            independent_core.IndependentCoreError,
+            match=expected_error,
+        ):
+            independent_core.replay_inputs(**replay_kwargs)
+
+    non_unit_fixture = _fixture(tmp_path / "board-non-unit-positive-counts")
+
+    def use_non_unit_board_counts(value: dict[str, Any]) -> None:
+        for entry in value["per_date"]:
+            entry["segment_counts"]["BSE"] = 2
+        value["pre_filter_segment_counts"]["BSE"] = 2 * len(value["per_date"])
+        value["per_date_board_ledger_root_sha256"] = _sha(value["per_date"])
+
+    _rewrite_candidate_snapshot(
+        non_unit_fixture,
+        "upstream_board_ledger",
+        use_non_unit_board_counts,
+    )
+    candidate = independent_core._load_candidate_container(
+        candidate_output_root=non_unit_fixture["kwargs"]["candidate_output_root"],
+        candidate_publication_path=non_unit_fixture["kwargs"][
+            "candidate_publication_path"
+        ],
+        expected_candidate_publication_sha256=non_unit_fixture["kwargs"][
+            "expected_candidate_publication_sha256"
+        ],
+    )
+    independent_core._replay_candidate_semantics(candidate)
+
+
+def test_differential_core_rejects_daily_basic_scope_and_eligibility_drift(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    source_receipt = _read(fixture["paths"]["daily_basic_receipt"])
+    original_snapshot = _read(
+        fixture["paths"]["candidate_snapshot_root"]
+        / "daily_basic_exact_set_receipt.json"
+    )
+    false_fields = (
+        "arbitrary_row_drops_permitted",
+        "embargo_consumed",
+        "final_oos_consumed",
+        "formal_factor_v3_materialization_performed",
+        "production_profile_registered",
+        "production_recommendation_eligible",
+        "rows_published",
+        "silent_row_drops_permitted",
+    )
+    true_fields = (
+        "all_supported_segments_compared_before_scope_filter",
+        "exact_set_verified",
+        "factor_v3_development_materialization_input_eligible",
+        "raw_source_rows_bound",
+        "source_ts_code_exact_set_verified_after_transition_filter",
+        "transition_resolved_identity_exact_set_verified",
+    )
+    cases: list[tuple[str, Any]] = [
+        *((field, True) for field in false_fields),
+        *((field, False) for field in true_fields),
+        ("authority_scope", "wrong"),
+        ("authority_status", "wrong"),
+        ("row_authority_status", "wrong"),
+    ]
+    for field, value in cases:
+        receipt = deepcopy(source_receipt)
+        receipt[field] = value
+        unsigned = dict(receipt)
+        unsigned.pop("authority_root_sha256")
+        receipt["authority_root_sha256"] = _sha(unsigned)
+        projection = candidate_authority.build_factor_v3_public_source_receipt_projection(
+            receipt,
+            kind="daily_basic_733_v2",
+        )
+        snapshot = {
+            "derived_adapter": deepcopy(original_snapshot["derived_adapter"]),
+            "schema": original_snapshot["schema"],
+            **projection,
+        }
+        with pytest.raises(independent_core.IndependentCoreError):
+            independent_core._validate_public_projection(
+                source_receipt=receipt,
+                snapshot=snapshot,
+                kind="daily_basic_733_v2",
+                sessions=receipt["trade_dates"],
             )
 
 
@@ -1835,7 +2896,7 @@ def test_any_candidate_or_upstream_safety_true_is_rejected_not_silently_zeroed(
                 lambda value, field=field: value.update({field: True}),
             )
             with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-                activation.publish_factor_v3_formal_development_input_activation(
+                activation._publish_disposable_test_factor_v3_formal_development_input_activation(
                     **fixture["kwargs"]
                 )
     for artifact, rewrite in (
@@ -1849,7 +2910,7 @@ def test_any_candidate_or_upstream_safety_true_is_rejected_not_silently_zeroed(
                 lambda value, field=field: value.update({field: True}),
             )
             with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-                activation.publish_factor_v3_formal_development_input_activation(
+                activation._publish_disposable_test_factor_v3_formal_development_input_activation(
                     **fixture["kwargs"]
                 )
 
@@ -1867,7 +2928,7 @@ def test_input_hash_paths_and_root_separation_fail_closed(
         fixture = _fixture(tmp_path / field)
         fixture["kwargs"][field] = "0" * 64
         with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-            activation.publish_factor_v3_formal_development_input_activation(
+            activation._publish_disposable_test_factor_v3_formal_development_input_activation(
                 **fixture["kwargs"]
             )
 
@@ -1903,7 +2964,7 @@ def test_input_hash_paths_and_root_separation_fail_closed(
         fixture = _fixture(tmp_path / name)
         fixture["kwargs"]["output_root"] = output_root(fixture["kwargs"])
         with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-            activation.publish_factor_v3_formal_development_input_activation(
+            activation._publish_disposable_test_factor_v3_formal_development_input_activation(
                 **fixture["kwargs"]
             )
 
@@ -1912,7 +2973,7 @@ def test_input_hash_paths_and_root_separation_fail_closed(
     loose.write_bytes(Path(fixture["kwargs"]["candidate_publication_path"]).read_bytes())
     fixture["kwargs"]["candidate_publication_path"] = loose.resolve()
     with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-        activation.publish_factor_v3_formal_development_input_activation(
+        activation._publish_disposable_test_factor_v3_formal_development_input_activation(
             **fixture["kwargs"]
         )
 
@@ -1926,7 +2987,7 @@ def test_input_hash_paths_and_root_separation_fail_closed(
     ).as_posix()
     _replace_candidate_manifest(fixture, manifest)
     with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-        activation.publish_factor_v3_formal_development_input_activation(
+        activation._publish_disposable_test_factor_v3_formal_development_input_activation(
             **fixture["kwargs"]
         )
 
@@ -1941,7 +3002,7 @@ def test_input_hash_paths_and_root_separation_fail_closed(
         loose.write_bytes(source.read_bytes())
         fixture["kwargs"][path_field] = loose.resolve()
         with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-            activation.publish_factor_v3_formal_development_input_activation(
+            activation._publish_disposable_test_factor_v3_formal_development_input_activation(
                 **fixture["kwargs"]
             )
 
@@ -1984,7 +3045,7 @@ def test_candidate_receipt_and_output_reparse_aliases_are_rejected(
         if name == "candidate":
             fixture["kwargs"]["candidate_output_root"] = alias
         with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-            activation.publish_factor_v3_formal_development_input_activation(
+            activation._publish_disposable_test_factor_v3_formal_development_input_activation(
                 **fixture["kwargs"]
             )
 
@@ -1995,7 +3056,7 @@ def test_candidate_receipt_and_output_reparse_aliases_are_rejected(
     _directory_alias(output_alias, real_output)
     fixture["kwargs"]["output_root"] = output_alias
     with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-        activation.publish_factor_v3_formal_development_input_activation(
+        activation._publish_disposable_test_factor_v3_formal_development_input_activation(
             **fixture["kwargs"]
         )
 
@@ -2004,7 +3065,7 @@ def test_activation_publication_and_verifier_reparse_aliases_are_rejected(
     tmp_path: Path,
 ) -> None:
     fixture = _fixture(tmp_path)
-    publication = activation.publish_factor_v3_formal_development_input_activation(
+    publication = activation._publish_disposable_test_factor_v3_formal_development_input_activation(
         **fixture["kwargs"]
     )
     output_root = Path(fixture["kwargs"]["output_root"])
@@ -2017,7 +3078,7 @@ def test_activation_publication_and_verifier_reparse_aliases_are_rejected(
     output_alias = tmp_path / "activation-publication-alias"
     _directory_alias(output_alias, output_root)
     with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-        activation.verify_factor_v3_formal_development_input_activation(
+        activation._verify_disposable_test_factor_v3_formal_development_input_activation(
             **verify_kwargs,
             activation_publication_path=output_alias.joinpath(
                 *publication_path.relative_to(output_root).parts
@@ -2031,7 +3092,7 @@ def test_activation_publication_and_verifier_reparse_aliases_are_rejected(
     verifier_alias = tmp_path / "verifier-alias"
     _directory_alias(verifier_alias, real_verifier)
     with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-        activation.verify_factor_v3_formal_development_input_activation(
+        activation._verify_disposable_test_factor_v3_formal_development_input_activation(
             **verify_kwargs,
             activation_publication_path=publication_path,
             expected_activation_publication_sha256=publication["publication_sha256"],
@@ -2043,7 +3104,7 @@ def test_independent_verifier_receipt_is_path_based_cas_and_create_once(
     tmp_path: Path,
 ) -> None:
     fixture = _fixture(tmp_path)
-    publication = activation.publish_factor_v3_formal_development_input_activation(
+    publication = activation._publish_disposable_test_factor_v3_formal_development_input_activation(
         **fixture["kwargs"]
     )
     output_root = Path(fixture["kwargs"]["output_root"])
@@ -2062,7 +3123,7 @@ def test_independent_verifier_receipt_is_path_based_cas_and_create_once(
             "verifier_output_root": verifier_root,
         }
     )
-    result = activation.verify_factor_v3_formal_development_input_activation(
+    result = activation._verify_disposable_test_factor_v3_formal_development_input_activation(
         **verify_kwargs
     )
     assert result["schema"] == activation.INDEPENDENT_VERIFIER_RECEIPT_SCHEMA
@@ -2073,9 +3134,10 @@ def test_independent_verifier_receipt_is_path_based_cas_and_create_once(
     assert _sha(original_raw) == result["receipt_file_sha256"]
     receipt = _read(receipt_path)
     publication_manifest = _read(publication_path)
-    assert receipt["verified"] is True
-    assert receipt["independent_public_replay_performed"] is True
-    assert receipt["formal_materialization_eligible"] is True
+    assert receipt["verified"] is False
+    assert receipt["independent_public_replay_performed"] is False
+    assert receipt["differential_contract_replay_performed"] is True
+    assert receipt["formal_materialization_eligible"] is False
     assert receipt["formal_materialization_performed"] is False
     assert receipt["activation_publication_file_sha256"] == publication_sha
     assert receipt["activation_root_sha256"] == publication_manifest[
@@ -2089,7 +3151,7 @@ def test_independent_verifier_receipt_is_path_based_cas_and_create_once(
     )
     assert all(receipt[field] is False for field in activation.SAFETY_FALSE_FIELDS)
     assert (
-        activation.verify_factor_v3_formal_development_input_activation(
+        activation._verify_disposable_test_factor_v3_formal_development_input_activation(
             **verify_kwargs
         )
         == result
@@ -2097,7 +3159,7 @@ def test_independent_verifier_receipt_is_path_based_cas_and_create_once(
     assert receipt_path.read_bytes() == original_raw
     receipt_path.write_bytes(b'{"drifted":true}')
     with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-        activation.verify_factor_v3_formal_development_input_activation(
+        activation._verify_disposable_test_factor_v3_formal_development_input_activation(
             **verify_kwargs
         )
     assert receipt_path.read_bytes() == b'{"drifted":true}'
@@ -2108,7 +3170,7 @@ def test_independent_verifier_receipt_is_path_based_cas_and_create_once(
     descriptor_raw = descriptor_path.read_bytes()
     descriptor_path.write_bytes(b'{"drifted":true}')
     with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-        activation.verify_factor_v3_formal_development_input_activation(
+        activation._verify_disposable_test_factor_v3_formal_development_input_activation(
             **verify_kwargs
         )
     assert descriptor_path.read_bytes() == b'{"drifted":true}'
@@ -2116,13 +3178,13 @@ def test_independent_verifier_receipt_is_path_based_cas_and_create_once(
     publication_raw = publication_path.read_bytes()
     publication_path.write_bytes(b'{"drifted":true}')
     with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-        activation.verify_factor_v3_formal_development_input_activation(
+        activation._verify_disposable_test_factor_v3_formal_development_input_activation(
             **verify_kwargs
         )
     assert publication_path.read_bytes() == b'{"drifted":true}'
     publication_path.write_bytes(publication_raw)
     with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-        activation.verify_factor_v3_formal_development_input_activation(
+        activation._verify_disposable_test_factor_v3_formal_development_input_activation(
             **{
                 **verify_kwargs,
                 "expected_activation_publication_sha256": "0" * 64,
@@ -2131,7 +3193,7 @@ def test_independent_verifier_receipt_is_path_based_cas_and_create_once(
     loose_publication = output_root / "loose-activation-publication.json"
     loose_publication.write_bytes(publication_raw)
     with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-        activation.verify_factor_v3_formal_development_input_activation(
+        activation._verify_disposable_test_factor_v3_formal_development_input_activation(
             **{
                 **verify_kwargs,
                 "activation_publication_path": loose_publication,
@@ -2153,7 +3215,7 @@ def test_independent_verifier_receipt_is_path_based_cas_and_create_once(
     )
     assert _write(forged_publication_path, forged_manifest) == forged_publication_sha
     with pytest.raises(activation.FactorV3FormalDevelopmentInputActivationError):
-        activation.verify_factor_v3_formal_development_input_activation(
+        activation._verify_disposable_test_factor_v3_formal_development_input_activation(
             **{
                 **verify_kwargs,
                 "activation_publication_path": forged_publication_path,
@@ -2180,6 +3242,144 @@ def test_independent_verifier_receipt_is_path_based_cas_and_create_once(
             activation.FactorV3FormalDevelopmentInputActivationError,
             match="independent|overlap|root",
         ):
-            activation.verify_factor_v3_formal_development_input_activation(
+            activation._verify_disposable_test_factor_v3_formal_development_input_activation(
                 **{**verify_kwargs, "verifier_output_root": overlap_root.resolve()}
             )
+
+
+def test_atomic_create_only_never_exposes_partial_final_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = (tmp_path / "cas" / "sha256" / "aa" / "artifact.json").resolve()
+
+    def fail_link(_source: Any, _destination: Any, **_kwargs: Any) -> None:
+        raise OSError("injected no-replace publication failure")
+
+    monkeypatch.setattr(activation.os, "link", fail_link)
+    with pytest.raises(
+        activation.FactorV3FormalDevelopmentInputActivationError,
+        match="injected|publication|create-only",
+    ):
+        activation._write_create_only(target, b'{"complete":true}', label="fixture CAS")
+    assert not target.exists()
+    assert not list(target.parent.glob(".factor-v3-cas-*.tmp"))
+
+
+def test_publication_is_terminal_and_not_visible_before_postverification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def fail_postverify(_held: Any) -> None:
+        raise activation.FactorV3FormalDevelopmentInputActivationError(
+            "injected prepublication postverification failure"
+        )
+
+    monkeypatch.setattr(activation, "_postverify_held_inputs", fail_postverify)
+    with pytest.raises(
+        activation.FactorV3FormalDevelopmentInputActivationError,
+        match="prepublication",
+    ):
+        activation._publish_disposable_test_factor_v3_formal_development_input_activation(
+            **fixture["kwargs"]
+        )
+    publication_root = Path(fixture["kwargs"]["output_root"]) / "publications"
+    assert not publication_root.exists() or not list(publication_root.rglob("*.json"))
+
+
+def test_close_all_attempts_every_handle_before_raising() -> None:
+    calls: list[str] = []
+
+    class Handle:
+        def __init__(self, name: str, *, fails: bool = False) -> None:
+            self.name = name
+            self.fails = fails
+
+        def close(self) -> None:
+            calls.append(self.name)
+            if self.fails:
+                raise OSError(f"{self.name} close failed")
+
+    with pytest.raises(OSError, match="second close failed"):
+        activation._close_all_held_files(
+            [Handle("first"), Handle("second", fails=True), Handle("third")]
+        )
+    assert calls == ["third", "second", "first"]
+
+
+def test_independent_verifier_does_not_reuse_publisher_replay_or_builders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+    publication = activation._publish_disposable_test_factor_v3_formal_development_input_activation(
+        **fixture["kwargs"]
+    )
+    publication_path = _publication_path(
+        Path(fixture["kwargs"]["output_root"]), publication
+    )
+
+    def shared_path_used(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("publisher replay/builder reached by independent verifier")
+
+    for name in (
+        "_activation_output_root",
+        "_assert_isolated",
+        "_descriptor_for",
+        "_forbidden_roots",
+        "_hold_files",
+        "_hold_inputs",
+        "_manifest_for",
+        "_postverify_activation_output",
+        "_postverify_held_inputs",
+        "_postverify_inputs",
+        "_read_json",
+        "_relative_path",
+        "_replay_inputs",
+        "_safe_output_root",
+        "_validate_candidate",
+        "_validate_evaluation_receipt",
+        "_validate_parent_receipt",
+        "_write_create_only",
+    ):
+        monkeypatch.setattr(activation, name, shared_path_used)
+    verifier_kwargs = {
+        key: value
+        for key, value in fixture["kwargs"].items()
+        if key != "output_root"
+    }
+    result = activation._verify_disposable_test_factor_v3_formal_development_input_activation(
+        **verifier_kwargs,
+        activation_publication_path=publication_path,
+        expected_activation_publication_sha256=publication["publication_sha256"],
+        verifier_output_root=(tmp_path / "independent-differential").resolve(),
+    )
+    assert result["verified"] is False
+    assert result["independent_public_replay_performed"] is False
+    assert result["differential_contract_replay_performed"] is True
+
+
+def test_independent_verifier_identity_binds_core_source_bytes() -> None:
+    from app import (
+        factor_v3_formal_development_input_activation_independent_core as core,
+    )
+    from app import (
+        factor_v3_formal_development_input_activation_independent_verifier as independent,
+    )
+
+    source = Path(core.__file__).resolve(strict=True)
+    original = source.read_bytes()
+    before = independent._producer_identity()
+    try:
+        source.write_bytes(original + b"\n")
+        after = independent._producer_identity()
+        assert after["root_sha256"] != before["root_sha256"]
+        assert (
+            after["dependencies"]["independent_core"]["sha256"]
+            != before["dependencies"]["independent_core"]["sha256"]
+        )
+    finally:
+        source.write_bytes(original)
+    assert independent._producer_identity() == before
