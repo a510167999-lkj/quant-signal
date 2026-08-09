@@ -16,6 +16,25 @@ from app import factor_v3_formal_development_input_activation as activation
 from app import factor_v3_parent_source_development_authority as parent_authority
 
 
+@pytest.fixture(autouse=True)
+def _explicit_native_parent_source_test_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority = object()
+    monkeypatch.setattr(
+        activation,
+        "_DISPOSABLE_TESTING_NATIVE_PARENT_SOURCE_AUTHORITY",
+        authority,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        activation,
+        "_REGISTERED_NATIVE_PARENT_SOURCE_AUTHORITY",
+        authority,
+        raising=False,
+    )
+
+
 def _bytes(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -1014,6 +1033,25 @@ def test_valid_activation_projects_only_verified_formal_development_input(
             **fixture["kwargs"]
         )
     assert descriptor_path.read_bytes() == b'{"drifted":true}'
+
+
+def test_native_parent_source_authority_absence_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+    monkeypatch.setattr(
+        activation,
+        "_REGISTERED_NATIVE_PARENT_SOURCE_AUTHORITY",
+        None,
+    )
+    with pytest.raises(
+        activation.FactorV3FormalDevelopmentInputActivationError,
+        match="native.*authority|authority.*unavailable",
+    ):
+        activation.publish_factor_v3_formal_development_input_activation(
+            **fixture["kwargs"]
+        )
 
 
 def test_candidate_unverified_or_nonterminal_authority_cannot_promote(
