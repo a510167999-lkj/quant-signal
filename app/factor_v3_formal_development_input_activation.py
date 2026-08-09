@@ -13,11 +13,53 @@ PUBLICATION_SCHEMA = (
 INDEPENDENT_VERIFIER_RECEIPT_SCHEMA = (
     "factor-v3-formal-development-input-activation-independent-verifier-receipt/v1"
 )
-PARENT_SOURCE_TERMINAL_EPOCH_RECEIPT_SCHEMA = (
-    "factor-v3-parent-source-machine-global-terminal-epoch-receipt/v1"
+PARENT_SOURCE_ATTEMPT_KEY_SCHEMA = (
+    "factor-v3-parent-source-development-authority-attempt-key/v1"
+)
+PARENT_SOURCE_GLOBAL_ATTEMPT_IDENTITY_SCHEMA = (
+    "factor-v3-parent-source-global-attempt-identity/v1"
+)
+PARENT_SOURCE_NATIVE_LEASE_POLICY_VERSION = (
+    "factor-v3-parent-source-machine-global-root-lease/v1"
+)
+PARENT_SOURCE_EPOCH_DIRECTORY_TEMPLATE = (
+    "attempts/sha256/{prefix}/{attempt_key}"
+)
+PARENT_SOURCE_EPOCH_FILE_NAMES = (
+    "run.claim.json",
+    "run.receipt.json",
+    "verify.claim.json",
+    "terminal.receipt.json",
+)
+PARENT_SOURCE_RUN_CLAIM_SCHEMA = "factor-v3-parent-source-root-run-claim/v1"
+PARENT_SOURCE_RUN_RECEIPT_SCHEMA = "factor-v3-parent-source-root-run-receipt/v1"
+PARENT_SOURCE_VERIFY_CLAIM_SCHEMA = "factor-v3-parent-source-root-verify-claim/v1"
+PARENT_SOURCE_TERMINAL_RECEIPT_SCHEMA = (
+    "factor-v3-parent-source-root-terminal-receipt/v1"
 )
 MATERIALIZER_INPUT_AUTHORITY_SCHEMA = (
     "audited-pit-factor-v3-development-input-authority/v1"
+)
+ACTIVATION_INPUT_BINDING_FIELDS = (
+    "attempt_key_sha256",
+    "candidate_authority_root_sha256",
+    "candidate_descriptor_sha256",
+    "candidate_publication_file_sha256",
+    "factor_v2_evaluation_authority_receipt_file_sha256",
+    "factor_v2_evaluation_authority_receipt_root_sha256",
+    "global_attempt_identity_sha256",
+    "global_attempt_ledger_root",
+    "global_run_claim_path",
+    "global_run_receipt_path",
+    "global_terminal_receipt_path",
+    "global_verify_claim_path",
+    "native_lease_identity_sha256",
+    "native_lease_policy_version",
+    "parent_source_authority_receipt_file_sha256",
+    "parent_source_authority_receipt_root_sha256",
+    "parent_source_terminal_receipt_file_sha256",
+    "run_spec_sha256",
+    "semantic_input_root_sha256",
 )
 PARENT_PROJECTION_SCHEMA = "factor-v3-parent-row-projection-roots/v1"
 PARENT_PROJECTION_FIELDS = (
@@ -43,6 +85,14 @@ FACTOR_V2_EVALUATION_PROJECTION_FIELDS = (
     "terminal_decision_descriptor_sha256",
     "evaluator_descriptor_sha256",
     "cost_slippage_execution_descriptor_sha256",
+)
+FACTOR_V2_EVALUATION_SOURCE_BINDING_FIELDS = (
+    "branch_receipt_sha256",
+    "decision_receipt_sha256",
+    "decision_receipt_raw_file_sha256",
+    "evaluation_artifact_sha256",
+    "selected_branch",
+    "snapshot_schema",
 )
 FACTOR_V2_EVALUATION_AUTHORITY_RECEIPT_SCHEMA = (
     "factor-v2-terminal-evaluator-formal-development-authority-receipt/v1"
@@ -76,10 +126,70 @@ SAFETY_FALSE_FIELDS = (
     "production_recommendation_eligible",
     "recommendation_generation_eligible",
 )
-PARENT_SOURCE_ROOT_STATE_COMPLETED = 2
-PARENT_SOURCE_ROOT_STATE_TERMINAL = 3
+PARENT_SOURCE_ROOT_STATE_EMPTY = 0
+PARENT_SOURCE_ROOT_STATE_RUN_CLAIMED = 1
+PARENT_SOURCE_ROOT_STATE_RUN_COMPLETED = 2
+PARENT_SOURCE_ROOT_STATE_VERIFY_CLAIMED = 3
+PARENT_SOURCE_ROOT_STATE_TERMINAL = 4
+PARENT_SOURCE_ROOT_ACTION_RUN = 1
 PARENT_SOURCE_ROOT_ACTION_VERIFY = 2
+PARENT_SOURCE_ROOT_TRANSITION_START_RUN = 1
+PARENT_SOURCE_ROOT_TRANSITION_REJECT = 2
 PARENT_SOURCE_ROOT_TRANSITION_START_VERIFY = 3
+PARENT_SOURCE_EPOCH_FILE_CONTRACT = {
+    "run.claim.json": {
+        "action": PARENT_SOURCE_ROOT_ACTION_RUN,
+        "fields": (
+            "action",
+            "attempt_key_sha256",
+            "global_attempt_identity_sha256",
+            "run_spec_sha256",
+            "schema",
+            "state",
+        ),
+        "schema": PARENT_SOURCE_RUN_CLAIM_SCHEMA,
+        "state": PARENT_SOURCE_ROOT_STATE_RUN_CLAIMED,
+    },
+    "run.receipt.json": {
+        "fields": (
+            "attempt_key_sha256",
+            "global_attempt_identity_sha256",
+            "run_claim_sha256",
+            "run_spec_sha256",
+            "schema",
+            "state",
+        ),
+        "schema": PARENT_SOURCE_RUN_RECEIPT_SCHEMA,
+        "state": PARENT_SOURCE_ROOT_STATE_RUN_COMPLETED,
+    },
+    "verify.claim.json": {
+        "action": PARENT_SOURCE_ROOT_ACTION_VERIFY,
+        "fields": (
+            "action",
+            "attempt_key_sha256",
+            "global_attempt_identity_sha256",
+            "run_receipt_sha256",
+            "run_spec_sha256",
+            "schema",
+            "state",
+        ),
+        "schema": PARENT_SOURCE_VERIFY_CLAIM_SCHEMA,
+        "state": PARENT_SOURCE_ROOT_STATE_VERIFY_CLAIMED,
+    },
+    "terminal.receipt.json": {
+        "fields": (
+            "attempt_key_sha256",
+            "global_attempt_identity_sha256",
+            "run_receipt_sha256",
+            "run_spec_sha256",
+            "schema",
+            "state",
+            "verify_claim_sha256",
+        ),
+        "schema": PARENT_SOURCE_TERMINAL_RECEIPT_SCHEMA,
+        "state": PARENT_SOURCE_ROOT_STATE_TERMINAL,
+    },
+}
 
 
 class FactorV3FormalDevelopmentInputActivationError(ValueError):
@@ -126,8 +236,10 @@ def verify_factor_v3_formal_development_input_activation(
 
 __all__ = (
     "ACTIVATION_SCHEMA",
+    "ACTIVATION_INPUT_BINDING_FIELDS",
     "EXACT_CALENDAR_COUNTS",
     "FACTOR_V2_EVALUATION_PROJECTION_FIELDS",
+    "FACTOR_V2_EVALUATION_SOURCE_BINDING_FIELDS",
     "FACTOR_V2_EVALUATION_AUTHORITY_RECEIPT_SCHEMA",
     "FACTOR_V2_EVALUATION_PROJECTION_SCHEMA",
     "FactorV3FormalDevelopmentInputActivationError",
@@ -136,11 +248,26 @@ __all__ = (
     "PARENT_PROJECTION_CONTRACT",
     "PARENT_PROJECTION_FIELDS",
     "PARENT_PROJECTION_SCHEMA",
+    "PARENT_SOURCE_EPOCH_DIRECTORY_TEMPLATE",
+    "PARENT_SOURCE_EPOCH_FILE_CONTRACT",
+    "PARENT_SOURCE_EPOCH_FILE_NAMES",
+    "PARENT_SOURCE_RUN_CLAIM_SCHEMA",
+    "PARENT_SOURCE_RUN_RECEIPT_SCHEMA",
+    "PARENT_SOURCE_VERIFY_CLAIM_SCHEMA",
+    "PARENT_SOURCE_TERMINAL_RECEIPT_SCHEMA",
+    "PARENT_SOURCE_ROOT_ACTION_RUN",
     "PARENT_SOURCE_ROOT_ACTION_VERIFY",
-    "PARENT_SOURCE_ROOT_STATE_COMPLETED",
+    "PARENT_SOURCE_ATTEMPT_KEY_SCHEMA",
+    "PARENT_SOURCE_GLOBAL_ATTEMPT_IDENTITY_SCHEMA",
+    "PARENT_SOURCE_NATIVE_LEASE_POLICY_VERSION",
+    "PARENT_SOURCE_ROOT_STATE_EMPTY",
+    "PARENT_SOURCE_ROOT_STATE_RUN_CLAIMED",
+    "PARENT_SOURCE_ROOT_STATE_RUN_COMPLETED",
     "PARENT_SOURCE_ROOT_STATE_TERMINAL",
+    "PARENT_SOURCE_ROOT_STATE_VERIFY_CLAIMED",
+    "PARENT_SOURCE_ROOT_TRANSITION_REJECT",
+    "PARENT_SOURCE_ROOT_TRANSITION_START_RUN",
     "PARENT_SOURCE_ROOT_TRANSITION_START_VERIFY",
-    "PARENT_SOURCE_TERMINAL_EPOCH_RECEIPT_SCHEMA",
     "PUBLICATION_SCHEMA",
     "SAFETY_FALSE_FIELDS",
     "UPSTREAM_SOURCE_SEGMENTS",
