@@ -61,6 +61,12 @@
 #ifndef F3_BROKER_COMPLETION_PUBLIC_BLOB_SHA256
 #define F3_BROKER_COMPLETION_PUBLIC_BLOB_SHA256 ""
 #endif
+#ifndef F3_BROKER_PARENT_SOURCE_GLOBAL_ATTEMPT_LEDGER_ROOT
+#define F3_BROKER_PARENT_SOURCE_GLOBAL_ATTEMPT_LEDGER_ROOT L""
+#endif
+#ifndef F3_BROKER_PARENT_SOURCE_GLOBAL_ATTEMPT_LEDGER_ROOT_POLICY_SHA256
+#define F3_BROKER_PARENT_SOURCE_GLOBAL_ATTEMPT_LEDGER_ROOT_POLICY_SHA256 ""
+#endif
 
 #ifdef F3_BROKER_TESTING
 #ifndef F3_BROKER_DISPOSABLE_TEST_MANIFEST
@@ -2399,6 +2405,1808 @@ static void digest_to_ascii(
         output[index * 2 + 1] = digits[digest[index] & 15];
     }
     output[64] = '\0';
+}
+
+#define F3_PARENT_SOURCE_ATTEMPT_KEY_SCHEMA_VALUE \
+    "factor-v3-parent-source-development-authority-attempt-key/v1"
+#define F3_PARENT_SOURCE_GLOBAL_ATTEMPT_SCHEMA_VALUE \
+    "factor-v3-parent-source-global-attempt-identity/v1"
+#define F3_PARENT_SOURCE_ROOT_POLICY_SCHEMA_VALUE \
+    "factor-v3-parent-source-root-policy/v1"
+#define F3_PARENT_SOURCE_MUTEX_PREFIX \
+    L"Global\\quant-signal-lkj.factor-v3.parent-source."
+#define F3_PARENT_SOURCE_MAX_TIMEOUT_MILLISECONDS 60000u
+#define F3_PARENT_SOURCE_RUN_CLAIM_SCHEMA_VALUE \
+    "factor-v3-parent-source-root-run-claim/v1"
+#define F3_PARENT_SOURCE_RUN_RECEIPT_SCHEMA_VALUE \
+    "factor-v3-parent-source-root-run-receipt/v1"
+#define F3_PARENT_SOURCE_VERIFY_CLAIM_SCHEMA_VALUE \
+    "factor-v3-parent-source-root-verify-claim/v1"
+#define F3_PARENT_SOURCE_TERMINAL_RECEIPT_SCHEMA_VALUE \
+    "factor-v3-parent-source-root-terminal-receipt/v1"
+#if defined(__GNUC__)
+#define F3_PARENT_SOURCE_UNUSED __attribute__((unused))
+#else
+#define F3_PARENT_SOURCE_UNUSED
+#endif
+
+typedef struct F3ParentSourceRootLease {
+    HANDLE mutex;
+    HANDLE root_directory;
+    HANDLE claim_directory;
+    DWORD root_volume_serial;
+    DWORD root_file_index_high;
+    DWORD root_file_index_low;
+    DWORD claim_volume_serial;
+    DWORD claim_file_index_high;
+    DWORD claim_file_index_low;
+    DWORD owner_thread_id;
+    wchar_t canonical_root[32768];
+    wchar_t canonical_claim_directory[32768];
+    wchar_t canonical_run_claim[32768];
+    wchar_t canonical_run_receipt[32768];
+    wchar_t canonical_verify_claim[32768];
+    wchar_t canonical_terminal_receipt[32768];
+    char run_spec_sha256[65];
+    char attempt_key_sha256[65];
+    char global_attempt_identity_sha256[65];
+    HeldFile epoch_files[4];
+    struct F3ParentSourceRootLease *next;
+} F3ParentSourceRootLease;
+
+typedef struct F3ParentSourceRootBinding {
+    char run_spec_sha256[65];
+    char attempt_key_sha256[65];
+    char global_attempt_identity_sha256[65];
+    struct F3ParentSourceRootBinding *next;
+} F3ParentSourceRootBinding;
+
+static SRWLOCK f3_parent_source_root_lease_lock = SRWLOCK_INIT;
+static F3ParentSourceRootLease *f3_parent_source_active_root_leases = NULL;
+static F3ParentSourceRootBinding *f3_parent_source_root_bindings = NULL;
+#ifdef F3_BROKER_TESTING
+static wchar_t f3_parent_source_disposable_fixed_root[32768] = {0};
+#endif
+
+static int factor_v3_parent_source_exact_sha256_ascii(const char *value) {
+    size_t index;
+    if (value == NULL) {
+        return 0;
+    }
+    for (index = 0; index < 64; ++index) {
+        if (!((value[index] >= '0' && value[index] <= '9')
+            || (value[index] >= 'a' && value[index] <= 'f'))) {
+            return 0;
+        }
+    }
+    return value[64] == '\0';
+}
+
+static int factor_v3_parent_source_hash_canonical_json(
+    const char *raw,
+    int raw_length,
+    char output[65]
+) {
+    unsigned char digest[32];
+    if (raw == NULL
+        || raw_length <= 0
+        || output == NULL
+        || !hash_memory(
+            (const unsigned char *)raw,
+            (DWORD)raw_length,
+            digest
+        )) {
+        return 0;
+    }
+    digest_to_ascii(digest, output);
+    SecureZeroMemory(digest, sizeof(digest));
+    return 1;
+}
+
+F3_PARENT_SOURCE_UNUSED static int factor_v3_parent_source_derive_attempt_key_sha256(
+    const char *semantic_input_root_sha256,
+    char attempt_key_sha256[65]
+) {
+    char canonical[256];
+    int length;
+    if (!factor_v3_parent_source_exact_sha256_ascii(
+            semantic_input_root_sha256
+        )
+        || attempt_key_sha256 == NULL) {
+        return 0;
+    }
+    length = snprintf(
+        canonical,
+        sizeof(canonical),
+        "{\"schema\":\"%s\",\"semantic_input_root_sha256\":\"%s\"}",
+        F3_PARENT_SOURCE_ATTEMPT_KEY_SCHEMA_VALUE,
+        semantic_input_root_sha256
+    );
+    if (length <= 0 || (size_t)length >= sizeof(canonical)) {
+        SecureZeroMemory(canonical, sizeof(canonical));
+        return 0;
+    }
+    if (!factor_v3_parent_source_hash_canonical_json(
+            canonical,
+            length,
+            attempt_key_sha256
+        )) {
+        SecureZeroMemory(canonical, sizeof(canonical));
+        return 0;
+    }
+    SecureZeroMemory(canonical, sizeof(canonical));
+    return 1;
+}
+
+static int factor_v3_parent_source_derive_global_attempt_identity_sha256(
+    const char *attempt_key_sha256,
+    char global_attempt_identity_sha256[65]
+) {
+    char canonical[256];
+    int length;
+    if (!factor_v3_parent_source_exact_sha256_ascii(attempt_key_sha256)
+        || global_attempt_identity_sha256 == NULL) {
+        return 0;
+    }
+    length = snprintf(
+        canonical,
+        sizeof(canonical),
+        "{\"attempt_key_sha256\":\"%s\",\"schema\":\"%s\"}",
+        attempt_key_sha256,
+        F3_PARENT_SOURCE_GLOBAL_ATTEMPT_SCHEMA_VALUE
+    );
+    if (length <= 0 || (size_t)length >= sizeof(canonical)) {
+        SecureZeroMemory(canonical, sizeof(canonical));
+        return 0;
+    }
+    if (!factor_v3_parent_source_hash_canonical_json(
+            canonical,
+            length,
+            global_attempt_identity_sha256
+        )) {
+        SecureZeroMemory(canonical, sizeof(canonical));
+        return 0;
+    }
+    SecureZeroMemory(canonical, sizeof(canonical));
+    return 1;
+}
+
+static int factor_v3_parent_source_derive_root_policy_sha256(
+    const wchar_t *canonical_root,
+    char root_policy_sha256[65]
+) {
+    static const char prefix[] = "{\"global_attempt_ledger_root\":\"";
+    static const char suffix[] = "\",\"schema\":\""
+        F3_PARENT_SOURCE_ROOT_POLICY_SCHEMA_VALUE "\"}";
+    char *utf8 = NULL;
+    char *canonical = NULL;
+    unsigned char digest[32];
+    int utf8_size;
+    size_t input_index;
+    size_t output_index;
+    size_t capacity;
+    int ok = 0;
+    if (canonical_root == NULL || root_policy_sha256 == NULL) {
+        return 0;
+    }
+    utf8_size = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        canonical_root,
+        -1,
+        NULL,
+        0,
+        NULL,
+        NULL
+    );
+    if (utf8_size <= 1 || (size_t)utf8_size > (SIZE_MAX - 256u) / 2u) {
+        return 0;
+    }
+    capacity = sizeof(prefix) - 1u
+        + ((size_t)utf8_size - 1u) * 2u
+        + sizeof(suffix);
+    utf8 = (char *)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        (size_t)utf8_size
+    );
+    canonical = (char *)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        capacity
+    );
+    if (utf8 == NULL
+        || canonical == NULL
+        || WideCharToMultiByte(
+            CP_UTF8,
+            WC_ERR_INVALID_CHARS,
+            canonical_root,
+            -1,
+            utf8,
+            utf8_size,
+            NULL,
+            NULL
+        ) != utf8_size) {
+        goto cleanup;
+    }
+    memcpy(canonical, prefix, sizeof(prefix) - 1u);
+    output_index = sizeof(prefix) - 1u;
+    for (input_index = 0; input_index + 1u < (size_t)utf8_size; ++input_index) {
+        unsigned char value = (unsigned char)utf8[input_index];
+        if (value < 0x20u) {
+            goto cleanup;
+        }
+        if (value == '\\' || value == '"') {
+            canonical[output_index++] = '\\';
+        }
+        canonical[output_index++] = (char)value;
+    }
+    memcpy(canonical + output_index, suffix, sizeof(suffix) - 1u);
+    output_index += sizeof(suffix) - 1u;
+    if (!hash_memory(
+            (const unsigned char *)canonical,
+            (DWORD)output_index,
+            digest
+        )) {
+        goto cleanup;
+    }
+    digest_to_ascii(digest, root_policy_sha256);
+    ok = 1;
+
+cleanup:
+    SecureZeroMemory(digest, sizeof(digest));
+    if (canonical != NULL) {
+        SecureZeroMemory(canonical, capacity);
+        HeapFree(GetProcessHeap(), 0, canonical);
+    }
+    if (utf8 != NULL) {
+        SecureZeroMemory(utf8, (size_t)utf8_size);
+        HeapFree(GetProcessHeap(), 0, utf8);
+    }
+    return ok;
+}
+
+static int factor_v3_parent_source_sha256_to_wide(
+    const char *value,
+    wchar_t output[65]
+) {
+    size_t index;
+    if (!factor_v3_parent_source_exact_sha256_ascii(value)
+        || output == NULL) {
+        return 0;
+    }
+    for (index = 0; index < 64; ++index) {
+        output[index] = (wchar_t)value[index];
+    }
+    output[64] = L'\0';
+    return 1;
+}
+
+static int factor_v3_parent_source_exact_canonical_path(
+    const wchar_t *path,
+    wchar_t output[32768]
+) {
+    return path != NULL
+        && output != NULL
+        && strict_windows_candidate_path(path)
+        && reject_reparse_chain(path)
+        && canonical_path(path, output, 32768u)
+        && _wcsicmp(path, output) == 0;
+}
+
+static int factor_v3_parent_source_expected_claim_paths(
+    const wchar_t *canonical_root,
+    const char *attempt_key_sha256,
+    wchar_t expected_run[32768],
+    wchar_t expected_verify[32768]
+) {
+    wchar_t attempt_key[65];
+    int run_length;
+    int verify_length;
+    if (canonical_root == NULL
+        || expected_run == NULL
+        || expected_verify == NULL
+        || !factor_v3_parent_source_sha256_to_wide(
+            attempt_key_sha256,
+            attempt_key
+        )) {
+        return 0;
+    }
+    run_length = swprintf(
+        expected_run,
+        32768u,
+        L"%ls\\attempts\\sha256\\%lc%lc\\%ls\\run.claim.json",
+        canonical_root,
+        attempt_key[0],
+        attempt_key[1],
+        attempt_key
+    );
+    verify_length = swprintf(
+        expected_verify,
+        32768u,
+        L"%ls\\attempts\\sha256\\%lc%lc\\%ls\\verify.claim.json",
+        canonical_root,
+        attempt_key[0],
+        attempt_key[1],
+        attempt_key
+    );
+    SecureZeroMemory(attempt_key, sizeof(attempt_key));
+    return run_length > 0
+        && verify_length > 0
+        && run_length < 32768
+        && verify_length < 32768;
+}
+
+static int factor_v3_parent_source_claim_paths_are_canonical(
+    const wchar_t *global_run_claim_path,
+    const wchar_t *global_verify_claim_path,
+    const wchar_t *canonical_root,
+    const char *attempt_key_sha256,
+    wchar_t canonical_run[32768],
+    wchar_t canonical_verify[32768]
+) {
+    wchar_t expected_run[32768];
+    wchar_t expected_verify[32768];
+    int ok = factor_v3_parent_source_expected_claim_paths(
+            canonical_root,
+            attempt_key_sha256,
+            expected_run,
+            expected_verify
+        )
+        && factor_v3_parent_source_exact_canonical_path(
+            global_run_claim_path,
+            canonical_run
+        )
+        && factor_v3_parent_source_exact_canonical_path(
+            global_verify_claim_path,
+            canonical_verify
+        )
+        && _wcsicmp(canonical_run, expected_run) == 0
+        && _wcsicmp(canonical_verify, expected_verify) == 0
+        && _wcsicmp(canonical_run, canonical_verify) != 0;
+    SecureZeroMemory(expected_run, sizeof(expected_run));
+    SecureZeroMemory(expected_verify, sizeof(expected_verify));
+    return ok;
+}
+
+static int factor_v3_parent_source_derive_epoch_receipt_paths(
+    F3ParentSourceRootLease *lease
+) {
+    wchar_t verify_parent[32768];
+    int run_length;
+    int terminal_length;
+    if (lease == NULL
+        || !parent_directory(
+            lease->canonical_run_claim,
+            lease->canonical_claim_directory,
+            sizeof(lease->canonical_claim_directory)
+                / sizeof(lease->canonical_claim_directory[0])
+        )
+        || !parent_directory(
+            lease->canonical_verify_claim,
+            verify_parent,
+            sizeof(verify_parent) / sizeof(verify_parent[0])
+        )
+        || _wcsicmp(
+            lease->canonical_claim_directory,
+            verify_parent
+        ) != 0) {
+        SecureZeroMemory(verify_parent, sizeof(verify_parent));
+        return 0;
+    }
+    run_length = swprintf(
+        lease->canonical_run_receipt,
+        sizeof(lease->canonical_run_receipt)
+            / sizeof(lease->canonical_run_receipt[0]),
+        L"%ls\\run.receipt.json",
+        lease->canonical_claim_directory
+    );
+    terminal_length = swprintf(
+        lease->canonical_terminal_receipt,
+        sizeof(lease->canonical_terminal_receipt)
+            / sizeof(lease->canonical_terminal_receipt[0]),
+        L"%ls\\terminal.receipt.json",
+        lease->canonical_claim_directory
+    );
+    SecureZeroMemory(verify_parent, sizeof(verify_parent));
+    return run_length > 0
+        && terminal_length > 0
+        && run_length < 32768
+        && terminal_length < 32768;
+}
+
+static int factor_v3_parent_source_open_claim_directory(
+    F3ParentSourceRootLease *lease
+) {
+    BY_HANDLE_FILE_INFORMATION information;
+    FILE_ATTRIBUTE_TAG_INFO tag;
+    wchar_t final_path[32768];
+    wchar_t observed[32768];
+    DWORD length;
+    if (lease == NULL
+        || !factor_v3_parent_source_exact_canonical_path(
+            lease->canonical_claim_directory,
+            observed
+        )) {
+        return 0;
+    }
+    lease->claim_directory = CreateFileW(
+        lease->canonical_claim_directory,
+        READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        NULL
+    );
+    if (lease->claim_directory == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    length = GetFinalPathNameByHandleW(
+        lease->claim_directory,
+        final_path,
+        sizeof(final_path) / sizeof(final_path[0]),
+        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
+    );
+    if (!GetFileInformationByHandle(lease->claim_directory, &information)
+        || !GetFileInformationByHandleEx(
+            lease->claim_directory,
+            FileAttributeTagInfo,
+            &tag,
+            sizeof(tag)
+        )
+        || (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+        || (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || length == 0
+        || length >= sizeof(final_path) / sizeof(final_path[0])
+        || !final_path_without_prefix(
+            final_path,
+            observed,
+            sizeof(observed) / sizeof(observed[0])
+        )
+        || _wcsicmp(observed, lease->canonical_claim_directory) != 0
+#ifndef F3_BROKER_TESTING
+        || !held_directory_allows_only_trusted_mutation(
+            lease->claim_directory
+        )
+#endif
+    ) {
+        CloseHandle(lease->claim_directory);
+        lease->claim_directory = INVALID_HANDLE_VALUE;
+        return 0;
+    }
+    lease->claim_volume_serial = information.dwVolumeSerialNumber;
+    lease->claim_file_index_high = information.nFileIndexHigh;
+    lease->claim_file_index_low = information.nFileIndexLow;
+    return 1;
+}
+
+static int factor_v3_parent_source_claim_directory_unchanged(
+    const F3ParentSourceRootLease *lease
+) {
+    BY_HANDLE_FILE_INFORMATION information;
+    FILE_ATTRIBUTE_TAG_INFO tag;
+    wchar_t final_path[32768];
+    wchar_t observed[32768];
+    DWORD length;
+    if (lease == NULL || lease->claim_directory == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    length = GetFinalPathNameByHandleW(
+        lease->claim_directory,
+        final_path,
+        sizeof(final_path) / sizeof(final_path[0]),
+        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
+    );
+    return GetFileInformationByHandle(lease->claim_directory, &information)
+        && GetFileInformationByHandleEx(
+            lease->claim_directory,
+            FileAttributeTagInfo,
+            &tag,
+            sizeof(tag)
+        )
+        && information.dwVolumeSerialNumber == lease->claim_volume_serial
+        && information.nFileIndexHigh == lease->claim_file_index_high
+        && information.nFileIndexLow == lease->claim_file_index_low
+        && (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+        && (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+        && length > 0
+        && length < sizeof(final_path) / sizeof(final_path[0])
+        && final_path_without_prefix(
+            final_path,
+            observed,
+            sizeof(observed) / sizeof(observed[0])
+        )
+        && _wcsicmp(observed, lease->canonical_claim_directory) == 0;
+}
+
+static int factor_v3_parent_source_mutex_security_is_trusted(HANDLE mutex) {
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    PACL dacl = NULL;
+    PSID owner = NULL;
+    int trusted = mutex != NULL
+        && GetSecurityInfo(
+            mutex,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &owner,
+            NULL,
+            &dacl,
+            NULL,
+            &descriptor
+        ) == ERROR_SUCCESS
+        && dacl != NULL
+        && trusted_namespace_owner(owner);
+#ifndef F3_BROKER_TESTING
+    if (trusted) {
+        GENERIC_MAPPING mapping = {
+            STANDARD_RIGHTS_READ | SYNCHRONIZE,
+            STANDARD_RIGHTS_WRITE | MUTEX_MODIFY_STATE,
+            STANDARD_RIGHTS_EXECUTE | SYNCHRONIZE,
+            MUTEX_ALL_ACCESS
+        };
+        trusted = dacl_mutation_writers_are_trusted(
+            dacl,
+            MUTEX_MODIFY_STATE | DELETE | WRITE_DAC | WRITE_OWNER,
+            &mapping
+        );
+    }
+#endif
+    if (descriptor != NULL) {
+        LocalFree(descriptor);
+    }
+    return trusted;
+}
+
+static int factor_v3_parent_source_open_root_directory(
+    const wchar_t *canonical_root,
+    F3ParentSourceRootLease *lease
+) {
+    BY_HANDLE_FILE_INFORMATION information;
+    FILE_ATTRIBUTE_TAG_INFO tag;
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    PACL dacl = NULL;
+    PSID owner = NULL;
+    int trusted;
+    if (canonical_root == NULL || lease == NULL) {
+        return 0;
+    }
+    lease->root_directory = CreateFileW(
+        canonical_root,
+        READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        NULL
+    );
+    if (lease->root_directory == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    trusted = GetFileInformationByHandle(
+            lease->root_directory,
+            &information
+        )
+        && GetFileInformationByHandleEx(
+            lease->root_directory,
+            FileAttributeTagInfo,
+            &tag,
+            sizeof(tag)
+        )
+        && (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+        && (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+        && GetSecurityInfo(
+            lease->root_directory,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &owner,
+            NULL,
+            &dacl,
+            NULL,
+            &descriptor
+        ) == ERROR_SUCCESS
+        && dacl != NULL
+        && trusted_namespace_owner(owner);
+#ifndef F3_BROKER_TESTING
+    if (trusted) {
+        trusted = held_directory_allows_only_trusted_mutation(
+            lease->root_directory
+        );
+    }
+#endif
+    if (descriptor != NULL) {
+        LocalFree(descriptor);
+    }
+    if (!trusted) {
+        CloseHandle(lease->root_directory);
+        lease->root_directory = INVALID_HANDLE_VALUE;
+        return 0;
+    }
+    lease->root_volume_serial = information.dwVolumeSerialNumber;
+    lease->root_file_index_high = information.nFileIndexHigh;
+    lease->root_file_index_low = information.nFileIndexLow;
+    return 1;
+}
+
+static int factor_v3_parent_source_root_directory_unchanged(
+    const F3ParentSourceRootLease *lease
+) {
+    BY_HANDLE_FILE_INFORMATION information;
+    FILE_ATTRIBUTE_TAG_INFO tag;
+    wchar_t final_path[32768];
+    wchar_t observed[32768];
+    DWORD length;
+    if (lease == NULL || lease->root_directory == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    length = GetFinalPathNameByHandleW(
+        lease->root_directory,
+        final_path,
+        32768u,
+        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
+    );
+    return GetFileInformationByHandle(lease->root_directory, &information)
+        && GetFileInformationByHandleEx(
+            lease->root_directory,
+            FileAttributeTagInfo,
+            &tag,
+            sizeof(tag)
+        )
+        && information.dwVolumeSerialNumber == lease->root_volume_serial
+        && information.nFileIndexHigh == lease->root_file_index_high
+        && information.nFileIndexLow == lease->root_file_index_low
+        && (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+        && (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+        && length > 0
+        && length < 32768u
+        && final_path_without_prefix(final_path, observed, 32768u)
+        && _wcsicmp(observed, lease->canonical_root) == 0;
+}
+
+static int factor_v3_parent_source_fixed_root_matches(
+    const wchar_t *canonical_root
+) {
+    wchar_t fixed_root[32768];
+    char derived_policy_sha256[65];
+    if (canonical_root == NULL) {
+        return 0;
+    }
+    if (F3_BROKER_PARENT_SOURCE_GLOBAL_ATTEMPT_LEDGER_ROOT[0] != L'\0') {
+        int matches = factor_v3_parent_source_exact_sha256_ascii(
+                F3_BROKER_PARENT_SOURCE_GLOBAL_ATTEMPT_LEDGER_ROOT_POLICY_SHA256
+            )
+            && factor_v3_parent_source_exact_canonical_path(
+                F3_BROKER_PARENT_SOURCE_GLOBAL_ATTEMPT_LEDGER_ROOT,
+                fixed_root
+            )
+            && _wcsicmp(canonical_root, fixed_root) == 0
+            && factor_v3_parent_source_derive_root_policy_sha256(
+                fixed_root,
+                derived_policy_sha256
+            )
+            && strcmp(
+                derived_policy_sha256,
+                F3_BROKER_PARENT_SOURCE_GLOBAL_ATTEMPT_LEDGER_ROOT_POLICY_SHA256
+            ) == 0;
+        SecureZeroMemory(
+            derived_policy_sha256,
+            sizeof(derived_policy_sha256)
+        );
+        return matches;
+    }
+#ifdef F3_BROKER_TESTING
+    if (f3_parent_source_disposable_fixed_root[0] == L'\0') {
+        size_t length = wcslen(canonical_root);
+        if (length >= 32768u) {
+            return 0;
+        }
+        memcpy(
+            f3_parent_source_disposable_fixed_root,
+            canonical_root,
+            (length + 1u) * sizeof(wchar_t)
+        );
+        return 1;
+    }
+    return _wcsicmp(
+        canonical_root,
+        f3_parent_source_disposable_fixed_root
+    ) == 0;
+#else
+    return 0;
+#endif
+}
+
+static int factor_v3_parent_source_active_lease_contains(
+    const F3ParentSourceRootLease *lease
+) {
+    const F3ParentSourceRootLease *current = f3_parent_source_active_root_leases;
+    while (current != NULL) {
+        if (current == lease) {
+            return 1;
+        }
+        current = current->next;
+    }
+    return 0;
+}
+
+static int factor_v3_parent_source_binding_matches_or_register(
+    const char *run_spec_sha256,
+    const char *attempt_key_sha256,
+    const char *global_attempt_identity_sha256
+) {
+    F3ParentSourceRootBinding *binding = f3_parent_source_root_bindings;
+    while (binding != NULL) {
+        if (strcmp(
+                binding->global_attempt_identity_sha256,
+                global_attempt_identity_sha256
+            ) == 0) {
+            return strcmp(binding->run_spec_sha256, run_spec_sha256) == 0
+                && strcmp(binding->attempt_key_sha256, attempt_key_sha256) == 0;
+        }
+        binding = binding->next;
+    }
+    binding = (F3ParentSourceRootBinding *)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        sizeof(*binding)
+    );
+    if (binding == NULL) {
+        return -1;
+    }
+    memcpy(binding->run_spec_sha256, run_spec_sha256, 65u);
+    memcpy(binding->attempt_key_sha256, attempt_key_sha256, 65u);
+    memcpy(
+        binding->global_attempt_identity_sha256,
+        global_attempt_identity_sha256,
+        65u
+    );
+    binding->next = f3_parent_source_root_bindings;
+    f3_parent_source_root_bindings = binding;
+    return 1;
+}
+
+static int factor_v3_parent_source_binding_matches(
+    const char *run_spec_sha256,
+    const char *attempt_key_sha256,
+    const char *global_attempt_identity_sha256
+) {
+    const F3ParentSourceRootBinding *binding = f3_parent_source_root_bindings;
+    while (binding != NULL) {
+        if (strcmp(
+                binding->global_attempt_identity_sha256,
+                global_attempt_identity_sha256
+            ) == 0) {
+            return strcmp(binding->run_spec_sha256, run_spec_sha256) == 0
+                && strcmp(binding->attempt_key_sha256, attempt_key_sha256) == 0;
+        }
+        binding = binding->next;
+    }
+    return 0;
+}
+
+F3_PARENT_SOURCE_UNUSED static int factor_v3_parent_source_acquire_root_lease(
+    const wchar_t *global_attempt_ledger_root,
+    const wchar_t *global_run_claim_path,
+    const wchar_t *global_verify_claim_path,
+    const char *run_spec_sha256,
+    const char *attempt_key_sha256,
+    const char *global_attempt_identity_sha256,
+    unsigned int timeout_milliseconds,
+    HANDLE *lease_handle
+) {
+    F3ParentSourceRootLease *lease = NULL;
+    char derived_global_identity[65];
+    wchar_t mutex_name[160];
+    wchar_t global_identity[65];
+    DWORD wait_result;
+    int result = 0;
+    int mutex_held = 0;
+    if (lease_handle == NULL) {
+        return 0;
+    }
+    *lease_handle = NULL;
+    if (!factor_v3_parent_source_exact_sha256_ascii(run_spec_sha256)
+        || !factor_v3_parent_source_exact_sha256_ascii(attempt_key_sha256)
+        || !factor_v3_parent_source_exact_sha256_ascii(
+            global_attempt_identity_sha256
+        )
+        || !factor_v3_parent_source_derive_global_attempt_identity_sha256(
+            attempt_key_sha256,
+            derived_global_identity
+        )
+        || strcmp(
+            derived_global_identity,
+            global_attempt_identity_sha256
+        ) != 0
+        || !factor_v3_parent_source_sha256_to_wide(
+            global_attempt_identity_sha256,
+            global_identity
+        )
+        || timeout_milliseconds > F3_PARENT_SOURCE_MAX_TIMEOUT_MILLISECONDS) {
+        return 3;
+    }
+    lease = (F3ParentSourceRootLease *)HeapAlloc(
+        GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        sizeof(*lease)
+    );
+    if (lease == NULL) {
+        return 0;
+    }
+    lease->root_directory = INVALID_HANDLE_VALUE;
+    lease->claim_directory = INVALID_HANDLE_VALUE;
+    {
+        size_t epoch_index;
+        for (epoch_index = 0; epoch_index < 4u; ++epoch_index) {
+            lease->epoch_files[epoch_index].handle = INVALID_HANDLE_VALUE;
+        }
+    }
+    if (!factor_v3_parent_source_exact_canonical_path(
+            global_attempt_ledger_root,
+            lease->canonical_root
+        )
+        || !factor_v3_parent_source_claim_paths_are_canonical(
+            global_run_claim_path,
+            global_verify_claim_path,
+            lease->canonical_root,
+            attempt_key_sha256,
+            lease->canonical_run_claim,
+            lease->canonical_verify_claim
+        )
+        || !factor_v3_parent_source_derive_epoch_receipt_paths(lease)
+        || !factor_v3_parent_source_open_root_directory(
+            lease->canonical_root,
+            lease
+        )
+        || !factor_v3_parent_source_open_claim_directory(
+            lease
+        )) {
+        result = 3;
+        goto cleanup;
+    }
+    if (swprintf(
+            mutex_name,
+            sizeof(mutex_name) / sizeof(mutex_name[0]),
+            L"%ls%ls",
+            F3_PARENT_SOURCE_MUTEX_PREFIX,
+            global_identity
+        ) <= 0) {
+        goto cleanup;
+    }
+    lease->mutex = CreateMutexW(NULL, FALSE, mutex_name);
+    if (lease->mutex == NULL
+        || !factor_v3_parent_source_mutex_security_is_trusted(lease->mutex)) {
+        goto cleanup;
+    }
+    wait_result = WaitForSingleObject(lease->mutex, timeout_milliseconds);
+    if (wait_result == WAIT_TIMEOUT) {
+        result = 2;
+        goto cleanup;
+    }
+    if (wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED_0) {
+        goto cleanup;
+    }
+    mutex_held = 1;
+    AcquireSRWLockExclusive(&f3_parent_source_root_lease_lock);
+    if (!factor_v3_parent_source_fixed_root_matches(lease->canonical_root)) {
+        result = 3;
+    } else {
+        int binding_result = factor_v3_parent_source_binding_matches_or_register(
+            run_spec_sha256,
+            attempt_key_sha256,
+            global_attempt_identity_sha256
+        );
+        F3ParentSourceRootLease *active = f3_parent_source_active_root_leases;
+        if (binding_result < 0) {
+            result = 0;
+        } else if (binding_result == 0) {
+            result = 3;
+        }
+        while (binding_result > 0 && result == 0 && active != NULL) {
+            if (strcmp(
+                    active->global_attempt_identity_sha256,
+                    global_attempt_identity_sha256
+                ) == 0) {
+                result = 2;
+                break;
+            }
+            active = active->next;
+        }
+        if (binding_result > 0 && result == 0 && active == NULL) {
+            memcpy(lease->run_spec_sha256, run_spec_sha256, 65u);
+            memcpy(lease->attempt_key_sha256, attempt_key_sha256, 65u);
+            memcpy(
+                lease->global_attempt_identity_sha256,
+                global_attempt_identity_sha256,
+                65u
+            );
+            lease->owner_thread_id = GetCurrentThreadId();
+            lease->next = f3_parent_source_active_root_leases;
+            f3_parent_source_active_root_leases = lease;
+            result = 1;
+        }
+    }
+    ReleaseSRWLockExclusive(&f3_parent_source_root_lease_lock);
+    if (result != 1) {
+        goto cleanup;
+    }
+    *lease_handle = (HANDLE)lease;
+    SecureZeroMemory(derived_global_identity, sizeof(derived_global_identity));
+    SecureZeroMemory(global_identity, sizeof(global_identity));
+    SecureZeroMemory(mutex_name, sizeof(mutex_name));
+    return 1;
+
+cleanup:
+    if (mutex_held && lease != NULL && lease->mutex != NULL) {
+        ReleaseMutex(lease->mutex);
+    }
+    if (lease != NULL) {
+        if (lease->mutex != NULL) {
+            CloseHandle(lease->mutex);
+        }
+        if (lease->root_directory != INVALID_HANDLE_VALUE) {
+            CloseHandle(lease->root_directory);
+        }
+        if (lease->claim_directory != INVALID_HANDLE_VALUE) {
+            CloseHandle(lease->claim_directory);
+        }
+        {
+            size_t epoch_index;
+            for (epoch_index = 0; epoch_index < 4u; ++epoch_index) {
+                close_held(&lease->epoch_files[epoch_index]);
+            }
+        }
+        SecureZeroMemory(lease, sizeof(*lease));
+        HeapFree(GetProcessHeap(), 0, lease);
+    }
+    SecureZeroMemory(derived_global_identity, sizeof(derived_global_identity));
+    SecureZeroMemory(global_identity, sizeof(global_identity));
+    SecureZeroMemory(mutex_name, sizeof(mutex_name));
+    return result;
+}
+
+static int factor_v3_parent_source_root_lease_unchanged(
+    HANDLE lease_handle,
+    const char *run_spec_sha256,
+    const char *attempt_key_sha256,
+    const char *global_attempt_identity_sha256
+) {
+    F3ParentSourceRootLease *lease = (F3ParentSourceRootLease *)lease_handle;
+    char derived_global_identity[65];
+    int registered;
+    int unchanged;
+    if (lease == NULL
+        || !factor_v3_parent_source_exact_sha256_ascii(run_spec_sha256)
+        || !factor_v3_parent_source_exact_sha256_ascii(attempt_key_sha256)
+        || !factor_v3_parent_source_exact_sha256_ascii(
+            global_attempt_identity_sha256
+        )
+        || !factor_v3_parent_source_derive_global_attempt_identity_sha256(
+            attempt_key_sha256,
+            derived_global_identity
+        )) {
+        return 0;
+    }
+    AcquireSRWLockShared(&f3_parent_source_root_lease_lock);
+    registered = factor_v3_parent_source_active_lease_contains(lease);
+    unchanged = registered
+        && lease->owner_thread_id == GetCurrentThreadId()
+        && strcmp(lease->run_spec_sha256, run_spec_sha256) == 0
+        && strcmp(lease->attempt_key_sha256, attempt_key_sha256) == 0
+        && strcmp(
+            lease->global_attempt_identity_sha256,
+            global_attempt_identity_sha256
+        ) == 0
+        && strcmp(derived_global_identity, global_attempt_identity_sha256) == 0
+        && factor_v3_parent_source_binding_matches(
+            run_spec_sha256,
+            attempt_key_sha256,
+            global_attempt_identity_sha256
+        )
+        && factor_v3_parent_source_fixed_root_matches(lease->canonical_root)
+        && factor_v3_parent_source_root_directory_unchanged(lease)
+        && factor_v3_parent_source_claim_directory_unchanged(lease);
+    ReleaseSRWLockShared(&f3_parent_source_root_lease_lock);
+    SecureZeroMemory(derived_global_identity, sizeof(derived_global_identity));
+    return unchanged;
+}
+
+F3_PARENT_SOURCE_UNUSED static int factor_v3_parent_source_release_root_lease(
+    HANDLE lease_handle
+) {
+    F3ParentSourceRootLease *lease = (F3ParentSourceRootLease *)lease_handle;
+    F3ParentSourceRootLease **current;
+    int closed;
+    if (lease == NULL) {
+        return 0;
+    }
+    AcquireSRWLockExclusive(&f3_parent_source_root_lease_lock);
+    current = &f3_parent_source_active_root_leases;
+    while (*current != NULL && *current != lease) {
+        current = &(*current)->next;
+    }
+    if (*current != lease || lease->owner_thread_id != GetCurrentThreadId()) {
+        ReleaseSRWLockExclusive(&f3_parent_source_root_lease_lock);
+        return 0;
+    }
+    if (!ReleaseMutex(lease->mutex)) {
+        ReleaseSRWLockExclusive(&f3_parent_source_root_lease_lock);
+        return 0;
+    }
+    *current = lease->next;
+    ReleaseSRWLockExclusive(&f3_parent_source_root_lease_lock);
+    closed = CloseHandle(lease->mutex) != 0;
+    closed = (CloseHandle(lease->root_directory) != 0) && closed;
+    closed = (CloseHandle(lease->claim_directory) != 0) && closed;
+    {
+        size_t epoch_index;
+        for (epoch_index = 0; epoch_index < 4u; ++epoch_index) {
+            close_held(&lease->epoch_files[epoch_index]);
+        }
+    }
+    SecureZeroMemory(lease, sizeof(*lease));
+    HeapFree(GetProcessHeap(), 0, lease);
+    return closed;
+}
+
+static int factor_v3_parent_source_render_run_claim(
+    const F3ParentSourceRootLease *lease,
+    char output[1024],
+    DWORD *output_size
+) {
+    int length;
+    if (lease == NULL || output == NULL || output_size == NULL) {
+        return 0;
+    }
+    length = snprintf(
+        output,
+        1024u,
+        "{\"action\":1,\"attempt_key_sha256\":\"%s\","
+        "\"global_attempt_identity_sha256\":\"%s\","
+        "\"run_spec_sha256\":\"%s\",\"schema\":\"%s\",\"state\":1}",
+        lease->attempt_key_sha256,
+        lease->global_attempt_identity_sha256,
+        lease->run_spec_sha256,
+        F3_PARENT_SOURCE_RUN_CLAIM_SCHEMA_VALUE
+    );
+    if (length <= 0 || length >= 1024) {
+        return 0;
+    }
+    *output_size = (DWORD)length;
+    return 1;
+}
+
+static int factor_v3_parent_source_raw_sha256(
+    const char *raw,
+    DWORD raw_size,
+    char output[65]
+) {
+    unsigned char digest[32];
+    if (raw == NULL
+        || output == NULL
+        || raw_size == 0
+        || !hash_memory((const unsigned char *)raw, raw_size, digest)) {
+        return 0;
+    }
+    digest_to_ascii(digest, output);
+    SecureZeroMemory(digest, sizeof(digest));
+    return 1;
+}
+
+static int factor_v3_parent_source_render_run_receipt(
+    const F3ParentSourceRootLease *lease,
+    const char *run_claim_sha256,
+    char output[1024],
+    DWORD *output_size
+) {
+    int length;
+    if (lease == NULL
+        || output == NULL
+        || output_size == NULL
+        || !factor_v3_parent_source_exact_sha256_ascii(run_claim_sha256)) {
+        return 0;
+    }
+    length = snprintf(
+        output,
+        1024u,
+        "{\"attempt_key_sha256\":\"%s\","
+        "\"global_attempt_identity_sha256\":\"%s\","
+        "\"run_claim_sha256\":\"%s\",\"run_spec_sha256\":\"%s\","
+        "\"schema\":\"%s\",\"state\":2}",
+        lease->attempt_key_sha256,
+        lease->global_attempt_identity_sha256,
+        run_claim_sha256,
+        lease->run_spec_sha256,
+        F3_PARENT_SOURCE_RUN_RECEIPT_SCHEMA_VALUE
+    );
+    if (length <= 0 || length >= 1024) {
+        return 0;
+    }
+    *output_size = (DWORD)length;
+    return 1;
+}
+
+static int factor_v3_parent_source_render_verify_claim(
+    const F3ParentSourceRootLease *lease,
+    const char *run_receipt_sha256,
+    char output[1024],
+    DWORD *output_size
+) {
+    int length;
+    if (lease == NULL
+        || output == NULL
+        || output_size == NULL
+        || !factor_v3_parent_source_exact_sha256_ascii(run_receipt_sha256)) {
+        return 0;
+    }
+    length = snprintf(
+        output,
+        1024u,
+        "{\"action\":2,\"attempt_key_sha256\":\"%s\","
+        "\"global_attempt_identity_sha256\":\"%s\","
+        "\"run_receipt_sha256\":\"%s\",\"run_spec_sha256\":\"%s\","
+        "\"schema\":\"%s\",\"state\":3}",
+        lease->attempt_key_sha256,
+        lease->global_attempt_identity_sha256,
+        run_receipt_sha256,
+        lease->run_spec_sha256,
+        F3_PARENT_SOURCE_VERIFY_CLAIM_SCHEMA_VALUE
+    );
+    if (length <= 0 || length >= 1024) {
+        return 0;
+    }
+    *output_size = (DWORD)length;
+    return 1;
+}
+
+static int factor_v3_parent_source_render_terminal_receipt(
+    const F3ParentSourceRootLease *lease,
+    const char *run_receipt_sha256,
+    const char *verify_claim_sha256,
+    char output[1024],
+    DWORD *output_size
+) {
+    int length;
+    if (lease == NULL
+        || output == NULL
+        || output_size == NULL
+        || !factor_v3_parent_source_exact_sha256_ascii(run_receipt_sha256)
+        || !factor_v3_parent_source_exact_sha256_ascii(verify_claim_sha256)) {
+        return 0;
+    }
+    length = snprintf(
+        output,
+        1024u,
+        "{\"attempt_key_sha256\":\"%s\","
+        "\"global_attempt_identity_sha256\":\"%s\","
+        "\"run_receipt_sha256\":\"%s\",\"run_spec_sha256\":\"%s\","
+        "\"schema\":\"%s\",\"state\":4,"
+        "\"verify_claim_sha256\":\"%s\"}",
+        lease->attempt_key_sha256,
+        lease->global_attempt_identity_sha256,
+        run_receipt_sha256,
+        lease->run_spec_sha256,
+        F3_PARENT_SOURCE_TERMINAL_RECEIPT_SCHEMA_VALUE,
+        verify_claim_sha256
+    );
+    if (length <= 0 || length >= 1024) {
+        return 0;
+    }
+    *output_size = (DWORD)length;
+    return 1;
+}
+
+static int factor_v3_parent_source_open_exact_epoch_file(
+    const wchar_t *path,
+    const char *expected,
+    DWORD expected_size,
+    HeldFile *held,
+    int *present
+) {
+    DWORD attributes;
+    DWORD error;
+    unsigned char *raw = NULL;
+    DWORD raw_size = 0;
+    int ok;
+    if (path == NULL
+        || expected == NULL
+        || expected_size == 0
+        || held == NULL
+        || present == NULL) {
+        return 0;
+    }
+    if (held->handle == INVALID_HANDLE_VALUE) {
+        attributes = GetFileAttributesW(path);
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            error = GetLastError();
+            if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+                *present = 0;
+                return 1;
+            }
+            return 0;
+        }
+        if (!open_held_file(path, 1024u, held)) {
+            return 0;
+        }
+    }
+    ok = read_candidate(held, &raw, &raw_size)
+        && raw_size == expected_size
+        && memcmp(raw, expected, expected_size) == 0
+        && held_unchanged(held, NULL);
+    if (raw != NULL) {
+        SecureZeroMemory(raw, (SIZE_T)raw_size + 1u);
+        HeapFree(GetProcessHeap(), 0, raw);
+    }
+    if (!ok) {
+        return 0;
+    }
+    *present = 1;
+    return 1;
+}
+
+static int factor_v3_parent_source_atomic_write_epoch_file(
+    F3ParentSourceRootLease *lease,
+    const wchar_t *path,
+    const char *raw,
+    DWORD raw_size,
+    HeldFile *held
+) {
+    wchar_t temporary[32768];
+    HANDLE stream = INVALID_HANDLE_VALUE;
+    DWORD written = 0;
+    DWORD total = 0;
+    unsigned int attempt;
+    int moved = 0;
+    int present = 0;
+    if (lease == NULL
+        || path == NULL
+        || raw == NULL
+        || raw_size == 0
+        || held == NULL
+        || held->handle != INVALID_HANDLE_VALUE
+        || !factor_v3_parent_source_root_directory_unchanged(lease)
+        || !factor_v3_parent_source_claim_directory_unchanged(lease)
+        || GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+        return 0;
+    }
+    for (attempt = 0u; attempt < 16u; ++attempt) {
+        int length = swprintf(
+            temporary,
+            sizeof(temporary) / sizeof(temporary[0]),
+            L"%ls\\.parent-source-epoch-staging-%lu-%lu-%llu-%u.tmp",
+            lease->canonical_claim_directory,
+            GetCurrentProcessId(),
+            GetCurrentThreadId(),
+            (unsigned long long)GetTickCount64(),
+            attempt
+        );
+        if (length <= 0
+            || (size_t)length >= sizeof(temporary) / sizeof(temporary[0])) {
+            return 0;
+        }
+        stream = CreateFileW(
+            temporary,
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            NULL,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+            NULL
+        );
+        if (stream != INVALID_HANDLE_VALUE) {
+            break;
+        }
+        if (GetLastError() != ERROR_FILE_EXISTS
+            && GetLastError() != ERROR_ALREADY_EXISTS) {
+            return 0;
+        }
+    }
+    if (stream == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    while (total < raw_size) {
+        if (!WriteFile(
+                stream,
+                raw + total,
+                raw_size - total,
+                &written,
+                NULL
+            )
+            || written == 0) {
+            goto cleanup;
+        }
+        total += written;
+    }
+    if (!FlushFileBuffers(stream)) {
+        goto cleanup;
+    }
+    CloseHandle(stream);
+    stream = INVALID_HANDLE_VALUE;
+    if (!MoveFileExW(temporary, path, MOVEFILE_WRITE_THROUGH)) {
+        goto cleanup;
+    }
+    moved = 1;
+    if (!factor_v3_parent_source_open_exact_epoch_file(
+            path,
+            raw,
+            raw_size,
+            held,
+            &present
+        )
+        || !present
+        || !factor_v3_parent_source_root_directory_unchanged(lease)
+        || !factor_v3_parent_source_claim_directory_unchanged(lease)) {
+        goto cleanup;
+    }
+    SecureZeroMemory(temporary, sizeof(temporary));
+    return 1;
+
+cleanup:
+    if (stream != INVALID_HANDLE_VALUE) {
+        CloseHandle(stream);
+    }
+    if (!moved) {
+        DeleteFileW(temporary);
+    }
+    SecureZeroMemory(temporary, sizeof(temporary));
+    return 0;
+}
+
+static int factor_v3_parent_source_epoch_directory_is_exact_namespace(
+    F3ParentSourceRootLease *lease
+) {
+    wchar_t pattern[32768];
+    WIN32_FIND_DATAW data;
+    HANDLE search = INVALID_HANDLE_VALUE;
+    unsigned int observed_mask = 0u;
+    DWORD terminal_error = ERROR_SUCCESS;
+    int length;
+    int ok = 0;
+    if (lease == NULL
+        || !factor_v3_parent_source_root_directory_unchanged(lease)
+        || !factor_v3_parent_source_claim_directory_unchanged(lease)) {
+        return 0;
+    }
+    length = swprintf(
+        pattern,
+        sizeof(pattern) / sizeof(pattern[0]),
+        L"%ls\\*",
+        lease->canonical_claim_directory
+    );
+    if (length <= 0
+        || (size_t)length >= sizeof(pattern) / sizeof(pattern[0])) {
+        return 0;
+    }
+    search = FindFirstFileExW(
+        pattern,
+        FindExInfoBasic,
+        &data,
+        FindExSearchNameMatch,
+        NULL,
+        FIND_FIRST_EX_LARGE_FETCH
+    );
+    if (search == INVALID_HANDLE_VALUE) {
+        terminal_error = GetLastError();
+        SecureZeroMemory(pattern, sizeof(pattern));
+        return terminal_error == ERROR_FILE_NOT_FOUND
+            && factor_v3_parent_source_root_directory_unchanged(lease)
+            && factor_v3_parent_source_claim_directory_unchanged(lease);
+    }
+    while (1) {
+        unsigned int bit = 0u;
+        if (wcscmp(data.cFileName, L".") != 0
+            && wcscmp(data.cFileName, L"..") != 0) {
+            if (wcscmp(data.cFileName, L"run.claim.json") == 0) {
+                bit = 1u;
+            } else if (wcscmp(data.cFileName, L"run.receipt.json") == 0) {
+                bit = 2u;
+            } else if (wcscmp(data.cFileName, L"verify.claim.json") == 0) {
+                bit = 4u;
+            } else if (wcscmp(
+                    data.cFileName,
+                    L"terminal.receipt.json"
+                ) == 0) {
+                bit = 8u;
+            }
+            if (bit == 0u
+                || (observed_mask & bit) != 0u
+                || (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+                || (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                goto cleanup;
+            }
+            observed_mask |= bit;
+        }
+        if (FindNextFileW(search, &data)) {
+            continue;
+        }
+        terminal_error = GetLastError();
+        if (terminal_error != ERROR_NO_MORE_FILES) {
+            goto cleanup;
+        }
+        break;
+    }
+    ok = factor_v3_parent_source_root_directory_unchanged(lease)
+        && factor_v3_parent_source_claim_directory_unchanged(lease);
+
+cleanup:
+    if (search != INVALID_HANDLE_VALUE && !FindClose(search)) {
+        ok = 0;
+    }
+    SecureZeroMemory(&data, sizeof(data));
+    SecureZeroMemory(pattern, sizeof(pattern));
+    return ok;
+}
+
+static int factor_v3_parent_source_observe_persistent_root_state(
+    F3ParentSourceRootLease *lease,
+    unsigned int *root_state
+) {
+    char run_claim[1024];
+    char run_receipt[1024];
+    char verify_claim[1024];
+    char terminal_receipt[1024];
+    char run_claim_sha256[65];
+    char run_receipt_sha256[65];
+    char verify_claim_sha256[65];
+    DWORD run_claim_size = 0;
+    DWORD run_receipt_size = 0;
+    DWORD verify_claim_size = 0;
+    DWORD terminal_receipt_size = 0;
+    int present[4] = {0, 0, 0, 0};
+    int ok = lease != NULL
+        && root_state != NULL
+        && factor_v3_parent_source_epoch_directory_is_exact_namespace(lease)
+        && factor_v3_parent_source_render_run_claim(
+            lease,
+            run_claim,
+            &run_claim_size
+        )
+        && factor_v3_parent_source_raw_sha256(
+            run_claim,
+            run_claim_size,
+            run_claim_sha256
+        )
+        && factor_v3_parent_source_render_run_receipt(
+            lease,
+            run_claim_sha256,
+            run_receipt,
+            &run_receipt_size
+        )
+        && factor_v3_parent_source_raw_sha256(
+            run_receipt,
+            run_receipt_size,
+            run_receipt_sha256
+        )
+        && factor_v3_parent_source_render_verify_claim(
+            lease,
+            run_receipt_sha256,
+            verify_claim,
+            &verify_claim_size
+        )
+        && factor_v3_parent_source_raw_sha256(
+            verify_claim,
+            verify_claim_size,
+            verify_claim_sha256
+        )
+        && factor_v3_parent_source_render_terminal_receipt(
+            lease,
+            run_receipt_sha256,
+            verify_claim_sha256,
+            terminal_receipt,
+            &terminal_receipt_size
+        )
+        && factor_v3_parent_source_open_exact_epoch_file(
+            lease->canonical_run_claim,
+            run_claim,
+            run_claim_size,
+            &lease->epoch_files[0],
+            &present[0]
+        )
+        && factor_v3_parent_source_open_exact_epoch_file(
+            lease->canonical_run_receipt,
+            run_receipt,
+            run_receipt_size,
+            &lease->epoch_files[1],
+            &present[1]
+        )
+        && factor_v3_parent_source_open_exact_epoch_file(
+            lease->canonical_verify_claim,
+            verify_claim,
+            verify_claim_size,
+            &lease->epoch_files[2],
+            &present[2]
+        )
+        && factor_v3_parent_source_open_exact_epoch_file(
+            lease->canonical_terminal_receipt,
+            terminal_receipt,
+            terminal_receipt_size,
+            &lease->epoch_files[3],
+            &present[3]
+        )
+        && factor_v3_parent_source_epoch_directory_is_exact_namespace(lease);
+    if (ok) {
+        if (!present[0] && !present[1] && !present[2] && !present[3]) {
+            *root_state = 0u;
+        } else if (present[0] && !present[1] && !present[2] && !present[3]) {
+            *root_state = 1u;
+        } else if (present[0] && present[1] && !present[2] && !present[3]) {
+            *root_state = 2u;
+        } else if (present[0] && present[1] && present[2] && !present[3]) {
+            *root_state = 3u;
+        } else if (present[0] && present[1] && present[2] && present[3]) {
+            *root_state = 4u;
+        } else {
+            ok = 0;
+        }
+    }
+    SecureZeroMemory(run_claim, sizeof(run_claim));
+    SecureZeroMemory(run_receipt, sizeof(run_receipt));
+    SecureZeroMemory(verify_claim, sizeof(verify_claim));
+    SecureZeroMemory(terminal_receipt, sizeof(terminal_receipt));
+    SecureZeroMemory(run_claim_sha256, sizeof(run_claim_sha256));
+    SecureZeroMemory(run_receipt_sha256, sizeof(run_receipt_sha256));
+    SecureZeroMemory(verify_claim_sha256, sizeof(verify_claim_sha256));
+    return ok;
+}
+
+F3_PARENT_SOURCE_UNUSED static int factor_v3_parent_source_publish_run_receipt(
+    HANDLE lease_handle,
+    const char *run_spec_sha256,
+    const char *attempt_key_sha256,
+    const char *global_attempt_identity_sha256
+) {
+    F3ParentSourceRootLease *lease = (F3ParentSourceRootLease *)lease_handle;
+    char run_claim[1024];
+    char run_receipt[1024];
+    char run_claim_sha256[65];
+    DWORD run_claim_size = 0;
+    DWORD run_receipt_size = 0;
+    unsigned int before = 99u;
+    unsigned int after = 99u;
+    int ok = factor_v3_parent_source_root_lease_unchanged(
+            lease_handle,
+            run_spec_sha256,
+            attempt_key_sha256,
+            global_attempt_identity_sha256
+        )
+        && factor_v3_parent_source_observe_persistent_root_state(lease, &before)
+        && before == 1u
+        && factor_v3_parent_source_render_run_claim(
+            lease,
+            run_claim,
+            &run_claim_size
+        )
+        && factor_v3_parent_source_raw_sha256(
+            run_claim,
+            run_claim_size,
+            run_claim_sha256
+        )
+        && factor_v3_parent_source_render_run_receipt(
+            lease,
+            run_claim_sha256,
+            run_receipt,
+            &run_receipt_size
+        )
+        && factor_v3_parent_source_atomic_write_epoch_file(
+            lease,
+            lease->canonical_run_receipt,
+            run_receipt,
+            run_receipt_size,
+            &lease->epoch_files[1]
+        )
+        && factor_v3_parent_source_observe_persistent_root_state(lease, &after)
+        && after == 2u;
+    SecureZeroMemory(run_claim, sizeof(run_claim));
+    SecureZeroMemory(run_receipt, sizeof(run_receipt));
+    SecureZeroMemory(run_claim_sha256, sizeof(run_claim_sha256));
+    return ok;
+}
+
+F3_PARENT_SOURCE_UNUSED static int factor_v3_parent_source_publish_terminal_receipt(
+    HANDLE lease_handle,
+    const char *run_spec_sha256,
+    const char *attempt_key_sha256,
+    const char *global_attempt_identity_sha256
+) {
+    F3ParentSourceRootLease *lease = (F3ParentSourceRootLease *)lease_handle;
+    char run_claim[1024];
+    char run_receipt[1024];
+    char verify_claim[1024];
+    char terminal_receipt[1024];
+    char run_claim_sha256[65];
+    char run_receipt_sha256[65];
+    char verify_claim_sha256[65];
+    DWORD run_claim_size = 0;
+    DWORD run_receipt_size = 0;
+    DWORD verify_claim_size = 0;
+    DWORD terminal_receipt_size = 0;
+    unsigned int before = 99u;
+    unsigned int after = 99u;
+    int ok = factor_v3_parent_source_root_lease_unchanged(
+            lease_handle,
+            run_spec_sha256,
+            attempt_key_sha256,
+            global_attempt_identity_sha256
+        )
+        && factor_v3_parent_source_observe_persistent_root_state(lease, &before)
+        && before == 3u
+        && factor_v3_parent_source_render_run_claim(
+            lease,
+            run_claim,
+            &run_claim_size
+        )
+        && factor_v3_parent_source_raw_sha256(
+            run_claim,
+            run_claim_size,
+            run_claim_sha256
+        )
+        && factor_v3_parent_source_render_run_receipt(
+            lease,
+            run_claim_sha256,
+            run_receipt,
+            &run_receipt_size
+        )
+        && factor_v3_parent_source_raw_sha256(
+            run_receipt,
+            run_receipt_size,
+            run_receipt_sha256
+        )
+        && factor_v3_parent_source_render_verify_claim(
+            lease,
+            run_receipt_sha256,
+            verify_claim,
+            &verify_claim_size
+        )
+        && factor_v3_parent_source_raw_sha256(
+            verify_claim,
+            verify_claim_size,
+            verify_claim_sha256
+        )
+        && factor_v3_parent_source_render_terminal_receipt(
+            lease,
+            run_receipt_sha256,
+            verify_claim_sha256,
+            terminal_receipt,
+            &terminal_receipt_size
+        )
+        && factor_v3_parent_source_atomic_write_epoch_file(
+            lease,
+            lease->canonical_terminal_receipt,
+            terminal_receipt,
+            terminal_receipt_size,
+            &lease->epoch_files[3]
+        )
+        && factor_v3_parent_source_observe_persistent_root_state(lease, &after)
+        && after == 4u;
+    SecureZeroMemory(run_claim, sizeof(run_claim));
+    SecureZeroMemory(run_receipt, sizeof(run_receipt));
+    SecureZeroMemory(verify_claim, sizeof(verify_claim));
+    SecureZeroMemory(terminal_receipt, sizeof(terminal_receipt));
+    SecureZeroMemory(run_claim_sha256, sizeof(run_claim_sha256));
+    SecureZeroMemory(run_receipt_sha256, sizeof(run_receipt_sha256));
+    SecureZeroMemory(verify_claim_sha256, sizeof(verify_claim_sha256));
+    return ok;
+}
+
+F3_PARENT_SOURCE_UNUSED static int factor_v3_parent_source_lookup_root_epoch_transition(
+    HANDLE lease_handle,
+    const char *run_spec_sha256,
+    const char *attempt_key_sha256,
+    const char *global_attempt_identity_sha256,
+    unsigned int requested_action,
+    unsigned int *observed_root_state,
+    unsigned int *transition
+) {
+    F3ParentSourceRootLease *lease = (F3ParentSourceRootLease *)lease_handle;
+    char raw[1024];
+    char run_claim[1024];
+    char run_claim_sha256[65];
+    char run_receipt[1024];
+    char run_receipt_sha256[65];
+    DWORD raw_size = 0;
+    DWORD run_claim_size = 0;
+    DWORD run_receipt_size = 0;
+    unsigned int state = 99u;
+    unsigned int after = 99u;
+    int ok;
+    if (observed_root_state == NULL
+        || transition == NULL
+        || requested_action < 1u
+        || requested_action > 2u
+        || !factor_v3_parent_source_root_lease_unchanged(
+            lease_handle,
+            run_spec_sha256,
+            attempt_key_sha256,
+            global_attempt_identity_sha256
+        )
+        || !factor_v3_parent_source_observe_persistent_root_state(
+            lease,
+            &state
+        )) {
+        return 0;
+    }
+    *observed_root_state = state;
+    if (state == 0u && requested_action == 1u) {
+        ok = factor_v3_parent_source_render_run_claim(
+                lease,
+                raw,
+                &raw_size
+            )
+            && factor_v3_parent_source_atomic_write_epoch_file(
+                lease,
+                lease->canonical_run_claim,
+                raw,
+                raw_size,
+                &lease->epoch_files[0]
+            )
+            && factor_v3_parent_source_observe_persistent_root_state(
+                lease,
+                &after
+            )
+            && after == 1u;
+        if (!ok) {
+            SecureZeroMemory(raw, sizeof(raw));
+            return 0;
+        }
+        *transition = 1u;
+    } else if (state == 2u && requested_action == 2u) {
+        ok = factor_v3_parent_source_render_run_claim(
+                lease,
+                run_claim,
+                &run_claim_size
+            )
+            && factor_v3_parent_source_raw_sha256(
+                run_claim,
+                run_claim_size,
+                run_claim_sha256
+            )
+            && factor_v3_parent_source_render_run_receipt(
+                lease,
+                run_claim_sha256,
+                run_receipt,
+                &run_receipt_size
+            )
+            && factor_v3_parent_source_raw_sha256(
+                run_receipt,
+                run_receipt_size,
+                run_receipt_sha256
+            )
+            && factor_v3_parent_source_render_verify_claim(
+                lease,
+                run_receipt_sha256,
+                raw,
+                &raw_size
+            )
+            && factor_v3_parent_source_atomic_write_epoch_file(
+                lease,
+                lease->canonical_verify_claim,
+                raw,
+                raw_size,
+                &lease->epoch_files[2]
+            )
+            && factor_v3_parent_source_observe_persistent_root_state(
+                lease,
+                &after
+            )
+            && after == 3u;
+        if (!ok) {
+            SecureZeroMemory(raw, sizeof(raw));
+            SecureZeroMemory(run_claim, sizeof(run_claim));
+            SecureZeroMemory(run_receipt, sizeof(run_receipt));
+            SecureZeroMemory(run_claim_sha256, sizeof(run_claim_sha256));
+            SecureZeroMemory(run_receipt_sha256, sizeof(run_receipt_sha256));
+            return 0;
+        }
+        *transition = 3u;
+    } else {
+        *transition = 2u;
+    }
+    SecureZeroMemory(raw, sizeof(raw));
+    SecureZeroMemory(run_claim, sizeof(run_claim));
+    SecureZeroMemory(run_receipt, sizeof(run_receipt));
+    SecureZeroMemory(run_claim_sha256, sizeof(run_claim_sha256));
+    SecureZeroMemory(run_receipt_sha256, sizeof(run_receipt_sha256));
+    return 1;
 }
 
 static int parse_production_candidate(

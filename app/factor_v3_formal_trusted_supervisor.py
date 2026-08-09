@@ -123,6 +123,49 @@ COMPLETED_SCHEMA = "factor-v3-formal-supervisor-execution-completed/v2"
 RESUME_TRANSITION_SCHEMA = "factor-v3-formal-supervisor-resume-transition/v1"
 WORKER_ENVIRONMENT_POLICY = worker_environment_policy()
 
+PARENT_SOURCE_ATTEMPT_KEY_SCHEMA = (
+    "factor-v3-parent-source-development-authority-attempt-key/v1"
+)
+PARENT_SOURCE_GLOBAL_ATTEMPT_IDENTITY_SCHEMA = (
+    "factor-v3-parent-source-global-attempt-identity/v1"
+)
+PARENT_SOURCE_ROOT_POLICY_SCHEMA = "factor-v3-parent-source-root-policy/v1"
+PARENT_SOURCE_ROOT_RUN_CLAIM_SCHEMA = "factor-v3-parent-source-root-run-claim/v1"
+PARENT_SOURCE_ROOT_RUN_RECEIPT_SCHEMA = (
+    "factor-v3-parent-source-root-run-receipt/v1"
+)
+PARENT_SOURCE_ROOT_VERIFY_CLAIM_SCHEMA = (
+    "factor-v3-parent-source-root-verify-claim/v1"
+)
+PARENT_SOURCE_ROOT_TERMINAL_RECEIPT_SCHEMA = (
+    "factor-v3-parent-source-root-terminal-receipt/v1"
+)
+PARENT_SOURCE_ROOT_STATE_EMPTY = 0
+PARENT_SOURCE_ROOT_STATE_CLAIMED = 1
+PARENT_SOURCE_ROOT_STATE_COMPLETED = 2
+PARENT_SOURCE_ROOT_STATE_VERIFY_CLAIMED = 3
+PARENT_SOURCE_ROOT_STATE_TERMINAL = 4
+PARENT_SOURCE_ROOT_ACTION_RUN = 1
+PARENT_SOURCE_ROOT_ACTION_VERIFY = 2
+PARENT_SOURCE_ROOT_TRANSITION_START_RUN = 1
+PARENT_SOURCE_ROOT_TRANSITION_REJECT = 2
+PARENT_SOURCE_ROOT_TRANSITION_START_VERIFY = 3
+PARENT_SOURCE_ROOT_LEASE_ERROR = 0
+PARENT_SOURCE_ROOT_LEASE_ACQUIRED = 1
+PARENT_SOURCE_ROOT_LEASE_CONTENDED = 2
+PARENT_SOURCE_ROOT_LEASE_BINDING_REJECTED = 3
+_PARENT_SOURCE_ROOT_MUTEX_PREFIX = (
+    "Global\\quant-signal-lkj.factor-v3.parent-source."
+)
+_PARENT_SOURCE_EPOCH_STAGING_PREFIX = ".parent-source-epoch-staging-"
+_PARENT_SOURCE_FIXED_GLOBAL_ATTEMPT_LEDGER_ROOT: Path | None = None
+_PARENT_SOURCE_FIXED_GLOBAL_ATTEMPT_LEDGER_ROOT_POLICY_SHA256: str | None = None
+_PARENT_SOURCE_REGISTERED_NATIVE_ROOT_POLICY_AUTHORITY: object | None = None
+_PARENT_SOURCE_DISPOSABLE_F3_BROKER_TESTING_ROOT_POLICY_AUTHORITY = object()
+_PARENT_SOURCE_ROOT_LEASE_STATE_LOCK = threading.RLock()
+_PARENT_SOURCE_ROOT_BINDINGS: dict[str, tuple[str, str, str]] = {}
+_PARENT_SOURCE_ACTIVE_ROOT_LEASES: set[str] = set()
+
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _MAX_AUTHORIZATION_BYTES = 4 * 1024 * 1024
@@ -427,6 +470,120 @@ def _require_sha256(value: Any, *, label: str) -> str:
     return value
 
 
+def factor_v3_parent_source_derive_attempt_key_sha256(
+    semantic_input_root_sha256: str,
+) -> str:
+    semantic_root = _require_sha256(
+        semantic_input_root_sha256,
+        label="parent source semantic input root SHA",
+    )
+    return hashlib.sha256(
+        _canonical_bytes(
+            {
+                "schema": PARENT_SOURCE_ATTEMPT_KEY_SCHEMA,
+                "semantic_input_root_sha256": semantic_root,
+            }
+        )
+    ).hexdigest()
+
+
+def factor_v3_parent_source_derive_global_attempt_identity_sha256(
+    attempt_key_sha256: str,
+) -> str:
+    attempt_key = _require_sha256(
+        attempt_key_sha256,
+        label="parent source attempt key SHA",
+    )
+    return hashlib.sha256(
+        _canonical_bytes(
+            {
+                "attempt_key_sha256": attempt_key,
+                "schema": PARENT_SOURCE_GLOBAL_ATTEMPT_IDENTITY_SCHEMA,
+            }
+        )
+    ).hexdigest()
+
+
+def factor_v3_parent_source_global_claim_paths(
+    global_attempt_ledger_root: str | Path,
+    attempt_key_sha256: str,
+) -> tuple[Path, Path]:
+    attempt_key = _require_sha256(
+        attempt_key_sha256,
+        label="parent source attempt key SHA",
+    )
+    root = Path(global_attempt_ledger_root)
+    if not root.is_absolute() or any(part in {".", ".."} for part in root.parts):
+        raise FormalSupervisorError("parent source global attempt ledger root rejected")
+    claim_root = root / "attempts" / "sha256" / attempt_key[:2] / attempt_key
+    return claim_root / "run.claim.json", claim_root / "verify.claim.json"
+
+
+def factor_v3_parent_source_root_policy_sha256(
+    global_attempt_ledger_root: str | Path,
+) -> str:
+    root = Path(global_attempt_ledger_root)
+    if not root.is_absolute() or any(part in {".", ".."} for part in root.parts):
+        raise FormalSupervisorError("parent source root policy path rejected")
+    return hashlib.sha256(
+        _canonical_bytes(
+            {
+                "global_attempt_ledger_root": str(root),
+                "schema": PARENT_SOURCE_ROOT_POLICY_SCHEMA,
+            }
+        )
+    ).hexdigest()
+
+
+def _factor_v3_parent_source_transition_from_observed_state(
+    *,
+    run_spec_sha256: str,
+    attempt_key_sha256: str,
+    global_attempt_identity_sha256: str,
+    observed_root_state: int,
+    requested_action: int,
+) -> int:
+    _require_sha256(run_spec_sha256, label="parent source run spec SHA")
+    attempt_key = _require_sha256(
+        attempt_key_sha256,
+        label="parent source attempt key SHA",
+    )
+    global_identity = _require_sha256(
+        global_attempt_identity_sha256,
+        label="parent source global attempt identity SHA",
+    )
+    if (
+        factor_v3_parent_source_derive_global_attempt_identity_sha256(attempt_key)
+        != global_identity
+        or type(observed_root_state) is not int
+        or observed_root_state not in {
+            PARENT_SOURCE_ROOT_STATE_EMPTY,
+            PARENT_SOURCE_ROOT_STATE_CLAIMED,
+            PARENT_SOURCE_ROOT_STATE_COMPLETED,
+            PARENT_SOURCE_ROOT_STATE_VERIFY_CLAIMED,
+            PARENT_SOURCE_ROOT_STATE_TERMINAL,
+        }
+        or type(requested_action) is not int
+        or requested_action
+        not in {
+            PARENT_SOURCE_ROOT_ACTION_RUN,
+            PARENT_SOURCE_ROOT_ACTION_VERIFY,
+        }
+    ):
+        raise FormalSupervisorError("parent source root epoch binding rejected")
+    if (
+        observed_root_state == PARENT_SOURCE_ROOT_STATE_EMPTY
+        and requested_action == PARENT_SOURCE_ROOT_ACTION_RUN
+    ):
+        return PARENT_SOURCE_ROOT_TRANSITION_START_RUN
+    if (
+        observed_root_state == PARENT_SOURCE_ROOT_STATE_COMPLETED
+        and requested_action == PARENT_SOURCE_ROOT_ACTION_VERIFY
+    ):
+        return PARENT_SOURCE_ROOT_TRANSITION_START_VERIFY
+    return PARENT_SOURCE_ROOT_TRANSITION_REJECT
+
+
 def _absolute_path(value: Any, *, label: str) -> Path:
     if type(value) is not str:
         raise FormalSupervisorError(f"{label} rejected")
@@ -644,6 +801,579 @@ class _HeldDirectoryChain:
         while self._handles:
             handle, _path, _identity = self._handles.pop()
             kernel32.CloseHandle(handle)
+
+
+def _validated_parent_source_root_lease_binding(
+    *,
+    global_attempt_ledger_root: str | Path,
+    global_run_claim_path: str | Path,
+    global_verify_claim_path: str | Path,
+    run_spec_sha256: str,
+    attempt_key_sha256: str,
+    global_attempt_identity_sha256: str,
+) -> tuple[Path, Path, Path, str, str, str]:
+    run_spec = _require_sha256(
+        run_spec_sha256,
+        label="parent source run spec SHA",
+    )
+    attempt_key = _require_sha256(
+        attempt_key_sha256,
+        label="parent source attempt key SHA",
+    )
+    global_identity = _require_sha256(
+        global_attempt_identity_sha256,
+        label="parent source global attempt identity SHA",
+    )
+    if (
+        factor_v3_parent_source_derive_global_attempt_identity_sha256(attempt_key)
+        != global_identity
+    ):
+        raise FormalSupervisorError("parent source global attempt identity rejected")
+    fixed_root = _PARENT_SOURCE_FIXED_GLOBAL_ATTEMPT_LEDGER_ROOT
+    fixed_root_policy_sha256 = (
+        _PARENT_SOURCE_FIXED_GLOBAL_ATTEMPT_LEDGER_ROOT_POLICY_SHA256
+    )
+    if (
+        fixed_root is None
+        or fixed_root_policy_sha256 is None
+        or _PARENT_SOURCE_REGISTERED_NATIVE_ROOT_POLICY_AUTHORITY
+        is not _PARENT_SOURCE_DISPOSABLE_F3_BROKER_TESTING_ROOT_POLICY_AUTHORITY
+    ):
+        raise FormalSupervisorError("parent source fixed global ledger root unavailable")
+    root = Path(global_attempt_ledger_root)
+    run_claim = Path(global_run_claim_path)
+    verify_claim = Path(global_verify_claim_path)
+    if (
+        not root.is_absolute()
+        or not run_claim.is_absolute()
+        or not verify_claim.is_absolute()
+        or any(
+            part in {".", ".."}
+            for path in (root, run_claim, verify_claim)
+            for part in path.parts
+        )
+    ):
+        raise FormalSupervisorError("parent source root lease path rejected")
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved_fixed_root = Path(fixed_root).resolve(strict=True)
+        resolved_claim_parent = run_claim.parent.resolve(strict=True)
+        resolved_verify_parent = verify_claim.parent.resolve(strict=True)
+    except OSError as exc:
+        raise FormalSupervisorError("parent source root lease path rejected") from exc
+    expected_run, expected_verify = factor_v3_parent_source_global_claim_paths(
+        resolved_root,
+        attempt_key,
+    )
+    if (
+        os.path.normcase(str(root)) != os.path.normcase(str(resolved_root))
+        or os.path.normcase(str(resolved_root))
+        != os.path.normcase(str(resolved_fixed_root))
+        or factor_v3_parent_source_root_policy_sha256(resolved_root)
+        != _require_sha256(
+            fixed_root_policy_sha256,
+            label="parent source fixed root policy SHA",
+        )
+        or os.path.normcase(str(run_claim)) != os.path.normcase(str(expected_run))
+        or os.path.normcase(str(verify_claim))
+        != os.path.normcase(str(expected_verify))
+        or resolved_claim_parent != expected_run.parent
+        or resolved_verify_parent != expected_verify.parent
+        or run_claim == verify_claim
+    ):
+        raise FormalSupervisorError("parent source root lease binding rejected")
+    return (
+        resolved_root,
+        expected_run,
+        expected_verify,
+        run_spec,
+        attempt_key,
+        global_identity,
+    )
+
+
+class _ParentSourceRootLease:
+    def __init__(
+        self,
+        *,
+        directory_chain: _HeldDirectoryChain,
+        mutex: Any,
+        root: Path,
+        run_claim: Path,
+        verify_claim: Path,
+        run_spec_sha256: str,
+        attempt_key_sha256: str,
+        global_attempt_identity_sha256: str,
+    ) -> None:
+        self._directory_chain = directory_chain
+        self._mutex = mutex
+        self._owner_thread_id = threading.get_ident()
+        self.root = root
+        self.run_claim = run_claim
+        self.verify_claim = verify_claim
+        self.run_spec_sha256 = run_spec_sha256
+        self.attempt_key_sha256 = attempt_key_sha256
+        self.global_attempt_identity_sha256 = global_attempt_identity_sha256
+        self._epoch_files: dict[str, Any] = {}
+
+    @classmethod
+    def acquire(
+        cls,
+        *,
+        global_attempt_ledger_root: str | Path,
+        global_run_claim_path: str | Path,
+        global_verify_claim_path: str | Path,
+        run_spec_sha256: str,
+        attempt_key_sha256: str,
+        global_attempt_identity_sha256: str,
+        timeout_milliseconds: int,
+    ) -> tuple[int, _ParentSourceRootLease | None]:
+        if (
+            type(timeout_milliseconds) is not int
+            or not 0 <= timeout_milliseconds <= 60_000
+        ):
+            return PARENT_SOURCE_ROOT_LEASE_BINDING_REJECTED, None
+        try:
+            (
+                root,
+                run_claim,
+                verify_claim,
+                run_spec,
+                attempt_key,
+                global_identity,
+            ) = _validated_parent_source_root_lease_binding(
+                global_attempt_ledger_root=global_attempt_ledger_root,
+                global_run_claim_path=global_run_claim_path,
+                global_verify_claim_path=global_verify_claim_path,
+                run_spec_sha256=run_spec_sha256,
+                attempt_key_sha256=attempt_key_sha256,
+                global_attempt_identity_sha256=global_attempt_identity_sha256,
+            )
+        except FormalSupervisorError:
+            return PARENT_SOURCE_ROOT_LEASE_BINDING_REJECTED, None
+        try:
+            directory_chain = _HeldDirectoryChain(run_claim.parent)
+        except FormalSupervisorError:
+            return PARENT_SOURCE_ROOT_LEASE_ERROR, None
+        kernel32 = _kernel32()
+        create_mutex = kernel32.CreateMutexW
+        create_mutex.argtypes = (
+            wintypes.LPVOID,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        )
+        create_mutex.restype = wintypes.HANDLE
+        mutex = create_mutex(
+            None,
+            False,
+            f"{_PARENT_SOURCE_ROOT_MUTEX_PREFIX}{global_identity}",
+        )
+        if mutex in (None, 0):
+            directory_chain.close()
+            return PARENT_SOURCE_ROOT_LEASE_ERROR, None
+        wait = kernel32.WaitForSingleObject
+        wait.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        wait.restype = wintypes.DWORD
+        wait_result = int(wait(mutex, timeout_milliseconds))
+        if wait_result == 258:
+            kernel32.CloseHandle(mutex)
+            directory_chain.close()
+            return PARENT_SOURCE_ROOT_LEASE_CONTENDED, None
+        if wait_result not in {0, 0x80}:
+            kernel32.CloseHandle(mutex)
+            directory_chain.close()
+            return PARENT_SOURCE_ROOT_LEASE_ERROR, None
+        acquired = False
+        try:
+            with _PARENT_SOURCE_ROOT_LEASE_STATE_LOCK:
+                fixed_root = _PARENT_SOURCE_FIXED_GLOBAL_ATTEMPT_LEDGER_ROOT
+                fixed_root_text = (
+                    None
+                    if fixed_root is None
+                    else os.path.normcase(str(Path(fixed_root).resolve(strict=True)))
+                )
+                root_text = os.path.normcase(str(root))
+                fixed_policy_sha256 = (
+                    _PARENT_SOURCE_FIXED_GLOBAL_ATTEMPT_LEDGER_ROOT_POLICY_SHA256
+                )
+                binding = _PARENT_SOURCE_ROOT_BINDINGS.get(global_identity)
+                expected_binding = (run_spec, attempt_key, root_text)
+                if (
+                    fixed_root_text != root_text
+                    or fixed_policy_sha256
+                    != factor_v3_parent_source_root_policy_sha256(root)
+                ):
+                    return PARENT_SOURCE_ROOT_LEASE_BINDING_REJECTED, None
+                if binding is not None and binding != expected_binding:
+                    return PARENT_SOURCE_ROOT_LEASE_BINDING_REJECTED, None
+                if global_identity in _PARENT_SOURCE_ACTIVE_ROOT_LEASES:
+                    return PARENT_SOURCE_ROOT_LEASE_CONTENDED, None
+                _PARENT_SOURCE_ROOT_BINDINGS.setdefault(
+                    global_identity,
+                    expected_binding,
+                )
+                _PARENT_SOURCE_ACTIVE_ROOT_LEASES.add(global_identity)
+                acquired = True
+            return PARENT_SOURCE_ROOT_LEASE_ACQUIRED, cls(
+                directory_chain=directory_chain,
+                mutex=mutex,
+                root=root,
+                run_claim=run_claim,
+                verify_claim=verify_claim,
+                run_spec_sha256=run_spec,
+                attempt_key_sha256=attempt_key,
+                global_attempt_identity_sha256=global_identity,
+            )
+        finally:
+            if not acquired:
+                kernel32.ReleaseMutex(mutex)
+                kernel32.CloseHandle(mutex)
+                directory_chain.close()
+
+    def _expected_epoch_files(self) -> tuple[tuple[Path, bytes], ...]:
+        run_receipt = self.run_claim.parent / "run.receipt.json"
+        terminal_receipt = self.run_claim.parent / "terminal.receipt.json"
+        run_claim_raw = _canonical_bytes(
+            {
+                "action": PARENT_SOURCE_ROOT_ACTION_RUN,
+                "attempt_key_sha256": self.attempt_key_sha256,
+                "global_attempt_identity_sha256": (
+                    self.global_attempt_identity_sha256
+                ),
+                "run_spec_sha256": self.run_spec_sha256,
+                "schema": PARENT_SOURCE_ROOT_RUN_CLAIM_SCHEMA,
+                "state": PARENT_SOURCE_ROOT_STATE_CLAIMED,
+            }
+        )
+        run_receipt_raw = _canonical_bytes(
+            {
+                "attempt_key_sha256": self.attempt_key_sha256,
+                "global_attempt_identity_sha256": (
+                    self.global_attempt_identity_sha256
+                ),
+                "run_claim_sha256": hashlib.sha256(run_claim_raw).hexdigest(),
+                "run_spec_sha256": self.run_spec_sha256,
+                "schema": PARENT_SOURCE_ROOT_RUN_RECEIPT_SCHEMA,
+                "state": PARENT_SOURCE_ROOT_STATE_COMPLETED,
+            }
+        )
+        verify_claim_raw = _canonical_bytes(
+            {
+                "action": PARENT_SOURCE_ROOT_ACTION_VERIFY,
+                "attempt_key_sha256": self.attempt_key_sha256,
+                "global_attempt_identity_sha256": (
+                    self.global_attempt_identity_sha256
+                ),
+                "run_receipt_sha256": hashlib.sha256(
+                    run_receipt_raw
+                ).hexdigest(),
+                "run_spec_sha256": self.run_spec_sha256,
+                "schema": PARENT_SOURCE_ROOT_VERIFY_CLAIM_SCHEMA,
+                "state": PARENT_SOURCE_ROOT_STATE_VERIFY_CLAIMED,
+            }
+        )
+        terminal_receipt_raw = _canonical_bytes(
+            {
+                "attempt_key_sha256": self.attempt_key_sha256,
+                "global_attempt_identity_sha256": (
+                    self.global_attempt_identity_sha256
+                ),
+                "run_receipt_sha256": hashlib.sha256(
+                    run_receipt_raw
+                ).hexdigest(),
+                "run_spec_sha256": self.run_spec_sha256,
+                "schema": PARENT_SOURCE_ROOT_TERMINAL_RECEIPT_SCHEMA,
+                "state": PARENT_SOURCE_ROOT_STATE_TERMINAL,
+                "verify_claim_sha256": hashlib.sha256(
+                    verify_claim_raw
+                ).hexdigest(),
+            }
+        )
+        return (
+            (self.run_claim, run_claim_raw),
+            (run_receipt, run_receipt_raw),
+            (self.verify_claim, verify_claim_raw),
+            (terminal_receipt, terminal_receipt_raw),
+        )
+
+    def _open_exact_epoch_file(self, path: Path, expected: bytes) -> bool:
+        key = os.path.normcase(str(path))
+        held = self._epoch_files.get(key)
+        if held is None:
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                raise FormalSupervisorError(
+                    "parent source persistent epoch rejected"
+                ) from exc
+            held = _HeldFile(
+                path,
+                expected_sha256=hashlib.sha256(expected).hexdigest(),
+                label="parent source persistent epoch",
+                max_bytes=1024,
+            )
+            self._epoch_files[key] = held
+        held.postverify()
+        if held.raw != expected:
+            raise FormalSupervisorError("parent source persistent epoch rejected")
+        return True
+
+    def _observe_persistent_root_state(self) -> int:
+        self._verify_epoch_directory_exact_namespace()
+        presence = tuple(
+            self._open_exact_epoch_file(path, raw)
+            for path, raw in self._expected_epoch_files()
+        )
+        self._verify_epoch_directory_exact_namespace()
+        states = {
+            (False, False, False, False): PARENT_SOURCE_ROOT_STATE_EMPTY,
+            (True, False, False, False): PARENT_SOURCE_ROOT_STATE_CLAIMED,
+            (True, True, False, False): PARENT_SOURCE_ROOT_STATE_COMPLETED,
+            (True, True, True, False): (
+                PARENT_SOURCE_ROOT_STATE_VERIFY_CLAIMED
+            ),
+            (True, True, True, True): PARENT_SOURCE_ROOT_STATE_TERMINAL,
+        }
+        state = states.get(presence)
+        if state is None:
+            raise FormalSupervisorError("parent source persistent epoch exact set rejected")
+        return state
+
+    def _verify_epoch_directory_exact_namespace(self) -> None:
+        expected_names = {path.name for path, _raw in self._expected_epoch_files()}
+        self._directory_chain.postverify()
+        try:
+            with os.scandir(self.run_claim.parent) as entries:
+                observed = tuple(entries)
+        except OSError as exc:
+            raise FormalSupervisorError(
+                "parent source persistent epoch namespace rejected"
+            ) from exc
+        if len(observed) > len(expected_names):
+            raise FormalSupervisorError(
+                "parent source persistent epoch namespace rejected"
+            )
+        for entry in observed:
+            try:
+                information = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise FormalSupervisorError(
+                    "parent source persistent epoch namespace rejected"
+                ) from exc
+            if (
+                entry.name not in expected_names
+                or not stat.S_ISREG(information.st_mode)
+                or int(getattr(information, "st_file_attributes", 0))
+                & _REPARSE_ATTRIBUTE
+            ):
+                raise FormalSupervisorError(
+                    "parent source persistent epoch namespace rejected"
+                )
+        self._directory_chain.postverify()
+
+    def _publish_epoch_file(self, index: int) -> None:
+        path, raw = self._expected_epoch_files()[index]
+        key = os.path.normcase(str(path))
+        if key in self._epoch_files or path.exists():
+            raise FormalSupervisorError("parent source persistent epoch replay rejected")
+        held = _HeldParentSourceEpochFile(
+            path,
+            raw,
+        )
+        held.postverify()
+        if held.raw != raw:
+            held.close()
+            raise FormalSupervisorError("parent source persistent epoch rejected")
+        self._epoch_files[key] = held
+
+    def unchanged(
+        self,
+        *,
+        run_spec_sha256: str,
+        attempt_key_sha256: str,
+        global_attempt_identity_sha256: str,
+    ) -> bool:
+        if (
+            self._mutex is None
+            or threading.get_ident() != self._owner_thread_id
+            or run_spec_sha256 != self.run_spec_sha256
+            or attempt_key_sha256 != self.attempt_key_sha256
+            or global_attempt_identity_sha256
+            != self.global_attempt_identity_sha256
+        ):
+            return False
+        try:
+            (
+                root,
+                run_claim,
+                verify_claim,
+                _run_spec,
+                _attempt_key,
+                _global_identity,
+            ) = _validated_parent_source_root_lease_binding(
+                global_attempt_ledger_root=self.root,
+                global_run_claim_path=self.run_claim,
+                global_verify_claim_path=self.verify_claim,
+                run_spec_sha256=run_spec_sha256,
+                attempt_key_sha256=attempt_key_sha256,
+                global_attempt_identity_sha256=global_attempt_identity_sha256,
+            )
+            self._directory_chain.postverify()
+            expected_epoch_files = {
+                os.path.normcase(str(path)): raw
+                for path, raw in self._expected_epoch_files()
+            }
+            for key, held in self._epoch_files.items():
+                held.postverify()
+                if held.raw != expected_epoch_files.get(key):
+                    return False
+        except FormalSupervisorError:
+            return False
+        with _PARENT_SOURCE_ROOT_LEASE_STATE_LOCK:
+            return (
+                root == self.root
+                and run_claim == self.run_claim
+                and verify_claim == self.verify_claim
+                and _PARENT_SOURCE_ROOT_BINDINGS.get(
+                    self.global_attempt_identity_sha256
+                )
+                == (
+                    self.run_spec_sha256,
+                    self.attempt_key_sha256,
+                    os.path.normcase(str(self.root)),
+                )
+                and self.global_attempt_identity_sha256
+                in _PARENT_SOURCE_ACTIVE_ROOT_LEASES
+            )
+
+    def root_epoch_transition(
+        self,
+        *,
+        run_spec_sha256: str,
+        attempt_key_sha256: str,
+        global_attempt_identity_sha256: str,
+        requested_action: int,
+    ) -> tuple[int, int]:
+        if not self.unchanged(
+            run_spec_sha256=run_spec_sha256,
+            attempt_key_sha256=attempt_key_sha256,
+            global_attempt_identity_sha256=global_attempt_identity_sha256,
+        ):
+            raise FormalSupervisorError("parent source root lease drifted")
+        observed_root_state = self._observe_persistent_root_state()
+        transition = _factor_v3_parent_source_transition_from_observed_state(
+            run_spec_sha256=run_spec_sha256,
+            attempt_key_sha256=attempt_key_sha256,
+            global_attempt_identity_sha256=global_attempt_identity_sha256,
+            observed_root_state=observed_root_state,
+            requested_action=requested_action,
+        )
+        if transition == PARENT_SOURCE_ROOT_TRANSITION_START_RUN:
+            self._publish_epoch_file(0)
+            if self._observe_persistent_root_state() != PARENT_SOURCE_ROOT_STATE_CLAIMED:
+                raise FormalSupervisorError("parent source run claim transition rejected")
+        elif transition == PARENT_SOURCE_ROOT_TRANSITION_START_VERIFY:
+            self._publish_epoch_file(2)
+            if (
+                self._observe_persistent_root_state()
+                != PARENT_SOURCE_ROOT_STATE_VERIFY_CLAIMED
+            ):
+                raise FormalSupervisorError(
+                    "parent source verify claim transition rejected"
+                )
+        return observed_root_state, transition
+
+    def publish_run_receipt(
+        self,
+        *,
+        run_spec_sha256: str,
+        attempt_key_sha256: str,
+        global_attempt_identity_sha256: str,
+    ) -> None:
+        if not self.unchanged(
+            run_spec_sha256=run_spec_sha256,
+            attempt_key_sha256=attempt_key_sha256,
+            global_attempt_identity_sha256=global_attempt_identity_sha256,
+        ):
+            raise FormalSupervisorError("parent source root lease drifted")
+        if self._observe_persistent_root_state() != PARENT_SOURCE_ROOT_STATE_CLAIMED:
+            raise FormalSupervisorError("parent source run receipt transition rejected")
+        self._publish_epoch_file(1)
+        if self._observe_persistent_root_state() != PARENT_SOURCE_ROOT_STATE_COMPLETED:
+            raise FormalSupervisorError("parent source run receipt transition rejected")
+
+    def publish_terminal_receipt(
+        self,
+        *,
+        run_spec_sha256: str,
+        attempt_key_sha256: str,
+        global_attempt_identity_sha256: str,
+    ) -> None:
+        if not self.unchanged(
+            run_spec_sha256=run_spec_sha256,
+            attempt_key_sha256=attempt_key_sha256,
+            global_attempt_identity_sha256=global_attempt_identity_sha256,
+        ):
+            raise FormalSupervisorError("parent source root lease drifted")
+        if (
+            self._observe_persistent_root_state()
+            != PARENT_SOURCE_ROOT_STATE_VERIFY_CLAIMED
+        ):
+            raise FormalSupervisorError(
+                "parent source terminal receipt transition rejected"
+            )
+        self._publish_epoch_file(3)
+        if self._observe_persistent_root_state() != PARENT_SOURCE_ROOT_STATE_TERMINAL:
+            raise FormalSupervisorError(
+                "parent source terminal receipt transition rejected"
+            )
+
+    def close(self) -> None:
+        if self._mutex is None:
+            return
+        if threading.get_ident() != self._owner_thread_id:
+            raise FormalSupervisorError("parent source root lease release rejected")
+        mutex = self._mutex
+        self._mutex = None
+        with _PARENT_SOURCE_ROOT_LEASE_STATE_LOCK:
+            _PARENT_SOURCE_ACTIVE_ROOT_LEASES.discard(
+                self.global_attempt_identity_sha256
+            )
+        kernel32 = _kernel32()
+        released = bool(kernel32.ReleaseMutex(mutex))
+        closed = bool(kernel32.CloseHandle(mutex))
+        while self._epoch_files:
+            _key, held = self._epoch_files.popitem()
+            held.close()
+        self._directory_chain.close()
+        if not released or not closed:
+            raise FormalSupervisorError("parent source root lease release rejected")
+
+    def __enter__(self) -> _ParentSourceRootLease:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
+def factor_v3_parent_source_lookup_root_epoch_transition(
+    lease: _ParentSourceRootLease,
+    *,
+    run_spec_sha256: str,
+    attempt_key_sha256: str,
+    global_attempt_identity_sha256: str,
+    requested_action: int,
+) -> tuple[int, int]:
+    if type(lease) is not _ParentSourceRootLease:
+        raise FormalSupervisorError("parent source root lease capability rejected")
+    return lease.root_epoch_transition(
+        run_spec_sha256=run_spec_sha256,
+        attempt_key_sha256=attempt_key_sha256,
+        global_attempt_identity_sha256=global_attempt_identity_sha256,
+        requested_action=requested_action,
+    )
 
 
 @contextmanager
@@ -1545,6 +2275,133 @@ class _HeldLedgerFile:
                         self._lease = None
                 finally:
                     self._chain.close()
+
+
+class _HeldParentSourceEpochFile:
+    def __init__(self, path: Path, raw: bytes) -> None:
+        self.path = path
+        self.raw = raw
+        self._held: _HeldFile | None = None
+        chain = _HeldDirectoryChain(path.parent)
+        parent_handle = None
+        stream = None
+        staging_path: Path | None = None
+        promoted = False
+        kernel32 = _kernel32()
+        try:
+            parent_handle, parent_identity = _open_directory_handle(
+                chain.path,
+                desired_access=0x40000000,
+            )
+            if parent_identity != chain._handles[-1][2]:
+                raise FormalSupervisorError(
+                    "parent source epoch directory drifted"
+                )
+            staging_path, handle = self._create_staging(chain.path)
+            try:
+                descriptor = msvcrt.open_osfhandle(
+                    int(handle),
+                    os.O_RDWR | getattr(os, "O_BINARY", 0),
+                )
+            except BaseException:
+                kernel32.CloseHandle(handle)
+                raise
+            stream = os.fdopen(descriptor, "w+b")
+            _write_all(stream.fileno(), raw, writer=os.write)
+            stream.flush()
+            os.fsync(stream.fileno())
+            opened = os.fstat(stream.fileno())
+            terminal = staging_path.lstat()
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or not os.path.samestat(opened, terminal)
+                or opened.st_size != len(raw)
+                or int(getattr(opened, "st_file_attributes", 0))
+                & _REPARSE_ATTRIBUTE
+                or int(getattr(opened, "st_nlink", 1)) != 1
+                or int(getattr(terminal, "st_nlink", 1)) != 1
+            ):
+                raise FormalSupervisorError(
+                    "parent source epoch staging rejected"
+                )
+            _rename_ledger_staging_no_replace(
+                stream,
+                parent_handle,
+                path.name,
+                replay_label="parent source persistent epoch",
+            )
+            promoted = True
+            stream.flush()
+            os.fsync(stream.fileno())
+            _flush_ledger_parent_handle(parent_handle)
+            stream.close()
+            stream = None
+            kernel32.CloseHandle(parent_handle)
+            parent_handle = None
+            chain.close()
+            self._held = _HeldFile(
+                path,
+                expected_sha256=hashlib.sha256(raw).hexdigest(),
+                label="parent source persistent epoch",
+                max_bytes=1024,
+            )
+        except BaseException:
+            if stream is not None:
+                if not promoted:
+                    try:
+                        _mark_ledger_descriptor_delete_on_close(stream.fileno())
+                    except FormalSupervisorError:
+                        pass
+                stream.close()
+            if parent_handle is not None:
+                kernel32.CloseHandle(parent_handle)
+            chain.close()
+            raise
+
+    @staticmethod
+    def _create_staging(parent: Path) -> tuple[Path, Any]:
+        kernel32 = _kernel32()
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        invalid = ctypes.c_void_p(-1).value
+        for _attempt in range(32):
+            staging_path = parent / (
+                f"{_PARENT_SOURCE_EPOCH_STAGING_PREFIX}"
+                f"{os.urandom(16).hex()}.tmp"
+            )
+            handle = create_file(
+                str(staging_path),
+                0x80000000 | 0x40000000 | 0x00010000,
+                0x00000001,
+                None,
+                1,
+                0x00200000 | 0x80000000,
+                None,
+            )
+            if handle not in (None, invalid):
+                return staging_path, handle
+            if ctypes.get_last_error() not in {80, 183}:
+                break
+        raise FormalSupervisorError("parent source epoch staging rejected")
+
+    def postverify(self) -> None:
+        if self._held is None:
+            raise FormalSupervisorError("parent source persistent epoch rejected")
+        self._held.postverify()
+
+    def close(self) -> None:
+        if self._held is not None:
+            self._held.close()
+            self._held = None
 
 
 def _der_length(raw: bytes, offset: int) -> tuple[int, int]:
