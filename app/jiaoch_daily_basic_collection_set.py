@@ -13,6 +13,7 @@ from datetime import date
 import hashlib
 import hmac
 import json
+import math
 from pathlib import Path
 import re
 from typing import Any
@@ -142,6 +143,42 @@ def _safe_response_failure_code(exc: BaseException) -> str:
 
 def _sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
+
+
+def _coerce_provider_nonfinite_json_to_null(raw_body: Any) -> bytes:
+    """Rewrite provider NaN/Infinity tokens to JSON null before CAS publish.
+
+    Jiaoch/Tushare-compatible gateways occasionally emit non-standard ``NaN``
+    literals for missing daily_basic numeric cells.  Strict JSON rejects those
+    tokens; map non-finite numbers to null and re-encode so the sealed raw
+    artifact stays JSON-compliant without inventing numeric values.
+    """
+
+    if type(raw_body) is not bytes:
+        raise ValueError("Jiaoch daily_basic raw body rejected")
+    try:
+        payload = json.loads(raw_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Jiaoch daily_basic raw body rejected") from exc
+
+    def scrub(value: Any) -> Any:
+        if type(value) is float and not math.isfinite(value):
+            return None
+        if type(value) is list:
+            return [scrub(item) for item in value]
+        if type(value) is dict:
+            return {key: scrub(item) for key, item in value.items()}
+        return value
+
+    try:
+        return json.dumps(
+            scrub(payload),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Jiaoch daily_basic raw body rejected") from exc
 
 
 def _request_spec(session: date) -> dict[str, Any]:
@@ -453,6 +490,8 @@ def _collect_jiaoch_daily_basic_collection_set_with_route_credential(
             body_complete = getattr(response, "body_complete", None)
             attempt_diagnostic["http_status"] = _safe_failure_status(http_status)
             attempt_diagnostic["body_complete"] = _safe_failure_body_complete(body_complete)
+            if type(raw_body) is bytes:
+                raw_body = _coerce_provider_nonfinite_json_to_null(raw_body)
             stage = "raw_publication"
             publication = raw_authority._publish_jiaoch_points_raw_attempt_for_collection(
                 output_root=root, raw_body=raw_body, credential=credential, credential_slot_id=_CREDENTIAL_SLOT_ID,

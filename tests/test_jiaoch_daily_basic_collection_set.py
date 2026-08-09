@@ -74,6 +74,46 @@ def test_synthetic_daily_basic_call_publishes_and_postverifies_one_raw_cas_set(
     assert verified["verified"] is True
 
 
+def test_provider_nan_literals_are_coerced_to_null_before_publish(
+    monkeypatch, tmp_path
+) -> None:
+    spec = collection._request_spec(date(2023, 8, 1))
+    # Non-standard provider body with a bare NaN token.
+    dirty = (
+        b'{"code":0,"msg":"success","data":{"fields":'
+        + json.dumps(spec["response_fields"]).encode()
+        + b',"items":[["000001.SZ","20230801",1,NaN,1,1,1,1]]}}'
+    )
+
+    class Transport:
+        def post(self, *, url, **_kwargs):
+            return SimpleNamespace(status=200, body_complete=True, body=dirty)
+
+    monkeypatch.setattr(collection.points_common, "_transport_factory", lambda: Transport())
+    policy = __import__(
+        "app.factor_v3_daily_basic_runner",
+        fromlist=["FACTOR_V3_DAILY_BASIC_COLLECTION_POLICY_DESCRIPTOR"],
+    ).FACTOR_V3_DAILY_BASIC_COLLECTION_POLICY_DESCRIPTOR["sha256"]
+
+    publication = collection._collect_jiaoch_daily_basic_collection_set_with_route_credential(
+        credential="test-only-credential",
+        generation_id="11111111-1111-4111-8111-111111111111",
+        policy_sha256=policy,
+        output_root=tmp_path,
+        trade_date="2023-08-01",
+        timeout_seconds=1,
+        max_attempts=1,
+    )
+
+    verified = collection.verify_jiaoch_daily_basic_collection_set(
+        output_root=tmp_path,
+        collection_set_relative_path=publication["collection_set_relative_path"],
+        expected_collection_set_sha256=publication["collection_set_sha256"],
+    )
+    assert verified["verified"] is True
+    assert publication["trade_date"] == "2023-08-01"
+
+
 def test_failed_attempts_expose_only_bounded_safe_diagnostics(
     monkeypatch, tmp_path
 ) -> None:
