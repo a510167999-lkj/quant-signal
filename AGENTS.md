@@ -2,7 +2,22 @@
 
 This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
-个人 A 股 / A 股 ETF 量化信号研究平台。FastAPI 后端 + 静态 Web 前端，部署在个人 VPS。**仅供个人研究，不构成投资建议。**
+个人 A 股量化信号研究平台。FastAPI 后端 + 静态 Web 前端，部署在个人 VPS。**仅供个人研究，不构成投资建议。**
+
+## Research goal（硬约束）
+
+权威常量见 `app/research_goal_contract.py`。改市场范围或绩效门槛必须先改该模块并补测试，禁止在业务代码里另起一套口径。
+
+| 维度 | 约束 |
+|------|------|
+| **数据** | **Jiaoch-only**（Tushare 镜像站）。正式训练/回测/证据链不得混未授权数据源。 |
+| **市场** | **仅沪深**：`SSE_MAIN`（沪主板）、`SZSE_MAIN`（深主板）、`SZSE_CHINEXT`（创业板）。**排除北证 `BSE` 与科创板 `SSE_STAR`（688/689）**。上游账本可先保留五板块用于 PIT 证明，下游策略宇宙必须过滤。 |
+| **主绩效** | 真实成本/滑点后：**滚动 12 个月净年化 ≥ 50%**，**最大回撤 ≤ 15%**。 |
+| **辅助诊断** | Profit Factor ≥ 1.3、Calmar ≥ 1.5；胜率观察约 52%–60%。辅助指标不能替代主绩效。 |
+| **分区** | `development → embargo → final-OOS` 严格隔离；development 结果不得直接注册生产 profile。 |
+| **产出** | 每日最多 **0–3** 只研究建议；**禁止自动下单**；未通过权威链与 OOS 门槛不得注册 production profile。 |
+
+当前阶段（Factor V3）：先闭合 Jiaoch 权威输入链与 formal materializer，再谈 OOF 训练与冲刺 50%/15%。**没有正式权威训练集之前，任何收益数字都只是不可晋级的假设筛选。**
 
 ## Commands
 
