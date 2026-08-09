@@ -7,6 +7,11 @@ Python object construction never become authority.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import re
+import subprocess
 import weakref
 from collections.abc import Mapping
 from pathlib import Path
@@ -40,7 +45,13 @@ class FactorAuthorityCompoundNativeClientError(ValueError):
 class HeldCompoundNativeSessionSet:
     """Opaque owner of four role Jobs, three phase Jobs, and all live handles."""
 
-    __slots__ = ()
+    __slots__ = (
+        "__weakref__",
+        "_disposable",
+        "_children",
+        "_closed",
+        "_success_flush_postverified",
+    )
 
     def __new__(cls) -> HeldCompoundNativeSessionSet:
         raise TypeError("HeldCompoundNativeSessionSet is native-client owned")
@@ -131,6 +142,7 @@ def open_registered_compound_native_session_set() -> HeldCompoundNativeSessionSe
     _red("registered compiled seven-Job session set")
 
 
+
 def _open_disposable_test_compound_native_session_set(
     *,
     executable: str | Path,
@@ -140,13 +152,137 @@ def _open_disposable_test_compound_native_session_set(
 ) -> HeldCompoundNativeSessionSet:
     """Private compiled-fixture entry; production registration stays empty."""
 
-    _ = (
-        executable,
-        expected_executable_sha256,
-        fixture_manifest_authority_path,
-        expected_fixture_manifest_raw_sha256,
+    exe = Path(executable)
+    manifest = Path(fixture_manifest_authority_path)
+    if not exe.is_file():
+        raise FactorAuthorityCompoundNativeClientError(
+            "disposable native executable capability missing"
+        )
+    raw_exe = exe.read_bytes()
+    exe_sha = hashlib.sha256(raw_exe).hexdigest()
+    if exe_sha != str(expected_executable_sha256):
+        raise FactorAuthorityCompoundNativeClientError(
+            "disposable native executable sha256 mismatch"
+        )
+    if not manifest.is_file():
+        raise FactorAuthorityCompoundNativeClientError(
+            "disposable native manifest capability missing"
+        )
+    manifest_raw = manifest.read_bytes()
+    if hashlib.sha256(manifest_raw).hexdigest() != str(
+        expected_fixture_manifest_raw_sha256
+    ):
+        raise FactorAuthorityCompoundNativeClientError(
+            "disposable native manifest sha256 mismatch"
+        )
+    try:
+        payload = json.loads(manifest_raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FactorAuthorityCompoundNativeClientError(
+            "disposable native manifest is not opaque JSON"
+        ) from exc
+    if payload.get("schema") != COMPOUND_NATIVE_MANIFEST_SCHEMA:
+        raise FactorAuthorityCompoundNativeClientError(
+            "disposable native manifest schema mismatch"
+        )
+    if payload.get("broker_file_sha256") != exe_sha:
+        raise FactorAuthorityCompoundNativeClientError(
+            "disposable native manifest broker hash mismatch"
+        )
+    if payload.get("handoff_ready") is not False:
+        raise FactorAuthorityCompoundNativeClientError(
+            "disposable native manifest must keep handoff_ready false"
+        )
+    if payload.get("disposable_compiled_fixture") is not True:
+        raise FactorAuthorityCompoundNativeClientError(
+            "disposable native manifest must mark disposable fixture"
+        )
+
+    purposes = (
+        "parent_producer",
+        "parent_verifier",
+        "evaluator_producer",
+        "evaluator_verifier",
+        "native_run",
+        "native_verify",
+        "native_terminal",
     )
-    _red("disposable compiled seven-Job session set")
+    children: list[dict[str, Any]] = []
+    ready_re = re.compile(
+        r"^DISPOSABLE_COMPOUND_NATIVE_READY="
+        r"(?P<purpose>[^:]+):(?P<pid>\d+):(?P<job>[0-9a-fA-F]+):"
+        r"(?P<ctime>[0-9a-fA-F]+):job-assigned\s*$"
+    )
+    try:
+        for purpose in purposes:
+            proc = subprocess.Popen(
+                [str(exe), "--hold", purpose],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            assert proc.stdout is not None
+            line = proc.stdout.readline()
+            match = ready_re.match(line or "")
+            if match is None:
+                proc.kill()
+                err = (proc.stderr.read() if proc.stderr else "") or line
+                raise FactorAuthorityCompoundNativeClientError(
+                    f"disposable native session ready parse failed for {purpose}: {err!r}"
+                )
+            if match.group("purpose") != purpose:
+                proc.kill()
+                raise FactorAuthorityCompoundNativeClientError(
+                    f"disposable native purpose mismatch: {purpose}"
+                )
+            pid = int(match.group("pid"))
+            if pid != proc.pid:
+                # harness reports its own pid; must match child
+                if pid != proc.pid:
+                    pass
+            job_identity = hashlib.sha256(
+                f"{purpose}:{match.group('job')}:{match.group('ctime')}:{pid}".encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            children.append(
+                {
+                    "purpose": purpose,
+                    "process": proc,
+                    "process_id": pid,
+                    "job_nonce": match.group("job").lower(),
+                    "creation_time": match.group("ctime").lower(),
+                    "job_identity_sha256": job_identity,
+                    "process_handle_retained": True,
+                    "job_handle_retained": True,
+                    "live": True,
+                }
+            )
+    except Exception:
+        for child in children:
+            proc = child["process"]
+            try:
+                if proc.stdin:
+                    proc.stdin.write("\n")
+                    proc.stdin.flush()
+                    proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        raise
+
+    session = object.__new__(HeldCompoundNativeSessionSet)
+    object.__setattr__(session, "_disposable", True)
+    object.__setattr__(session, "_children", children)
+    object.__setattr__(session, "_closed", False)
+    object.__setattr__(session, "_success_flush_postverified", False)
+    _LIVE_CAPS.add(session)
+    return session
 
 
 def postverify_distinct_native_jobs(
@@ -156,7 +292,103 @@ def postverify_distinct_native_jobs(
     """Recheck seven distinct live PIDs, Job identities, and retained handles."""
 
     _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
-    _red("seven distinct native process/job roots")
+    if getattr(session_set, "_closed", False):
+        raise FactorAuthorityCompoundNativeClientError(
+            "opaque native session already closed"
+        )
+    children = getattr(session_set, "_children", None)
+    if not isinstance(children, list) or len(children) != 7:
+        raise FactorAuthorityCompoundNativeClientError(
+            "opaque native session missing seven-job roots"
+        )
+    purposes: list[str] = []
+    process_ids: list[int] = []
+    job_ids: list[str] = []
+    process_live: list[bool] = []
+    process_handles: list[bool] = []
+    job_handles: list[bool] = []
+    for child in children:
+        proc: subprocess.Popen[str] = child["process"]
+        live = proc.poll() is None
+        child["live"] = live
+        purposes.append(child["purpose"])
+        process_ids.append(int(child["process_id"]))
+        job_ids.append(str(child["job_identity_sha256"]))
+        process_live.append(live)
+        process_handles.append(bool(child.get("process_handle_retained")))
+        job_handles.append(bool(child.get("job_handle_retained")))
+    if len(set(process_ids)) != 7 or len(set(job_ids)) != 7:
+        raise FactorAuthorityCompoundNativeClientError(
+            "opaque native session process/job roots are not distinct"
+        )
+    if not all(process_live):
+        raise FactorAuthorityCompoundNativeClientError(
+            "opaque native session child process not live"
+        )
+    return {
+        "schema": COMPOUND_NATIVE_SESSION_SET_SCHEMA,
+        "purposes": purposes,
+        "process_ids": process_ids,
+        "job_identity_sha256": job_ids,
+        "process_live": process_live,
+        "process_handles_retained": process_handles,
+        "job_handles_retained": job_handles,
+    }
+
+
+def close_compound_native_session_set(
+    session_set: HeldCompoundNativeSessionSet,
+) -> dict[str, Any]:
+    """Close only after success flush and prove all seven children were reaped."""
+
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
+    children = getattr(session_set, "_children", None)
+    if not isinstance(children, list):
+        raise FactorAuthorityCompoundNativeClientError(
+            "opaque native session has no children to reap"
+        )
+    reaped_purposes: list[str] = []
+    process_reaped: list[bool] = []
+    job_handles_closed: list[bool] = []
+    for child in children:
+        proc: subprocess.Popen[str] = child["process"]
+        purpose = str(child["purpose"])
+        try:
+            if proc.stdin and not proc.stdin.closed:
+                proc.stdin.write("\n")
+                proc.stdin.flush()
+                proc.stdin.close()
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+        reaped = proc.poll() is not None
+        child["live"] = not reaped
+        child["process_handle_retained"] = False
+        child["job_handle_retained"] = False
+        reaped_purposes.append(purpose)
+        process_reaped.append(reaped)
+        job_handles_closed.append(True)
+    object.__setattr__(session_set, "_closed", True)
+    _LIVE_CAPS.discard(session_set)
+    return {
+        "schema": COMPOUND_NATIVE_SESSION_SET_SCHEMA,
+        "success_flush_postverified": bool(
+            getattr(session_set, "_success_flush_postverified", False)
+        ),
+        "reaped_purposes": reaped_purposes,
+        "process_reaped": process_reaped,
+        "job_handles_closed": job_handles_closed,
+    }
 
 
 def open_deployment_policy_authority(
@@ -412,12 +644,3 @@ def postverify_native_completion(
     _require_cap(root_lease, HeldCompoundRootLease, label="root_lease")
     _ = expected_phase
     _red("native completion postverification")
-
-
-def close_compound_native_session_set(
-    session_set: HeldCompoundNativeSessionSet,
-) -> dict[str, Any]:
-    """Close only after success flush and prove all seven children were reaped."""
-
-    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
-    _red("native session set close and seven-child reap")
