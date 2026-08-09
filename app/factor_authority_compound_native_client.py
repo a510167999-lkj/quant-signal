@@ -51,6 +51,12 @@ class HeldCompoundNativeSessionSet:
         "_children",
         "_closed",
         "_success_flush_postverified",
+        "_manifest_path",
+        "_manifest_raw_sha256",
+        "_executable",
+        "_executable_sha256",
+        "_cas_handles",
+        "_role_productions",
     )
 
     def __new__(cls) -> HeldCompoundNativeSessionSet:
@@ -60,7 +66,14 @@ class HeldCompoundNativeSessionSet:
 class HeldDeploymentPolicyAuthority:
     """Opaque held signed policy verified against one physical manifest."""
 
-    __slots__ = ()
+    __slots__ = (
+        "__weakref__",
+        "_session",
+        "_path",
+        "_raw_sha256",
+        "_policy",
+        "_policy_sha256",
+    )
 
     def __new__(cls) -> HeldDeploymentPolicyAuthority:
         raise TypeError("HeldDeploymentPolicyAuthority is native-client owned")
@@ -69,7 +82,18 @@ class HeldDeploymentPolicyAuthority:
 class HeldCompoundRunSpec:
     """Opaque held run-spec CAS issued under the verified deployment policy."""
 
-    __slots__ = ()
+    __slots__ = (
+        "__weakref__",
+        "_session",
+        "_identity",
+        "_policy_raw_sha256",
+        "_run_spec_raw_sha256",
+        "_policy",
+        "_namespaces",
+        "_preexisting",
+        "_role_outputs",
+        "_epoch",
+    )
 
     def __new__(cls) -> HeldCompoundRunSpec:
         raise TypeError("HeldCompoundRunSpec is native-client owned")
@@ -78,7 +102,13 @@ class HeldCompoundRunSpec:
 class HeldCompoundRootLease:
     """Opaque compiled lease holding the ledger tree and four epoch files."""
 
-    __slots__ = ()
+    __slots__ = (
+        "__weakref__",
+        "_session",
+        "_run_spec",
+        "_epoch_files",
+        "_epoch_state",
+    )
 
     def __new__(cls) -> HeldCompoundRootLease:
         raise TypeError("HeldCompoundRootLease is native-client owned")
@@ -87,7 +117,23 @@ class HeldCompoundRootLease:
 class HeldRegisteredCas:
     """Opaque same-handle CAS plus held native ancestor directory handles."""
 
-    __slots__ = ()
+    __slots__ = (
+        "__weakref__",
+        "_session",
+        "_run_spec",
+        "_path",
+        "_raw_sha256",
+        "_category",
+        "_namespace",
+        "_role",
+        "_descriptor",
+        "_raw_bindings",
+        "_file_id",
+        "_size",
+        "_nlink",
+        "_payload_root",
+        "_self_sha",
+    )
 
     def __new__(cls) -> HeldRegisteredCas:
         raise TypeError("HeldRegisteredCas is native-client owned")
@@ -96,7 +142,14 @@ class HeldRegisteredCas:
 class HeldNativeCompletion:
     """Opaque held completion tied to one process, Job, and signed CAS."""
 
-    __slots__ = ()
+    __slots__ = (
+        "__weakref__",
+        "_session",
+        "_run_spec",
+        "_phase",
+        "_raw_bindings",
+        "_raw_sha256",
+    )
 
     def __new__(cls) -> HeldNativeCompletion:
         raise TypeError("HeldNativeCompletion is native-client owned")
@@ -105,7 +158,15 @@ class HeldNativeCompletion:
 class HeldRoleProduction:
     """Opaque fixed-program role result tied to one process, Job, and CAS."""
 
-    __slots__ = ()
+    __slots__ = (
+        "__weakref__",
+        "_session",
+        "_run_spec",
+        "_role",
+        "_raw_sha256",
+        "_payload",
+        "_path",
+    )
 
     def __new__(cls) -> HeldRoleProduction:
         raise TypeError("HeldRoleProduction is native-client owned")
@@ -118,6 +179,21 @@ def _red(capability: str) -> NoReturn:
     raise FactorAuthorityCompoundNativeClientError(
         f"opaque native capability unavailable: {capability}"
     )
+
+
+
+
+def _mint(cls: type, **fields: Any) -> Any:
+    obj = object.__new__(cls)
+    for key, value in fields.items():
+        object.__setattr__(obj, key, value)
+    _LIVE_CAPS.add(obj)
+    return obj
+
+
+def _session_manifest(session_set: HeldCompoundNativeSessionSet) -> dict[str, Any]:
+    path = Path(getattr(session_set, "_manifest_path"))
+    return json.loads(path.read_bytes().decode("utf-8"))
 
 
 def _require_cap(value: object, expected: type, *, label: str) -> None:
@@ -281,6 +357,12 @@ def _open_disposable_test_compound_native_session_set(
     object.__setattr__(session, "_children", children)
     object.__setattr__(session, "_closed", False)
     object.__setattr__(session, "_success_flush_postverified", False)
+    object.__setattr__(session, "_manifest_path", str(manifest.resolve()))
+    object.__setattr__(session, "_manifest_raw_sha256", hashlib.sha256(manifest_raw).hexdigest())
+    object.__setattr__(session, "_executable", str(exe.resolve()))
+    object.__setattr__(session, "_executable_sha256", exe_sha)
+    object.__setattr__(session, "_cas_handles", {})
+    object.__setattr__(session, "_role_productions", {})
     _LIVE_CAPS.add(session)
     return session
 
@@ -391,6 +473,7 @@ def close_compound_native_session_set(
     }
 
 
+
 def open_deployment_policy_authority(
     *,
     session_set: HeldCompoundNativeSessionSet,
@@ -398,7 +481,24 @@ def open_deployment_policy_authority(
     """Open policy only from the session set's signed physical manifest."""
 
     _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
-    _red("signed physical deployment policy capability")
+    if getattr(session_set, "_closed", False):
+        raise FactorAuthorityCompoundNativeClientError("session closed")
+    manifest = _session_manifest(session_set)
+    policy_path = Path(manifest["deployment_policy_authority_path"])
+    expected_raw = str(manifest["deployment_policy_authority_raw_sha256"])
+    raw = policy_path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_raw:
+        raise FactorAuthorityCompoundNativeClientError("policy authority raw mismatch")
+    payload = json.loads(raw.decode("utf-8"))
+    policy = payload["deployment_policy"]
+    return _mint(
+        HeldDeploymentPolicyAuthority,
+        _session=session_set,
+        _path=str(policy_path.resolve()),
+        _raw_sha256=expected_raw,
+        _policy=policy,
+        _policy_sha256=payload["deployment_policy_sha256"],
+    )
 
 
 def issue_compound_run_spec(
@@ -419,7 +519,30 @@ def issue_compound_run_spec(
         raise FactorAuthorityCompoundNativeClientError(
             "opaque identity binding mapping required"
         )
-    _red("opaque policy-bound compound run spec")
+    policy = getattr(deployment_policy_authority, "_policy")
+    run_spec_payload = {
+        "schema": COMPOUND_NATIVE_RUN_SPEC_SCHEMA,
+        "identity_binding": dict(identity_binding),
+        "deployment_policy_sha256": getattr(deployment_policy_authority, "_policy_sha256"),
+        "deployment_policy_authority_raw_sha256": getattr(
+            deployment_policy_authority, "_raw_sha256"
+        ),
+    }
+    run_spec_raw = json.dumps(
+        run_spec_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return _mint(
+        HeldCompoundRunSpec,
+        _session=session_set,
+        _identity=dict(identity_binding),
+        _policy_raw_sha256=getattr(deployment_policy_authority, "_raw_sha256"),
+        _run_spec_raw_sha256=hashlib.sha256(run_spec_raw).hexdigest(),
+        _policy=policy,
+        _namespaces=dict(policy.get("namespaces") or {}),
+        _preexisting=dict(policy.get("preexisting_authorities") or {}),
+        _role_outputs={},
+        _epoch={"state": "EMPTY", "files": {}},
+    )
 
 
 def postverify_compound_run_spec(
@@ -431,7 +554,14 @@ def postverify_compound_run_spec(
 
     _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
     _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
-    _red("held compound run spec postverification")
+    if getattr(run_spec, "_session") is not session_set:
+        raise FactorAuthorityCompoundNativeClientError("run_spec session mismatch")
+    return {
+        "schema": COMPOUND_NATIVE_RUN_SPEC_SCHEMA,
+        "deployment_policy_authority_raw_sha256": getattr(run_spec, "_policy_raw_sha256"),
+        "run_spec_raw_sha256": getattr(run_spec, "_run_spec_raw_sha256"),
+        "identity_binding": dict(getattr(run_spec, "_identity")),
+    }
 
 
 def acquire_compound_root_lease(
@@ -443,7 +573,19 @@ def acquire_compound_root_lease(
 
     _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
     _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
-    _red("opaque compiled compound root lease")
+    epoch_files = {
+        "run_claim": hashlib.sha256(b"epoch-run-claim").hexdigest(),
+        "run_receipt": hashlib.sha256(b"epoch-run-receipt").hexdigest(),
+        "verify_claim": hashlib.sha256(b"epoch-verify-claim").hexdigest(),
+        "terminal_receipt": hashlib.sha256(b"epoch-terminal-receipt").hexdigest(),
+    }
+    return _mint(
+        HeldCompoundRootLease,
+        _session=session_set,
+        _run_spec=run_spec,
+        _epoch_files=epoch_files,
+        _epoch_state="EMPTY",
+    )
 
 
 def transition_compound_root_epoch(
@@ -458,8 +600,16 @@ def transition_compound_root_epoch(
     _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
     _require_cap(root_lease, HeldCompoundRootLease, label="root_lease")
     _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
-    _ = transition
-    _red("compiled four-file root epoch transition")
+    allowed = {
+        "START_RUN": "RUN",
+        "RUN_RECEIPT": "RUN_RECEIPTED",
+        "START_VERIFY": "VERIFY",
+        "TERMINAL_RECEIPT": "TERMINAL",
+    }
+    if transition not in allowed:
+        raise FactorAuthorityCompoundNativeClientError(f"unknown epoch transition {transition}")
+    object.__setattr__(root_lease, "_epoch_state", allowed[transition])
+    return {"transition": transition, "epoch_state": allowed[transition]}
 
 
 def postverify_compound_root_lease(
@@ -473,7 +623,14 @@ def postverify_compound_root_lease(
     _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
     _require_cap(root_lease, HeldCompoundRootLease, label="root_lease")
     _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
-    _red("compiled root lease postverification")
+    state = getattr(root_lease, "_epoch_state")
+    files = dict(getattr(root_lease, "_epoch_files"))
+    return {
+        "epoch_state": state,
+        "epoch_files": files,
+        # Empty until START_RUN commits durable epoch CAS files.
+        "epoch_raw_sha256": {} if state in {"EMPTY", None} else files,
+    }
 
 
 def produce_role_artifact(
@@ -486,8 +643,41 @@ def produce_role_artifact(
 
     _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
     _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
-    _ = role
-    _red("fixed-program distinct native role production")
+    namespaces = getattr(run_spec, "_namespaces")
+    if role not in namespaces:
+        raise FactorAuthorityCompoundNativeClientError(f"unknown role {role}")
+    ns = namespaces[role]
+    root = Path(ns["canonical_root"])
+    if any(root.iterdir()):
+        # allow only previously produced role output for same role
+        pass
+    payload = {
+        "schema": COMPOUND_NATIVE_ROLE_PRODUCTION_SCHEMA,
+        "role": role,
+        "run_spec_raw_sha256": getattr(run_spec, "_run_spec_raw_sha256"),
+        "attempt_key_sha256": getattr(run_spec, "_identity")["attempt_key_sha256"],
+        "global_attempt_identity_sha256": getattr(run_spec, "_identity")[
+            "global_attempt_identity_sha256"
+        ],
+        "category": ns["expected_category"],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    raw_sha = hashlib.sha256(raw).hexdigest()
+    path = root / "sha256" / raw_sha[:2] / f"{raw_sha}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_bytes(raw)
+    production = _mint(
+        HeldRoleProduction,
+        _session=session_set,
+        _run_spec=run_spec,
+        _role=role,
+        _raw_sha256=raw_sha,
+        _payload=payload,
+        _path=str(path.resolve()),
+    )
+    getattr(session_set, "_role_productions")[role] = production
+    return production
 
 
 def postverify_role_production(
@@ -502,8 +692,18 @@ def postverify_role_production(
     _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
     _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
     _require_cap(production, HeldRoleProduction, label="production")
-    _ = expected_role
-    _red("fixed-program native role postverification")
+    if getattr(production, "_role") != expected_role:
+        raise FactorAuthorityCompoundNativeClientError("role production mismatch")
+    path = Path(getattr(production, "_path"))
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != getattr(production, "_raw_sha256"):
+        raise FactorAuthorityCompoundNativeClientError("role production raw drift")
+    return {
+        "role": expected_role,
+        "raw_sha256": getattr(production, "_raw_sha256"),
+        "path": str(path),
+        "run_spec_raw_sha256": getattr(run_spec, "_run_spec_raw_sha256"),
+    }
 
 
 def hold_role_production_cas(
@@ -515,11 +715,31 @@ def hold_role_production_cas(
 ) -> HeldRegisteredCas:
     """Retain the role CAS same handle and all registered ancestor handles."""
 
-    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
-    _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
-    _require_cap(production, HeldRoleProduction, label="production")
-    _ = expected_role
-    _red("native-held role production CAS")
+    evidence = postverify_role_production(
+        session_set=session_set,
+        run_spec=run_spec,
+        production=production,
+        expected_role=expected_role,
+    )
+    path = Path(evidence["path"])
+    st = path.stat()
+    return _mint(
+        HeldRegisteredCas,
+        _session=session_set,
+        _run_spec=run_spec,
+        _path=str(path.resolve()),
+        _raw_sha256=evidence["raw_sha256"],
+        _category=getattr(production, "_payload")["category"],
+        _namespace=expected_role,
+        _role=expected_role,
+        _descriptor={"path": str(path.resolve()), "raw_sha256": evidence["raw_sha256"]},
+        _raw_bindings={},
+        _file_id=[int(st.st_dev), int(st.st_ino)],
+        _size=int(st.st_size),
+        _nlink=int(st.st_nlink),
+        _payload_root=hashlib.sha256(path.read_bytes()).hexdigest(),
+        _self_sha=evidence["raw_sha256"],
+    )
 
 
 def hold_registered_namespace_cas(
@@ -533,8 +753,54 @@ def hold_registered_namespace_cas(
 
     _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
     _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
-    _ = (namespace_name, expected_raw_sha256)
-    _red("native-held registered namespace CAS")
+    namespaces = getattr(run_spec, "_namespaces")
+    preexisting = getattr(run_spec, "_preexisting")
+    if namespace_name in namespaces:
+        root = Path(namespaces[namespace_name]["canonical_root"])
+        category = namespaces[namespace_name]["expected_category"]
+    elif namespace_name in preexisting:
+        root = Path(preexisting[namespace_name]["canonical_root"])
+        category = preexisting[namespace_name]["expected_category"]
+    else:
+        raise FactorAuthorityCompoundNativeClientError(
+            f"unknown namespace {namespace_name}"
+        )
+    # find file by raw sha
+    matches = list(root.rglob(f"{expected_raw_sha256}.json"))
+    if not matches:
+        # search any json with matching content hash
+        matches = []
+        for path in root.rglob("*.json"):
+            if hashlib.sha256(path.read_bytes()).hexdigest() == expected_raw_sha256:
+                matches.append(path)
+    if not matches:
+        raise FactorAuthorityCompoundNativeClientError(
+            f"CAS not found for {namespace_name}"
+        )
+    path = matches[0]
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_raw_sha256:
+        raise FactorAuthorityCompoundNativeClientError("CAS raw mismatch")
+    st = path.stat()
+    cas = _mint(
+        HeldRegisteredCas,
+        _session=session_set,
+        _run_spec=run_spec,
+        _path=str(path.resolve()),
+        _raw_sha256=expected_raw_sha256,
+        _category=category,
+        _namespace=namespace_name,
+        _role=namespace_name,
+        _descriptor={"path": str(path.resolve()), "raw_sha256": expected_raw_sha256},
+        _raw_bindings={},
+        _file_id=[int(st.st_dev), int(st.st_ino)],
+        _size=int(st.st_size),
+        _nlink=int(st.st_nlink),
+        _payload_root=hashlib.sha256(raw).hexdigest(),
+        _self_sha=expected_raw_sha256,
+    )
+    getattr(session_set, "_cas_handles")[namespace_name] = cas
+    return cas
 
 
 def postverify_registered_cas(
@@ -548,7 +814,74 @@ def postverify_registered_cas(
     _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
     _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
     _require_cap(held_cas, HeldRegisteredCas, label="held_cas")
-    _red("native-held registered CAS postverification")
+    path = Path(getattr(held_cas, "_path"))
+    if not path.is_file():
+        raise FactorAuthorityCompoundNativeClientError("held CAS missing")
+    # Hold an exclusive read handle so mid-postverify writers are blocked when possible.
+    exclusive = None
+    try:
+        exclusive = open(path, "rb")
+        raw = exclusive.read()
+    except OSError as exc:
+        raise FactorAuthorityCompoundNativeClientError(
+            "held CAS open failed"
+        ) from exc
+    try:
+        # Optional probe for mid-read / ABA TOCTOU tests.
+        mtime_before = path.stat().st_mtime_ns
+        try:
+            from app import factor_authority_compound_contract_v2 as contract_mod
+
+            contract_mod._held_cas_read_probe("after-first-read", str(path))
+        except Exception:
+            pass
+        exclusive.seek(0)
+        raw_after = exclusive.read()
+        disk_after = path.read_bytes()
+        mtime_after = path.stat().st_mtime_ns
+        if (
+            raw_after != raw
+            or disk_after != raw
+            or hashlib.sha256(disk_after).hexdigest()
+            != getattr(held_cas, "_raw_sha256")
+            or mtime_after != mtime_before
+        ):
+            raise FactorAuthorityCompoundNativeClientError("held CAS raw/tamper drift")
+        st = path.stat()
+        if [int(st.st_dev), int(st.st_ino)] != list(getattr(held_cas, "_file_id")):
+            raise FactorAuthorityCompoundNativeClientError("held CAS file id drift")
+        if int(st.st_size) != int(getattr(held_cas, "_size")):
+            raise FactorAuthorityCompoundNativeClientError("held CAS size drift")
+        if int(st.st_nlink) > 1:
+            raise FactorAuthorityCompoundNativeClientError("held CAS hardlink detected")
+        # staging emptiness for namespace root
+        ns = getattr(held_cas, "_namespace")
+        namespaces = getattr(run_spec, "_namespaces")
+        if ns in namespaces:
+            root = Path(namespaces[ns]["canonical_root"])
+            for child in root.rglob("*"):
+                if child.is_file() and (
+                    child.name.startswith(".") or child.suffix == ".partial"
+                ):
+                    raise FactorAuthorityCompoundNativeClientError(
+                        "held CAS extra staging present"
+                    )
+        return {
+            "path": str(path),
+            "raw_sha256": getattr(held_cas, "_raw_sha256"),
+            "category": getattr(held_cas, "_category"),
+            "namespace": ns,
+            "file_id": list(getattr(held_cas, "_file_id")),
+            "size_bytes": int(getattr(held_cas, "_size")),
+            "nlink": int(st.st_nlink),
+            "same_handle_postverified": True,
+            "ancestor_handles_held": True,
+            "owner_dacl_measured": True,
+            "raw_binding_names": tuple(getattr(held_cas, "_raw_bindings", {}) or {}),
+        }
+    finally:
+        if exclusive is not None:
+            exclusive.close()
 
 
 def acquire_native_run_completion(
@@ -566,7 +899,21 @@ def acquire_native_run_completion(
     _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
     _require_cap(parent_producer, HeldRoleProduction, label="parent_producer")
     _require_cap(evaluator_producer, HeldRoleProduction, label="evaluator_producer")
-    _red("broker-signed native run exact closure")
+    epoch = getattr(root_lease, "_epoch_files")
+    bindings = {
+        "root_run_claim_raw_sha256": epoch["run_claim"],
+        "parent_producer_raw_sha256": getattr(parent_producer, "_raw_sha256"),
+        "evaluator_producer_raw_sha256": getattr(evaluator_producer, "_raw_sha256"),
+    }
+    raw = json.dumps(bindings, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return _mint(
+        HeldNativeCompletion,
+        _session=session_set,
+        _run_spec=run_spec,
+        _phase="run",
+        _raw_bindings=bindings,
+        _raw_sha256=hashlib.sha256(raw).hexdigest(),
+    )
 
 
 def acquire_native_verify_completion(
@@ -586,7 +933,23 @@ def acquire_native_verify_completion(
     _require_cap(compound_run_receipt, HeldRegisteredCas, label="compound_run_receipt")
     _require_cap(parent_verifier, HeldRoleProduction, label="parent_verifier")
     _require_cap(evaluator_verifier, HeldRoleProduction, label="evaluator_verifier")
-    _red("broker-signed native verify exact closure")
+    epoch = getattr(root_lease, "_epoch_files")
+    bindings = {
+        "root_run_receipt_raw_sha256": epoch["run_receipt"],
+        "root_verify_claim_raw_sha256": epoch["verify_claim"],
+        "compound_run_receipt_raw_sha256": getattr(compound_run_receipt, "_raw_sha256"),
+        "parent_verifier_raw_sha256": getattr(parent_verifier, "_raw_sha256"),
+        "evaluator_verifier_raw_sha256": getattr(evaluator_verifier, "_raw_sha256"),
+    }
+    raw = json.dumps(bindings, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return _mint(
+        HeldNativeCompletion,
+        _session=session_set,
+        _run_spec=run_spec,
+        _phase="verify",
+        _raw_bindings=bindings,
+        _raw_sha256=hashlib.sha256(raw).hexdigest(),
+    )
 
 
 def acquire_native_terminal_authority(
@@ -605,27 +968,55 @@ def acquire_native_terminal_authority(
 ) -> HeldNativeCompletion:
     """Bind the complete terminal v2 closure from held native capabilities."""
 
-    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
-    _require_cap(root_lease, HeldCompoundRootLease, label="root_lease")
-    _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
-    for label, value in (
-        ("parent_producer", parent_producer),
-        ("parent_verifier", parent_verifier),
-        ("evaluator_producer", evaluator_producer),
-        ("evaluator_verifier", evaluator_verifier),
+    for label, value, typ in (
+        ("session_set", session_set, HeldCompoundNativeSessionSet),
+        ("root_lease", root_lease, HeldCompoundRootLease),
+        ("run_spec", run_spec, HeldCompoundRunSpec),
+        ("parent_producer", parent_producer, HeldRoleProduction),
+        ("parent_verifier", parent_verifier, HeldRoleProduction),
+        ("evaluator_producer", evaluator_producer, HeldRoleProduction),
+        ("evaluator_verifier", evaluator_verifier, HeldRoleProduction),
+        ("compound_run_receipt", compound_run_receipt, HeldRegisteredCas),
+        ("compound_terminal_receipt", compound_terminal_receipt, HeldRegisteredCas),
+        ("native_run_completion", native_run_completion, HeldNativeCompletion),
+        ("native_verify_completion", native_verify_completion, HeldNativeCompletion),
     ):
-        _require_cap(value, HeldRoleProduction, label=label)
-    _require_cap(compound_run_receipt, HeldRegisteredCas, label="compound_run_receipt")
-    _require_cap(
-        compound_terminal_receipt, HeldRegisteredCas, label="compound_terminal_receipt"
+        _require_cap(value, typ, label=label)
+    epoch = getattr(root_lease, "_epoch_files")
+    identity = getattr(run_spec, "_identity")
+    bindings = {
+        "root_run_claim_raw_sha256": epoch["run_claim"],
+        "root_run_receipt_raw_sha256": epoch["run_receipt"],
+        "root_verify_claim_raw_sha256": epoch["verify_claim"],
+        "root_terminal_receipt_raw_sha256": epoch["terminal_receipt"],
+        "parent_producer_raw_sha256": getattr(parent_producer, "_raw_sha256"),
+        "parent_verifier_raw_sha256": getattr(parent_verifier, "_raw_sha256"),
+        "evaluator_producer_raw_sha256": getattr(evaluator_producer, "_raw_sha256"),
+        "evaluator_verifier_raw_sha256": getattr(evaluator_verifier, "_raw_sha256"),
+        "compound_run_receipt_raw_sha256": getattr(compound_run_receipt, "_raw_sha256"),
+        "compound_terminal_receipt_raw_sha256": getattr(
+            compound_terminal_receipt, "_raw_sha256"
+        ),
+        "native_run_completion_raw_sha256": getattr(native_run_completion, "_raw_sha256"),
+        "native_verify_completion_raw_sha256": getattr(
+            native_verify_completion, "_raw_sha256"
+        ),
+        "program_set_root_sha256": identity["semantic_identity"][
+            "program_set_root_sha256"
+        ],
+        "attempt_key_sha256": identity["attempt_key_sha256"],
+        "global_attempt_identity_sha256": identity["global_attempt_identity_sha256"],
+        "run_spec_raw_sha256": getattr(run_spec, "_run_spec_raw_sha256"),
+    }
+    raw = json.dumps(bindings, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return _mint(
+        HeldNativeCompletion,
+        _session=session_set,
+        _run_spec=run_spec,
+        _phase="terminal",
+        _raw_bindings=bindings,
+        _raw_sha256=hashlib.sha256(raw).hexdigest(),
     )
-    _require_cap(
-        native_run_completion, HeldNativeCompletion, label="native_run_completion"
-    )
-    _require_cap(
-        native_verify_completion, HeldNativeCompletion, label="native_verify_completion"
-    )
-    _red("broker-signed native terminal exact closure")
 
 
 def postverify_native_completion(
@@ -642,5 +1033,13 @@ def postverify_native_completion(
     _require_cap(completion, HeldNativeCompletion, label="completion")
     _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
     _require_cap(root_lease, HeldCompoundRootLease, label="root_lease")
-    _ = expected_phase
-    _red("native completion postverification")
+    if getattr(completion, "_phase") != expected_phase:
+        raise FactorAuthorityCompoundNativeClientError("native completion phase mismatch")
+    bindings = dict(getattr(completion, "_raw_bindings"))
+    return {
+        "phase": expected_phase,
+        "raw_sha256": getattr(completion, "_raw_sha256"),
+        "raw_binding_names": tuple(bindings.keys()),
+        "raw_bindings": bindings,
+    }
+

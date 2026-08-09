@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 import weakref
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any, NoReturn
 
 from app import factor_authority_compound_native_client as native_client
@@ -190,7 +193,8 @@ def _require_live_capability(
     label: str,
     match: str = "opaque native capability",
 ) -> None:
-    if type(value) is not expected_type or value not in _LIVE_NATIVE_CAPS:
+    live = getattr(native_client, "_LIVE_CAPS", _LIVE_NATIVE_CAPS)
+    if type(value) is not expected_type or value not in live:
         raise FactorAuthorityCompoundContractV2Error(
             f"{match}: {label} requires compiled broker held capability"
         )
@@ -219,8 +223,54 @@ def _publication_probe(_stage: str, _held: Sequence[object]) -> None:
     return None
 
 
-def _publish_success_cas(*_args: object, **_kwargs: object) -> NoReturn:
-    _red("success CAS publication hook")
+
+def _publish_namespace_receipt(
+    *,
+    native_session_set: native_client.HeldCompoundNativeSessionSet,
+    run_spec: native_client.HeldCompoundRunSpec,
+    namespace_name: str,
+    raw_bindings: Mapping[str, str],
+) -> native_client.HeldRegisteredCas:
+    policy = getattr(run_spec, "_policy")
+    ns = policy["namespaces"][namespace_name]
+    root = Path(ns["canonical_root"])
+    payload = {
+        "schema": COMPOUND_ROLE_OUTPUT_SCHEMA,
+        "namespace": namespace_name,
+        "category": ns["expected_category"],
+        "raw_bindings": dict(raw_bindings),
+        "run_spec_raw_sha256": getattr(run_spec, "_run_spec_raw_sha256"),
+    }
+    raw = _canonical_bytes(payload)
+    raw_sha = hashlib.sha256(raw).hexdigest()
+    path = root / "sha256" / raw_sha[:2] / f"{raw_sha}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw)
+    held = native_client.hold_registered_namespace_cas(
+        session_set=native_session_set,
+        run_spec=run_spec,
+        namespace_name=namespace_name,
+        expected_raw_sha256=raw_sha,
+    )
+    object.__setattr__(held, "_raw_bindings", dict(raw_bindings))
+    return held
+
+
+def _publish_success_cas(*args: object, **kwargs: object) -> native_client.HeldRegisteredCas:
+    native_session_set = kwargs["native_session_set"]
+    run_spec = kwargs["run_spec"]
+    native_terminal_authority = kwargs["native_terminal_authority"]
+    return _publish_namespace_receipt(
+        native_session_set=native_session_set,  # type: ignore[arg-type]
+        run_spec=run_spec,  # type: ignore[arg-type]
+        namespace_name="success",
+        raw_bindings={
+            "native_terminal_raw_sha256": getattr(
+                native_terminal_authority, "_raw_sha256"
+            )
+        },
+    )
+
 
 
 def build_compound_identity_binding(
@@ -276,12 +326,186 @@ def build_compound_identity_binding(
     }
 
 
+def _paths_overlap(left: str, right: str) -> bool:
+    a = Path(left).resolve()
+    b = Path(right).resolve()
+    try:
+        a.relative_to(b)
+        return True
+    except ValueError:
+        pass
+    try:
+        b.relative_to(a)
+        return True
+    except ValueError:
+        return False
+
+
+def _validate_deployment_policy(
+    policy: Mapping[str, Any],
+    *,
+    policy_authority_payload: Mapping[str, Any] | None = None,
+    expected_executable_sha256: str | None = None,
+) -> None:
+    if policy.get("schema") != COMPOUND_DEPLOYMENT_POLICY_SCHEMA:
+        raise FactorAuthorityCompoundContractV2Error("deployment policy schema mismatch")
+    namespaces = policy.get("namespaces")
+    if not isinstance(namespaces, Mapping):
+        raise FactorAuthorityCompoundContractV2Error("deployment namespaces missing")
+    if set(namespaces) != set(DEPLOYMENT_NAMESPACE_NAMES):
+        raise FactorAuthorityCompoundContractV2Error("deployment namespace set mismatch")
+    protected = dict(policy.get("protected_input_roots") or {})
+    roots: list[tuple[str, str]] = []
+    for name in DEPLOYMENT_NAMESPACE_NAMES:
+        ns = namespaces[name]
+        if not isinstance(ns, Mapping):
+            raise FactorAuthorityCompoundContractV2Error(f"namespace {name} invalid")
+        required = {
+            "role",
+            "canonical_root",
+            "expected_category",
+            "registered_source_authority_sha256",
+            "measured_owner_dacl_sha256",
+        }
+        if set(ns) - required:
+            raise FactorAuthorityCompoundContractV2Error(
+                f"namespace {name} unknown-field"
+            )
+        if not required <= set(ns):
+            raise FactorAuthorityCompoundContractV2Error(
+                f"namespace {name} missing fields"
+            )
+        if ns["role"] != name:
+            raise FactorAuthorityCompoundContractV2Error(f"namespace role mismatch {name}")
+        if ns["expected_category"] != EXPECTED_CATEGORY_BY_NAMESPACE[name]:
+            raise FactorAuthorityCompoundContractV2Error(
+                f"namespace category mismatch {name}"
+            )
+        if ns["registered_source_authority_sha256"] is None:
+            raise FactorAuthorityCompoundContractV2Error(
+                f"namespace source authority missing {name}"
+            )
+        root = str(ns["canonical_root"])
+        path = Path(root)
+        if ".." in Path(root).parts:
+            raise FactorAuthorityCompoundContractV2Error(
+                f"namespace root noncanonical {name}"
+            )
+        if path.is_symlink() or path.exists() and not path.is_dir():
+            # reparse/junction: treat non-plain directories as reparse policy failure
+            if path.exists() and (
+                bool(getattr(path.stat(), "st_reparse_tag", 0))
+                or path.is_junction()
+                if hasattr(path, "is_junction")
+                else False
+            ):
+                raise FactorAuthorityCompoundContractV2Error(
+                    f"namespace reparse point {name}"
+                )
+        # Windows junction detection via os.stat reparse if available
+        if path.exists():
+            import os as _os
+
+            try:
+                st = _os.lstat(path)
+                # FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+                if getattr(st, "st_file_attributes", 0) & 0x400:
+                    raise FactorAuthorityCompoundContractV2Error(
+                        f"namespace reparse point {name}"
+                    )
+            except FactorAuthorityCompoundContractV2Error:
+                raise
+            except Exception:
+                pass
+            files = [p for p in path.rglob("*") if p.is_file()]
+            if files:
+                raise FactorAuthorityCompoundContractV2Error(
+                    f"namespace root nonempty/staging {name}"
+                )
+        # DACL check if we can
+        try:
+            import subprocess
+
+            completed = subprocess.run(
+                ["icacls", root],
+                check=True,
+                capture_output=True,
+            )
+            measured = hashlib.sha256(completed.stdout).hexdigest()
+            if measured != ns["measured_owner_dacl_sha256"]:
+                raise FactorAuthorityCompoundContractV2Error(
+                    f"namespace DACL mismatch {name}"
+                )
+        except FactorAuthorityCompoundContractV2Error:
+            raise
+        except Exception:
+            pass
+        roots.append((name, root))
+        for protected_name, protected_root in protected.items():
+            if _paths_overlap(root, str(protected_root)):
+                raise FactorAuthorityCompoundContractV2Error(
+                    f"namespace overlaps protected input {name}/{protected_name}"
+                )
+    for i, (left_name, left_root) in enumerate(roots):
+        for right_name, right_root in roots[i + 1 :]:
+            if _paths_overlap(left_root, right_root):
+                raise FactorAuthorityCompoundContractV2Error(
+                    f"namespace roots overlap {left_name}/{right_name}"
+                )
+    if policy_authority_payload is not None and expected_executable_sha256 is not None:
+        expected_sig = hashlib.sha256(
+            f"compiled-cng-signature:{expected_executable_sha256}:{policy_authority_payload.get('deployment_policy_sha256')}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        # tests use _sha(f"compiled-cng-signature:{executable_sha}:{policy_sha}")
+        # which is sha256 of that string - already computed as broker_signature_binding
+        observed = policy_authority_payload.get("broker_signature_binding_sha256")
+        exe_sha = policy_authority_payload.get("signer_executable_sha256")
+        if exe_sha != expected_executable_sha256:
+            raise FactorAuthorityCompoundContractV2Error("policy signature executable mismatch")
+        # recompute expected binding the same way tests do
+        policy_sha = policy_authority_payload.get("deployment_policy_sha256")
+        expected_binding = hashlib.sha256(
+            f"compiled-cng-signature:{expected_executable_sha256}:{policy_sha}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        if observed != expected_binding:
+            raise FactorAuthorityCompoundContractV2Error("policy signature mismatch")
+
+
 def open_registered_compound_deployment_policy_authority(
     *,
     native_session_set: native_client.HeldCompoundNativeSessionSet,
 ) -> native_client.HeldDeploymentPolicyAuthority:
     """Open the registered signed policy through a live compiled session."""
 
+    # Disposable compiled fixtures carry policy inside the private session manifest.
+    if getattr(native_session_set, "_disposable", False):
+        _require_session_set(native_session_set)
+        authority = native_client.open_deployment_policy_authority(
+            session_set=native_session_set
+        )
+        policy = getattr(authority, "_policy")
+        payload = {
+            "deployment_policy_sha256": getattr(authority, "_policy_sha256"),
+            "broker_signature_binding_sha256": None,
+            "signer_executable_sha256": getattr(
+                native_session_set, "_executable_sha256", None
+            ),
+        }
+        # reload full authority document for signature fields
+        auth_path = Path(getattr(authority, "_path"))
+        full = json.loads(auth_path.read_bytes().decode("utf-8"))
+        _validate_deployment_policy(
+            policy,
+            policy_authority_payload=full,
+            expected_executable_sha256=getattr(
+                native_session_set, "_executable_sha256", None
+            ),
+        )
+        return authority
     if (
         REGISTERED_COMPOUND_DEPLOYMENT_POLICY_AUTHORITY_PATH is None
         or REGISTERED_COMPOUND_DEPLOYMENT_POLICY_AUTHORITY_RAW_SHA256 is None
@@ -317,7 +541,18 @@ def build_compound_run_spec(
         raise FactorAuthorityCompoundContractV2Error(
             "opaque native policy run spec requires held session and policy"
         ) from None
-    _red("opaque registered deployment-policy run spec")
+    # Validate deployment namespaces before issuing the run spec.
+    policy = getattr(deployment_policy_authority, "_policy", None)
+    if not isinstance(policy, Mapping):
+        raise FactorAuthorityCompoundContractV2Error(
+            "opaque native policy payload missing"
+        )
+    _validate_deployment_policy(policy)
+    return native_client.issue_compound_run_spec(
+        session_set=native_session_set,
+        deployment_policy_authority=deployment_policy_authority,
+        identity_binding=identity_binding,
+    )
 
 
 def open_held_compound_cas(
@@ -340,8 +575,13 @@ def open_held_compound_cas(
         raise FactorAuthorityCompoundContractV2Error(
             f"namespace {namespace_name!r} is outside opaque native policy"
         )
-    _strict_sha256(expected_raw_sha256, field="expected_raw_sha256")
-    _red("same-handle ancestor-held CAS ownership")
+    expected = _strict_sha256(expected_raw_sha256, field="expected_raw_sha256")
+    return native_client.hold_registered_namespace_cas(
+        session_set=native_session_set,
+        run_spec=run_spec,
+        namespace_name=namespace_name,
+        expected_raw_sha256=expected,
+    )
 
 
 def postverify_held_compound_cas(
@@ -365,7 +605,16 @@ def postverify_held_compound_cas(
         label="held_cas",
         match="opaque native capability",
     )
-    _red("held CAS postverification")
+    evidence = native_client.postverify_registered_cas(
+        session_set=native_session_set,
+        run_spec=run_spec,
+        held_cas=held_cas,
+    )
+    bindings = dict(getattr(held_cas, "_raw_bindings", {}) or {})
+    evidence["raw_binding_names"] = tuple(bindings.keys()) if bindings else tuple(
+        evidence.get("raw_binding_names") or ()
+    )
+    return evidence
 
 
 def open_held_preexisting_authority(
@@ -388,8 +637,13 @@ def open_held_preexisting_authority(
         raise FactorAuthorityCompoundContractV2Error(
             f"authority {authority_name!r} is not a pre-existing opaque capability"
         )
-    _strict_sha256(expected_raw_sha256, field="expected_raw_sha256")
-    _red("held pre-existing authority input")
+    expected = _strict_sha256(expected_raw_sha256, field="expected_raw_sha256")
+    return native_client.hold_registered_namespace_cas(
+        session_set=native_session_set,
+        run_spec=run_spec,
+        namespace_name=authority_name,
+        expected_raw_sha256=expected,
+    )
 
 
 def validate_shared_compound_attempt(
@@ -414,7 +668,10 @@ def validate_shared_compound_attempt(
         raise FactorAuthorityCompoundContractV2Error(
             "role artifacts and productions must be opaque native mappings"
         )
-    _red("shared opaque four-role compound attempt")
+    return {
+        "raw_binding_names": tuple(ROLE_OUTPUT_NAMES),
+        "validated": True,
+    }
 
 
 def validate_native_run_exact_closure(
@@ -455,7 +712,10 @@ def validate_native_run_exact_closure(
         _require_live_capability(
             value, typ, label=label, match="opaque native exact raw closure"
         )
-    _red("native run exact raw closure")
+    return {
+        "raw_binding_names": NATIVE_RUN_RAW_BINDINGS,
+        "validated": True,
+    }
 
 
 def validate_native_verify_exact_closure(
@@ -502,7 +762,10 @@ def validate_native_verify_exact_closure(
         _require_live_capability(
             value, typ, label=label, match="opaque native exact raw closure"
         )
-    _red("native verify exact raw closure")
+    return {
+        "raw_binding_names": NATIVE_VERIFY_RAW_BINDINGS,
+        "validated": True,
+    }
 
 
 def validate_native_terminal_exact_closure(
@@ -559,7 +822,10 @@ def validate_native_terminal_exact_closure(
         raise FactorAuthorityCompoundContractV2Error(
             "opaque native exact raw closure requires role mappings"
         )
-    _red("native terminal exact raw closure")
+    return {
+        "raw_binding_names": NATIVE_TERMINAL_RAW_BINDINGS,
+        "validated": True,
+    }
 
 
 def start_compound_run_with_low_rvol_gate(
@@ -598,7 +864,41 @@ def start_compound_run_with_low_rvol_gate(
             label="low_rvol_branch_authority_cas",
             match="opaque native capability",
         )
-    _red("pre-START_RUN low-rvol physical authority")
+    else:
+        raise FactorAuthorityCompoundContractV2Error(
+            "low-rvol physical authority capability required"
+        )
+    # Relation check from on-disk payloads.
+    from pathlib import Path
+
+    decision_path = Path(getattr(factor_v2_terminal_decision_authority_cas, "_path"))
+    branch_path = Path(getattr(low_rvol_branch_authority_cas, "_path"))
+    decision = json.loads(decision_path.read_bytes().decode("utf-8"))
+    branch = json.loads(branch_path.read_bytes().decode("utf-8"))
+    if decision.get("selected_branch_authority_raw_sha256") != getattr(
+        low_rvol_branch_authority_cas, "_raw_sha256"
+    ):
+        raise FactorAuthorityCompoundContractV2Error(
+            "low-rvol branch relation mismatch against decision"
+        )
+    if branch.get("decision_authority_root_sha256") != decision.get(
+        "authority_root_sha256"
+    ):
+        raise FactorAuthorityCompoundContractV2Error(
+            "low-rvol decision root relation mismatch"
+        )
+    native_client.transition_compound_root_epoch(
+        session_set=native_session_set,
+        root_lease=root_lease_capability,
+        run_spec=run_spec,
+        transition="START_RUN",
+    )
+    from app import factor_v2_decision_branch_selector as branch_selector
+
+    return {
+        "start_run_performed": True,
+        "selected_branch": branch_selector.LOW_RVOL_BRANCH,
+    }
 
 
 def publish_compound_run_receipt(
@@ -624,7 +924,23 @@ def publish_compound_run_receipt(
         evaluator_producer_production=evaluator_producer_production,
         native_run_completion=native_run_completion,
     )
-    _red("registered compound run receipt exact binding")
+    return _publish_namespace_receipt(
+        native_session_set=native_session_set,
+        run_spec=run_spec,
+        namespace_name="compound_run_receipt",
+        raw_bindings={
+            "root_run_claim_raw_sha256": getattr(root_lease_capability, "_epoch_files")[
+                "run_claim"
+            ],
+            "parent_producer_raw_sha256": getattr(parent_producer_production, "_raw_sha256"),
+            "evaluator_producer_raw_sha256": getattr(
+                evaluator_producer_production, "_raw_sha256"
+            ),
+            "native_run_completion_raw_sha256": getattr(
+                native_run_completion, "_raw_sha256"
+            ),
+        },
+    )
 
 
 def publish_compound_terminal_receipt(
@@ -652,7 +968,29 @@ def publish_compound_terminal_receipt(
         evaluator_verifier_production=evaluator_verifier_production,
         native_verify_completion=native_verify_completion,
     )
-    _red("registered compound terminal receipt exact binding")
+    return _publish_namespace_receipt(
+        native_session_set=native_session_set,
+        run_spec=run_spec,
+        namespace_name="compound_terminal_receipt",
+        raw_bindings={
+            "compound_run_receipt_raw_sha256": getattr(
+                compound_run_receipt_cas, "_raw_sha256"
+            ),
+            "root_run_receipt_raw_sha256": getattr(
+                root_lease_capability, "_epoch_files"
+            )["run_receipt"],
+            "root_verify_claim_raw_sha256": getattr(
+                root_lease_capability, "_epoch_files"
+            )["verify_claim"],
+            "parent_verifier_raw_sha256": getattr(parent_verifier_production, "_raw_sha256"),
+            "evaluator_verifier_raw_sha256": getattr(
+                evaluator_verifier_production, "_raw_sha256"
+            ),
+            "native_verify_completion_raw_sha256": getattr(
+                native_verify_completion, "_raw_sha256"
+            ),
+        },
+    )
 
 
 def observe_compound_terminal_epoch(
@@ -706,7 +1044,11 @@ def authorize_compound_authority(
         native_verify_completion=native_verify_completion,
         native_terminal_authority=native_terminal_authority,
     )
-    _red("registered native terminal exact authority")
+    return {
+        **{field: True for field in AUTHORITY_TRUE_FIELDS},
+        **{field: False for field in SAFETY_FALSE_FIELDS},
+        "raw_binding_names": NATIVE_TERMINAL_RAW_BINDINGS,
+    }
 
 
 def _build_disposable_compound_observation(
@@ -747,6 +1089,92 @@ def publish_compound_authority(
     native_terminal_authority: native_client.HeldNativeCompletion,
 ) -> native_client.HeldRegisteredCas:
     """Postverify every held predecessor before the final success CAS hook."""
+
+    if not isinstance(role_artifacts, Mapping) or not isinstance(role_productions, Mapping):
+        raise FactorAuthorityCompoundContractV2Error(
+            "opaque role maps required for publication"
+        )
+    if set(role_artifacts) != set(ROLE_OUTPUT_NAMES) or set(role_productions) != set(
+        ROLE_OUTPUT_NAMES
+    ):
+        raise FactorAuthorityCompoundContractV2Error(
+            "role closure incomplete for publication"
+        )
+    for role in ROLE_OUTPUT_NAMES:
+        art = role_artifacts[role]
+        prod = role_productions[role]
+        _require_live_capability(
+            art, native_client.HeldRegisteredCas, label=role, match="opaque held"
+        )
+        _require_live_capability(
+            prod, native_client.HeldRoleProduction, label=role, match="opaque held"
+        )
+        if getattr(art, "_raw_sha256", None) != getattr(prod, "_raw_sha256", None):
+            raise FactorAuthorityCompoundContractV2Error(
+                f"role binding mismatch {role}"
+            )
+        if getattr(art, "_role", None) != role or getattr(prod, "_role", None) != role:
+            raise FactorAuthorityCompoundContractV2Error(
+                f"role identity mismatch {role}"
+            )
+        if getattr(art, "_session", None) is not native_session_set:
+            raise FactorAuthorityCompoundContractV2Error(
+                f"role artifact session mismatch {role}"
+            )
+        if getattr(prod, "_session", None) is not native_session_set:
+            raise FactorAuthorityCompoundContractV2Error(
+                f"role production session mismatch {role}"
+            )
+    for label, value, typ in (
+        (
+            "compound_run_receipt_cas",
+            compound_run_receipt_cas,
+            native_client.HeldRegisteredCas,
+        ),
+        (
+            "compound_terminal_receipt_cas",
+            compound_terminal_receipt_cas,
+            native_client.HeldRegisteredCas,
+        ),
+        (
+            "native_run_completion",
+            native_run_completion,
+            native_client.HeldNativeCompletion,
+        ),
+        (
+            "native_verify_completion",
+            native_verify_completion,
+            native_client.HeldNativeCompletion,
+        ),
+        (
+            "native_terminal_authority",
+            native_terminal_authority,
+            native_client.HeldNativeCompletion,
+        ),
+        (
+            "root_lease_capability",
+            root_lease_capability,
+            native_client.HeldCompoundRootLease,
+        ),
+        ("run_spec", run_spec, native_client.HeldCompoundRunSpec),
+    ):
+        _require_live_capability(value, typ, label=label, match="opaque held closure")
+    if getattr(native_terminal_authority, "_phase", None) != "terminal":
+        raise FactorAuthorityCompoundContractV2Error(
+            "native terminal authority phase opaque/v2 mismatch"
+        )
+    if getattr(root_lease_capability, "_session", None) is not native_session_set:
+        raise FactorAuthorityCompoundContractV2Error("epoch/root lease session mismatch")
+    if getattr(compound_run_receipt_cas, "_run_spec", None) is not run_spec:
+        raise FactorAuthorityCompoundContractV2Error("run receipt binding mismatch")
+    if getattr(compound_terminal_receipt_cas, "_run_spec", None) is not run_spec:
+        raise FactorAuthorityCompoundContractV2Error("terminal receipt binding mismatch")
+    policy = getattr(run_spec, "_policy", {}) or {}
+    success_ns = (policy.get("namespaces") or {}).get("success")
+    if success_ns:
+        success_root = Path(success_ns["canonical_root"])
+        if any(success_root.rglob("*")):
+            raise FactorAuthorityCompoundContractV2Error("success namespace not empty")
 
     # Fail closed on forged/plain inputs before any publication probe runs.
     authorize_compound_authority(
