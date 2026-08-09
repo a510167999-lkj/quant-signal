@@ -90,7 +90,7 @@ def resolve_tushare_source(
         )
         return TushareSource(
             name="jiaoch",
-            api_url="https://jiaoch.site",
+            api_url="http://jiaoch.site",
             allowed_hosts=("jiaoch.site",),
             token=token,
             request_protocol="tushare-path-per-interface/v1",

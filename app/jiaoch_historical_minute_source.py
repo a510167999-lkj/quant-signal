@@ -19,7 +19,7 @@ from app.research_pit_transport import UrllibTushareTransport
 
 
 SCHEMA_VERSION = "jiaoch-historical-minute-source-diagnostic/v1"
-_JIAOCH_API_URLS = frozenset({"https://jiaoch.site", "https://jiaoch.site/"})
+_JIAOCH_API_URLS = frozenset({"http://jiaoch.site", "http://jiaoch.site/"})
 _REQUEST_PROTOCOL = "tushare-path-per-interface/v1"
 _INTERFACE = "stk_mins"
 _PATH = "/stk_mins"

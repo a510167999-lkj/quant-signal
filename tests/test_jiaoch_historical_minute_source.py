@@ -41,7 +41,7 @@ class RecordingTransport:
 def _source(token: str = TOKEN) -> TushareSource:
     return TushareSource(
         name="jiaoch",
-        api_url="https://jiaoch.site",
+        api_url="http://jiaoch.site",
         allowed_hosts=("jiaoch.site",),
         token=token,
         request_protocol="tushare-path-per-interface/v1",
@@ -125,7 +125,7 @@ def test_unsafe_proxy_source_is_rejected_before_transport_construction(
     )
     unsafe = TushareSource(
         name="jiaoch",
-        api_url="https://jiaoch.site",
+        api_url="http://jiaoch.site",
         allowed_hosts=("jiaoch.site",),
         token=TOKEN,
         request_protocol="tushare-path-per-interface/v1",
@@ -180,7 +180,7 @@ def test_permission_denied_is_terminal_single_request_and_fixed_stk_mins_post(
     _assert_unbound(manifest)
     assert len(transport.calls) == 1
     call = transport.calls[0]
-    assert call["url"] == "https://jiaoch.site/stk_mins"
+    assert call["url"] == "http://jiaoch.site/stk_mins"
     assert call["timeout_s"] == 7.5
     assert call["max_body_bytes"] == 1024 * 1024
     assert call["headers"] == {

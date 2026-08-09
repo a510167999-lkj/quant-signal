@@ -375,8 +375,8 @@ def _fetch_jiaoch_current_pool_risk_descriptor(*, as_of: str, universe_path: str
     if as_of != retrieved.date().isoformat():
         raise ValueError("--as-of must equal the Shanghai collection day")
     source = resolve_tushare_source("jiaoch", api_url=None, allow_insecure_http=False)
-    if not source.api_url.startswith("https://"):
-        raise ValueError("Jiaoch HTTPS endpoint required")
+    if source.api_url.rstrip("/") != "http://jiaoch.site":
+        raise ValueError("Jiaoch documented HTTP endpoint required")
     transport = UrllibTushareTransport(proxy_url=source.proxy_url)
 
     def fetch(api_name: str, params: dict[str, str], fields: tuple[str, ...]) -> Mapping[str, Any]:

@@ -134,11 +134,11 @@ def test_attempt_schema_binds_request_route_raw_object_and_all_safety_false(
     assert attempt["schema"] == "jiaoch-minute-raw-attempt/v1"
     assert attempt["source_id"] == "jiaoch"
     assert attempt["credential_slot_id"] == "historical-minute"
-    assert attempt["endpoint"] == "https://jiaoch.site/stk_mins"
+    assert attempt["endpoint"] == "http://jiaoch.site/stk_mins"
     assert attempt["api_name"] == "stk_mins"
     assert attempt["request_semantics"] == {
         "api_name": "stk_mins",
-        "endpoint": "https://jiaoch.site/stk_mins",
+        "endpoint": "http://jiaoch.site/stk_mins",
         "fields": "",
         "method": "POST",
         "params": PARAMS,
@@ -197,8 +197,8 @@ def test_daily_endpoint_is_derived_internally_for_the_same_minute_slot(
     )
 
     attempt = _load_attempt(tmp_path, publication)
-    assert attempt["endpoint"] == "https://jiaoch.site/daily"
-    assert attempt["request_semantics"]["endpoint"] == "https://jiaoch.site/daily"
+    assert attempt["endpoint"] == "http://jiaoch.site/daily"
+    assert attempt["request_semantics"]["endpoint"] == "http://jiaoch.site/daily"
     assert "endpoint" not in inspect.signature(publish_jiaoch_minute_raw_attempt).parameters
     assert (
         verify_jiaoch_minute_raw_attempt(

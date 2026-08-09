@@ -571,7 +571,7 @@ def test_closed_collection_uses_one_points_token_and_exactly_one_direct_post(
     assert constructions == [None]
     assert len(transport.calls) == 1
     call = transport.calls[0]
-    assert call["url"] == "https://jiaoch.site/trade_cal"
+    assert call["url"] == "http://jiaoch.site/trade_cal"
     assert call["timeout_s"] == 7.5
     assert call["max_body_bytes"] == 32 * 1024 * 1024
     assert call["headers"] == {

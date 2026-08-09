@@ -375,9 +375,9 @@ def test_closed_collection_uses_one_transport_one_minute_token_and_exactly_three
     assert constructions == [None]
     assert len(transport.calls) == 3
     assert [call["url"] for call in transport.calls] == [
-        "https://jiaoch.site/stk_mins",
-        "https://jiaoch.site/stk_mins",
-        "https://jiaoch.site/daily",
+        "http://jiaoch.site/stk_mins",
+        "http://jiaoch.site/stk_mins",
+        "http://jiaoch.site/daily",
     ]
     assert [json.loads(call["body"])["api_name"] for call in transport.calls] == [
         "stk_mins",

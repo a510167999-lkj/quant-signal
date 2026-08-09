@@ -3,7 +3,7 @@ import pytest
 from app.research_pit_sources import resolve_tushare_source
 
 
-def test_jiaoch_profile_is_https_pinned_and_uses_its_own_environment_token(monkeypatch):
+def test_jiaoch_profile_is_http_pinned_and_uses_its_own_environment_token(monkeypatch):
     monkeypatch.setenv("JIAOCH_TOKEN", "compatible-source-token")
 
     source = resolve_tushare_source(
@@ -11,7 +11,7 @@ def test_jiaoch_profile_is_https_pinned_and_uses_its_own_environment_token(monke
     )
 
     assert source.name == "jiaoch"
-    assert source.api_url == "https://jiaoch.site"
+    assert source.api_url == "http://jiaoch.site"
     assert source.allowed_hosts == ("jiaoch.site",)
     assert source.token == "compatible-source-token"
     assert source.request_protocol == "tushare-path-per-interface/v1"

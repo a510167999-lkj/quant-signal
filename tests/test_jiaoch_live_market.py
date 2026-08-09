@@ -73,7 +73,7 @@ def test_client_requires_exact_jiaoch_response_contract_and_keeps_token_out_of_r
     )
 
     assert rows == [{"ts_code": "600519.SH", "trade_date": "20250101", "adj_factor": 1.0}]
-    assert transport.calls[0]["url"] == "https://jiaoch.site/adj_factor"
+    assert transport.calls[0]["url"] == "http://jiaoch.site/adj_factor"
     assert b"points-secret" in transport.calls[0]["body"]
 
 

@@ -1252,7 +1252,7 @@ def test_path_per_interface_protocol_posts_to_canonical_api_name_path():
     collector = api.ControlledTushareCollector(
         store=RecordingStore(),
         token=TOKEN,
-        api_url="https://jiaoch.site",
+        api_url="http://jiaoch.site",
         transport=transport,
         clock=FakeTrustedClock(),
         allowed_hosts=("jiaoch.site",),
@@ -1268,7 +1268,7 @@ def test_path_per_interface_protocol_posts_to_canonical_api_name_path():
 
     collector.fetch_partition(_spec(api))
 
-    assert transport.calls[0]["url"] == "https://jiaoch.site/stock_basic"
+    assert transport.calls[0]["url"] == "http://jiaoch.site/stock_basic"
 
 
 def test_source_routing_identity_is_read_only_and_cannot_redirect_token():
@@ -2550,7 +2550,7 @@ def test_fetch_cli_reads_jiaoch_token_only_from_environment_and_forwards_options
         == 0
     )
     assert captured["token"] == TOKEN
-    assert captured["api_url"] == "https://jiaoch.site"
+    assert captured["api_url"] == "http://jiaoch.site"
     assert captured["source_profile"] == "jiaoch"
     assert captured["request_protocol"] == "tushare-path-per-interface/v1"
     assert captured["max_attempts"] == 2
@@ -2780,7 +2780,7 @@ def test_fetch_cli_selects_jiaoch_profile_without_exposing_token(
         ]
     ) == 0
     assert captured["token"] == TOKEN
-    assert captured["api_url"] == "https://jiaoch.site"
+    assert captured["api_url"] == "http://jiaoch.site"
     assert captured["allowed_hosts"] == ("jiaoch.site",)
     assert captured["source_profile"] == "jiaoch"
     assert captured["request_protocol"] == "tushare-path-per-interface/v1"
@@ -2831,7 +2831,7 @@ def test_fetch_cli_defaults_to_jiaoch_source_profile(tmp_path, monkeypatch, caps
 
     assert captured["source_profile"] == "jiaoch"
     assert captured["token"] == TOKEN
-    assert captured["api_url"] == "https://jiaoch.site"
+    assert captured["api_url"] == "http://jiaoch.site"
     output = capsys.readouterr().out
     assert TOKEN not in output
     assert "official-token-must-not-be-used" not in output
@@ -3497,7 +3497,7 @@ def test_current_pool_market_cli_defaults_to_jiaoch_and_emits_compact_safe_repor
 
     assert captured["source_profile"] == "jiaoch"
     assert captured["token"] == TOKEN
-    assert captured["api_url"] == "https://jiaoch.site"
+    assert captured["api_url"] == "http://jiaoch.site"
     assert captured["allowed_hosts"] == ("jiaoch.site",)
     assert captured["workers"] == 2
     assert captured["max_attempts"] == 2

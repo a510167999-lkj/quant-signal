@@ -404,8 +404,8 @@ def test_closed_collection_uses_one_transport_one_points_token_and_exactly_two_d
     assert constructions == [None]
     assert len(transport.calls) == 2
     assert [call["url"] for call in transport.calls] == [
-        "https://jiaoch.site/daily_basic",
-        "https://jiaoch.site/moneyflow",
+        "http://jiaoch.site/daily_basic",
+        "http://jiaoch.site/moneyflow",
     ]
     assert [json.loads(call["body"])["api_name"] for call in transport.calls] == [
         "daily_basic",

@@ -122,8 +122,8 @@ def test_same_raw_body_reuses_cas_but_each_call_has_an_independent_uuid_attempt(
 @pytest.mark.parametrize(
     ("api_name", "fields", "endpoint"),
     [
-        ("daily_basic", DAILY_BASIC_FIELDS, "https://jiaoch.site/daily_basic"),
-        ("moneyflow", MONEYFLOW_FIELDS, "https://jiaoch.site/moneyflow"),
+        ("daily_basic", DAILY_BASIC_FIELDS, "http://jiaoch.site/daily_basic"),
+        ("moneyflow", MONEYFLOW_FIELDS, "http://jiaoch.site/moneyflow"),
     ],
 )
 def test_attempt_binds_closed_cross_section_request_and_all_safety_false(

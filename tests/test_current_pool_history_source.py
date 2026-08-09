@@ -195,7 +195,7 @@ def _record_attempt(
         "partition_key": trade_date,
         "api_name": dataset,
         "method": "POST",
-        "url": "https://jiaoch.site",
+        "url": "http://jiaoch.site",
         "wire_params": {"trade_date": trade_date.replace("-", "")},
         "receipt_params": {"trade_date": trade_date},
         "fields": DATASET_FIELDS[dataset],

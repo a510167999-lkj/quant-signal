@@ -652,7 +652,14 @@ class ControlledTushareCollector:
         if str(parsed.hostname or "").lower() not in normalized_hosts:
             raise PITCollectionError("Tushare API host is not pinned")
         if parsed.scheme == "http" and not allow_insecure_http:
-            raise PITCollectionError("plain HTTP requires explicit allow_insecure_http")
+            # Jiaoch documents plain HTTP as the pinned gateway transport
+            # (http://jiaoch.site); other sources still require explicit opt-in.
+            jiaoch_documented_http = (
+                str(source_profile).strip().lower() == "jiaoch"
+                and str(parsed.hostname or "").lower() == "jiaoch.site"
+            )
+            if not jiaoch_documented_http:
+                raise PITCollectionError("plain HTTP requires explicit allow_insecure_http")
         if int(max_attempts) <= 0:
             raise PITCollectionError("max_attempts must be positive")
         if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= 8:

@@ -855,7 +855,7 @@ def test_frozen_jiaoch_source_guard_requires_exact_source_type() -> None:
         token="synthetic-token",
         generation_id=SOURCE_GENERATION_ID,
         name="jiaoch",
-        api_url="https://jiaoch.site",
+        api_url="http://jiaoch.site",
         allowed_hosts=("jiaoch.site",),
         request_protocol="tushare-path-per-interface/v1",
         row_cap_overrides=(("stk_limit", 10_000),),

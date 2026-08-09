@@ -780,7 +780,7 @@ def test_jiaoch_fetch_adapter_uses_fixed_path_and_rejects_unsafe_responses(
         lambda *args, **kwargs: SimpleNamespace(
             token=token,
             proxy_url=None,
-            api_url="https://jiaoch.site",
+            api_url="http://jiaoch.site",
             allowed_hosts=("jiaoch.site",),
         ),
     )
@@ -793,7 +793,7 @@ def test_jiaoch_fetch_adapter_uses_fixed_path_and_rejects_unsafe_responses(
         as_of="2026-07-13", output_dir=tmp_path / "ok", now_provider=now
     )
     assert len(calls) == 8
-    assert {call["url"] for call in calls} == {"https://jiaoch.site/stock_basic"}
+    assert {call["url"] for call in calls} == {"http://jiaoch.site/stock_basic"}
     assert all(call["max_body_bytes"] == 5 * 1024 * 1024 for call in calls)
 
     for unsafe in (
@@ -879,7 +879,7 @@ def test_fetch_binds_as_of_to_shanghai_collection_day(monkeypatch, tmp_path: Pat
         current_pool_source,
         "resolve_tushare_source",
         lambda *args, **kwargs: SimpleNamespace(
-            token="secret", proxy_url=None, api_url="https://jiaoch.site"
+            token="secret", proxy_url=None, api_url="http://jiaoch.site"
         ),
     )
     monkeypatch.setattr(current_pool_source, "UrllibTushareTransport", Transport)

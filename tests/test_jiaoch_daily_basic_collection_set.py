@@ -69,7 +69,7 @@ def test_synthetic_daily_basic_call_publishes_and_postverifies_one_raw_cas_set(
         max_attempts=1,
     )
 
-    assert calls == ["https://jiaoch.site/daily_basic"]
+    assert calls == ["http://jiaoch.site/daily_basic"]
     assert resumed["collection_set_sha256"] == publication["collection_set_sha256"]
     assert verified["verified"] is True
 

@@ -29,8 +29,8 @@ COLLECTION_ATTEMPT_SCHEMA = "jiaoch-points-raw-attempt/v2"
 COLLECTOR_VERSION = "app.jiaoch_points_raw_authority/1"
 _SOURCE_ID = "jiaoch"
 _API_ENDPOINTS = {
-    "daily_basic": "https://jiaoch.site/daily_basic",
-    "moneyflow": "https://jiaoch.site/moneyflow",
+    "daily_basic": "http://jiaoch.site/daily_basic",
+    "moneyflow": "http://jiaoch.site/moneyflow",
 }
 _FIELDS_BY_API = {
     "daily_basic": (

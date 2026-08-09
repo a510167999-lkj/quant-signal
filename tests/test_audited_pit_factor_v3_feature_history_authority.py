@@ -408,7 +408,7 @@ def _collector_for_session(
     transport: _FeatureHistoryTransport,
     trade_date: str,
     *,
-    api_url: str = "https://jiaoch.site",
+    api_url: str = "http://jiaoch.site",
     source_profile: str = "jiaoch",
     request_protocol: str = "tushare-path-per-interface/v1",
 ) -> ControlledTushareCollector:
@@ -424,6 +424,8 @@ def _collector_for_session(
         clock=_FixtureClock(),
         max_attempts=3,
         sleeper=lambda _seconds: None,
+        # Fixture transport only; explicit for non-jiaoch HTTP cases.
+        allow_insecure_http=api_url.startswith("http://"),
         source_profile=source_profile,
         request_protocol=request_protocol,
         row_cap_overrides=(
@@ -548,7 +550,7 @@ def _real_store_fixture(
     include_star: bool = True,
     semantic_empty_sessions: frozenset[str] = frozenset(),
     omit_market_session: str | None = None,
-    api_url: str = "https://jiaoch.site",
+    api_url: str = "http://jiaoch.site",
     source_profile: str = "jiaoch",
     request_protocol: str = "tushare-path-per-interface/v1",
 ) -> tuple[
@@ -2292,12 +2294,12 @@ def test_formal_authority_rejects_raw_receipt_tamper_even_with_refreshed_databas
             "tushare-path-per-interface/v1",
         ),
         (
-            "https://jiaoch.site",
+            "http://jiaoch.site",
             "feature-history-fixture",
             "tushare-path-per-interface/v1",
         ),
         (
-            "https://jiaoch.site",
+            "http://jiaoch.site",
             "jiaoch",
             "tushare-root-post/v1",
         ),

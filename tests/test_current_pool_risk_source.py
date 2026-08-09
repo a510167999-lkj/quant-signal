@@ -406,7 +406,7 @@ def test_transport_exception_never_exposes_token(monkeypatch, tmp_path: Path):
         def post(self, **kwargs):
             raise RuntimeError(f"network failed {token}")
 
-    monkeypatch.setattr(current_pool_risk_source, "resolve_tushare_source", lambda *a, **k: SimpleNamespace(token=token, proxy_url=None, api_url="https://jiaoch.site"))
+    monkeypatch.setattr(current_pool_risk_source, "resolve_tushare_source", lambda *a, **k: SimpleNamespace(token=token, proxy_url=None, api_url="http://jiaoch.site"))
     monkeypatch.setattr(current_pool_risk_source, "UrllibTushareTransport", Transport)
     with pytest.raises(CurrentPoolRiskSourceError) as caught:
         fetch_jiaoch_current_pool_risk_descriptor(as_of="2026-07-13", universe_path=universe, output_dir=tmp_path / "risk", now_provider=lambda: datetime(2026, 7, 13, 9, 30, tzinfo=ZoneInfo("Asia/Shanghai")))
@@ -426,7 +426,7 @@ def test_transport_exception_message_includes_exception_type_without_token(monke
         def post(self, **kwargs):
             raise TimeoutError(f"connect timed out leaked={token}")
 
-    monkeypatch.setattr(current_pool_risk_source, "resolve_tushare_source", lambda *a, **k: SimpleNamespace(token=token, proxy_url=None, api_url="https://jiaoch.site"))
+    monkeypatch.setattr(current_pool_risk_source, "resolve_tushare_source", lambda *a, **k: SimpleNamespace(token=token, proxy_url=None, api_url="http://jiaoch.site"))
     monkeypatch.setattr(current_pool_risk_source, "UrllibTushareTransport", Transport)
     with pytest.raises(CurrentPoolRiskSourceError) as caught:
         fetch_jiaoch_current_pool_risk_descriptor(
@@ -565,7 +565,7 @@ def test_jiaoch_adapter_uses_fixed_https_paths_and_rejects_secret(monkeypatch, t
     monkeypatch.setattr(
         current_pool_risk_source,
         "resolve_tushare_source",
-        lambda *a, **k: SimpleNamespace(token=token, proxy_url=None, api_url="https://jiaoch.site"),
+        lambda *a, **k: SimpleNamespace(token=token, proxy_url=None, api_url="http://jiaoch.site"),
     )
     monkeypatch.setattr(current_pool_risk_source, "UrllibTushareTransport", Transport)
     def now():
@@ -579,9 +579,9 @@ def test_jiaoch_adapter_uses_fixed_https_paths_and_rejects_secret(monkeypatch, t
     )
     assert len(calls) == 39
     assert {call["url"] for call in calls} == {
-        "https://jiaoch.site/stock_st",
-        "https://jiaoch.site/suspend_d",
-        "https://jiaoch.site/namechange",
+        "http://jiaoch.site/stock_st",
+        "http://jiaoch.site/suspend_d",
+        "http://jiaoch.site/namechange",
     }
     assert token not in Path(next((tmp_path / "risk").glob("*.json"))).read_text(
         encoding="utf-8"

@@ -132,7 +132,7 @@ def test_fetch_jiaoch_announcements_uses_anns_d_and_maps_native_rows():
 
     source = TushareSource(
         name="jiaoch",
-        api_url="https://jiaoch.site",
+        api_url="http://jiaoch.site",
         allowed_hosts=("jiaoch.site",),
         token="unit-test-secret",
         request_protocol="tushare-path-per-interface/v1",
@@ -146,7 +146,7 @@ def test_fetch_jiaoch_announcements_uses_anns_d_and_maps_native_rows():
         transport=Transport(),
     )
 
-    assert captured["url"] == "https://jiaoch.site/anns_d"
+    assert captured["url"] == "http://jiaoch.site/anns_d"
     request = json.loads(captured["body"])
     assert request["api_name"] == "anns_d"
     assert request["params"] == {

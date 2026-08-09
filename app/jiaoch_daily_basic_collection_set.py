@@ -149,7 +149,7 @@ def _request_spec(session: date) -> dict[str, Any]:
         raise ValueError("Jiaoch daily_basic collection trade date rejected")
     return {
         "api_name": "daily_basic",
-        "endpoint": "https://jiaoch.site/daily_basic",
+        "endpoint": "http://jiaoch.site/daily_basic",
         "fields": raw_authority._FIELDS_BY_API["daily_basic"],
         "params": {"trade_date": session.strftime("%Y%m%d"), "ts_code": ""},
         "response_fields": raw_authority._FIELDS_BY_API["daily_basic"].split(","),
