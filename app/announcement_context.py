@@ -258,7 +258,7 @@ def fetch_jiaoch_announcements(
         raise AnnouncementSourceError(code) from None
     if (
         selected.name != "jiaoch"
-        or selected.api_url.rstrip("/") != "http://jiaoch.site"
+        or selected.api_url.rstrip("/") != "https://jiaoch.site"
         or selected.request_protocol != "tushare-path-per-interface/v1"
     ):
         raise AnnouncementSourceError("source_config_invalid")

@@ -22,8 +22,8 @@ COLLECTION_ATTEMPT_SCHEMA = "jiaoch-minute-raw-attempt/v2"
 COLLECTOR_VERSION = "app.jiaoch_minute_raw_authority/1"
 _SOURCE_ID = "jiaoch"
 _API_ENDPOINTS = {
-    "daily": "http://jiaoch.site/daily",
-    "stk_mins": "http://jiaoch.site/stk_mins",
+    "daily": "https://jiaoch.site/daily",
+    "stk_mins": "https://jiaoch.site/stk_mins",
 }
 _REQUEST_PROTOCOL = "tushare-path-per-interface/v1"
 _TRANSPORT = "app.research_pit_transport.UrllibTushareTransport"

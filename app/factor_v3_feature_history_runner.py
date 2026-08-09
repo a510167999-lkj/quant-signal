@@ -147,7 +147,7 @@ class _FrozenJiaochSource:
     token: str = field(repr=False)
     generation_id: str
     name: str = "jiaoch"
-    api_url: str = "http://jiaoch.site"
+    api_url: str = "https://jiaoch.site"
     allowed_hosts: tuple[str, ...] = ("jiaoch.site",)
     request_protocol: str = "tushare-path-per-interface/v1"
     row_cap_overrides: tuple[tuple[str, int], ...] = (("stk_limit", 10_000),)
@@ -929,9 +929,9 @@ def _validated_frozen_jiaoch_source(source: Any) -> Any:
     if (
         source != frozen
         or name != "jiaoch"
-        or parsed.scheme != "http"
+        or parsed.scheme != "https"
         or parsed.hostname != "jiaoch.site"
-        or port not in {None, 80}
+        or port not in {None, 443}
         or parsed.username is not None
         or parsed.password is not None
         or parsed.path not in {"", "/"}

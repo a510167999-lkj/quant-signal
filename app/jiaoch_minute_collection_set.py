@@ -233,7 +233,7 @@ def _request_specs(ts_code: str, session: date) -> tuple[dict[str, Any], ...]:
     return (
         {
             "api_name": "stk_mins",
-            "endpoint": "http://jiaoch.site/stk_mins",
+            "endpoint": "https://jiaoch.site/stk_mins",
             "fields": "",
             "params": {
                 "end_date": f"{day} 16:00:00",
@@ -247,7 +247,7 @@ def _request_specs(ts_code: str, session: date) -> tuple[dict[str, Any], ...]:
         },
         {
             "api_name": "stk_mins",
-            "endpoint": "http://jiaoch.site/stk_mins",
+            "endpoint": "https://jiaoch.site/stk_mins",
             "fields": "",
             "params": {
                 "end_date": f"{day} 16:00:00",
@@ -261,7 +261,7 @@ def _request_specs(ts_code: str, session: date) -> tuple[dict[str, Any], ...]:
         },
         {
             "api_name": "daily",
-            "endpoint": "http://jiaoch.site/daily",
+            "endpoint": "https://jiaoch.site/daily",
             "fields": _DAILY_FIELDS_TEXT,
             "params": {
                 "trade_date": session.strftime("%Y%m%d"),

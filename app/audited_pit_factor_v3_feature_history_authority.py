@@ -84,7 +84,9 @@ _REQUIRED_FEATURE_HISTORY_APIS = ("bak_basic", *_REQUIRED_MARKET_SHARDS)
 _NONEMPTY_MARKET_SHARDS = frozenset({"daily", "adj_factor", "stk_limit"})
 _BOARD_COUNT_FIELDS = frozenset({"beijing", "chinext", "mainboard", "science_technology"})
 _FROZEN_JIAOCH_SOURCE_AUTHORITY = {
-    "base_origin": "http://jiaoch.site:80",
+    # Historical feature-history freeze: sealed against the origin used at
+    # collection time. Live daily_basic transport may still use documented HTTP.
+    "base_origin": "https://jiaoch.site:443",
     "request_protocol": "tushare-path-per-interface/v1",
     "source_profile": "jiaoch",
 }
@@ -284,7 +286,7 @@ FACTOR_V3_FEATURE_HISTORY_AUTHORITY_CONTRACT = {
     "safety": deepcopy(_SAFETY),
 }
 FACTOR_V3_FEATURE_HISTORY_AUTHORITY_CONTRACT_SHA256 = (
-    "147cd98aaf36d51486180bf9677ac3d712f0546f6348851c4c04d401d388e747"
+    "ba6e4f6e67871cb5e6341ac7cb9a84c7fa5f9c2055ac1fbbbdf9e1af35ab2cee"
 )
 if (
     canonical_sha256(FACTOR_V3_FEATURE_HISTORY_AUTHORITY_CONTRACT)

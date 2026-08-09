@@ -908,7 +908,7 @@ def _probe_jiaoch_connectivity(timeout_seconds: float = 10.0) -> dict:
 
     # Step 2: source profile(URL 固定,token 可选——缺 token 也要能测 DNS/TLS)
     token = str(os.getenv("JIAOCH_TOKEN") or "")
-    api_url = "http://jiaoch.site"
+    api_url = "https://jiaoch.site"
     proxy_url = None
     network_route = "direct"
     configured_proxy = str(os.getenv("JIAOCH_PROXY_URL") or "")

@@ -197,7 +197,7 @@ def _request_specs(session: date) -> tuple[dict[str, Any], ...]:
     return (
         {
             "api_name": "daily_basic",
-            "endpoint": "http://jiaoch.site/daily_basic",
+            "endpoint": "https://jiaoch.site/daily_basic",
             "fields": raw_authority._FIELDS_BY_API["daily_basic"],
             "params": params,
             "response_fields": raw_authority._FIELDS_BY_API["daily_basic"].split(","),
@@ -206,7 +206,7 @@ def _request_specs(session: date) -> tuple[dict[str, Any], ...]:
         },
         {
             "api_name": "moneyflow",
-            "endpoint": "http://jiaoch.site/moneyflow",
+            "endpoint": "https://jiaoch.site/moneyflow",
             "fields": raw_authority._FIELDS_BY_API["moneyflow"],
             "params": params,
             "response_fields": raw_authority._FIELDS_BY_API["moneyflow"].split(","),

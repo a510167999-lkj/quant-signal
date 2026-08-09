@@ -33,7 +33,7 @@ from app.research_pit_sources import _validate_loopback_http_proxy
 from app.research_pit_transport import UrllibTushareTransport
 
 
-JIAOCH_API_URL = "http://jiaoch.site"
+JIAOCH_API_URL = "https://jiaoch.site"
 DAILY_FIELDS = (
     "ts_code",
     "trade_date",
