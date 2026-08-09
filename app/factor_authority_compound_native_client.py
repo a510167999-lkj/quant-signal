@@ -7,6 +7,7 @@ Python object construction never become authority.
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, NoReturn
@@ -99,13 +100,34 @@ class HeldRoleProduction:
         raise TypeError("HeldRoleProduction is native-client owned")
 
 
+_LIVE_CAPS: weakref.WeakSet[object] = weakref.WeakSet()
+
+
 def _red(capability: str) -> NoReturn:
-    raise NotImplementedError(f"factor authority compound native RED: {capability}")
+    raise FactorAuthorityCompoundNativeClientError(
+        f"opaque native capability unavailable: {capability}"
+    )
+
+
+def _require_cap(value: object, expected: type, *, label: str) -> None:
+    if type(value) is not expected or value not in _LIVE_CAPS:
+        raise FactorAuthorityCompoundNativeClientError(
+            f"opaque native session capability required for {label}"
+        )
 
 
 def open_registered_compound_native_session_set() -> HeldCompoundNativeSessionSet:
     """Open the registered broker once and retain all seven process/Job handles."""
 
+    if (
+        REGISTERED_COMPOUND_NATIVE_MANIFEST_SHA256 is None
+        or REGISTERED_COMPOUND_NATIVE_BROKER_PATH is None
+        or REGISTERED_COMPOUND_NATIVE_BROKER_FILE_SHA256 is None
+        or HANDOFF_READY != 1
+    ):
+        raise FactorAuthorityCompoundNativeClientError(
+            "compound native broker registration/manifest is closed"
+        )
     _red("registered compiled seven-Job session set")
 
 
@@ -118,6 +140,12 @@ def _open_disposable_test_compound_native_session_set(
 ) -> HeldCompoundNativeSessionSet:
     """Private compiled-fixture entry; production registration stays empty."""
 
+    _ = (
+        executable,
+        expected_executable_sha256,
+        fixture_manifest_authority_path,
+        expected_fixture_manifest_raw_sha256,
+    )
     _red("disposable compiled seven-Job session set")
 
 
@@ -127,6 +155,7 @@ def postverify_distinct_native_jobs(
 ) -> dict[str, Any]:
     """Recheck seven distinct live PIDs, Job identities, and retained handles."""
 
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
     _red("seven distinct native process/job roots")
 
 
@@ -136,6 +165,7 @@ def open_deployment_policy_authority(
 ) -> HeldDeploymentPolicyAuthority:
     """Open policy only from the session set's signed physical manifest."""
 
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
     _red("signed physical deployment policy capability")
 
 
@@ -147,6 +177,16 @@ def issue_compound_run_spec(
 ) -> HeldCompoundRunSpec:
     """Issue and hold a policy-bound run-spec CAS before any output exists."""
 
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
+    _require_cap(
+        deployment_policy_authority,
+        HeldDeploymentPolicyAuthority,
+        label="deployment_policy_authority",
+    )
+    if not isinstance(identity_binding, Mapping):
+        raise FactorAuthorityCompoundNativeClientError(
+            "opaque identity binding mapping required"
+        )
     _red("opaque policy-bound compound run spec")
 
 
@@ -157,6 +197,8 @@ def postverify_compound_run_spec(
 ) -> dict[str, Any]:
     """Recheck held raw hash, policy, identity, and the live session set."""
 
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
+    _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
     _red("held compound run spec postverification")
 
 
@@ -167,6 +209,8 @@ def acquire_compound_root_lease(
 ) -> HeldCompoundRootLease:
     """Acquire the compiled root-relative lease and retain ancestor handles."""
 
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
+    _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
     _red("opaque compiled compound root lease")
 
 
@@ -179,6 +223,10 @@ def transition_compound_root_epoch(
 ) -> dict[str, Any]:
     """Perform START_RUN, RUN_RECEIPT, START_VERIFY, or TERMINAL_RECEIPT."""
 
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
+    _require_cap(root_lease, HeldCompoundRootLease, label="root_lease")
+    _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
+    _ = transition
     _red("compiled four-file root epoch transition")
 
 
@@ -190,6 +238,9 @@ def postverify_compound_root_lease(
 ) -> dict[str, Any]:
     """Recheck the live compiled lease, epoch raws, and held directories."""
 
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
+    _require_cap(root_lease, HeldCompoundRootLease, label="root_lease")
+    _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
     _red("compiled root lease postverification")
 
 
@@ -201,6 +252,9 @@ def produce_role_artifact(
 ) -> HeldRoleProduction:
     """Run the registered fixed role program in its dedicated Job/process."""
 
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
+    _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
+    _ = role
     _red("fixed-program distinct native role production")
 
 
@@ -213,6 +267,10 @@ def postverify_role_production(
 ) -> dict[str, Any]:
     """Recheck fixed program, role, run-spec raw, Job/process, and held CAS."""
 
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
+    _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
+    _require_cap(production, HeldRoleProduction, label="production")
+    _ = expected_role
     _red("fixed-program native role postverification")
 
 
@@ -225,6 +283,10 @@ def hold_role_production_cas(
 ) -> HeldRegisteredCas:
     """Retain the role CAS same handle and all registered ancestor handles."""
 
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
+    _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
+    _require_cap(production, HeldRoleProduction, label="production")
+    _ = expected_role
     _red("native-held role production CAS")
 
 
@@ -237,6 +299,9 @@ def hold_registered_namespace_cas(
 ) -> HeldRegisteredCas:
     """Retain a policy-registered CAS without path or category override."""
 
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
+    _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
+    _ = (namespace_name, expected_raw_sha256)
     _red("native-held registered namespace CAS")
 
 
@@ -248,6 +313,9 @@ def postverify_registered_cas(
 ) -> dict[str, Any]:
     """Recheck handle, ancestors, file ID, nlink, roots, DACL, and payload."""
 
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
+    _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
+    _require_cap(held_cas, HeldRegisteredCas, label="held_cas")
     _red("native-held registered CAS postverification")
 
 
@@ -261,6 +329,11 @@ def acquire_native_run_completion(
 ) -> HeldNativeCompletion:
     """Bind run.claim raw and exactly the two producer raw identities."""
 
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
+    _require_cap(root_lease, HeldCompoundRootLease, label="root_lease")
+    _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
+    _require_cap(parent_producer, HeldRoleProduction, label="parent_producer")
+    _require_cap(evaluator_producer, HeldRoleProduction, label="evaluator_producer")
     _red("broker-signed native run exact closure")
 
 
@@ -275,6 +348,12 @@ def acquire_native_verify_completion(
 ) -> HeldNativeCompletion:
     """Bind run/verify epochs, compound run, and two verifier raw identities."""
 
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
+    _require_cap(root_lease, HeldCompoundRootLease, label="root_lease")
+    _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
+    _require_cap(compound_run_receipt, HeldRegisteredCas, label="compound_run_receipt")
+    _require_cap(parent_verifier, HeldRoleProduction, label="parent_verifier")
+    _require_cap(evaluator_verifier, HeldRoleProduction, label="evaluator_verifier")
     _red("broker-signed native verify exact closure")
 
 
@@ -294,6 +373,26 @@ def acquire_native_terminal_authority(
 ) -> HeldNativeCompletion:
     """Bind the complete terminal v2 closure from held native capabilities."""
 
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
+    _require_cap(root_lease, HeldCompoundRootLease, label="root_lease")
+    _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
+    for label, value in (
+        ("parent_producer", parent_producer),
+        ("parent_verifier", parent_verifier),
+        ("evaluator_producer", evaluator_producer),
+        ("evaluator_verifier", evaluator_verifier),
+    ):
+        _require_cap(value, HeldRoleProduction, label=label)
+    _require_cap(compound_run_receipt, HeldRegisteredCas, label="compound_run_receipt")
+    _require_cap(
+        compound_terminal_receipt, HeldRegisteredCas, label="compound_terminal_receipt"
+    )
+    _require_cap(
+        native_run_completion, HeldNativeCompletion, label="native_run_completion"
+    )
+    _require_cap(
+        native_verify_completion, HeldNativeCompletion, label="native_verify_completion"
+    )
     _red("broker-signed native terminal exact closure")
 
 
@@ -307,6 +406,11 @@ def postverify_native_completion(
 ) -> dict[str, Any]:
     """Recheck recorded exact closure, signature, Job, process, and held CAS."""
 
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
+    _require_cap(completion, HeldNativeCompletion, label="completion")
+    _require_cap(run_spec, HeldCompoundRunSpec, label="run_spec")
+    _require_cap(root_lease, HeldCompoundRootLease, label="root_lease")
+    _ = expected_phase
     _red("native completion postverification")
 
 
@@ -315,4 +419,5 @@ def close_compound_native_session_set(
 ) -> dict[str, Any]:
     """Close only after success flush and prove all seven children were reaped."""
 
+    _require_cap(session_set, HeldCompoundNativeSessionSet, label="session_set")
     _red("native session set close and seven-child reap")
