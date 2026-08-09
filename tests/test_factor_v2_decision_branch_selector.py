@@ -50,7 +50,7 @@ RECEIPT_FIELDS = {
     "receipt_sha256",
 }
 BRANCH_RECEIPT_SCHEMA_VERSION = (
-    "factor-v2-decision-branch-selector-receipt/v1"
+    "factor-v2-decision-branch-structural-adapter/v2"
 )
 SELECTION_RULE = (
     "first_green_in_arm_order_else_low_rvol20_rank_overlay_20"
@@ -60,6 +60,10 @@ BRANCH_RECEIPT_FIELDS = {
     "source_decision_receipt_raw_file_sha256",
     "source_decision_receipt_sha256",
     "evaluation_artifact_sha256",
+    "contract_binding_validated",
+    "publisher_terminal_chain_verified",
+    "source_authority_complete",
+    "formal_materialization_eligible",
     "arm_order",
     "arm_decisions",
     "selection_rule",
@@ -236,7 +240,7 @@ def test_selects_first_green_in_frozen_order_or_unique_low_rvol_on_all_red(
         ),
     ],
 )
-def test_builds_exact_self_hashed_branch_receipt_for_execution_stress(
+def test_builds_exact_unverified_structural_adapter_for_execution_stress(
     tmp_path: Path,
     decisions: dict[str, str],
     selected_branch: str,
@@ -265,7 +269,11 @@ def test_builds_exact_self_hashed_branch_receipt_for_execution_stress(
         "selected_branch": selected_branch,
         "selected_arm": selected_arm,
         "low_rvol_overlay_status": low_rvol_overlay_status,
-        "verified": True,
+        "contract_binding_validated": True,
+        "publisher_terminal_chain_verified": False,
+        "source_authority_complete": False,
+        "formal_materialization_eligible": False,
+        "verified": False,
         "embargo_consumed": False,
         "final_oos_consumed": False,
         "production_recommendation_eligible": False,
@@ -358,6 +366,23 @@ def test_reader_ignores_access_time_drift_but_keeps_stable_identity(
         )
         == "low_rvol20_rank_overlay_20"
     )
+
+
+def test_rejects_reparse_point_in_ancestor_path(tmp_path: Path) -> None:
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    path, raw_sha256 = _write_receipt(real_root, _receipt())
+    alias_root = tmp_path / "alias"
+    try:
+        alias_root.symlink_to(real_root, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlink unavailable: {type(exc).__name__}")
+
+    with pytest.raises(RuntimeError, match="reparse"):
+        select_factor_v2_decision_branch(
+            alias_root / path.name,
+            expected_raw_file_sha256=raw_sha256,
+        )
 
 
 def test_rejects_tampering_even_when_the_raw_file_hash_matches(

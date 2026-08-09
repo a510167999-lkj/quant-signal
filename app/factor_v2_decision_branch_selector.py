@@ -1,4 +1,4 @@
-"""Select the preregistered factor-v2 branch from a minimal receipt."""
+"""Structurally select a Factor V2 branch without granting source authority."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from typing import Any
 ARM_ORDER = ("v2_control", "overnight_20", "intraday_20")
 LOW_RVOL_BRANCH = "low_rvol20_rank_overlay_20"
 RECEIPT_SCHEMA_VERSION = "factor-v2-development-evaluation-decision-verification-receipt/v1"
-BRANCH_RECEIPT_SCHEMA_VERSION = "factor-v2-decision-branch-selector-receipt/v1"
+BRANCH_RECEIPT_SCHEMA_VERSION = "factor-v2-decision-branch-structural-adapter/v2"
 SELECTION_RULE = "first_green_in_arm_order_else_low_rvol20_rank_overlay_20"
 FACTOR_V2_SPEC_SHA256 = "685487c7159a6f0e9748bb46265b93d4c86f4a9dc7dc734beac2c267547a2cdf"
 EVALUATION_PRODUCER_ROOT_SHA256 = "926b9229a2e6e47ae24f3b590fab46ded2244e757fbe92fc6bbf0dd3de1dd938"
@@ -102,7 +102,20 @@ def _identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
+def _reject_reparse_chain(path: Path) -> Path:
+    absolute = Path(os.path.abspath(path))
+    for current in (*reversed(absolute.parents), absolute):
+        try:
+            metadata = os.lstat(current)
+        except OSError as exc:
+            raise RuntimeError("decision receipt is unavailable") from exc
+        if stat.S_ISLNK(metadata.st_mode) or _is_reparse(metadata):
+            raise RuntimeError("decision receipt path must not contain a reparse point")
+    return absolute
+
+
 def _read_direct_bytes(path: Path) -> bytes:
+    path = _reject_reparse_chain(path)
     try:
         path_metadata = os.lstat(path)
     except OSError as exc:
@@ -240,6 +253,8 @@ def select_factor_v2_decision_branch(
     *,
     expected_raw_file_sha256: str,
 ) -> str:
+    """Return the structural branch choice; this does not grant authority."""
+
     receipt, _ = _validated_receipt(path, expected_raw_file_sha256)
     return _select_branch(receipt)
 
@@ -249,6 +264,8 @@ def build_factor_v2_decision_branch_receipt(
     *,
     expected_raw_file_sha256: str,
 ) -> dict[str, Any]:
+    """Build an explicitly unverified structural adapter receipt."""
+
     source, raw_sha256 = _validated_receipt(
         path,
         expected_raw_file_sha256,
@@ -266,7 +283,11 @@ def build_factor_v2_decision_branch_receipt(
         "selected_branch": selected_branch,
         "selected_arm": selected_arm,
         "low_rvol_overlay_status": ("VOID" if selected_arm is not None else "ELIGIBLE"),
-        "verified": True,
+        "contract_binding_validated": True,
+        "publisher_terminal_chain_verified": False,
+        "source_authority_complete": False,
+        "formal_materialization_eligible": False,
+        "verified": False,
         "embargo_consumed": False,
         "final_oos_consumed": False,
         "production_recommendation_eligible": False,

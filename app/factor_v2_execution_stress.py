@@ -76,6 +76,10 @@ _SELECTOR_FIELDS = (
     "source_decision_receipt_raw_file_sha256",
     "source_decision_receipt_sha256",
     "evaluation_artifact_sha256",
+    "contract_binding_validated",
+    "publisher_terminal_chain_verified",
+    "source_authority_complete",
+    "formal_materialization_eligible",
     "verified",
     "embargo_consumed",
     "final_oos_consumed",
@@ -309,7 +313,9 @@ def _verify_selector(receipt: Any) -> dict[str, Any]:
         _SELECTOR_FIELDS,
         field="branch_selector_receipt",
     )
-    if source["schema_version"] != ("factor-v2-decision-branch-selector-receipt/v1"):
+    if source["schema_version"] != (
+        "factor-v2-decision-branch-structural-adapter/v2"
+    ):
         raise ValueError("branch selector schema drifted")
     if source["arm_order"] != list(_ARM_ORDER):
         raise ValueError("branch selector arm order drifted")
@@ -344,11 +350,14 @@ def _verify_selector(receipt: Any) -> dict[str, Any]:
         source["evaluation_artifact_sha256"],
         field="branch_selector_receipt.evaluation_artifact_sha256",
     )
-    if not _require_bool(
-        source["verified"],
-        field="branch_selector_receipt.verified",
+    if (
+        source["contract_binding_validated"] is not True
+        or source["publisher_terminal_chain_verified"] is not False
+        or source["source_authority_complete"] is not False
+        or source["formal_materialization_eligible"] is not False
+        or source["verified"] is not False
     ):
-        raise ValueError("branch selector receipt is not verified")
+        raise ValueError("branch selector structural adapter scope drifted")
     for name in (
         "embargo_consumed",
         "final_oos_consumed",

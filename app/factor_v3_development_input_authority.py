@@ -754,11 +754,14 @@ def _validate_branch_receipt(value: Any, *, expected_raw_sha256: str) -> dict[st
     expected_fields = {
         "arm_decisions",
         "arm_order",
+        "contract_binding_validated",
         "embargo_consumed",
         "evaluation_artifact_sha256",
         "final_oos_consumed",
+        "formal_materialization_eligible",
         "low_rvol_overlay_status",
         "production_recommendation_eligible",
+        "publisher_terminal_chain_verified",
         "receipt_sha256",
         "schema_version",
         "selected_arm",
@@ -766,14 +769,19 @@ def _validate_branch_receipt(value: Any, *, expected_raw_sha256: str) -> dict[st
         "selection_rule",
         "source_decision_receipt_raw_file_sha256",
         "source_decision_receipt_sha256",
+        "source_authority_complete",
         "verified",
     }
     if type(value) is not dict or set(value) != expected_fields:
         raise ValueError("factor-v2 branch receipt fields rejected")
     if (
         value.get("schema_version")
-        != "factor-v2-decision-branch-selector-receipt/v1"
-        or value.get("verified") is not True
+        != "factor-v2-decision-branch-structural-adapter/v2"
+        or value.get("contract_binding_validated") is not True
+        or value.get("publisher_terminal_chain_verified") is not False
+        or value.get("source_authority_complete") is not False
+        or value.get("formal_materialization_eligible") is not False
+        or value.get("verified") is not False
         or value.get("source_decision_receipt_raw_file_sha256") != expected_raw_sha256
         or value.get("embargo_consumed") is not False
         or value.get("final_oos_consumed") is not False

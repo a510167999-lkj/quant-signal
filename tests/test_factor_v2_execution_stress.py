@@ -108,7 +108,7 @@ def _inputs() -> dict[str, Any]:
 def _selector_receipt() -> dict[str, Any]:
     return _signed(
         {
-            "schema_version": "factor-v2-decision-branch-selector-receipt/v1",
+        "schema_version": "factor-v2-decision-branch-structural-adapter/v2",
             "arm_order": list(ARM_ORDER),
             "arm_decisions": {
                 "v2_control": "RED",
@@ -124,7 +124,11 @@ def _selector_receipt() -> dict[str, Any]:
             "source_decision_receipt_raw_file_sha256": "1" * 64,
             "source_decision_receipt_sha256": "8" * 64,
             "evaluation_artifact_sha256": "a" * 64,
-            "verified": True,
+        "contract_binding_validated": True,
+        "publisher_terminal_chain_verified": False,
+        "source_authority_complete": False,
+        "formal_materialization_eligible": False,
+        "verified": False,
             "embargo_consumed": False,
             "final_oos_consumed": False,
             "production_recommendation_eligible": False,

@@ -515,7 +515,7 @@ def _install_source_stubs(
     def branch_receipt(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         calls["branch"] += 1
         unsigned = {
-            "schema_version": "factor-v2-decision-branch-selector-receipt/v1",
+            "schema_version": "factor-v2-decision-branch-structural-adapter/v2",
             "source_decision_receipt_raw_file_sha256": "d" * 64,
             "source_decision_receipt_sha256": _sha("decision"),
             "evaluation_artifact_sha256": _sha("evaluation"),
@@ -529,7 +529,11 @@ def _install_source_stubs(
             "selected_branch": "v2_control",
             "selected_arm": "v2_control",
             "low_rvol_overlay_status": "VOID",
-            "verified": True,
+            "contract_binding_validated": True,
+            "publisher_terminal_chain_verified": False,
+            "source_authority_complete": False,
+            "formal_materialization_eligible": False,
+            "verified": False,
             "embargo_consumed": False,
             "final_oos_consumed": False,
             "production_recommendation_eligible": False,
@@ -915,7 +919,7 @@ def test_bse_and_star_must_be_present_on_every_upstream_date(
         )
 
 
-def test_factor_v2_branch_receipt_must_be_verified_and_content_addressed(
+def test_factor_v2_branch_adapter_must_be_exact_and_content_addressed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -924,7 +928,7 @@ def test_factor_v2_branch_receipt_must_be_verified_and_content_addressed(
 
     def forged(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {
-            "schema_version": "factor-v2-decision-branch-selector-receipt/v1",
+            "schema_version": "factor-v2-decision-branch-structural-adapter/v2",
             "selected_branch": "forged",
             "verified": True,
             "receipt_sha256": "0" * 64,
