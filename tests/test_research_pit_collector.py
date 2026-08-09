@@ -2504,11 +2504,11 @@ def test_collector_refuses_to_send_token_to_an_unpinned_host():
         )
 
 
-def test_fetch_cli_reads_token_only_from_environment_and_forwards_controlled_options(
+def test_fetch_cli_reads_jiaoch_token_only_from_environment_and_forwards_options(
     tmp_path, monkeypatch, capsys
 ):
     captured = {}
-    monkeypatch.setenv("TUSHARE_TOKEN", TOKEN)
+    monkeypatch.setenv("JIAOCH_TOKEN", TOKEN)
 
     class Collector:
         def __init__(self, **kwargs):
@@ -2532,15 +2532,13 @@ def test_fetch_cli_reads_token_only_from_environment_and_forwards_controlled_opt
             [
                 "research-pit-fetch-tushare",
                 "--source-profile",
-                "official",
+                "jiaoch",
                 "--store-dir",
                 str(tmp_path / "store"),
                 "--start-date",
                 "2024-01-01",
                 "--end-date",
                 "2024-01-03",
-                "--api-url",
-                "https://api.tushare.pro",
                 "--max-attempts",
                 "2",
                 "--timeout-seconds",
@@ -2552,7 +2550,9 @@ def test_fetch_cli_reads_token_only_from_environment_and_forwards_controlled_opt
         == 0
     )
     assert captured["token"] == TOKEN
-    assert captured["api_url"] == "https://api.tushare.pro"
+    assert captured["api_url"] == "https://jiaoch.site"
+    assert captured["source_profile"] == "jiaoch"
+    assert captured["request_protocol"] == "tushare-path-per-interface/v1"
     assert captured["max_attempts"] == 2
     assert captured["timeout_s"] == 7.0
     assert captured["transport_options"] == {"proxy_url": None}
@@ -2564,6 +2564,68 @@ def test_fetch_cli_reads_token_only_from_environment_and_forwards_controlled_opt
         "contract_sha256"
     ]
     assert TOKEN not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["research-pit-fetch-tushare", "research-pit-fetch-calendars"],
+)
+@pytest.mark.parametrize(
+    "blocked_arguments",
+    [
+        ["--source-profile", "official"],
+        ["--api-url", "https://api.tushare.pro"],
+        ["--allow-insecure-official-http"],
+    ],
+)
+def test_generic_research_cli_rejects_non_jiaoch_controls_before_side_effects(
+    tmp_path, monkeypatch, command, blocked_arguments
+):
+    touched = []
+
+    def forbidden(*_args, **_kwargs):
+        touched.append(True)
+        raise AssertionError("non-Jiaoch control crossed the CLI boundary")
+
+    monkeypatch.setenv("VPS_RUNTIME_ROLE", "local_research")
+    monkeypatch.setenv("DISABLE_ENV_FILE", "1")
+    monkeypatch.setattr(jobs, "load_temporal_partition_contract", forbidden)
+    monkeypatch.setattr(jobs, "resolve_tushare_source", forbidden)
+    monkeypatch.setattr(jobs, "PITReceiptStore", forbidden)
+    monkeypatch.setattr(jobs, "ControlledTushareCollector", forbidden, raising=False)
+
+    with pytest.raises(SystemExit) as exc_info:
+        jobs.main(
+            [
+                command,
+                "--store-dir",
+                str(tmp_path / "store"),
+                "--start-date",
+                "2024-01-01",
+                "--end-date",
+                "2024-01-03",
+                *blocked_arguments,
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    assert touched == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["research-pit-fetch-tushare", "research-pit-fetch-calendars"],
+)
+def test_generic_research_cli_help_exposes_only_jiaoch_source(command, capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        jobs.main([command, "--help"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "--source-profile {jiaoch}" in output
+    assert "official" not in output
+    assert "--api-url" not in output
+    assert "--allow-insecure-official-http" not in output
 
 
 def test_fetch_cli_rejects_temporal_range_before_source_store_clock_or_transport(

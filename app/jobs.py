@@ -4616,9 +4616,8 @@ def main(argv=None) -> int:
     pit_fetch.add_argument("--store-dir", required=True)
     pit_fetch.add_argument("--start-date", required=True)
     pit_fetch.add_argument("--end-date", required=True)
-    pit_fetch.add_argument("--source-profile", choices=("official", "jiaoch"), default="jiaoch")
-    pit_fetch.add_argument("--api-url")
-    pit_fetch.add_argument("--allow-insecure-official-http", action="store_true")
+    pit_fetch.add_argument("--source-profile", choices=("jiaoch",), default="jiaoch")
+    pit_fetch.set_defaults(api_url=None, allow_insecure_official_http=False)
     pit_fetch.add_argument("--max-attempts", type=int, default=3)
     pit_fetch.add_argument("--timeout-seconds", type=float, default=30.0)
     pit_fetch.add_argument("--workers", type=int, choices=range(1, 9), default=1)
@@ -4634,10 +4633,9 @@ def main(argv=None) -> int:
     pit_calendar_fetch.add_argument("--start-date", required=True)
     pit_calendar_fetch.add_argument("--end-date", required=True)
     pit_calendar_fetch.add_argument(
-        "--source-profile", choices=("official", "jiaoch"), default="jiaoch"
+        "--source-profile", choices=("jiaoch",), default="jiaoch"
     )
-    pit_calendar_fetch.add_argument("--api-url")
-    pit_calendar_fetch.add_argument("--allow-insecure-official-http", action="store_true")
+    pit_calendar_fetch.set_defaults(api_url=None, allow_insecure_official_http=False)
     pit_calendar_fetch.add_argument("--max-attempts", type=int, default=3)
     pit_calendar_fetch.add_argument("--timeout-seconds", type=float, default=30.0)
     pit_calendar_fetch.add_argument("--workers", type=int, choices=range(1, 9), default=1)
@@ -6976,9 +6974,9 @@ def main(argv=None) -> int:
             "collect",
         )
         source = resolve_tushare_source(
-            args.source_profile,
-            api_url=args.api_url,
-            allow_insecure_http=args.allow_insecure_official_http,
+            "jiaoch",
+            api_url=None,
+            allow_insecure_http=False,
         )
         collector = ControlledTushareCollector(
             store=PITReceiptStore(args.store_dir),
@@ -6988,7 +6986,7 @@ def main(argv=None) -> int:
             clock=SystemTrustedClock(),
             max_attempts=args.max_attempts,
             timeout_s=args.timeout_seconds,
-            allow_insecure_http=args.allow_insecure_official_http,
+            allow_insecure_http=False,
             allowed_hosts=source.allowed_hosts,
             source_profile=source.name,
             request_protocol=source.request_protocol,
