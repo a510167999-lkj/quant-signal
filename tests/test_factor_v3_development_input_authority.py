@@ -12,6 +12,7 @@ import pytest
 
 from app import audited_pit_factor_v3_points_contract as points
 from app import factor_v3_development_input_authority as authority
+from app import factor_v3_formal_development_input_activation as activation
 from app import jiaoch_daily_basic_exact_set_authority as legacy_daily
 from app.jiaoch_points_response_normalization import NormalizedDailyBasicRow
 
@@ -165,30 +166,99 @@ def _parent_snapshot(
     return path, hashlib.sha256(raw).hexdigest(), rows
 
 
+def _complete_daily_statistic(trade_date: str) -> dict[str, Any]:
+    counts = {name: 1 for name in activation.UPSTREAM_SOURCE_SEGMENTS}
+    codes = ["000001.SZ", "300001.SZ", "430001.BJ", "600001.SH", "688001.SH"]
+    collection_sha = _sha(["collection", trade_date])
+    attempt_sha = _sha(["attempt", trade_date])
+    raw_sha = _sha(["raw-body", trade_date])
+    return {
+        "authoritative_daily_filtered_codes_sha256": _sha(codes),
+        "authoritative_daily_generation_id": _sha(["generation", trade_date]),
+        "authoritative_daily_generation_lineage_sha256": _sha(
+            ["lineage", trade_date]
+        ),
+        "authoritative_daily_generation_manifest_sha256": _sha(
+            ["manifest", trade_date]
+        ),
+        "authoritative_daily_raw_codes_sha256": _sha(["daily", trade_date]),
+        "authoritative_daily_raw_row_count": len(codes),
+        "authoritative_daily_raw_segment_counts": dict(counts),
+        "authoritative_daily_resolved_identities_sha256": _sha(codes),
+        "authoritative_daily_transition_excluded_codes_sha256": _sha([]),
+        "authoritative_daily_transition_excluded_row_count": 0,
+        "authoritative_daily_vintage": f"{trade_date}T16:00:00+08:00",
+        "collection_set_relative_path": (
+            f"daily_basic_collection_sets/sha256/{collection_sha[:2]}/"
+            f"{collection_sha}.json"
+        ),
+        "collection_set_sha256": collection_sha,
+        "daily_basic_attempt_relative_path": (
+            f"daily_basic_attempts/sha256/{attempt_sha[:2]}/{attempt_sha}.json"
+        ),
+        "daily_basic_attempt_sha256": attempt_sha,
+        "daily_basic_canonical_rows_sha256": _sha(["basic", trade_date]),
+        "daily_basic_filtered_codes_sha256": _sha(codes),
+        "daily_basic_normalization_receipt_sha256": _sha(
+            ["normalization", trade_date]
+        ),
+        "daily_basic_raw_codes_sha256": _sha(codes),
+        "daily_basic_raw_relative_path": (
+            f"daily_basic_raw/sha256/{raw_sha[:2]}/{raw_sha}.body"
+        ),
+        "daily_basic_raw_row_count": len(codes),
+        "daily_basic_raw_segment_counts": dict(counts),
+        "daily_basic_raw_sha256": raw_sha,
+        "daily_basic_resolved_identities_sha256": _sha(codes),
+        "daily_basic_source_normalization_rows_sha256": _sha(
+            ["source-normalization", trade_date]
+        ),
+        "daily_basic_transition_excluded_codes_sha256": _sha([]),
+        "daily_basic_transition_excluded_row_count": 0,
+        "daily_basic_transition_overlap_comparison_fields": [
+            "turnover_rate",
+            "turnover_rate_f",
+            "free_share",
+            "float_share",
+            "total_mv",
+            "circ_mv",
+        ],
+        "daily_basic_transition_overlap_pair_count": 0,
+        "daily_basic_transition_overlap_root_sha256": _sha([]),
+        "extra_daily_basic_code_count": 0,
+        "missing_authoritative_daily_code_count": 0,
+        "source_ts_code_exact_set_verified_after_transition_filter": True,
+        "target_scope_codes_sha256": _sha(
+            ["000001.SZ", "300001.SZ", "600001.SH"]
+        ),
+        "target_scope_resolved_identities_sha256": _sha(
+            ["000001.SZ", "300001.SZ", "600001.SH"]
+        ),
+        "target_scope_row_count": 3,
+        "trade_date": trade_date,
+        "transition_filtered_row_count": len(codes),
+        "transition_resolved_identity_exact_set_verified": True,
+    }
+
+
 def _daily_receipt(
     tmp_path: Path,
     sessions: list[str],
 ) -> tuple[Path, dict[str, Any], dict[str, Any]]:
-    per_date = [
-        {
-            "trade_date": trade_date,
-            "authoritative_daily_raw_codes_sha256": _sha(["daily", trade_date]),
-            "daily_basic_canonical_rows_sha256": _sha(["basic", trade_date]),
-            "daily_basic_raw_segment_counts": {
-                "BSE": 1,
-                "SSE_MAIN": 1,
-                "SSE_STAR": 1,
-                "SZSE_CHINEXT": 1,
-                "SZSE_MAIN": 1,
-            },
-        }
-        for trade_date in sessions
-    ]
+    per_date = [_complete_daily_statistic(trade_date) for trade_date in sessions]
     unsigned = {
+        "all_supported_segments_compared_before_scope_filter": True,
+        "arbitrary_row_drops_permitted": False,
+        "audited_daily_authority": {
+            "artifact_root_sha256": _sha("audited-daily-artifact"),
+            "daily_identity_root_sha256": _sha("daily-identity"),
+            "schema": "audited-daily-authority-descriptor/v1",
+        },
         "schema": "factor-v3-daily-basic-733-exact-set-receipt/v2",
         "authority_status": "VERIFIED_FACTOR_V3_733_DAILY_BASIC_EXACT_SET",
         "authority_scope": "FACTOR_V3_250_PREWINDOW_PLUS_483_DEVELOPMENT_INPUT_ONLY",
         "row_authority_status": "GRANTED_FOR_BOUND_FACTOR_V3_733_COVERAGE_ONLY",
+        "exact_set_verified": True,
         "trade_date_count": 733,
         "trade_dates": sessions,
         "trade_dates_sha256": _sha(sessions),
@@ -196,14 +266,42 @@ def _daily_receipt(
         "per_date_statistics": per_date,
         "per_date_statistics_sha256": _sha(per_date),
         "publication_capability_sha256": _sha("publication-proof"),
-        "all_supported_segments_compared_before_scope_filter": True,
         "factor_v3_development_materialization_input_eligible": True,
+        "factor_v3_target_identity_root_sha256": _sha("target-identity"),
+        "factor_v3_target_scope": {
+            "excluded_segments": ["SSE_STAR", "BSE"],
+            "included_segments": ["SSE_MAIN", "SZSE_MAIN", "SZSE_CHINEXT"],
+            "policy_id": "factor-v3-mainboard-chinext-only/v1",
+            "target_identity_row_count": 0,
+        },
         "formal_factor_v3_materialization_performed": False,
         "embargo_consumed": False,
         "final_oos_consumed": False,
+        "producer_binding": {
+            "root_sha256": _sha("daily-producer"),
+            "schema": "factor-v3-daily-basic-producer/v1",
+        },
         "production_profile_registered": False,
         "production_recommendation_eligible": False,
+        "raw_source_rows_bound": True,
         "rows_published": False,
+        "security_code_transition_authority": {
+            "artifact_root_sha256": _sha("transition-authority"),
+            "schema": "security-code-transition-authority/v1",
+        },
+        "silent_row_drops_permitted": False,
+        "source_binding_root_sha256": _sha("source-binding"),
+        "source_missingness": {
+            "extra_daily_basic_code_count": 0,
+            "missing_authoritative_daily_code_count": 0,
+            "status": "NONE_AFTER_AUTHORIZED_TRANSITION_FILTER",
+            "unproven_source_missingness_count": 0,
+        },
+        "source_ts_code_exact_set_verified_after_transition_filter": True,
+        "transition_boundary_authority_root_sha256": _sha("transition-boundary"),
+        "transition_boundary_count": 0,
+        "transition_overlap_authority_root_sha256": _sha("transition-overlap"),
+        "transition_resolved_identity_exact_set_verified": True,
     }
     receipt = {**unsigned, "authority_root_sha256": _sha(unsigned)}
     raw = _bytes(receipt)
@@ -456,15 +554,36 @@ def _install_source_stubs(
     source, identity = _source_authority(sessions)
 
     def history_receipt() -> dict[str, Any]:
-        receipt = {
+        unsigned = {
             "schema_version": "audited-pit-factor-v3-feature-history-authority-receipt/v3",
             "verified": True,
             "authority_status": "VERIFIED_FEATURE_HISTORY_ONLY",
             "feature_history_only": True,
+            "factor_v3_points_contract_sha256": points.FACTOR_V3_POINTS_CONTRACT_SHA256,
+            "factor_v3_feature_history_authority_contract_sha256": _sha(
+                "feature-history-contract"
+            ),
+            "collection_publication_manifest_sha256": _sha("history-manifest"),
+            "collection_plan_sha256": _sha("history-plan"),
             "session_count": 250,
             "sessions_sha256": _sha(context["prewindow"]),
-            "receipt_sha256": _sha("history-receipt"),
+            "session_authority_refs_sha256": _sha("history-session-refs"),
+            "snapshot_index_sha256": _sha("history-snapshot-index"),
+            "pit_store_database_sha256": _sha("history-database"),
+            "pit_store_database_bytes": 1,
+            "pit_store_receipt_manifest_sha256": _sha("history-receipt-manifest"),
+            "pit_store_raw_artifact_set_sha256": _sha("history-raw-artifact-set"),
             "source_authority_root_sha256": _sha("history-source"),
+            "upstream_scope_root_sha256": _sha("history-upstream-scope"),
+            "producer_code_root_sha256": _sha("history-producer"),
+            "exact_nonempty_bak_basic_session_count": 250,
+            "daily_generation_session_count": 250,
+            "suspend_d_authority_session_count": 250,
+            "upstream_star_preserved_session_count": 250,
+            "upstream_beijing_preserved_session_count": 250,
+            "security_code_transition_contract_sha256": _sha(
+                "security-code-transition-contract"
+            ),
             "factor_materialization_eligible": False,
             "experiment_launch_eligible": False,
             "embargo_consumed": False,
@@ -472,7 +591,7 @@ def _install_source_stubs(
             "production_profile_registered": False,
             "production_recommendation_eligible": False,
         }
-        return receipt
+        return {**unsigned, "receipt_sha256": _sha(unsigned)}
 
     def load_history_spec(_path: Any) -> dict[str, Any]:
         return {
@@ -488,16 +607,17 @@ def _install_source_stubs(
 
     def history_attestation(**_kwargs: Any) -> dict[str, Any]:
         calls["history_attestation"] += 1
+        receipt = history_receipt()
         return {
             "verified": True,
             "session_count": 250,
             "sessions_sha256": _sha(context["prewindow"]),
-            "receipt_sha256": _sha("history-receipt"),
+            "receipt_sha256": receipt["receipt_sha256"],
             "authority_binding": {
                 "collection_publication_output_root": str(Path.cwd()),
                 "manifest_relative_path": "manifest.json",
                 "manifest_sha256": _sha("history-manifest"),
-                "receipt": history_receipt(),
+                "receipt": receipt,
             },
         }
 
@@ -776,6 +896,74 @@ def test_publish_and_public_postverify_real_authority_schemas(
     assert receipt_projection["source_receipt_projection_sha256"] == _sha(
         receipt_projection["source_receipt_projection"]
     )
+    history_projection_path = (
+        descriptor_path.parent
+        / snapshots["feature_history_receipt"]["relative_path"]
+    )
+    history_projection = json.loads(
+        history_projection_path.read_text(encoding="utf-8")
+    )
+    history_receipt = {
+        **history_projection["source_receipt_projection"],
+        "receipt_sha256": history_projection["source_receipt_sha256"],
+    }
+    authority.validate_factor_v3_public_source_receipt_projection(
+        source_receipt=history_receipt,
+        projected_snapshot=history_projection,
+        kind="feature_history_v3",
+        sessions=context["prewindow"],
+        formal_schema_required=False,
+    )
+    authority.validate_factor_v3_public_source_receipt_projection(
+        source_receipt=context["daily_receipt"],
+        projected_snapshot=receipt_projection,
+        kind="daily_basic_733_v2",
+        sessions=context["sessions"],
+        formal_schema_required=False,
+    )
+    snapshot_payloads = {
+        name: json.loads(
+            (descriptor_path.parent / snapshots[name]["relative_path"]).read_text(
+                encoding="utf-8"
+            )
+        )
+        for name in authority._SNAPSHOT_NAMES
+    }
+    activation._validate_candidate_receipt_snapshots(
+        snapshot_payloads,
+        snapshot_payloads["calendar"],
+    )
+
+    for source_receipt, projected_snapshot, kind, sessions in (
+        (
+            history_receipt,
+            history_projection,
+            "feature_history_v3",
+            context["prewindow"],
+        ),
+        (
+            context["daily_receipt"],
+            receipt_projection,
+            "daily_basic_733_v2",
+            context["sessions"],
+        ),
+    ):
+        for mutation in ("extra", "missing"):
+            drifted = deepcopy(projected_snapshot)
+            projection = drifted["source_receipt_projection"]
+            if mutation == "extra":
+                projection["unbound_public_field"] = True
+            else:
+                projection.pop(next(iter(projection)))
+            drifted["source_receipt_projection_sha256"] = _sha(projection)
+            with pytest.raises(ValueError, match="projection"):
+                authority.validate_factor_v3_public_source_receipt_projection(
+                    source_receipt=source_receipt,
+                    projected_snapshot=drifted,
+                    kind=kind,
+                    sessions=sessions,
+                    formal_schema_required=False,
+                )
 
     combined_text = "\n".join(
         path.read_text(encoding="utf-8")
