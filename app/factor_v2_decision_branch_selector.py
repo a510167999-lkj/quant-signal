@@ -85,12 +85,29 @@ def _strict_sha256(value: Any, field: str) -> str:
     return value
 
 
+def _is_reparse(metadata: os.stat_result) -> bool:
+    return bool(
+        getattr(metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
 def _read_direct_bytes(path: Path) -> bytes:
     try:
         path_metadata = os.lstat(path)
     except OSError as exc:
         raise RuntimeError("decision receipt is unavailable") from exc
-    if stat.S_ISLNK(path_metadata.st_mode):
+    if stat.S_ISLNK(path_metadata.st_mode) or _is_reparse(path_metadata):
         raise RuntimeError("decision receipt must not be a symbolic link")
 
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
@@ -100,13 +117,24 @@ def _read_direct_bytes(path: Path) -> bytes:
     except OSError as exc:
         raise RuntimeError("decision receipt is unavailable") from exc
     try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
+        before_fd = os.fstat(descriptor)
+        if not stat.S_ISREG(before_fd.st_mode):
             raise RuntimeError("decision receipt must be a regular file")
         chunks: list[bytes] = []
         while chunk := os.read(descriptor, 1024 * 1024):
             chunks.append(chunk)
-        if os.fstat(descriptor) != metadata:
+        after_fd = os.fstat(descriptor)
+        try:
+            after_path = os.lstat(path)
+        except OSError as exc:
+            raise RuntimeError("decision receipt changed while being read") from exc
+        if (
+            _identity(path_metadata) != _identity(before_fd)
+            or _identity(before_fd) != _identity(after_fd)
+            or _identity(before_fd) != _identity(after_path)
+            or stat.S_ISLNK(after_path.st_mode)
+            or _is_reparse(after_path)
+        ):
             raise RuntimeError("decision receipt changed while being read")
         return b"".join(chunks)
     finally:

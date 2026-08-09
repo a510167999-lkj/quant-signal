@@ -6,10 +6,12 @@ import io
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from app import factor_v2_decision_branch_selector as selector
 from app.factor_v2_decision_branch_selector import (
     build_factor_v2_decision_branch_receipt,
     select_factor_v2_decision_branch,
@@ -321,6 +323,41 @@ def test_rejects_raw_file_hash_mismatch(tmp_path: Path) -> None:
             path,
             expected_raw_file_sha256="0" * 64,
         )
+
+
+def test_reader_ignores_access_time_drift_but_keeps_stable_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, raw_sha256 = _write_receipt(tmp_path, _receipt())
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    try:
+        observed = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    calls = 0
+
+    def fstat_with_access_time_drift(_descriptor: int) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(
+            st_dev=observed.st_dev,
+            st_ino=observed.st_ino,
+            st_mode=observed.st_mode,
+            st_size=observed.st_size,
+            st_mtime_ns=observed.st_mtime_ns,
+            st_atime_ns=observed.st_atime_ns + calls,
+        )
+
+    monkeypatch.setattr(selector.os, "fstat", fstat_with_access_time_drift)
+
+    assert (
+        select_factor_v2_decision_branch(
+            path,
+            expected_raw_file_sha256=raw_sha256,
+        )
+        == "low_rvol20_rank_overlay_20"
+    )
 
 
 def test_rejects_tampering_even_when_the_raw_file_hash_matches(
