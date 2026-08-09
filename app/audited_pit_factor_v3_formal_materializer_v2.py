@@ -31,7 +31,9 @@ class HeldDisposableMaterializationInputsV2:
 
 
 def _red(capability: str) -> NoReturn:
-    raise NotImplementedError(f"Factor V3 formal materializer v2 RED: {capability}")
+    raise FactorV3FormalMaterializerV2Error(
+        f"Factor V3 formal materializer v2 unavailable: {capability}"
+    )
 
 
 def _held_input_probe(
@@ -70,7 +72,20 @@ def reject_unregistered_activation_input_v2(
 ) -> NoReturn:
     """Reject v1, candidates, disposable receipts, and caller authority."""
 
-    _red("unregistered activation input rejection")
+    from app import audited_pit_factor_v3_formal_materializer_v2_contract as contract
+
+    formal_ok = (
+        untrusted_schema == contract.FORMAL_ACTIVATION_INDEPENDENT_RECEIPT_SCHEMA
+        and untrusted_authority_scope == contract.FORMAL_AUTHORITY_SCOPE
+    )
+    if not formal_ok:
+        raise FactorV3FormalMaterializerV2Error(
+            "unregistered activation input rejected: "
+            f"schema={untrusted_schema!r} scope={untrusted_authority_scope!r}"
+        )
+    raise FactorV3FormalMaterializerV2Error(
+        "activation input rejected without opaque registered capability"
+    )
 
 
 def validate_exact_calendar_projection_v2(
@@ -191,6 +206,14 @@ def _publish_disposable_materialization_contract_v2(
 def produce_registered_factor_v3_formal_materialization_v2_once() -> dict[str, Any]:
     """Acquire and consume one unswappable registered native capability."""
 
+    if (
+        authority.REGISTERED_ACTIVATION_AUTHORITY_LOCATOR_RAW_SHA256 is None
+        or authority.REGISTERED_MATERIALIZER_V2_NATIVE_TCB_SHA256 is None
+        or authority.REGISTERED_MATERIALIZER_V2_NATIVE_BROKER is None
+    ):
+        raise authority.FactorV3FormalMaterializerV2UnavailableError(
+            "registered materializer v2 native TCB/activation authority is unavailable"
+        )
     _red("registered opaque single-attempt producer")
 
 

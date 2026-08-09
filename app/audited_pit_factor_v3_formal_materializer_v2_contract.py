@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import MappingProxyType
 
+from app import research_goal_contract as research_goal
+
 
 FORMAL_ACTIVATION_INDEPENDENT_RECEIPT_SCHEMA = (
     "factor-v3-formal-development-input-activation-independent-verifier-receipt/v2"
@@ -196,10 +198,11 @@ ACTIVATION_V2_REQUIRED_TRUE_FIELDS = (
     *ACTIVATION_V2_INDEPENDENT_TRUE_FIELDS,
 )
 COMPOUND_V2_NATIVE_TERMINAL_RAW_BINDINGS = (
-    "root_run_claim_raw_sha256",
-    "root_run_receipt_raw_sha256",
-    "root_verify_claim_raw_sha256",
-    "root_terminal_receipt_raw_sha256",
+    # Epoch raws use non-root names in the activation transitive closure.
+    "run_claim_raw_sha256",
+    "run_receipt_raw_sha256",
+    "verify_claim_raw_sha256",
+    "terminal_receipt_raw_sha256",
     "parent_producer_raw_sha256",
     "parent_verifier_raw_sha256",
     "evaluator_producer_raw_sha256",
@@ -507,3 +510,11 @@ RUNNER_ATTEMPT_STATES = (
 RUNNER_CLAIM_SCHEMA = "factor-v3-formal-materializer-v2-run-claim/v1"
 RUNNER_STATUS_SCHEMA = "factor-v3-formal-materializer-v2-run-status/v1"
 RUNNER_CLI_MODES = ("run", "verify")
+
+# Keep materializer market scope identical to the frozen research goal.
+assert UPSTREAM_SOURCE_SEGMENTS == research_goal.UPSTREAM_SOURCE_SEGMENTS
+assert DOWNSTREAM_ELIGIBLE_SEGMENTS == research_goal.DOWNSTREAM_ELIGIBLE_SEGMENTS
+assert tuple(SEGMENT_CLASSIFICATION_CONTRACT.keys()) == tuple(
+    research_goal.SEGMENT_CLASSIFICATION_CONTRACT.keys()
+)
+

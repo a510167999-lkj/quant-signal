@@ -225,22 +225,25 @@ def test_rejects_unregistered_activation_and_unforgeable_capability(
         "schema",
     }
     if case == "activation-v1":
-        producer.reject_unregistered_activation_input_v2(
-            untrusted_schema=(
-                "factor-v3-formal-development-input-activation-independent-verifier-receipt/v1"
-            ),
-            untrusted_authority_scope=contract.FORMAL_AUTHORITY_SCOPE,
-        )
+        with pytest.raises(producer.FactorV3FormalMaterializerV2Error):
+            producer.reject_unregistered_activation_input_v2(
+                untrusted_schema=(
+                    "factor-v3-formal-development-input-activation-independent-verifier-receipt/v1"
+                ),
+                untrusted_authority_scope=contract.FORMAL_AUTHORITY_SCOPE,
+            )
     elif case == "candidate-v3":
-        producer.reject_unregistered_activation_input_v2(
-            untrusted_schema="factor-v3-development-input-authority-publication/v3",
-            untrusted_authority_scope=contract.FORMAL_AUTHORITY_SCOPE,
-        )
+        with pytest.raises(producer.FactorV3FormalMaterializerV2Error):
+            producer.reject_unregistered_activation_input_v2(
+                untrusted_schema="factor-v3-development-input-authority-publication/v3",
+                untrusted_authority_scope=contract.FORMAL_AUTHORITY_SCOPE,
+            )
     elif case == "disposable-v2":
-        producer.reject_unregistered_activation_input_v2(
-            untrusted_schema=contract.FORMAL_ACTIVATION_INDEPENDENT_RECEIPT_SCHEMA,
-            untrusted_authority_scope=contract.DISPOSABLE_AUTHORITY_SCOPE,
-        )
+        with pytest.raises(producer.FactorV3FormalMaterializerV2Error):
+            producer.reject_unregistered_activation_input_v2(
+                untrusted_schema=contract.FORMAL_ACTIVATION_INDEPENDENT_RECEIPT_SCHEMA,
+                untrusted_authority_scope=contract.DISPOSABLE_AUTHORITY_SCOPE,
+            )
     else:
         fake: object
         if case == "caller-dict-capability":
