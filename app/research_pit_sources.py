@@ -88,9 +88,11 @@ def resolve_tushare_source(
         proxy_url = (
             _validate_loopback_http_proxy(configured_proxy) if configured_proxy else None
         )
+        # Provider documents plain HTTP path-per-interface transport
+        # (http://jiaoch.site/<api_name>). HTTPS cert on jiaoch.site is expired.
         return TushareSource(
             name="jiaoch",
-            api_url="https://jiaoch.site",
+            api_url="http://jiaoch.site",
             allowed_hosts=("jiaoch.site",),
             token=token,
             request_protocol="tushare-path-per-interface/v1",

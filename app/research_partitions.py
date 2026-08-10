@@ -34,6 +34,39 @@ _V2_TOP_LEVEL_KEYS = {
     "development_evidence",
     "contract_sha256",
 }
+# Path A only: shadow post-train OOS collect/evaluate without unsealing frozen-v1.
+_PATH_A_SHADOW_TOP_LEVEL_KEYS = {
+    "schema_version",
+    "policy_version",
+    "roles",
+    "path_a_shadow_evidence",
+    "contract_sha256",
+}
+_PATH_A_SHADOW_ROLE_NAMES = ("train_frozen_readonly", "shadow_post_train_oos")
+_PATH_A_SHADOW_OPERATIONS = {
+    "train_frozen_readonly": [],
+    "shadow_post_train_oos": ["collect", "evaluate", "diagnose"],
+}
+_PATH_A_SHADOW_BOUNDS = (
+    ("2016-01-01", "2026-07-03", True),
+    ("2026-07-04", None, False),
+)
+_PATH_A_SHADOW_EVIDENCE_KEYS = {
+    "purpose",
+    "frozen_v1_contract_sha256",
+    "train_inclusive_session_end",
+    "not_formal_final_oos",
+    "automatic_trading_allowed",
+}
+_EXPECTED_PATH_A_SHADOW_EVIDENCE = {
+    "purpose": "path_a_shadow_post_train_oos_collect_and_zero_refit_evaluate",
+    "frozen_v1_contract_sha256": (
+        "cf70083e66f8706bf21e48b655c5b4342886e230c6a88dcfff04698d12b2e227"
+    ),
+    "train_inclusive_session_end": "2026-07-03",
+    "not_formal_final_oos": True,
+    "automatic_trading_allowed": False,
+}
 _EVIDENCE_KEYS = {"strategy_results", "real_pit_windows"}
 _V2_EVIDENCE_KEYS = {
     "current_pool_coverage_audit",
@@ -241,6 +274,27 @@ def _validate_v2_contract(contract: Any) -> None:
         raise PartitionContractError("current-pool development evidence differs from frozen values")
 
 
+def _validate_path_a_shadow_contract(contract: Any) -> None:
+    _require_exact_keys(contract, _PATH_A_SHADOW_TOP_LEVEL_KEYS, "contract")
+    if contract["schema_version"] != "research-temporal-partitions/v1-path-a-shadow-oos":
+        raise PartitionContractError("unsupported schema_version")
+    if contract["policy_version"] != "path-a-shadow-post-train-oos/v1":
+        raise PartitionContractError("unsupported policy_version")
+    digest = contract["contract_sha256"]
+    if not isinstance(digest, str) or digest != _canonical_sha256(contract):
+        raise PartitionContractError("contract hash mismatch")
+    _validate_roles(
+        contract["roles"],
+        role_names=_PATH_A_SHADOW_ROLE_NAMES,
+        bounds=_PATH_A_SHADOW_BOUNDS,
+        operations=_PATH_A_SHADOW_OPERATIONS,
+    )
+    evidence = contract["path_a_shadow_evidence"]
+    _require_exact_keys(evidence, _PATH_A_SHADOW_EVIDENCE_KEYS, "path_a_shadow_evidence")
+    if evidence != _EXPECTED_PATH_A_SHADOW_EVIDENCE:
+        raise PartitionContractError("path-a shadow evidence differs from frozen values")
+
+
 def _validate_contract(contract: Any) -> None:
     if not isinstance(contract, dict):
         raise PartitionContractError("contract has missing or unknown fields")
@@ -249,6 +303,8 @@ def _validate_contract(contract: Any) -> None:
         _validate_v1_contract(contract)
     elif policy == "current-pool-development-forward-oos/v2":
         _validate_v2_contract(contract)
+    elif policy == "path-a-shadow-post-train-oos/v1":
+        _validate_path_a_shadow_contract(contract)
     else:
         raise PartitionContractError("unsupported policy_version")
 

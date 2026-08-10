@@ -1,0 +1,32 @@
+{
+  "schema_version": "research-temporal-partitions/v1-path-a-shadow-oos",
+  "policy_version": "path-a-shadow-post-train-oos/v1",
+  "roles": [
+    {
+      "name": "train_frozen_readonly",
+      "start_date": "2016-01-01",
+      "end_date": "2026-07-03",
+      "sealed": true,
+      "permitted_operations": []
+    },
+    {
+      "name": "shadow_post_train_oos",
+      "start_date": "2026-07-04",
+      "end_date": null,
+      "sealed": false,
+      "permitted_operations": [
+        "collect",
+        "evaluate",
+        "diagnose"
+      ]
+    }
+  ],
+  "path_a_shadow_evidence": {
+    "purpose": "path_a_shadow_post_train_oos_collect_and_zero_refit_evaluate",
+    "frozen_v1_contract_sha256": "cf70083e66f8706bf21e48b655c5b4342886e230c6a88dcfff04698d12b2e227",
+    "train_inclusive_session_end": "2026-07-03",
+    "not_formal_final_oos": true,
+    "automatic_trading_allowed": false
+  },
+  "contract_sha256": "d731783ed06684f66b9b6f41d45022b18cea3af1dce68b969559be54f8ca2e6c"
+}

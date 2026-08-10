@@ -288,7 +288,11 @@ CREATE TABLE IF NOT EXISTS current_pool_market_collection_bindings (
     end_date TEXT NOT NULL,
     temporal_contract_sha256 TEXT NOT NULL,
     temporal_role TEXT NOT NULL CHECK (
-        temporal_role IN ('development', 'contaminated_diagnostic')
+        temporal_role IN (
+            'development',
+            'contaminated_diagnostic',
+            'shadow_post_train_oos'
+        )
     ),
     source_profile TEXT NOT NULL,
     market_generation_root_sha256 TEXT NOT NULL,
@@ -1802,6 +1806,7 @@ class PITReceiptStore:
             connection.commit()
             connection.execute("BEGIN IMMEDIATE")
             self._migrate_published_generation_pins(connection)
+            self._migrate_market_collection_binding_roles(connection)
             stored_version = connection.execute(
                 "SELECT value FROM store_metadata WHERE key = 'schema_version'"
             ).fetchone()
@@ -1821,6 +1826,66 @@ class PITReceiptStore:
             )
             connection.execute("PRAGMA user_version = 4")
             self._recover_orphan_promotions_on_connection(connection)
+
+    def _migrate_market_collection_binding_roles(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        """Allow Path-A shadow_post_train_oos on market collection bindings.
+
+        Existing stores created the table with a two-role CHECK constraint.
+        SQLite cannot ALTER CHECK in place; rebuild only when needed.
+        """
+
+        row = connection.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'table' AND name = 'current_pool_market_collection_bindings'
+            """
+        ).fetchone()
+        if row is None or not row[0]:
+            return
+        ddl = str(row[0])
+        if "shadow_post_train_oos" in ddl:
+            return
+        if "contaminated_diagnostic" not in ddl:
+            return
+        connection.execute(
+            """
+            CREATE TABLE current_pool_market_collection_bindings__v2 (
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                temporal_contract_sha256 TEXT NOT NULL,
+                temporal_role TEXT NOT NULL CHECK (
+                    temporal_role IN (
+                        'development',
+                        'contaminated_diagnostic',
+                        'shadow_post_train_oos'
+                    )
+                ),
+                source_profile TEXT NOT NULL,
+                market_generation_root_sha256 TEXT NOT NULL,
+                market_session_count INTEGER NOT NULL CHECK (market_session_count > 0),
+                binding_sha256 TEXT NOT NULL UNIQUE,
+                PRIMARY KEY (start_date, end_date)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO current_pool_market_collection_bindings__v2
+            SELECT start_date, end_date, temporal_contract_sha256, temporal_role,
+                   source_profile, market_generation_root_sha256,
+                   market_session_count, binding_sha256
+            FROM current_pool_market_collection_bindings
+            """
+        )
+        connection.execute("DROP TABLE current_pool_market_collection_bindings")
+        connection.execute(
+            """
+            ALTER TABLE current_pool_market_collection_bindings__v2
+            RENAME TO current_pool_market_collection_bindings
+            """
+        )
 
     def _migrate_published_generation_pins(self, connection: sqlite3.Connection) -> None:
         records = []
@@ -7674,7 +7739,13 @@ class PITReceiptStore:
             or normalized_sessions != sorted(set(normalized_sessions))
             or normalized_sessions[0] < start
             or normalized_sessions[-1] > end
-            or temporal_role not in {"development", "contaminated_diagnostic"}
+            or temporal_role
+            not in {
+                "development",
+                "contaminated_diagnostic",
+                # Path A F1 shadow post-train OOS collect (not formal final_oos).
+                "shadow_post_train_oos",
+            }
             or not isinstance(source_profile, str)
             or not source_profile.strip()
         ):
