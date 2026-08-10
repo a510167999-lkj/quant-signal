@@ -16,6 +16,7 @@ from typing import Any
 from app import factor_v3_path_a_f0_oos_readiness as f0
 from app import factor_v3_path_a_frozen_train_window_replay as train_replay
 from app import factor_v3_path_a_p0_drawdown_overlay_specs as specs
+from app import factor_v3_path_a_p1_acceptance_protocol as p1a
 from app import factor_v3_train_window_freeze_contract as freeze
 from app import research_goal_contract as goal
 from app.research_equity import _equity_points_from_slot_daily_returns
@@ -543,20 +544,15 @@ def build_path_a_p0_drawdown_overlay(
                 "worst_mdd_window": rs.get("worst_mdd_window"),
                 "latest_window": rs.get("latest_window"),
             },
-            "scoreboard": {
-                "W1_worst_rolling_return_pct": rs.get("min_return_pct"),
-                "W2_worst_rolling_mdd_pct": rs.get("worst_mdd_pct"),
-                "W3_both_pass_rate": rs.get("both_pass_rate"),
-                "W4_return_pass_rate": rs.get("return_pass_rate"),
-                "W4_drawdown_pass_rate": rs.get("drawdown_pass_rate"),
-                "W5_latest_rolling_pass_50_15": train_replay._pass_50_15(
-                    latest_ret, latest_mdd
-                ),
-                "W6_full_path_return_pct": metrics.get("portfolio_compounded_return_pct"),
-                "W6_full_path_mdd_pct": port_mdd,
-                "W6_full_path_mdd_pass_15": port_mdd is not None
-                and abs(float(port_mdd)) <= goal.TARGET_MAX_DRAWDOWN_PCT,
-            },
+            "scoreboard": p1a.build_w_scoreboard(
+                {
+                    **metrics,
+                    "portfolio_max_drawdown_pct": port_mdd,
+                    "rolling_1y_latest_return_pct": latest_ret,
+                    "rolling_1y_latest_max_drawdown_pct": latest_mdd,
+                },
+                rolling_summary=rs,
+            ),
             "rolling_12m_summary": rs,
             # keep windows only for non-baseline to control size? keep all for audit
             "rolling_12m_window_count": len(metrics.get("rolling_12m_windows") or []),
@@ -619,6 +615,7 @@ def build_path_a_p0_drawdown_overlay(
         "variants": variants_out,
         "ranking_by_mdd_then_stability": [r["candidate_id"] for r in ranked],
         "best_by_mdd": ranked[0]["candidate_id"] if ranked else None,
+        "p1a_acceptance": p1a.validate_variants(variants_out),
         "effective_strategy_found": False,
         "formal_final_oos_executable": False,
         "meets_user_requirement_as_guarantee": False,
