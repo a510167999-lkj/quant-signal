@@ -73,8 +73,12 @@ def _kernel_dict() -> dict[str, Any]:
     return k
 
 
-def _select_kernel_trades(train_trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    kernel = _kernel_dict()
+def _select_kernel_trades(
+    train_trades: list[dict[str, Any]],
+    *,
+    kernel_override: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    kernel = kernel_override or _kernel_dict()
     payload = sweep_qualified_trades(
         deepcopy(train_trades),
         hold_days=int(kernel["hold_days"]),
@@ -773,6 +777,12 @@ __all__ = [
     "STAGE_GOAL_ID",
     "STAGE_GOAL_SUMMARY",
     "PathAP0Error",
+    "_baseline_equity_curve",
+    "_kernel_dict",
+    "_metrics_bundle",
+    "_select_kernel_trades",
+    "_sha",
+    "_state_from_curve",
     "apply_p0_overlay",
     "build_path_a_p0_drawdown_overlay",
     "write_path_a_p0_drawdown_overlay",
