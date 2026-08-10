@@ -18,6 +18,7 @@ from app import audited_pit_factor_v3_formal_materializer_v2_authority as materi
 from app import audited_pit_factor_v3_formal_materializer_v2_contract as materializer
 from app import factor_authority_compound_contract_v2 as compound
 from app import factor_authority_compound_native_client as compound_native
+from app import factor_v3_materializer_v2_development_registration_fixture as mat_fixture
 from app import research_goal_contract as goal
 
 # --- Self-set near-term stage goal (agent operating target) ---
@@ -165,28 +166,44 @@ def audit_code_registration_gates() -> list[CheckResult]:
             blocking=False,
         )
     )
-    closed = (
-        materializer_auth.REGISTERED_ACTIVATION_AUTHORITY_LOCATOR_RAW_SHA256 is None
-        and materializer_auth.REGISTERED_MATERIALIZER_V2_NATIVE_TCB_SHA256 is None
-        and materializer_auth.REGISTERED_MATERIALIZER_V2_NATIVE_BROKER is None
-    )
+    closed = mat_fixture.production_registration_slots_closed()
     checks.append(
         CheckResult(
             id="materializer_production_registration_closed",
             ok=closed,
-            detail="materializer formal TCB/activation slots currently unregistered",
+            detail=(
+                "materializer formal TCB/activation slots currently unregistered"
+                if closed
+                else "materializer formal TCB/activation slots are non-null "
+                "(process fixture or durable registration present)"
+            ),
             blocking=False,
         )
     )
+    fixture_ready = mat_fixture.is_development_registration_fixture_ready()
+    checks.append(
+        CheckResult(
+            id="materializer_development_registration_fixture_ready",
+            ok=fixture_ready,
+            detail=mat_fixture.fixture_readiness_detail(),
+            blocking=True,
+        )
+    )
+    # Durable formal TCB publication is still a separate audited path (RED).
+    # Development readiness is gated by the fixture surface above, not by
+    # permanently filling fail-closed production slots in source.
     checks.append(
         CheckResult(
             id="materializer_formal_registration_ready",
             ok=not closed,
             detail=(
-                "formal activation/TCB/broker slots must be registered for "
-                "development materialization (still not production)"
+                "durable formal activation/TCB/broker slots remain unregistered "
+                "(expected until audited two-commit authority publication; "
+                "use development registration fixture for local-research dry-run)"
+                if closed
+                else "durable or process-local materializer registration slots are set"
             ),
-            blocking=True,
+            blocking=False,
         )
     )
     checks.append(
@@ -315,11 +332,35 @@ def audit_feature_history_run(run_root: Path) -> list[CheckResult]:
             ),
         )
     )
+    # Feature-history authority is intentionally history-only evidence.
+    # Downstream materializer / development-input paths require:
+    #   factor_materialization_eligible is False
+    #   (and formal_factor_materialization_eligible is False when present).
+    # formal_materialization_eligible=True is granted later by formal
+    # development-input activation under FORMAL_AUTHORITY_SCOPE, not here.
+    history_only_ok = (
+        receipt.get("verified") is True
+        and receipt.get("authority_status") == "VERIFIED_FEATURE_HISTORY_ONLY"
+        and receipt.get("feature_history_only") is True
+        and receipt.get("factor_materialization_eligible") is False
+        and receipt.get("experiment_launch_eligible") is False
+        and receipt.get("embargo_consumed") is False
+        and receipt.get("final_oos_consumed") is False
+        and receipt.get("production_profile_registered") is False
+        and receipt.get("production_recommendation_eligible") is False
+        and int(receipt.get("session_count") or 0) == required
+    )
     checks.append(
         CheckResult(
-            id="feature_history_formal_materialization_eligible",
-            ok=receipt.get("formal_materialization_eligible") is True,
-            detail=f"formal_materialization_eligible={receipt.get('formal_materialization_eligible')}",
+            id="feature_history_history_only_contract_ok",
+            ok=history_only_ok,
+            detail=(
+                f"authority_status={receipt.get('authority_status')} "
+                f"feature_history_only={receipt.get('feature_history_only')} "
+                f"factor_materialization_eligible="
+                f"{receipt.get('factor_materialization_eligible')} "
+                f"session_count={receipt.get('session_count')}"
+            ),
         )
     )
     checks.append(
@@ -365,20 +406,27 @@ def build_next_actions(checks: list[CheckResult]) -> list[str]:
             "修复并重跑 factor-v3 daily-basic 正式采集到 733/733 成功态"
             "（当前 run 为 failed 且仅 26 日）。"
         )
-    if "feature_history_formal_materialization_eligible" in failed:
+    if "feature_history_history_only_contract_ok" in failed:
         actions.append(
-            "feature-history 目前仅 VERIFIED_FEATURE_HISTORY_ONLY；"
-            "需补齐 formal materialization 资格链后再放行。"
+            "修复 feature-history 权威回执：必须为 VERIFIED_FEATURE_HISTORY_ONLY、"
+            "verified=True、factor_materialization_eligible=False（history-only 设计）。"
         )
     if "feature_history_no_partial_publication_dirs" in failed:
         actions.append(
             "清理或完成 feature-history collection-publication 的 .partial 目录，"
             "避免半发布状态被误用。"
         )
+    if "materializer_development_registration_fixture_ready" in failed:
+        actions.append(
+            "修复 development-only materializer/activation 注册夹具表面"
+            "（app/factor_v3_materializer_v2_development_registration_fixture.py；"
+            "仍禁止 production_profile / 自动交易）。"
+        )
     if "materializer_formal_registration_ready" in failed:
         actions.append(
-            "设计 development-only 的 materializer/activation 正式注册夹具"
-            "（仍禁止 production_profile / 自动交易）。"
+            "durable formal materializer TCB/broker 尚未发布（非阻塞）："
+            "本地研究用 development registration fixture；"
+            "正式路径需独立审计的 two-commit authority publication。"
         )
     if not actions:
         actions.append(

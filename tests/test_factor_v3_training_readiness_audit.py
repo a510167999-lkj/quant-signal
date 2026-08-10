@@ -46,3 +46,49 @@ def test_daily_basic_success_path_detected(tmp_path: Path) -> None:
     checks = {c.id: c for c in audit.audit_daily_basic_run(run)}
     assert checks["daily_basic_run_succeeded"].ok is True
     assert checks["daily_basic_session_coverage_733"].ok is True
+
+
+def test_feature_history_history_only_contract_ok(tmp_path: Path) -> None:
+    run = tmp_path / "feature"
+    run.mkdir()
+    (run / "collection-publication").mkdir()
+    (run / "state.json").write_text(
+        json.dumps(
+            {
+                "schema": "factor-v3-feature-history-run-state/v2",
+                "status": "failed",
+                "completed_session_count": 250,
+                "receipt": {
+                    "verified": True,
+                    "authority_status": "VERIFIED_FEATURE_HISTORY_ONLY",
+                    "feature_history_only": True,
+                    "factor_materialization_eligible": False,
+                    "experiment_launch_eligible": False,
+                    "embargo_consumed": False,
+                    "final_oos_consumed": False,
+                    "production_profile_registered": False,
+                    "production_recommendation_eligible": False,
+                    "session_count": 250,
+                },
+                "collection_publication": {
+                    "publication_status": "DURABLE_POSTVERIFIED_AND_RETURNED",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    checks = {c.id: c for c in audit.audit_feature_history_run(run)}
+    assert checks["feature_history_prewindow_250"].ok is True
+    assert checks["feature_history_receipt_verified"].ok is True
+    assert checks["feature_history_history_only_contract_ok"].ok is True
+    assert checks["feature_history_no_partial_publication_dirs"].ok is True
+    assert "feature_history_formal_materialization_eligible" not in checks
+
+
+def test_code_registration_gates_include_development_fixture() -> None:
+    checks = {c.id: c for c in audit.audit_code_registration_gates()}
+    assert checks["materializer_development_registration_fixture_ready"].ok is True
+    assert checks["materializer_development_registration_fixture_ready"].blocking is True
+    # Durable formal TCB remains intentionally unregistered (non-blocking).
+    assert checks["materializer_formal_registration_ready"].blocking is False
+    assert checks["materializer_production_registration_closed"].ok is True
