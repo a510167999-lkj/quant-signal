@@ -19,22 +19,16 @@ from app import audited_pit_factor_v3_formal_materializer_v2_contract as materia
 from app import factor_authority_compound_contract_v2 as compound
 from app import factor_authority_compound_native_client as compound_native
 from app import factor_v3_materializer_v2_development_registration_fixture as mat_fixture
+from app import factor_v3_parent_eval_authority_inventory as parent_eval_inventory
 from app import research_goal_contract as goal
 
 # --- Self-set near-term stage goal (agent operating target) ---
-# Prior stage factor-v3-dev-matrix-readiness/v1 cleared daily-basic 733 +
-# feature-history 250 + materializer development fixture. Current stage
-# advances one step toward formal materialization without claiming formal
-# eligibility or publishing durable native TCB.
-STAGE_GOAL_ID = "factor-v3-activation-disposable-proof/v1"
-STAGE_GOAL_SUMMARY = (
-    "在 development-only 边界内，完成 formal-development-input-activation 的 "
-    "disposable 证明链 dry-run（publish + independent differential verify），"
-    "并证明 public formal entrypoint 仍 fail-closed；"
-    "保留 daily-basic 733 / feature-history 250 / materializer fixture 前置；"
-    "不宣称 formal_materialization_eligible；"
-    "不碰 embargo/final-OOS/生产/自动交易。"
-)
+# Prior stages: daily-basic 733, feature-history 250, materializer dry-run,
+# activation disposable proof. Current stage inventories parent/eval real
+# authority binding gaps without granting formal eligibility.
+STAGE_GOAL_ID = parent_eval_inventory.STAGE_GOAL_ID
+STAGE_GOAL_SUMMARY = parent_eval_inventory.STAGE_GOAL_SUMMARY
+ACTIVATION_STAGE_GOAL_ID = "factor-v3-activation-disposable-proof/v1"
 
 DEFAULT_DAILY_RUN = Path(
     "data/research_runs/audited_pit_factor_v3_daily_basic_collection_v2_development_733_http_publish"
@@ -47,6 +41,9 @@ DEFAULT_MATERIALIZER_DRY_RUN_POINTER = Path(
 )
 DEFAULT_ACTIVATION_DRY_RUN_POINTER = Path(
     "data/research_runs/factor_v3_activation_development_dry_run/LATEST.json"
+)
+DEFAULT_PARENT_EVAL_INVENTORY_POINTER = Path(
+    "data/research_runs/factor_v3_parent_eval_authority_inventory/LATEST.json"
 )
 
 JIAOCH_ENV_CANDIDATES = (
@@ -346,7 +343,27 @@ def audit_development_dry_run_evidence(repo_root: Path) -> list[CheckResult]:
         _audit_dry_run_pointer(
             activation_pointer,
             check_id="activation_development_dry_run_ok",
+            require_stage_goal_id=ACTIVATION_STAGE_GOAL_ID,
+        )
+    )
+    inventory_pointer = (repo_root / DEFAULT_PARENT_EVAL_INVENTORY_POINTER).resolve()
+    checks.append(
+        _audit_dry_run_pointer(
+            inventory_pointer,
+            check_id="parent_eval_authority_inventory_ok",
             require_stage_goal_id=STAGE_GOAL_ID,
+        )
+    )
+    inv_payload = _read_json(inventory_pointer) or {}
+    checks.append(
+        CheckResult(
+            id="parent_eval_formal_not_ready_documented",
+            ok=inv_payload.get("formal_parent_eval_ready") is False,
+            detail=(
+                f"formal_parent_eval_ready={inv_payload.get('formal_parent_eval_ready')} "
+                f"(must remain False until formal receipts exist)"
+            ),
+            blocking=True,
         )
     )
     # Formal public activation must remain closed at source (not just dry-run).
@@ -522,6 +539,17 @@ def build_next_actions(checks: list[CheckResult]) -> list[str]:
             "scripts/run_factor_v3_activation_development_dry_run.py "
             "完成 disposable activation 证明链并确认 LATEST.json ok。"
         )
+    if "parent_eval_authority_inventory_ok" in failed:
+        actions.append(
+            "在 VPS_RUNTIME_ROLE=local_research 下重跑 "
+            "scripts/run_factor_v3_parent_eval_authority_inventory.py "
+            "生成 parent/eval 权威 inventory 并确认 LATEST.json ok。"
+        )
+    if "parent_eval_formal_not_ready_documented" in failed:
+        actions.append(
+            "inventory 不得将 formal_parent_eval_ready 标为 True；"
+            "正式 parent/eval 权威收据缺失时应保持 False。"
+        )
     if "materializer_formal_registration_ready" in failed:
         actions.append(
             "durable formal materializer TCB/broker 尚未发布（非阻塞）："
@@ -530,8 +558,8 @@ def build_next_actions(checks: list[CheckResult]) -> list[str]:
         )
     if not actions:
         actions.append(
-            "本阶段 disposable activation 证明已齐；下一阶段应推进 parent-source/"
-            "evaluation 真实权威与 formal activation（仍禁止生产与自动交易）。"
+            "本阶段 parent/eval inventory 已齐；下一阶段应发布 formal parent-source "
+            "与 evaluation authority 收据（仍禁止 production profile / 自动交易）。"
         )
     actions.append(
         "在未通过 final-OOS 与 50%/15% 门槛前，禁止注册生产 profile、禁止自动下单。"

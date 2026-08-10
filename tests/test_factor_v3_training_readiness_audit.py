@@ -9,10 +9,9 @@ from app import research_goal_contract as goal
 
 def test_stage_goal_is_development_only_and_aligned_with_research_goal() -> None:
     summary = audit.STAGE_GOAL_SUMMARY.lower()
-    assert audit.STAGE_GOAL_ID == "factor-v3-activation-disposable-proof/v1"
-    assert "development" in summary
-    assert "activation" in summary or "activation" in audit.STAGE_GOAL_ID
-    assert "embargo" in summary or "oos" in summary or "生产" in audit.STAGE_GOAL_SUMMARY
+    assert audit.STAGE_GOAL_ID == "factor-v3-parent-eval-real-authority-inventory/v1"
+    assert "parent" in summary or "inventory" in summary
+    assert "embargo" in summary or "oos" in summary or "生产" in audit.STAGE_GOAL_SUMMARY or "自动交易" in audit.STAGE_GOAL_SUMMARY
     assert "formal_materialization_eligible" in audit.STAGE_GOAL_SUMMARY
     assert goal.TARGET_ROLLING_12M_NET_RETURN_PCT == 50.0
     assert goal.TARGET_MAX_DRAWDOWN_PCT == 15.0
@@ -30,6 +29,7 @@ def test_audit_reports_blocking_gaps_without_raising(tmp_path: Path, monkeypatch
     assert "daily_basic_state_present" in report.blocking_gaps
     assert "activation_development_dry_run_ok" in report.blocking_gaps
     assert "materializer_development_dry_run_ok" in report.blocking_gaps
+    assert "parent_eval_authority_inventory_ok" in report.blocking_gaps
     markdown = audit.render_markdown(report)
     assert "Blocking gaps" in markdown
     assert "50" in markdown
@@ -42,7 +42,7 @@ def test_dry_run_pointer_audit_accepts_valid_activation_evidence(tmp_path: Path)
             {
                 "ok": True,
                 "development_only": True,
-                "stage_goal_id": audit.STAGE_GOAL_ID,
+                "stage_goal_id": audit.ACTIVATION_STAGE_GOAL_ID,
                 "evidence_sha256": "a" * 64,
                 "production_profile_registered": False,
                 "automatic_trading_allowed": False,
@@ -54,6 +54,31 @@ def test_dry_run_pointer_audit_accepts_valid_activation_evidence(tmp_path: Path)
     check = audit._audit_dry_run_pointer(
         pointer,
         check_id="activation_development_dry_run_ok",
+        require_stage_goal_id=audit.ACTIVATION_STAGE_GOAL_ID,
+    )
+    assert check.ok is True
+
+
+def test_inventory_pointer_audit_accepts_stage_goal(tmp_path: Path) -> None:
+    pointer = tmp_path / "LATEST.json"
+    pointer.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "development_only": True,
+                "stage_goal_id": audit.STAGE_GOAL_ID,
+                "inventory_sha256": "b" * 64,
+                "production_profile_registered": False,
+                "automatic_trading_allowed": False,
+                "formal_materialization_eligible": False,
+                "formal_parent_eval_ready": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    check = audit._audit_dry_run_pointer(
+        pointer,
+        check_id="parent_eval_authority_inventory_ok",
         require_stage_goal_id=audit.STAGE_GOAL_ID,
     )
     assert check.ok is True
