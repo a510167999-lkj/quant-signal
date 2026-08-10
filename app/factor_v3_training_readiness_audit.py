@@ -20,15 +20,17 @@ from app import factor_authority_compound_contract_v2 as compound
 from app import factor_authority_compound_native_client as compound_native
 from app import factor_v3_materializer_v2_development_registration_fixture as mat_fixture
 from app import factor_v3_parent_eval_authority_inventory as parent_eval_inventory
+from app import factor_v3_train_locked_formal_data_receipts as train_locked_receipts
+from app import factor_v3_train_window_freeze_contract as train_freeze
 from app import research_goal_contract as goal
 
 # --- Self-set near-term stage goal (agent operating target) ---
-# Prior stages: daily-basic 733, feature-history 250, materializer dry-run,
-# activation disposable proof. Current stage inventories parent/eval real
-# authority binding gaps without granting formal eligibility.
-STAGE_GOAL_ID = parent_eval_inventory.STAGE_GOAL_ID
-STAGE_GOAL_SUMMARY = parent_eval_inventory.STAGE_GOAL_SUMMARY
+# Prior: inventory parent/eval gaps. Current: seal train-locked upstream formal
+# data receipts under freeze before 2026-08-01 (no daily incremental sync).
+STAGE_GOAL_ID = train_locked_receipts.STAGE_GOAL_ID
+STAGE_GOAL_SUMMARY = train_locked_receipts.STAGE_GOAL_SUMMARY
 ACTIVATION_STAGE_GOAL_ID = "factor-v3-activation-disposable-proof/v1"
+PARENT_EVAL_INVENTORY_STAGE_GOAL_ID = parent_eval_inventory.STAGE_GOAL_ID
 
 DEFAULT_DAILY_RUN = Path(
     "data/research_runs/audited_pit_factor_v3_daily_basic_collection_v2_development_733_http_publish"
@@ -44,6 +46,9 @@ DEFAULT_ACTIVATION_DRY_RUN_POINTER = Path(
 )
 DEFAULT_PARENT_EVAL_INVENTORY_POINTER = Path(
     "data/research_runs/factor_v3_parent_eval_authority_inventory/LATEST.json"
+)
+DEFAULT_TRAIN_LOCKED_RECEIPTS_POINTER = Path(
+    "data/research_runs/factor_v3_train_locked_formal_data_receipts/LATEST.json"
 )
 
 JIAOCH_ENV_CANDIDATES = (
@@ -351,7 +356,7 @@ def audit_development_dry_run_evidence(repo_root: Path) -> list[CheckResult]:
         _audit_dry_run_pointer(
             inventory_pointer,
             check_id="parent_eval_authority_inventory_ok",
-            require_stage_goal_id=STAGE_GOAL_ID,
+            require_stage_goal_id=PARENT_EVAL_INVENTORY_STAGE_GOAL_ID,
         )
     )
     inv_payload = _read_json(inventory_pointer) or {}
@@ -362,6 +367,63 @@ def audit_development_dry_run_evidence(repo_root: Path) -> list[CheckResult]:
             detail=(
                 f"formal_parent_eval_ready={inv_payload.get('formal_parent_eval_ready')} "
                 f"(must remain False until formal receipts exist)"
+            ),
+            blocking=True,
+        )
+    )
+    # Train-window freeze + sealed upstream formal data receipts
+    freeze_ok = True
+    freeze_detail = ""
+    try:
+        train_freeze.assert_train_window_freeze_consistent()
+        freeze_detail = (
+            f"exclusive_end={train_freeze.TRAIN_EXCLUSIVE_END_DATE} "
+            f"inclusive_end={train_freeze.TRAIN_INCLUSIVE_SESSION_END} "
+            f"daily_sync={train_freeze.DAILY_INCREMENTAL_SYNC_REQUIRED}"
+        )
+    except train_freeze.TrainWindowFreezeError as exc:
+        freeze_ok = False
+        freeze_detail = str(exc)
+    checks.append(
+        CheckResult(
+            id="train_window_freeze_consistent",
+            ok=freeze_ok,
+            detail=freeze_detail,
+            blocking=True,
+        )
+    )
+    train_pointer = (repo_root / DEFAULT_TRAIN_LOCKED_RECEIPTS_POINTER).resolve()
+    checks.append(
+        _audit_dry_run_pointer(
+            train_pointer,
+            check_id="train_locked_formal_data_receipts_ok",
+            require_stage_goal_id=STAGE_GOAL_ID,
+        )
+    )
+    train_payload = _read_json(train_pointer) or {}
+    checks.append(
+        CheckResult(
+            id="train_locked_no_daily_incremental_sync",
+            ok=train_payload.get("daily_incremental_sync_required") is False,
+            detail=(
+                f"daily_incremental_sync_required="
+                f"{train_payload.get('daily_incremental_sync_required')}"
+            ),
+            blocking=True,
+        )
+    )
+    checks.append(
+        CheckResult(
+            id="train_locked_upstream_complete_parent_eval_open",
+            ok=(
+                train_payload.get("upstream_formal_data_complete") is True
+                and train_payload.get("parent_eval_formal_complete") is False
+            ),
+            detail=(
+                f"upstream_formal_data_complete="
+                f"{train_payload.get('upstream_formal_data_complete')} "
+                f"parent_eval_formal_complete="
+                f"{train_payload.get('parent_eval_formal_complete')}"
             ),
             blocking=True,
         )
@@ -550,6 +612,17 @@ def build_next_actions(checks: list[CheckResult]) -> list[str]:
             "inventory 不得将 formal_parent_eval_ready 标为 True；"
             "正式 parent/eval 权威收据缺失时应保持 False。"
         )
+    if (
+        "train_window_freeze_consistent" in failed
+        or "train_locked_formal_data_receipts_ok" in failed
+        or "train_locked_no_daily_incremental_sync" in failed
+        or "train_locked_upstream_complete_parent_eval_open" in failed
+    ):
+        actions.append(
+            "在 VPS_RUNTIME_ROLE=local_research 下重跑 "
+            "scripts/publish_factor_v3_train_locked_formal_data_receipts.py："
+            "训练集锁定 2026-08-01 前、不日更，封存 733/250/attestation 上游 formal 收据。"
+        )
     if "materializer_formal_registration_ready" in failed:
         actions.append(
             "durable formal materializer TCB/broker 尚未发布（非阻塞）："
@@ -558,8 +631,9 @@ def build_next_actions(checks: list[CheckResult]) -> list[str]:
         )
     if not actions:
         actions.append(
-            "本阶段 parent/eval inventory 已齐；下一阶段应发布 formal parent-source "
-            "与 evaluation authority 收据（仍禁止 production profile / 自动交易）。"
+            "train-locked 上游 formal 数据收据已封存（至 2026-07-03，exclusive end "
+            "2026-08-01，不日更）；下一阶段再补 durable parent/eval formal 收据，"
+            "以便进入策略开发矩阵。永不自动交易。"
         )
     actions.append(
         "在未通过 final-OOS 与 50%/15% 门槛前，禁止注册生产 profile、禁止自动下单。"
