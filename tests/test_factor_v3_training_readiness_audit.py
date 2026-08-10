@@ -9,8 +9,11 @@ from app import research_goal_contract as goal
 
 def test_stage_goal_is_development_only_and_aligned_with_research_goal() -> None:
     summary = audit.STAGE_GOAL_SUMMARY.lower()
+    assert audit.STAGE_GOAL_ID == "factor-v3-activation-disposable-proof/v1"
     assert "development" in summary
+    assert "activation" in summary or "activation" in audit.STAGE_GOAL_ID
     assert "embargo" in summary or "oos" in summary or "生产" in audit.STAGE_GOAL_SUMMARY
+    assert "formal_materialization_eligible" in audit.STAGE_GOAL_SUMMARY
     assert goal.TARGET_ROLLING_12M_NET_RETURN_PCT == 50.0
     assert goal.TARGET_MAX_DRAWDOWN_PCT == 15.0
     assert "BSE" in goal.DOWNSTREAM_EXCLUDED_SEGMENTS
@@ -25,9 +28,35 @@ def test_audit_reports_blocking_gaps_without_raising(tmp_path: Path, monkeypatch
     assert report.ready_for_formal_development_materialization is False
     assert "jiaoch_credential_available" in report.blocking_gaps
     assert "daily_basic_state_present" in report.blocking_gaps
+    assert "activation_development_dry_run_ok" in report.blocking_gaps
+    assert "materializer_development_dry_run_ok" in report.blocking_gaps
     markdown = audit.render_markdown(report)
     assert "Blocking gaps" in markdown
     assert "50" in markdown
+
+
+def test_dry_run_pointer_audit_accepts_valid_activation_evidence(tmp_path: Path) -> None:
+    pointer = tmp_path / "LATEST.json"
+    pointer.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "development_only": True,
+                "stage_goal_id": audit.STAGE_GOAL_ID,
+                "evidence_sha256": "a" * 64,
+                "production_profile_registered": False,
+                "automatic_trading_allowed": False,
+                "formal_materialization_eligible": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    check = audit._audit_dry_run_pointer(
+        pointer,
+        check_id="activation_development_dry_run_ok",
+        require_stage_goal_id=audit.STAGE_GOAL_ID,
+    )
+    assert check.ok is True
 
 
 def test_daily_basic_success_path_detected(tmp_path: Path) -> None:

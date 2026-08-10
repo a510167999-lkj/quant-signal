@@ -22,11 +22,17 @@ from app import factor_v3_materializer_v2_development_registration_fixture as ma
 from app import research_goal_contract as goal
 
 # --- Self-set near-term stage goal (agent operating target) ---
-STAGE_GOAL_ID = "factor-v3-dev-matrix-readiness/v1"
+# Prior stage factor-v3-dev-matrix-readiness/v1 cleared daily-basic 733 +
+# feature-history 250 + materializer development fixture. Current stage
+# advances one step toward formal materialization without claiming formal
+# eligibility or publishing durable native TCB.
+STAGE_GOAL_ID = "factor-v3-activation-disposable-proof/v1"
 STAGE_GOAL_SUMMARY = (
-    "在 development-only 边界内，打通 Jiaoch 正式训练集物化前置："
-    "daily-basic 733 日完整权威 + feature-history 250 预窗权威 + "
-    "compound/activation 正式门控 + materializer v2 正式注册路径；"
+    "在 development-only 边界内，完成 formal-development-input-activation 的 "
+    "disposable 证明链 dry-run（publish + independent differential verify），"
+    "并证明 public formal entrypoint 仍 fail-closed；"
+    "保留 daily-basic 733 / feature-history 250 / materializer fixture 前置；"
+    "不宣称 formal_materialization_eligible；"
     "不碰 embargo/final-OOS/生产/自动交易。"
 )
 
@@ -35,6 +41,12 @@ DEFAULT_DAILY_RUN = Path(
 )
 DEFAULT_FEATURE_RUN = Path(
     "data/research_runs/audited_pit_factor_v3_feature_history_collection_v1_development_prewindow_250"
+)
+DEFAULT_MATERIALIZER_DRY_RUN_POINTER = Path(
+    "data/research_runs/factor_v3_materializer_v2_development_dry_run/LATEST.json"
+)
+DEFAULT_ACTIVATION_DRY_RUN_POINTER = Path(
+    "data/research_runs/factor_v3_activation_development_dry_run/LATEST.json"
 )
 
 JIAOCH_ENV_CANDIDATES = (
@@ -285,6 +297,83 @@ def audit_daily_basic_run(run_root: Path) -> list[CheckResult]:
     return checks
 
 
+def _audit_dry_run_pointer(
+    pointer_path: Path,
+    *,
+    check_id: str,
+    require_stage_goal_id: str | None = None,
+) -> CheckResult:
+    payload = _read_json(pointer_path)
+    if payload is None:
+        return CheckResult(
+            id=check_id,
+            ok=False,
+            detail=f"missing or invalid pointer {pointer_path}",
+        )
+    ok = payload.get("ok") is True and payload.get("development_only") is True
+    if require_stage_goal_id is not None:
+        ok = ok and payload.get("stage_goal_id") == require_stage_goal_id
+    if payload.get("production_profile_registered") is True:
+        ok = False
+    if payload.get("automatic_trading_allowed") is True:
+        ok = False
+    if (
+        "formal_materialization_eligible" in payload
+        and payload.get("formal_materialization_eligible") is not False
+    ):
+        ok = False
+    detail = (
+        f"ok={payload.get('ok')} development_only={payload.get('development_only')} "
+        f"stage_goal_id={payload.get('stage_goal_id')} "
+        f"evidence_sha256={payload.get('evidence_sha256')}"
+    )
+    return CheckResult(id=check_id, ok=ok, detail=detail, blocking=True)
+
+
+def audit_development_dry_run_evidence(repo_root: Path) -> list[CheckResult]:
+    checks: list[CheckResult] = []
+    materializer_pointer = (
+        repo_root / DEFAULT_MATERIALIZER_DRY_RUN_POINTER
+    ).resolve()
+    activation_pointer = (repo_root / DEFAULT_ACTIVATION_DRY_RUN_POINTER).resolve()
+    checks.append(
+        _audit_dry_run_pointer(
+            materializer_pointer,
+            check_id="materializer_development_dry_run_ok",
+        )
+    )
+    checks.append(
+        _audit_dry_run_pointer(
+            activation_pointer,
+            check_id="activation_development_dry_run_ok",
+            require_stage_goal_id=STAGE_GOAL_ID,
+        )
+    )
+    # Formal public activation must remain closed at source (not just dry-run).
+    checks.append(
+        CheckResult(
+            id="activation_formal_public_entrypoint_closed",
+            ok=callable(
+                getattr(
+                    __import__(
+                        "app.factor_v3_formal_development_input_activation",
+                        fromlist=["publish_factor_v3_formal_development_input_activation"],
+                    ),
+                    "publish_factor_v3_formal_development_input_activation",
+                    None,
+                )
+            ),
+            detail=(
+                "public formal activation entrypoint exists and disposable dry-run "
+                "must keep formal_materialization_eligible=False "
+                "(see activation_development_dry_run_ok)"
+            ),
+            blocking=False,
+        )
+    )
+    return checks
+
+
 def audit_feature_history_run(run_root: Path) -> list[CheckResult]:
     checks: list[CheckResult] = []
     state_path = run_root / "state.json"
@@ -422,6 +511,17 @@ def build_next_actions(checks: list[CheckResult]) -> list[str]:
             "（app/factor_v3_materializer_v2_development_registration_fixture.py；"
             "仍禁止 production_profile / 自动交易）。"
         )
+    if "materializer_development_dry_run_ok" in failed:
+        actions.append(
+            "在 VPS_RUNTIME_ROLE=local_research 下重跑 "
+            "scripts/run_factor_v3_materializer_v2_development_dry_run.py 并确认 LATEST.json ok。"
+        )
+    if "activation_development_dry_run_ok" in failed:
+        actions.append(
+            "在 VPS_RUNTIME_ROLE=local_research 下重跑 "
+            "scripts/run_factor_v3_activation_development_dry_run.py "
+            "完成 disposable activation 证明链并确认 LATEST.json ok。"
+        )
     if "materializer_formal_registration_ready" in failed:
         actions.append(
             "durable formal materializer TCB/broker 尚未发布（非阻塞）："
@@ -430,7 +530,8 @@ def build_next_actions(checks: list[CheckResult]) -> list[str]:
         )
     if not actions:
         actions.append(
-            "前置已齐：可启动 development-only formal materialization 试跑并保留证据。"
+            "本阶段 disposable activation 证明已齐；下一阶段应推进 parent-source/"
+            "evaluation 真实权威与 formal activation（仍禁止生产与自动交易）。"
         )
     actions.append(
         "在未通过 final-OOS 与 50%/15% 门槛前，禁止注册生产 profile、禁止自动下单。"
@@ -454,10 +555,13 @@ def run_factor_v3_training_readiness_audit(
     checks.extend(audit_jiaoch_credentials())
     checks.extend(audit_daily_basic_run(daily))
     checks.extend(audit_feature_history_run(feature))
+    checks.extend(audit_development_dry_run_evidence(root))
 
     blocking = [c.detail if c.detail else c.id for c in checks if c.blocking and not c.ok]
     # prefer ids for clarity
     blocking_ids = [c.id for c in checks if c.blocking and not c.ok]
+    # Field name is historical: means "current stage gates clear toward formal
+    # development materialization path", not that formal eligibility is granted.
     ready = not blocking_ids
     report = ReadinessReport(
         stage_goal_id=STAGE_GOAL_ID,
