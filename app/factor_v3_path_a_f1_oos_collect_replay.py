@@ -28,6 +28,9 @@ from app.research_partitions import (
     load_temporal_partition_contract,
 )
 from app.research_sweep import sweep_qualified_trades
+from app.factor_v3_path_a_f1_oos_qualified import (  # noqa: E402
+    generate_path_a_oos_qualified_trades,
+)
 
 STAGE_GOAL_ID = "path-a-f1-oos-collect-replay/v1"
 STAGE_GOAL_SUMMARY = (
@@ -218,6 +221,38 @@ def _load_frozen_candidate(repo: Path) -> dict[str, Any]:
     }
 
 
+def _oos_trade_inventory(trades: list[dict[str, Any]], spec: dict[str, Any]) -> dict[str, Any]:
+    levels: dict[str, int] = {}
+    need = set(spec.get("required_signal_tags") or [])
+    excl = set(spec.get("excluded_signal_tags") or [])
+    allowed_mkt = set(spec.get("market_levels") or [])
+    tag_hit = 0
+    mkt_hit = 0
+    full_hit = 0
+    for trade in trades:
+        level = str(trade.get("market_level") or "unknown")
+        levels[level] = levels.get(level, 0) + 1
+        tags = {str(t) for t in (trade.get("signal_tags") or [])}
+        mkt_ok = (not allowed_mkt) or (level in allowed_mkt)
+        tags_ok = (not need or need.issubset(tags)) and (not excl or not (tags & excl))
+        if mkt_ok:
+            mkt_hit += 1
+        if tags_ok:
+            tag_hit += 1
+        if mkt_ok and tags_ok:
+            full_hit += 1
+    return {
+        "oos_trade_count": len(trades),
+        "market_level_counts": dict(sorted(levels.items())),
+        "count_matching_market_levels": mkt_hit,
+        "count_matching_signal_tags": tag_hit,
+        "count_matching_frozen_spec_prefilter": full_hit,
+        "required_signal_tags": sorted(need),
+        "excluded_signal_tags": sorted(excl),
+        "allowed_market_levels": sorted(allowed_mkt),
+    }
+
+
 def _zero_refit_replay(
     trades: list[dict[str, Any]],
     spec: dict[str, Any],
@@ -226,11 +261,13 @@ def _zero_refit_replay(
 ) -> dict[str, Any]:
     """Replay frozen spec with no parameter search (fixed_spec=True)."""
 
+    inventory = _oos_trade_inventory(trades, spec)
     if not trades:
         return {
             "executed": False,
             "reason": "no_oos_trades",
             "selected_trade_count": 0,
+            "inventory": inventory,
         }
     payload = sweep_qualified_trades(
         deepcopy(trades),
@@ -268,6 +305,11 @@ def _zero_refit_replay(
             "reason": "fixed_spec_produced_no_rows",
             "selected_trade_count": 0,
             "pass_both_50_15": False,
+            "inventory": inventory,
+            "interpretation": (
+                "Zero-refit ran; frozen filters selected no OOS trades. "
+                "This is a diagnostic result, not a formal final-OOS fail/pass."
+            ),
         }
     row = rows[0]
     ret = row.get(
@@ -304,6 +346,7 @@ def _zero_refit_replay(
         "rolling_1y_latest_return_pct": ret_f,
         "rolling_1y_latest_max_drawdown_pct": mdd_f,
         "pass_both_50_15_on_rolling_1y": dual,
+        "inventory": inventory,
         "note": (
             "Short post-train OOS windows usually lack full rolling-12m coverage; "
             "portfolio totals are diagnostic only, not formal final-OOS pass."
@@ -410,8 +453,10 @@ def build_path_a_f1_oos_collect_replay(
     repo_root: Path | None = None,
     require_local_research: bool = True,
     collect: bool = False,
+    generate_qualified: bool = False,
     oos_end_date: str = DEFAULT_OOS_END,
     oos_qualified_path: Path | None = None,
+    max_universe_symbols: int = 300,
 ) -> dict[str, Any]:
     if require_local_research:
         role = _require_local_research()
@@ -465,6 +510,14 @@ def build_path_a_f1_oos_collect_replay(
         if oos_qualified_path is not None
         else (root / DEFAULT_OOS_QUALIFIED)
     )
+    generate_result: dict[str, Any] | None = None
+    if generate_qualified:
+        generate_result = generate_path_a_oos_qualified_trades(
+            repo_root=root,
+            oos_store=oos_store_path,
+            output_path=oos_qt_path,
+            max_universe_symbols=max_universe_symbols,
+        )
     oos_qt = _audit_oos_trades(oos_qt_path)
 
     # Load OOS trades for zero-refit if present
@@ -577,6 +630,7 @@ def build_path_a_f1_oos_collect_replay(
         "oos_market_store_before": oos_store_before,
         "oos_market_store_after": oos_store_after,
         "collect_attempt": collect_result,
+        "generate_qualified_attempt": generate_result,
         "train_qualified_audit": {
             "path": _rel(root, root / DEFAULT_TRAIN_QUALIFIED),
             "last_signal_date": train_qt.get("last_signal_date"),
@@ -589,8 +643,9 @@ def build_path_a_f1_oos_collect_replay(
         "warnings": warnings,
         "shadow_oos_collect_ok": int(oos_store_after.get("post_train_session_count") or 0)
         > 0,
+        # Replay OK means zero-refit executed on OOS trades (0 selected is valid).
         "shadow_oos_replay_ok": bool(replay.get("executed"))
-        and int(replay.get("selected_trade_count") or 0) > 0,
+        and int(oos_qt.get("oos_trade_count") or 0) > 0,
         "formal_final_oos_executable": False,
         "effective_strategy_found": False,
         "ok": True,
@@ -613,7 +668,14 @@ def build_path_a_f1_oos_collect_replay(
                     if int(oos_qt.get("oos_trade_count") or 0) == 0
                     else None
                 ),
-                "re-run F1 zero-refit after OOS qualified trades exist",
+                (
+                    "frozen filters selected 0 OOS trades (market mostly non-favorable); "
+                    "collect more OOS sessions or review candidate regime filters"
+                    if bool(replay.get("executed"))
+                    and int(replay.get("selected_trade_count") or 0) == 0
+                    and int(oos_qt.get("oos_trade_count") or 0) > 0
+                    else None
+                ),
                 "do not unseal frozen-v1 casually; formal final-OOS still blocked",
                 "never auto-trade; never merge OOS into train",
             ]

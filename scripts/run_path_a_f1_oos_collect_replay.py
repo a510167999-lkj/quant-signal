@@ -47,6 +47,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Attempt OOS market collect into path_a_oos_market (needs JIAOCH_TOKEN)",
     )
+    parser.add_argument(
+        "--generate-qualified",
+        action="store_true",
+        help="Generate OOS qualified trades into path_a_oos/ (never overwrites train cache)",
+    )
+    parser.add_argument("--max-universe-symbols", type=int, default=300)
     parser.add_argument("--oos-end-date", default=DEFAULT_OOS_END)
     parser.add_argument("--oos-qualified-path", type=Path, default=None)
     args = parser.parse_args(argv)
@@ -59,8 +65,10 @@ def main(argv: list[str] | None = None) -> int:
         repo_root=repo,
         require_local_research=not args.allow_any_role,
         collect=bool(args.collect),
+        generate_qualified=bool(args.generate_qualified),
         oos_end_date=str(args.oos_end_date),
         oos_qualified_path=args.oos_qualified_path,
+        max_universe_symbols=int(args.max_universe_symbols),
     )
     output_root = (
         args.output_root
@@ -74,6 +82,38 @@ def main(argv: list[str] | None = None) -> int:
     print("shadow_oos_replay_ok=", report.get("shadow_oos_replay_ok"))
     print("formal_final_oos_still_sealed=", report.get("formal_final_oos_still_sealed"))
     print("effective_strategy_found=", report.get("effective_strategy_found"))
+    gen = report.get("generate_qualified_attempt") or {}
+    if gen:
+        print(
+            "generate_qualified oos_trades=",
+            gen.get("oos_trade_count"),
+            "signals=",
+            gen.get("first_signal_date"),
+            "..",
+            gen.get("last_signal_date"),
+        )
+    zr = report.get("zero_refit_replay") or {}
+    if zr:
+        inv = zr.get("inventory") or {}
+        print(
+            "zero_refit executed=",
+            zr.get("executed"),
+            "selected=",
+            zr.get("selected_trade_count"),
+            "reason=",
+            zr.get("reason"),
+            "port_ret=",
+            zr.get("portfolio_compounded_return_pct"),
+            "port_mdd=",
+            zr.get("portfolio_max_drawdown_pct"),
+        )
+        if inv:
+            print(
+                "inventory levels=",
+                inv.get("market_level_counts"),
+                "prefilter_match=",
+                inv.get("count_matching_frozen_spec_prefilter"),
+            )
     print("\nblockers:")
     for b in report.get("blockers") or []:
         print("-", b.get("code"), ":", b.get("detail"))
