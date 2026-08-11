@@ -33,7 +33,7 @@ from app.research_pit_sources import _validate_loopback_http_proxy
 from app.research_pit_transport import UrllibTushareTransport
 
 
-JIAOCH_API_URL = "https://jiaoch.site"
+JIAOCH_API_URL = "http://jiaoch.site"
 DAILY_FIELDS = (
     "ts_code",
     "trade_date",
@@ -49,6 +49,8 @@ DAILY_FIELDS = (
 )
 ADJ_FACTOR_FIELDS = ("ts_code", "trade_date", "adj_factor")
 BAK_BASIC_FIELDS = ("trade_date", "ts_code", "name", "industry", "list_date")
+# stk_mins minute bars (used to synthesize daily OHLCV when /daily is empty).
+STK_MINS_FIELDS = ("ts_code", "trade_time", "open", "close", "high", "low", "vol", "amount")
 _MAX_BODY_BYTES = 32 * 1024 * 1024
 _MAX_ROWS = 10_000
 _TOKEN_ENV_BY_SLOT = {
@@ -267,6 +269,77 @@ class JiaochHttpClient:
             rows.append(dict(zip(expected_fields, values, strict=True)))
         return rows
 
+    def fetch_stk_mins(
+        self,
+        *,
+        ts_code: str,
+        start_date: str,
+        end_date: str,
+        freq: str = "5min",
+    ) -> list[dict[str, Any]]:
+        """Fetch historical minute bars from /stk_mins (historical-minute slot).
+
+        stk_mins caps the number of rows per request; a wide date range returns
+        only the most recent slice. We segment the range into monthly chunks so
+        the full history is recovered.
+        """
+
+        token = self._token("historical-minute")
+        timeout_seconds = float(os.getenv("JIAOCH_LIVE_TIMEOUT_SECONDS", "12"))
+        chunks = _monthly_chunks(start_date, end_date)
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _fetch_one(chunk: tuple[str, str]) -> list[dict[str, Any]]:
+            chunk_start, chunk_end = chunk
+            body = _canonical_json(
+                {
+                    "api_name": "stk_mins",
+                    "token": token,
+                    "params": {
+                        "ts_code": ts_code,
+                        "start_date": chunk_start,
+                        "end_date": chunk_end,
+                        "freq": freq,
+                    },
+                }
+            )
+            response = self._transport.post(
+                url=f"{self._api_url}/stk_mins",
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Encoding": "identity",
+                    "Connection": "close",
+                    "Content-Type": "application/json; charset=utf-8",
+                    "User-Agent": "quant-signal-jiaoch-live/1",
+                },
+                body=body,
+                timeout_s=timeout_seconds,
+                max_body_bytes=self._max_body_bytes,
+            )
+            raw = response.body if isinstance(response.body, bytes) else b""
+            if response.status != 200 or response.body_complete is not True:
+                raise JiaochLiveMarketError("Jiaoch stk_mins response transport rejected")
+            payload = _strict_json_loads(raw)
+            if not isinstance(payload, Mapping) or payload.get("code") != 0:
+                msg = payload.get("msg", "") if isinstance(payload, Mapping) else ""
+                raise JiaochLiveMarketError(f"Jiaoch stk_mins request failed: {msg}")
+            data = payload.get("data")
+            if not isinstance(data, Mapping) or not isinstance(data.get("items"), list):
+                return []
+            rows: list[dict[str, Any]] = []
+            for values in data["items"]:
+                if not isinstance(values, list) or len(values) != len(STK_MINS_FIELDS):
+                    continue
+                rows.append(dict(zip(STK_MINS_FIELDS, values, strict=True)))
+            return rows
+
+        all_rows: list[dict[str, Any]] = []
+        max_workers = min(len(chunks), int(os.getenv("JIAOCH_STK_MINS_WORKERS", "2")))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for chunk_rows in pool.map(_fetch_one, chunks):
+                all_rows.extend(chunk_rows)
+        return all_rows
+
 
 def _daily_frame(rows: Sequence[Mapping[str, Any]], *, symbol: str, market: str) -> pd.DataFrame:
     records = []
@@ -298,6 +371,86 @@ def _daily_frame(rows: Sequence[Mapping[str, Any]], *, symbol: str, market: str)
         raise JiaochLiveMarketError(f"Jiaoch daily returned no rows for {market}:{symbol}")
     frame = pd.DataFrame(records).sort_values("date").drop_duplicates("date", keep="last")
     return frame.reset_index(drop=True)
+
+
+def _aggregate_daily_from_minutes(
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Aggregate stk_mins 5-minute bars into daily OHLCV rows (DAILY_FIELDS format).
+
+    For each trading day: open = first bar's open, close = last bar's close,
+    high/low = max/min across all bars, vol/amount = sum.
+    """
+
+    by_date: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        trade_time = str(row.get("trade_time") or "")
+        trade_date = trade_time[:10]  # YYYY-MM-DD
+        if not trade_date:
+            continue
+        by_date.setdefault(trade_date, []).append(row)
+    daily: list[dict[str, Any]] = []
+    prev_close: float | None = None
+    for trade_date in sorted(by_date):
+        bars = by_date[trade_date]
+        opens = [float(b["open"]) for b in bars if b.get("open") is not None]
+        closes = [float(b["close"]) for b in bars if b.get("close") is not None]
+        highs = [float(b["high"]) for b in bars if b.get("high") is not None]
+        lows = [float(b["low"]) for b in bars if b.get("low") is not None]
+        vols = [float(b["vol"]) for b in bars if b.get("vol") is not None]
+        amounts = [float(b["amount"]) for b in bars if b.get("amount") is not None]
+        if not opens or not closes:
+            continue
+        ts_code = str(bars[0].get("ts_code") or "")
+        day_close = closes[-1]
+        day_open = opens[0]
+        # pre_close is the previous trading day's close; for the first day use
+        # the day's own open as a fallback (no prior reference available).
+        pre_close = prev_close if prev_close is not None else day_open
+        change = day_close - pre_close
+        pct_chg = (day_close / pre_close - 1) * 100 if pre_close else 0.0
+        daily.append({
+            "ts_code": ts_code,
+            "trade_date": trade_date.replace("-", ""),
+            "open": day_open,
+            "high": max(highs) if highs else day_open,
+            "low": min(lows) if lows else day_open,
+            "close": day_close,
+            "pre_close": pre_close,
+            "change": change,
+            "pct_chg": pct_chg,
+            "vol": sum(vols),
+            "amount": sum(amounts),
+        })
+        prev_close = day_close
+    return daily
+
+
+def _monthly_chunks(start: str, end: str) -> list[tuple[str, str]]:
+    """Split a YYYYMMDD date range into quarterly (3-month) chunks.
+
+    stk_mins returns ~3000+ rows per request; a quarterly chunk (~63 trading
+    days × 49 bars ≈ 3000) fits within that budget while minimizing HTTP
+    round-trips (3 years → ~12 requests instead of ~36 monthly).
+    """
+
+    from datetime import date as _date, timedelta as _td
+
+    def _parse(s: str) -> _date:
+        return _date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+
+    def _fmt(d: _date) -> str:
+        return d.strftime("%Y%m%d")
+
+    s, e = _parse(start), _parse(end)
+    chunks: list[tuple[str, str]] = []
+    cur = s
+    quarter_days = 91  # ~3 calendar months
+    while cur <= e:
+        chunk_end = min(cur + _td(days=quarter_days), e)
+        chunks.append((_fmt(cur), _fmt(chunk_end)))
+        cur = chunk_end + _td(days=1)
+    return chunks
 
 
 def _apply_qfq(
@@ -376,16 +529,20 @@ class JiaochMarketDataProvider:
         start_date, end_date = _date_strings(lookback_days)
         try:
             ts_code = _tushare_ts_code(normalized)
-            rows = self.client.fetch(
-                "daily",
-                params={
-                    "ts_code": ts_code,
-                    "start_date": start_date,
-                    "end_date": end_date,
-                },
-                fields=DAILY_FIELDS,
+            # The Jiaoch mirror does not serve /daily directly; synthesize daily
+            # OHLCV by aggregating stk_mins 5-minute bars.
+            min_rows = self.client.fetch_stk_mins(
+                ts_code=ts_code,
+                start_date=start_date,
+                end_date=end_date,
+                freq="5min",
             )
-            frame = _daily_frame(rows, symbol=normalized, market=market)
+            daily_rows = _aggregate_daily_from_minutes(min_rows)
+            if not daily_rows:
+                raise JiaochLiveMarketError(
+                    "Jiaoch stk_mins returned no rows for daily synthesis"
+                )
+            frame = _daily_frame(daily_rows, symbol=normalized, market=market)
             if adjust == "qfq":
                 factor_rows = self.client.fetch(
                     "adj_factor",
@@ -398,7 +555,7 @@ class JiaochMarketDataProvider:
                 )
                 frame = _apply_qfq(frame, factor_rows, expected_code=ts_code)
             frame = _trim_frame(frame, start_date, end_date)
-            source = "Jiaoch daily qfq" if adjust == "qfq" else "Jiaoch daily raw"
+            source = "Jiaoch stk_mins daily qfq" if adjust == "qfq" else "Jiaoch stk_mins daily raw"
             self._write_cache(normalized, market, adjust, frame, source)
         except Exception as exc:
             cached = self._read_cache(
