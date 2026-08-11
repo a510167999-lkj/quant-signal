@@ -36,3 +36,25 @@ def test_f3_skip_path_on_real_workspace(monkeypatch: pytest.MonkeyPatch) -> None
     assert report["automatic_trading_allowed"] is False
     assert report["effective_strategy_found"] is False
     assert report["formal_final_oos_executable"] is False
+
+
+def test_market_level_snapshot_missing_file(tmp_path: Path) -> None:
+    snap = f3._oos_market_level_snapshot(tmp_path / "nonexistent.json")
+    assert snap["present"] is False
+    assert snap["frozen_rule_pass_trades"] == 0
+
+
+def test_market_level_snapshot_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VPS_RUNTIME_ROLE", "local_research")
+    repo = Path(__file__).resolve().parents[1]
+    qt_path = repo / "data/research_cache/path_a_oos/qualified_hold5_stop5_oos.json"
+    if not qt_path.is_file():
+        pytest.skip("OOS qualified trades missing")
+    snap = f3._oos_market_level_snapshot(qt_path)
+    assert snap["present"] is True
+    assert isinstance(snap["by_trade"], dict)
+    assert snap["frozen_rule_pass_trades"] >= 0
+    # all keys in by_trade are known levels
+    for lvl in snap["by_trade"]:
+        assert lvl in ("favorable", "neutral", "cautious", "defensive", "unknown")
+

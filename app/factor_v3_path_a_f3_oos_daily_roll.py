@@ -20,6 +20,9 @@ from app import factor_v3_path_a_f1_oos_collect_replay as f1
 from app import factor_v3_path_a_f2_oos_extend_replay as f2
 from app import factor_v3_train_window_freeze_contract as freeze
 
+# Frozen rule allowed levels (mirrors F0 candidate; read-only for monitoring).
+_FROZEN_MARKET_LEVELS = ("favorable", "neutral")
+
 STAGE_GOAL_ID = "path-a-f3-oos-daily-roll/v1"
 STAGE_GOAL_SUMMARY = (
     "路径 A F3：每个交易日收盘后自动推高 OOS end-date，日增扩采并 zero-refit；"
@@ -52,6 +55,44 @@ def _canonical_bytes(value: Any) -> bytes:
 
 def _sha(value: Any) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _oos_market_level_snapshot(qt_path: Path) -> dict[str, Any]:
+    """Read-only market_level distribution from the OOS qualified trades file.
+
+    Lets the daily roll surface "still all cautious/defensive" at a glance
+    instead of silently selecting 0.
+    """
+
+    payload = f1._load_json(qt_path)
+    if payload is None:
+        return {"present": False, "by_trade": {}, "by_day": {},
+                "frozen_rule_pass_trades": 0}
+    trades = [
+        t for t in (payload.get("qualified_trades") or [])
+        if str(t.get("signal_date") or "")[:10] >= f1.OOS_COLLECTION_START
+    ]
+    by_trade: dict[str, int] = {}
+    day_level: dict[str, str] = {}
+    for t in trades:
+        level = str(t.get("market_level") or "unknown")
+        by_trade[level] = by_trade.get(level, 0) + 1
+        d = str(t.get("signal_date") or "")[:10]
+        if d and d not in day_level:
+            day_level[d] = level
+    by_day: dict[str, int] = {}
+    for level in day_level.values():
+        by_day[level] = by_day.get(level, 0) + 1
+    frozen_pass = sum(
+        n for lvl, n in by_trade.items() if lvl in _FROZEN_MARKET_LEVELS
+    )
+    return {
+        "present": True,
+        "by_trade": by_trade,
+        "by_day": by_day,
+        "frozen_rule_pass_trades": frozen_pass,
+        "frozen_rule_allowed_levels": list(_FROZEN_MARKET_LEVELS),
+    }
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -214,6 +255,9 @@ def build_path_a_f3_oos_daily_roll(
         "sessions_after": sessions_after,
         "sessions_delta": sessions_delta,
         "oos_qualified_audit": oos_qt,
+        "oos_market_level_snapshot": _oos_market_level_snapshot(
+            root / f1.DEFAULT_OOS_QUALIFIED
+        ),
         "f2_pointer": {
             "report_sha256": f2_latest.get("report_sha256"),
             "oos_post_train_sessions": f2_latest.get("oos_post_train_sessions"),
