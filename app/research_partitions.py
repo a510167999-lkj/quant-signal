@@ -124,6 +124,21 @@ _EXPECTED_V2_EVIDENCE = {
     "history_start": "2024-07-05",
     "history_end": "2026-07-03",
 }
+# V3 extends the development window backward to ~3 years (2023-07-03) using the
+# same current_pool snapshot. Same key structure as V2; only bounds/evidence differ.
+_V3_ROLE_NAMES = _V2_ROLE_NAMES
+_V3_OPERATIONS = _V2_OPERATIONS
+_V3_BOUNDS = (
+    ("2023-07-03", "2026-07-03", False),
+    ("2026-07-04", "2026-07-12", True),
+    ("2026-07-13", None, True),
+)
+_V3_EVIDENCE_KEYS = _V2_EVIDENCE_KEYS
+_EXPECTED_V3_EVIDENCE = {
+    "current_pool_coverage_audit": _EXPECTED_V2_EVIDENCE["current_pool_coverage_audit"],
+    "history_start": "2023-07-03",
+    "history_end": "2026-07-03",
+}
 _EXPECTED_WINDOWS = [
     {
         "start_date": "2024-01-02",
@@ -274,6 +289,27 @@ def _validate_v2_contract(contract: Any) -> None:
         raise PartitionContractError("current-pool development evidence differs from frozen values")
 
 
+def _validate_v3_contract(contract: Any) -> None:
+    _require_exact_keys(contract, _V2_TOP_LEVEL_KEYS, "contract")
+    if contract["schema_version"] != "research-temporal-partitions/v1":
+        raise PartitionContractError("unsupported schema_version")
+    if contract["policy_version"] != "current-pool-development-forward-oos/v3":
+        raise PartitionContractError("unsupported policy_version")
+    digest = contract["contract_sha256"]
+    if not isinstance(digest, str) or digest != _canonical_sha256(contract):
+        raise PartitionContractError("contract hash mismatch")
+    _validate_roles(
+        contract["roles"],
+        role_names=_V3_ROLE_NAMES,
+        bounds=_V3_BOUNDS,
+        operations=_V3_OPERATIONS,
+    )
+    evidence = contract["development_evidence"]
+    _require_exact_keys(evidence, _V3_EVIDENCE_KEYS, "development_evidence")
+    if evidence != _EXPECTED_V3_EVIDENCE:
+        raise PartitionContractError("v3 development evidence differs from frozen values")
+
+
 def _validate_path_a_shadow_contract(contract: Any) -> None:
     _require_exact_keys(contract, _PATH_A_SHADOW_TOP_LEVEL_KEYS, "contract")
     if contract["schema_version"] != "research-temporal-partitions/v1-path-a-shadow-oos":
@@ -303,6 +339,8 @@ def _validate_contract(contract: Any) -> None:
         _validate_v1_contract(contract)
     elif policy == "current-pool-development-forward-oos/v2":
         _validate_v2_contract(contract)
+    elif policy == "current-pool-development-forward-oos/v3":
+        _validate_v3_contract(contract)
     elif policy == "path-a-shadow-post-train-oos/v1":
         _validate_path_a_shadow_contract(contract)
     else:
