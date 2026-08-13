@@ -19,6 +19,14 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 当前阶段（Factor V3）：先闭合 Jiaoch 权威输入链与 formal materializer，再谈 OOF 训练与冲刺 50%/15%。**没有正式权威训练集之前，任何收益数字都只是不可晋级的假设筛选。**
 
+### Factor V3 当前停点（2026-08-13）
+
+- frozen-v3 引用的 current-pool coverage audit 已从本机已验证的激活副本 `data/current_pool_audit.json` 原字节恢复到 `data/research_artifacts/current_pool_audits/6de58a9b42ef6134219ea2b155afa43836cde24cc86bafeb2f71f3653830cf55.json`。
+- 恢复件的 canonical SHA256 为 `6de58a9b42ef6134219ea2b155afa43836cde24cc86bafeb2f71f3653830cf55`、`source_as_of=2026-07-22`，且与激活副本字节一致；`data/research_partitions/frozen-v3.json` 已作为不可变契约纳入版本控制，其内容及 contract SHA256 `de6eb76a6f9e4aba312874745df389e2ea6cd3be6f078a9d56b3ca2162dbdbbe` 未改动。coverage-audit 大文件仍是本机 gitignored 运行时证据，禁止把“契约已跟踪”误写成“audit 已随 Git 分发”。
+- frozen-v3 development 的 `collect/publish/train/validate/backtest` evidence 门禁已验证为 GREEN；这只闭合 coverage-audit 锚可用性，不代表 728-session Jiaoch 权威输入链或 audited artifact 已完成。
+- **按用户要求停在这里。** 后续会话取得明确指令后，才从独立全新 store 开始 Jiaoch-only 重采；禁止续写旧 store、复制旧 attempts、离线 rebind 或以 `reused` 冒充 capture-time authority。
+- 下一阶段仍限定 development-only：完整 SSE calendar、728 个 membership、728×4 market shards，并把 CNINFO 停牌证据作为单列 official evidence；不得进入 embargo、final-OOS、production、qualified-trades 重跑或自动交易。
+
 ## Commands
 
 虚拟环境与依赖：

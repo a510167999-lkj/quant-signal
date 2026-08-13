@@ -1,0 +1,37 @@
+{
+  "schema_version": "research-temporal-partitions/v1",
+  "policy_version": "current-pool-development-forward-oos/v3",
+  "roles": [
+    {
+      "name": "development",
+      "start_date": "2023-07-03",
+      "end_date": "2026-07-03",
+      "sealed": false,
+      "permitted_operations": ["collect", "publish", "train", "validate", "backtest"]
+    },
+    {
+      "name": "embargo",
+      "start_date": "2026-07-04",
+      "end_date": "2026-07-12",
+      "sealed": true,
+      "permitted_operations": []
+    },
+    {
+      "name": "final_oos",
+      "start_date": "2026-07-13",
+      "end_date": null,
+      "sealed": true,
+      "permitted_operations": []
+    }
+  ],
+  "development_evidence": {
+    "current_pool_coverage_audit": {
+      "path": "data/research_artifacts/current_pool_audits/6de58a9b42ef6134219ea2b155afa43836cde24cc86bafeb2f71f3653830cf55.json",
+      "canonical_sha256": "6de58a9b42ef6134219ea2b155afa43836cde24cc86bafeb2f71f3653830cf55",
+      "source_as_of": "2026-07-22"
+    },
+    "history_start": "2023-07-03",
+    "history_end": "2026-07-03"
+  },
+  "contract_sha256": "de6eb76a6f9e4aba312874745df389e2ea6cd3be6f078a9d56b3ca2162dbdbbe"
+}
