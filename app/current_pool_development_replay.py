@@ -9,6 +9,7 @@ strategy profile.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -27,6 +28,10 @@ from app.current_pool_source import _strict_json_loads, verify_current_pool_univ
 from app.execution import assess_entry_executability
 from app.research_partitions import assert_range_allowed, load_temporal_partition_contract
 from app.research_portfolio import _realized_trade_from_future
+from app.research_pit_store import (
+    PITReceiptError,
+    PITReceiptStore,
+)
 from app.research_sweep import sweep_qualified_trades
 
 
@@ -91,17 +96,8 @@ def _load_json(path: str | Path) -> dict[str, Any]:
     return payload
 
 
-def _readonly_connection(path: str | Path) -> sqlite3.Connection:
-    database = Path(path) / "metadata.sqlite3"
-    if not database.is_file():
-        raise CurrentPoolDevelopmentReplayError("current-pool market store is missing")
-    connection = sqlite3.connect(f"file:{database.resolve().as_posix()}?mode=ro", uri=True)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA query_only=ON")
-    return connection
-
-
 def _verify_market_refs(
+    store: PITReceiptStore,
     connection: sqlite3.Connection,
     history_payload: Mapping[str, Any],
     contract_sha256: str,
@@ -141,21 +137,84 @@ def _verify_market_refs(
     ]
     if observed != expected or any(row["status"] != "published" for row in rows):
         raise CurrentPoolDevelopmentReplayError("market generations do not match history evidence")
+    try:
+        sessions = store._current_pool_calendar_authority_on_connection(
+            connection,
+            start_date=str(history_payload["history_start"]),
+            end_date=str(history_payload["history_end"]),
+            temporal_contract_sha256=contract_sha256,
+            temporal_role="development",
+            source_profile="jiaoch",
+        )
+        if sessions != [ref["trade_date"] for ref in expected]:
+            raise CurrentPoolDevelopmentReplayError(
+                "market references differ from verified calendar"
+            )
+        for ref in expected:
+            generation, manifest, source, role, temporal_contract = (
+                store._membership_market_authority_on_connection(
+                    connection, ref["trade_date"]
+                )
+            )
+            stored_lineage = generation.get("lineage_sha256")
+            if not stored_lineage or not hmac.compare_digest(
+                str(stored_lineage), str(manifest["lineage_sha256"])
+            ):
+                raise CurrentPoolDevelopmentReplayError(
+                    "market generation lineage verification failed"
+                )
+            verified_ref = {
+                "trade_date": str(generation["trade_date"]),
+                "generation_id": str(generation["generation_id"]),
+                "manifest_sha256": str(manifest["manifest_sha256"]),
+                "lineage_sha256": str(stored_lineage),
+                "vintage": str(generation["vintage"]),
+            }
+            if (
+                verified_ref != ref
+                or role != "development"
+                or temporal_contract != contract_sha256
+            ):
+                raise CurrentPoolDevelopmentReplayError(
+                    "market attempt authority differs from frozen evidence"
+                )
+            store._assert_membership_source_profile(source, "jiaoch")
+    except PITReceiptError as exc:
+        raise CurrentPoolDevelopmentReplayError(
+            "market attempt authority verification failed"
+        ) from exc
     binding = connection.execute(
         """
         SELECT temporal_contract_sha256, temporal_role, source_profile,
-               market_generation_root_sha256, market_session_count
+               market_generation_root_sha256, market_session_count, binding_sha256
         FROM current_pool_market_collection_bindings
         WHERE start_date = ? AND end_date = ?
         """,
         (history_payload["history_start"], history_payload["history_end"]),
     ).fetchone()
-    if binding is None or (
+    if binding is None:
+        raise CurrentPoolDevelopmentReplayError("market evidence lacks frozen temporal binding")
+    unsigned_binding = {
+        "schema_version": "current-pool-market-temporal-binding/v1",
+        "start_date": str(history_payload["history_start"]),
+        "end_date": str(history_payload["history_end"]),
+        "temporal_contract_sha256": str(binding["temporal_contract_sha256"]),
+        "temporal_role": str(binding["temporal_role"]),
+        "source_profile": str(binding["source_profile"]),
+        "market_generation_root_sha256": str(
+            binding["market_generation_root_sha256"]
+        ),
+        "market_session_count": int(binding["market_session_count"]),
+    }
+    if (
         binding["temporal_contract_sha256"] != contract_sha256
         or binding["temporal_role"] != "development"
         or binding["source_profile"] != "jiaoch"
         or binding["market_generation_root_sha256"] != _sha256(expected)
         or int(binding["market_session_count"]) != len(expected)
+        or not hmac.compare_digest(
+            str(binding["binding_sha256"]), _sha256(unsigned_binding)
+        )
     ):
         raise CurrentPoolDevelopmentReplayError("market evidence lacks frozen temporal binding")
     shard_counts = connection.execute(
@@ -388,17 +447,21 @@ def run_current_pool_development_replay(
     if set(names_by_symbol) != set(verified_audit["allowed_symbols"]):
         raise CurrentPoolDevelopmentReplayError("audit and universe symbols differ")
 
-    connection = _readonly_connection(store_dir)
     try:
-        refs = _verify_market_refs(connection, history_payload, contract["contract_sha256"])
-        bars = _load_bars(
-            connection,
-            set(names_by_symbol),
-            history_payload["history_start"],
-            history_payload["history_end"],
-        )
-    finally:
-        connection.close()
+        with PITReceiptStore.readonly_snapshot(store_dir) as (store, connection):
+            refs = _verify_market_refs(
+                store, connection, history_payload, contract["contract_sha256"]
+            )
+            bars = _load_bars(
+                connection,
+                set(names_by_symbol),
+                history_payload["history_start"],
+                history_payload["history_end"],
+            )
+    except (PITReceiptError, sqlite3.Error) as exc:
+        raise CurrentPoolDevelopmentReplayError(
+            "current-pool market store verification failed"
+        ) from exc
     trades = _candidate_trades_from_bars(bars, names_by_symbol, settings)
     sweep = sweep_qualified_trades(
         trades,

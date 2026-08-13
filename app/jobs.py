@@ -4105,7 +4105,7 @@ def main(argv=None) -> int:
     pit_audit.add_argument("--store-dir", required=True)
     pit_audit.add_argument("--start-date", required=True)
     pit_audit.add_argument("--end-date", required=True)
-    pit_audit.add_argument("--calendar-exchanges", default="SSE,SZSE")
+    pit_audit.add_argument("--calendar-exchanges", default="SSE")
 
     current_pool_audit = subparsers.add_parser("research-current-pool-audit")
     current_pool_audit.add_argument("--universe-path", required=True)

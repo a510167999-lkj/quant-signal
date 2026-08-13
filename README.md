@@ -425,32 +425,16 @@ python -m app.jobs research-pit-audit-store \
   --store-dir data/research_receipts/pit-universe \
   --start-date 2024-01-02 \
   --end-date 2024-01-31 \
-  --calendar-exchanges SSE,SZSE
+  --calendar-exchanges SSE
 ```
 
-For controlled collection, keep the token out of command-line arguments and files. The collector
-first freezes the two exchange calendars, then stages the exact eight L/D/P/G master requests into
-one immutable stock-master generation, atomically publishes its verified head, and only then derives
-daily requests from the common SSE/SZSE open sessions. It records every transport failure, retryable
+For controlled collection, keep the token out of command-line arguments and files. The CLI is
+Jiaoch-only: it freezes the provider's authoritative SSE calendar and applies the same A-share open
+sessions to both exchanges. The collector then stages the
+exact eight L/D/P/G master requests into one immutable stock-master generation, atomically publishes
+its verified head, and only then derives daily requests. It records every transport failure, retryable
 HTTP body, API error, invalid response, successful candidate, reuse, and immutable conflict before
 receipt promotion or generation staging:
-
-```bash
-export TUSHARE_TOKEN='<token-in-process-environment-only>'
-
-python -m app.jobs research-pit-fetch-tushare \
-  --store-dir data/research_receipts/pit-universe \
-  --start-date 2016-01-01 \
-  --end-date 2025-12-31 \
-  --api-url http://api.tushare.pro \
-  --allow-insecure-official-http \
-  --max-attempts 3 \
-  --timeout-seconds 30
-```
-
-The same audited historical PIT collection path can use the pinned Jiaoch
-Tushare-compatible source. Its credential is separate from the official provider token,
-and this profile fixes both HTTPS and the allowed host instead of accepting a URL override:
 
 ```bash
 export JIAOCH_TOKEN='<token-in-process-environment-only>'
@@ -464,7 +448,9 @@ python -m app.jobs research-pit-fetch-tushare \
   --timeout-seconds 30
 ```
 
-For PIT collection this profile only changes the historical evidence source. It does not replace
+The pinned Jiaoch Tushare-compatible source uses a credential separate from the official provider
+token and fixes the documented HTTP path-per-interface gateway and allowed host instead of accepting
+a URL override. For PIT collection this profile only changes the historical evidence source. It does not replace
 the daily recommendation market-data provider, alter strategy parameters, or qualify results as
 OOS evidence. Announcement context separately attempts Jiaoch `anns_d` first and falls back to the
 official CNINFO disclosure lookup on a stable, token-free failure code. The current credential's
@@ -476,9 +462,8 @@ success message `"success"` with business code zero; other non-empty success mes
 fail-closed. A collection is not publishable until its stock-master identifiers and row-cap
 semantics also pass the existing coverage audit.
 
-The official REST documentation currently names the plain-HTTP endpoint, so this project refuses it
-unless `--allow-insecure-official-http` is explicit. HTTPS may be supplied through `--api-url` when a
-verified endpoint is available. The built-in clock gate fails closed unless the host reports network
+The current PIT CLI does not expose an official-provider URL override; its source authority is the
+pinned Jiaoch gateway above. The built-in clock gate fails closed unless the host reports network
 time synchronization with measured evidence; on macOS, merely enabling Network Time is insufficient
 without an SNTP offset within one second. The attestation is refreshed after a five-minute TTL. A
 successful report deep-verifies every calendar/daily receipt plus the active stock generation,

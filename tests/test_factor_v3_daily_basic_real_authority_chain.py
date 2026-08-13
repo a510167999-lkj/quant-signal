@@ -25,6 +25,7 @@ from app.research_pit_store import (
     NORMALIZED_FIELDS,
     PITReceiptStore,
 )
+from app.research_pit_sources import JIAOCH_ROW_CAP_OVERRIDES
 from scripts import build_factor_v3_daily_basic_formal_run_spec as formal_spec
 from tests import test_audited_pit_factor_v3_feature_history_authority as history_fixture
 from tests import test_research_pit_store as pit_fixture
@@ -132,6 +133,7 @@ def _real_feature_history_run(
             store,
             transport,
             session,
+            api_url="https://jiaoch.site",
         )
         collector.fetch_membership_snapshot(history_fixture.build_bak_basic_specs([session])[0])
         collector.collect_market_session_generation(
@@ -206,11 +208,15 @@ def _seed_stock_generation(
                 "partition_key": partition,
                 "api_name": "stock_basic",
                 "method": "POST",
-                "url": "https://api.tushare.pro",
+                "url": "http://jiaoch.site/stock_basic",
                 "wire_params": params,
                 "receipt_params": params,
                 "fields": list(NORMALIZED_FIELDS["stock_basic"]),
                 "row_cap": 6000,
+                "source_profile": "jiaoch",
+                "request_protocol": "tushare-path-per-interface/v1",
+                "network_route": "direct",
+                "proxy_endpoint": None,
                 "temporal_contract_sha256": temporal_contract_sha256,
                 "temporal_role": "development",
             }
@@ -256,17 +262,24 @@ def _publish_market_session(
     for index, dataset in enumerate(MARKET_SESSION_DATASETS, 1):
         retrieved_at = (started + timedelta(seconds=index)).isoformat()
         fields = pit_fixture._MARKET_DATASET_FIELDS[dataset]
+        row_cap = dict(JIAOCH_ROW_CAP_OVERRIDES).get(
+            dataset, MARKET_SESSION_ROW_CAPS[dataset]
+        )
         semantics = {
             "schema_version": "tushare-wire-request/v1",
             "dataset": dataset,
             "partition_key": session,
             "api_name": dataset,
             "method": "POST",
-            "url": "https://api.tushare.pro",
+            "url": f"http://jiaoch.site/{dataset}",
             "wire_params": {"trade_date": session.replace("-", "")},
             "receipt_params": {"trade_date": session},
             "fields": fields,
-            "row_cap": MARKET_SESSION_ROW_CAPS[dataset],
+            "row_cap": row_cap,
+            "source_profile": "jiaoch",
+            "request_protocol": "tushare-path-per-interface/v1",
+            "network_route": "direct",
+            "proxy_endpoint": None,
             "temporal_contract_sha256": temporal_contract_sha256,
             "temporal_role": "development",
         }
@@ -305,7 +318,7 @@ def _publish_market_session(
             started_at=(started + timedelta(seconds=index - 1)).isoformat(),
             retrieved_at=retrieved_at,
             elapsed_ns=1,
-            row_cap=MARKET_SESSION_ROW_CAPS[dataset],
+            row_cap=row_cap,
             body_complete=True,
         )
         store.stage_market_session_attempt(
@@ -314,6 +327,69 @@ def _publish_market_session(
             attempt["attempt_id"],
         )
     store.publish_market_session_generation(generation["generation_id"])
+
+
+def _ingest_controlled_receipt(
+    store: PITReceiptStore,
+    *,
+    dataset: str,
+    partition_key: str,
+    params: dict[str, str],
+    raw_bytes: bytes,
+    retrieved_at: str,
+    row_cap: int,
+    temporal_contract_sha256: str,
+) -> None:
+    receipt_params = {
+        key: (
+            f"{value[:4]}-{value[4:6]}-{value[6:]}"
+            if key.endswith("date") and len(value) == 8
+            else value
+        )
+        for key, value in params.items()
+    }
+    semantics = {
+        "schema_version": "tushare-wire-request/v1",
+        "dataset": dataset,
+        "partition_key": partition_key,
+        "api_name": dataset,
+        "method": "POST",
+        "url": f"http://jiaoch.site/{dataset}",
+        "wire_params": params,
+        "receipt_params": receipt_params,
+        "fields": list(NORMALIZED_FIELDS[dataset]),
+        "row_cap": row_cap,
+        "source_profile": "jiaoch",
+        "request_protocol": "tushare-path-per-interface/v1",
+        "network_route": "direct",
+        "proxy_endpoint": None,
+        "temporal_contract_sha256": temporal_contract_sha256,
+        "temporal_role": "development",
+    }
+    wire_sha256 = hashlib.sha256(
+        f"{dataset}:{partition_key}".encode()
+    ).hexdigest()
+    attempt = store.record_fetch_attempt(
+        dataset=dataset,
+        partition_key=partition_key,
+        endpoint=dataset,
+        params=params,
+        fields=NORMALIZED_FIELDS[dataset],
+        wire_request_sha256=wire_sha256,
+        request_body_sha256=wire_sha256,
+        request_semantics=semantics,
+        raw_bytes=raw_bytes,
+        http_status=200,
+        started_at=retrieved_at,
+        retrieved_at=retrieved_at,
+        elapsed_ns=1,
+        row_cap=row_cap,
+        body_complete=True,
+    )
+    assert store.promote_fetch_attempt(attempt["attempt_id"])["status"] in {
+        "stored",
+        "reused",
+    }
 
 
 def _calendar_rows(
@@ -354,34 +430,34 @@ def _real_development_artifact(
         started,
         temporal_contract_sha256=temporal_contract_sha256,
     )
-    for exchange in ("SSE", "SZSE"):
-        store.ingest_tushare_response(
+    for exchange in ("SSE",):
+        _ingest_controlled_receipt(
+            store,
             dataset="trade_cal",
             partition_key=f"{exchange}:{sessions[0]}:{sessions[-1]}",
-            endpoint="trade_cal",
             params={
                 "exchange": exchange,
                 "start_date": sessions[0].replace("-", ""),
                 "end_date": sessions[-1].replace("-", ""),
             },
             raw_bytes=pit_fixture._calendar_response(_calendar_rows(exchange, sessions)),
-            http_status=200,
             retrieved_at=started,
             row_cap=10000,
+            temporal_contract_sha256=temporal_contract_sha256,
         )
     for session in sessions:
-        store.ingest_tushare_response(
+        _ingest_controlled_receipt(
+            store,
             dataset="bak_basic",
             partition_key=session,
-            endpoint="bak_basic",
             params={"trade_date": session.replace("-", "")},
             raw_bytes=pit_fixture._daily_response(
                 session.replace("-", ""),
                 [[_daily_authority_code(session), "Fixture", "Industry"]],
             ),
-            http_status=200,
             retrieved_at=f"{session}T08:00:00+00:00",
             row_cap=7000,
+            temporal_contract_sha256=temporal_contract_sha256,
         )
         _publish_market_session(
             store,

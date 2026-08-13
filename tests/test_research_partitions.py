@@ -18,6 +18,7 @@ from app.research_partitions import (
 
 CONTRACT_PATH = Path("data/research_partitions/frozen-v1.json")
 V2_CONTRACT_PATH = Path("data/research_partitions/frozen-v2.json")
+V3_CONTRACT_PATH = Path("data/research_partitions/frozen-v3.json")
 
 
 def _canonical_sha256(payload):
@@ -328,3 +329,44 @@ def test_current_pool_v2_rejects_audit_evidence_hash_mismatch(monkeypatch):
 
     with pytest.raises(PartitionContractError, match="evidence does not match"):
         assert_range_allowed(contract, "development", "2024-07-05", "2026-07-03", "collect")
+
+
+def test_current_pool_v3_permits_only_verified_development_evidence(monkeypatch):
+    contract = load_temporal_partition_contract(V3_CONTRACT_PATH)
+    evidence = contract["development_evidence"]["current_pool_coverage_audit"]
+    monkeypatch.setattr(
+        current_pool_gate,
+        "verify_current_pool_audit",
+        lambda _path: {
+            "canonical_sha256": evidence["canonical_sha256"],
+            "source_as_of": evidence["source_as_of"],
+        },
+    )
+
+    assert_range_allowed(
+        contract, "development", "2023-07-03", "2026-07-03", "collect"
+    )
+
+
+def test_current_pool_v3_rejects_missing_audit_evidence(tmp_path, monkeypatch):
+    contract = load_temporal_partition_contract(V3_CONTRACT_PATH)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(PartitionContractError, match="evidence is unavailable"):
+        assert_range_allowed(
+            contract, "development", "2023-07-03", "2026-07-03", "collect"
+        )
+
+
+def test_current_pool_v3_rejects_audit_evidence_hash_mismatch(monkeypatch):
+    contract = load_temporal_partition_contract(V3_CONTRACT_PATH)
+    monkeypatch.setattr(
+        current_pool_gate,
+        "verify_current_pool_audit",
+        lambda _path: {"canonical_sha256": "0" * 64, "source_as_of": "2026-07-22"},
+    )
+
+    with pytest.raises(PartitionContractError, match="evidence does not match"):
+        assert_range_allowed(
+            contract, "development", "2023-07-03", "2026-07-03", "collect"
+        )

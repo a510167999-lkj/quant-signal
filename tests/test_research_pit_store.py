@@ -3,7 +3,7 @@ import json
 import shutil
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -668,7 +668,18 @@ def _market_default_rows(dataset, trade_date):
 
 
 def _publish_market_session_for_audit(
-    store, trade_date, started, *, stk_limit_rows=None
+    store,
+    trade_date,
+    started,
+    *,
+    stk_limit_rows=None,
+    source_profile=None,
+    temporal_role=None,
+    temporal_contract_sha256=None,
+    source_origin=None,
+    request_protocol=None,
+    network_route="direct",
+    proxy_endpoint=None,
 ):
     """Publish one four-shard market session generation for ``trade_date``.
 
@@ -681,6 +692,14 @@ def _publish_market_session_for_audit(
     for index, dataset in enumerate(MARKET_SESSION_DATASETS, 1):
         retrieved_at = (started + timedelta(seconds=index)).isoformat()
         fields = _MARKET_DATASET_FIELDS[dataset]
+        controlled_authority = source_profile is not None
+        row_cap = (
+            dict(research_pit_store.JIAOCH_ROW_CAP_OVERRIDES).get(
+                dataset, MARKET_SESSION_ROW_CAPS[dataset]
+            )
+            if source_profile == "jiaoch"
+            else MARKET_SESSION_ROW_CAPS[dataset]
+        )
         semantics = {
             "schema_version": "tushare-wire-request/v1",
             "dataset": dataset,
@@ -691,8 +710,34 @@ def _publish_market_session_for_audit(
             "wire_params": {"trade_date": trade_date.replace("-", "")},
             "receipt_params": {"trade_date": trade_date},
             "fields": fields,
-            "row_cap": MARKET_SESSION_ROW_CAPS[dataset],
+            "row_cap": row_cap,
         }
+        if controlled_authority:
+            protocol = request_protocol or (
+                "tushare-path-per-interface/v1"
+                if source_profile == "jiaoch"
+                else "tushare-root-post/v1"
+            )
+            origin = source_origin or (
+                "http://jiaoch.site"
+                if source_profile == "jiaoch"
+                else "https://api.tushare.pro"
+            )
+            semantics.update(
+                {
+                    "url": (
+                        f"{origin}/{dataset}"
+                        if protocol == "tushare-path-per-interface/v1"
+                        else origin
+                    ),
+                    "source_profile": source_profile,
+                    "request_protocol": protocol,
+                    "network_route": network_route,
+                    "proxy_endpoint": proxy_endpoint,
+                    "temporal_role": temporal_role,
+                    "temporal_contract_sha256": temporal_contract_sha256,
+                }
+            )
         raw = json.dumps(
             {
                 "request_id": f"audit-fixture-{dataset}-{trade_date}",
@@ -733,13 +778,539 @@ def _publish_market_session_for_audit(
             started_at=(started + timedelta(seconds=index - 1)).isoformat(),
             retrieved_at=retrieved_at,
             elapsed_ns=1_000_000_000,
-            row_cap=MARKET_SESSION_ROW_CAPS[dataset],
+            row_cap=row_cap,
             body_complete=True,
         )
         store.stage_market_session_attempt(
             generation["generation_id"], dataset, attempt["attempt_id"]
         )
     return store.publish_market_session_generation(generation["generation_id"])
+
+
+def _ingest_sse_calendar(
+    store,
+    rows,
+    *,
+    start_date,
+    end_date,
+    controlled=True,
+    source_profile="jiaoch",
+    temporal_role="development",
+    temporal_contract_sha256="a" * 64,
+):
+    partition_key = f"SSE:{start_date}:{end_date}"
+    params = {
+        "exchange": "SSE",
+        "start_date": start_date.replace("-", ""),
+        "end_date": end_date.replace("-", ""),
+    }
+    raw = _calendar_response(rows)
+    if not controlled:
+        return store.ingest_tushare_response(
+            dataset="trade_cal",
+            partition_key=partition_key,
+            endpoint="trade_cal",
+            params=params,
+            raw_bytes=raw,
+            http_status=200,
+            retrieved_at=f"{start_date}T16:00:00+08:00",
+            row_cap=10000,
+        )
+    return _promote_controlled_receipt(
+        store,
+        dataset="trade_cal",
+        partition_key=partition_key,
+        params=params,
+        raw_bytes=raw,
+        retrieved_at=f"{start_date}T16:00:00+08:00",
+        row_cap=10000,
+        source_profile=source_profile,
+        temporal_role=temporal_role,
+        temporal_contract_sha256=temporal_contract_sha256,
+    )
+
+
+def _promote_controlled_receipt(
+    store,
+    *,
+    dataset,
+    partition_key,
+    params,
+    raw_bytes,
+    retrieved_at,
+    row_cap,
+    source_profile="jiaoch",
+    temporal_role="development",
+    temporal_contract_sha256="a" * 64,
+):
+    receipt_params = research_pit_store._normalize_request_params(dataset, params)
+    protocol = (
+        "tushare-path-per-interface/v1"
+        if source_profile == "jiaoch"
+        else "tushare-root-post/v1"
+    )
+    semantics = {
+        "schema_version": "tushare-wire-request/v1",
+        "dataset": dataset,
+        "partition_key": partition_key,
+        "api_name": dataset,
+        "method": "POST",
+        "url": (
+            f"http://jiaoch.site/{dataset}"
+            if source_profile == "jiaoch"
+            else "https://api.tushare.pro"
+        ),
+        "wire_params": research_pit_store._canonical_wire_params(
+            dataset, receipt_params
+        ),
+        "receipt_params": receipt_params,
+        "fields": list(NORMALIZED_FIELDS[dataset]),
+        "row_cap": row_cap,
+        "source_profile": source_profile,
+        "request_protocol": protocol,
+        "network_route": "direct",
+        "proxy_endpoint": None,
+        "temporal_role": temporal_role,
+        "temporal_contract_sha256": temporal_contract_sha256,
+    }
+    wire_sha256 = hashlib.sha256(
+        f"{dataset}:{partition_key}:{retrieved_at}".encode("utf-8")
+    ).hexdigest()
+    attempt = store.record_fetch_attempt(
+        dataset=dataset,
+        partition_key=partition_key,
+        endpoint=dataset,
+        params=params,
+        fields=NORMALIZED_FIELDS[dataset],
+        wire_request_sha256=wire_sha256,
+        request_body_sha256=wire_sha256,
+        request_semantics=semantics,
+        raw_bytes=raw_bytes,
+        http_status=200,
+        started_at=retrieved_at,
+        retrieved_at=retrieved_at,
+        elapsed_ns=1_000_000_000,
+        row_cap=row_cap,
+        body_complete=True,
+    )
+    promoted = store.promote_fetch_attempt(attempt["attempt_id"])
+    assert promoted["status"] == "stored"
+    return promoted
+
+
+def test_market_collection_binding_requires_attempt_temporal_and_source_authority(
+    tmp_path,
+):
+    store = PITReceiptStore(str(tmp_path / "store"))
+    session = "2024-01-02"
+    contract_sha256 = "a" * 64
+    _ingest_sse_calendar(
+        store,
+        [["SSE", "20240102", 1, "20231229"]],
+        start_date=session,
+        end_date=session,
+    )
+    _publish_market_session_for_audit(
+        store,
+        session,
+        datetime(2024, 1, 2, 16, 0, tzinfo=timezone.utc),
+        source_profile="jiaoch",
+        temporal_role="development",
+        temporal_contract_sha256=contract_sha256,
+    )
+
+    with pytest.raises(PITReceiptError, match="authority"):
+        store.bind_current_pool_market_collection(
+            start_date=session,
+            end_date=session,
+            sessions=[session],
+            temporal_contract_sha256="b" * 64,
+            temporal_role="development",
+            source_profile="jiaoch",
+        )
+    with pytest.raises(PITReceiptError, match="authority"):
+        store.bind_current_pool_market_collection(
+            start_date=session,
+            end_date=session,
+            sessions=[session],
+            temporal_contract_sha256=contract_sha256,
+            temporal_role="contaminated_diagnostic",
+            source_profile="jiaoch",
+        )
+    with pytest.raises(PITReceiptError, match="authority"):
+        store.bind_current_pool_market_collection(
+            start_date=session,
+            end_date=session,
+            sessions=[session],
+            temporal_contract_sha256=contract_sha256,
+            temporal_role="development",
+            source_profile="official",
+        )
+
+    binding = store.bind_current_pool_market_collection(
+        start_date=session,
+        end_date=session,
+        sessions=[session],
+        temporal_contract_sha256=contract_sha256,
+        temporal_role="development",
+        source_profile="jiaoch",
+    )
+    assert binding["market_session_count"] == 1
+    assert binding["temporal_contract_sha256"] == contract_sha256
+    assert binding["source_profile"] == "jiaoch"
+
+
+def test_market_collection_binding_rejects_tampered_persisted_lineage(tmp_path):
+    store = PITReceiptStore(str(tmp_path / "store"))
+    session = "2024-01-02"
+    contract_sha256 = "a" * 64
+    _ingest_sse_calendar(
+        store,
+        [["SSE", "20240102", 1, "20231229"]],
+        start_date=session,
+        end_date=session,
+    )
+    published = _publish_market_session_for_audit(
+        store,
+        session,
+        datetime(2024, 1, 2, 16, 0, tzinfo=timezone.utc),
+        source_profile="jiaoch",
+        temporal_role="development",
+        temporal_contract_sha256=contract_sha256,
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE market_session_generations SET lineage_sha256 = ? "
+            "WHERE generation_id = ?",
+            ("0" * 64, published["generation_id"]),
+        )
+
+    with pytest.raises(PITReceiptError, match="binding generation lineage mismatch"):
+        store.bind_current_pool_market_collection(
+            start_date=session,
+            end_date=session,
+            sessions=[session],
+            temporal_contract_sha256=contract_sha256,
+            temporal_role="development",
+            source_profile="jiaoch",
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_origin", "request_protocol", "network_route", "proxy_endpoint"),
+    [
+        ("https://api.tushare.pro", "tushare-path-per-interface/v1", "direct", None),
+        ("http://jiaoch.site", "tushare-root-post/v1", "direct", None),
+        (
+            "http://jiaoch.site",
+            "tushare-path-per-interface/v1",
+            "loopback_http_proxy",
+            "http://192.0.2.1:7897",
+        ),
+        (
+            "http://jiaoch.site",
+            "tushare-path-per-interface/v1",
+            "direct",
+            "http://127.0.0.1:7897",
+        ),
+    ],
+)
+def test_market_collection_binding_rejects_spoofed_jiaoch_authority(
+    tmp_path,
+    source_origin,
+    request_protocol,
+    network_route,
+    proxy_endpoint,
+):
+    store = PITReceiptStore(str(tmp_path / "store"))
+    session = "2024-01-02"
+    contract_sha256 = "a" * 64
+    _ingest_sse_calendar(
+        store,
+        [["SSE", "20240102", 1, "20231229"]],
+        start_date=session,
+        end_date=session,
+    )
+    _publish_market_session_for_audit(
+        store,
+        session,
+        datetime(2024, 1, 2, 16, 0, tzinfo=timezone.utc),
+        source_profile="jiaoch",
+        temporal_role="development",
+        temporal_contract_sha256=contract_sha256,
+        source_origin=source_origin,
+        request_protocol=request_protocol,
+        network_route=network_route,
+        proxy_endpoint=proxy_endpoint,
+    )
+
+    with pytest.raises(PITReceiptError, match="Jiaoch"):
+        store.bind_current_pool_market_collection(
+            start_date=session,
+            end_date=session,
+            sessions=[session],
+            temporal_contract_sha256=contract_sha256,
+            temporal_role="development",
+            source_profile="jiaoch",
+        )
+
+
+def test_market_collection_binding_requires_exact_verified_calendar_sessions(tmp_path):
+    store = PITReceiptStore(str(tmp_path / "store"))
+    start = "2024-01-02"
+    end = "2024-01-03"
+    contract_sha256 = "a" * 64
+    _ingest_sse_calendar(
+        store,
+        [
+            ["SSE", "20240102", 1, "20231229"],
+            ["SSE", "20240103", 1, "20240102"],
+        ],
+        start_date=start,
+        end_date=end,
+    )
+    for offset, session in enumerate((start, end)):
+        _publish_market_session_for_audit(
+            store,
+            session,
+            datetime(2024, 1, 2 + offset, 16, 0, tzinfo=timezone.utc),
+            source_profile="jiaoch",
+            temporal_role="development",
+            temporal_contract_sha256=contract_sha256,
+        )
+
+    with pytest.raises(PITReceiptError, match="sessions differ from verified calendar"):
+        store.bind_current_pool_market_collection(
+            start_date=start,
+            end_date=end,
+            sessions=[start],
+            temporal_contract_sha256=contract_sha256,
+            temporal_role="development",
+            source_profile="jiaoch",
+        )
+
+
+@pytest.mark.parametrize(
+    ("calendar_kwargs", "message"),
+    [
+        ({"controlled": False}, "controlled receipt attempt authority is missing"),
+        ({"source_profile": "official"}, "source profile authority"),
+        ({"temporal_contract_sha256": "b" * 64}, "calendar authority"),
+    ],
+)
+def test_market_collection_binding_requires_controlled_jiaoch_calendar_authority(
+    tmp_path, calendar_kwargs, message
+):
+    store = PITReceiptStore(str(tmp_path / "store"))
+    session = "2024-01-02"
+    contract_sha256 = "a" * 64
+    _ingest_sse_calendar(
+        store,
+        [["SSE", "20240102", 1, "20231229"]],
+        start_date=session,
+        end_date=session,
+        **calendar_kwargs,
+    )
+    _publish_market_session_for_audit(
+        store,
+        session,
+        datetime(2024, 1, 2, 16, 0, tzinfo=timezone.utc),
+        source_profile="jiaoch",
+        temporal_role="development",
+        temporal_contract_sha256=contract_sha256,
+    )
+
+    with pytest.raises(PITReceiptError, match=message):
+        store.bind_current_pool_market_collection(
+            start_date=session,
+            end_date=session,
+            sessions=[session],
+            temporal_contract_sha256=contract_sha256,
+            temporal_role="development",
+            source_profile="jiaoch",
+        )
+
+
+def test_market_calendar_authority_rejects_split_receipts_in_readonly_consumer(
+    tmp_path,
+):
+    store = PITReceiptStore(str(tmp_path / "store"))
+    contract_sha256 = "a" * 64
+    _ingest_sse_calendar(
+        store,
+        [["SSE", "20240102", 1, "20231229"]],
+        start_date="2024-01-02",
+        end_date="2024-01-03",
+    )
+    _ingest_sse_calendar(
+        store,
+        [["SSE", "20240103", 1, "20240102"]],
+        start_date="2024-01-03",
+        end_date="2024-01-03",
+    )
+
+    with PITReceiptStore.readonly_snapshot(store.root) as (readonly, connection):
+        with pytest.raises(PITReceiptError, match="exact calendar receipt"):
+            readonly._current_pool_calendar_authority_on_connection(
+                connection,
+                start_date="2024-01-02",
+                end_date="2024-01-03",
+                temporal_contract_sha256=contract_sha256,
+                temporal_role="development",
+                source_profile="jiaoch",
+            )
+
+
+def test_current_pool_replay_rejects_tampered_market_binding_hash(tmp_path):
+    from app.current_pool_development_replay import (
+        CurrentPoolDevelopmentReplayError,
+        _verify_market_refs,
+    )
+
+    store = PITReceiptStore(str(tmp_path / "store"))
+    session = "2024-01-02"
+    contract_sha256 = "a" * 64
+    _ingest_sse_calendar(
+        store,
+        [["SSE", "20240102", 1, "20231229"]],
+        start_date=session,
+        end_date=session,
+    )
+    published = _publish_market_session_for_audit(
+        store,
+        session,
+        datetime(2024, 1, 2, 16, 0, tzinfo=timezone.utc),
+        source_profile="jiaoch",
+        temporal_role="development",
+        temporal_contract_sha256=contract_sha256,
+    )
+    store.bind_current_pool_market_collection(
+        start_date=session,
+        end_date=session,
+        sessions=[session],
+        temporal_contract_sha256=contract_sha256,
+        temporal_role="development",
+        source_profile="jiaoch",
+    )
+    history = {
+        "history_start": session,
+        "history_end": session,
+        "market_generation_refs": [
+            {
+                "trade_date": session,
+                "generation_id": published["generation_id"],
+                "manifest_sha256": published["manifest_sha256"],
+                "lineage_sha256": published["lineage_sha256"],
+                "vintage": published["vintage"],
+            }
+        ],
+    }
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE current_pool_market_collection_bindings "
+            "SET binding_sha256 = ? WHERE start_date = ? AND end_date = ?",
+            ("0" * 64, session, session),
+        )
+
+    with PITReceiptStore.readonly_snapshot(store.root) as (readonly, connection):
+        with pytest.raises(
+            CurrentPoolDevelopmentReplayError,
+            match="lacks frozen temporal binding",
+        ):
+            _verify_market_refs(readonly, connection, history, contract_sha256)
+
+
+@pytest.mark.parametrize("attempt_dataset", ["trade_cal", "daily"])
+def test_current_pool_replay_rejects_tampered_market_attempt_authority(
+    tmp_path, attempt_dataset
+):
+    from app.current_pool_development_replay import (
+        CurrentPoolDevelopmentReplayError,
+        _verify_market_refs,
+    )
+
+    store = PITReceiptStore(str(tmp_path / "store"))
+    session = "2024-01-02"
+    contract_sha256 = "a" * 64
+    _ingest_sse_calendar(
+        store,
+        [["SSE", "20240102", 1, "20231229"]],
+        start_date=session,
+        end_date=session,
+    )
+    published = _publish_market_session_for_audit(
+        store,
+        session,
+        datetime(2024, 1, 2, 16, 0, tzinfo=timezone.utc),
+        source_profile="jiaoch",
+        temporal_role="development",
+        temporal_contract_sha256=contract_sha256,
+    )
+    store.bind_current_pool_market_collection(
+        start_date=session,
+        end_date=session,
+        sessions=[session],
+        temporal_contract_sha256=contract_sha256,
+        temporal_role="development",
+        source_profile="jiaoch",
+    )
+    history = {
+        "history_start": session,
+        "history_end": session,
+        "market_generation_refs": [
+            {
+                "trade_date": session,
+                "generation_id": published["generation_id"],
+                "manifest_sha256": published["manifest_sha256"],
+                "lineage_sha256": published["lineage_sha256"],
+                "vintage": published["vintage"],
+            }
+        ],
+    }
+    with sqlite3.connect(store.database_path) as connection:
+        if attempt_dataset == "trade_cal":
+            attempt = connection.execute(
+                """
+                SELECT attempt_id, request_semantics_json
+                FROM fetch_attempts
+                WHERE dataset = 'trade_cal' AND partition_key = ?
+                """,
+                (f"SSE:{session}:{session}",),
+            ).fetchone()
+        else:
+            attempt = connection.execute(
+                """
+                SELECT attempt.attempt_id, attempt.request_semantics_json
+                FROM market_session_generation_shards AS shard
+                JOIN fetch_attempts AS attempt ON attempt.attempt_id = shard.attempt_id
+                WHERE shard.generation_id = ? AND shard.dataset = 'daily'
+                """,
+                (published["generation_id"],),
+            ).fetchone()
+        semantics = json.loads(attempt[1])
+        semantics["temporal_contract_sha256"] = "b" * 64
+        canonical = json.dumps(
+            semantics, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        connection.execute(
+            """
+            UPDATE fetch_attempts
+            SET request_semantics_json = ?, request_semantics_sha256 = ?
+            WHERE attempt_id = ?
+            """,
+            (
+                canonical,
+                hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+                attempt[0],
+            ),
+        )
+
+    with PITReceiptStore.readonly_snapshot(store.root) as (readonly, connection):
+        with pytest.raises(
+            CurrentPoolDevelopmentReplayError,
+            match="authority",
+        ):
+            _verify_market_refs(readonly, connection, history, contract_sha256)
 
 
 def _ingest_complete_two_day_fixture(
@@ -751,7 +1322,14 @@ def _ingest_complete_two_day_fixture(
     calendar_padding=False,
     include_future_p_and_g=False,
     include_current_code_migration=False,
+    temporal_role=None,
+    temporal_contract_sha256=None,
+    calendar_sessions=None,
+    calendar_exchanges=("SSE", "SZSE"),
 ):
+    if (temporal_role is None) != (temporal_contract_sha256 is None):
+        raise ValueError("fixture temporal authority must be atomic")
+    controlled_authority = temporal_role is not None
     generation = store.begin_or_resume_stock_basic_generation(
         "2024-01-01T16:00:00+08:00"
     )
@@ -821,6 +1399,18 @@ def _ingest_complete_two_day_fixture(
                 "fields": list(NORMALIZED_FIELDS["stock_basic"]),
                 "row_cap": 6000,
             }
+            if controlled_authority:
+                semantics.update(
+                    {
+                        "url": "http://jiaoch.site/stock_basic",
+                        "source_profile": "jiaoch",
+                        "request_protocol": "tushare-path-per-interface/v1",
+                        "network_route": "direct",
+                        "proxy_endpoint": None,
+                        "temporal_role": temporal_role,
+                        "temporal_contract_sha256": temporal_contract_sha256,
+                    }
+                )
             attempt = store.record_fetch_attempt(
                 dataset="stock_basic",
                 partition_key=partition,
@@ -843,32 +1433,69 @@ def _ingest_complete_two_day_fixture(
                 generation["generation_id"], partition, attempt["attempt_id"]
             )["status"] == "staged"
         
-        calendar_start = "2024-01-01" if calendar_padding else "2024-01-02"
-        calendar_end = "2024-01-04" if calendar_padding else "2024-01-03"
-        calendar_rows = [
-            [exchange, "20240102", 1, "20231229"],
-            [exchange, "20240103", 1, "20240102"],
-        ]
-        if calendar_padding:
+        if exchange in calendar_exchanges:
+            calendar_start = "2024-01-01" if calendar_padding else "2024-01-02"
+            calendar_end = "2024-01-04" if calendar_padding else "2024-01-03"
             calendar_rows = [
-                [exchange, "20240101", 0, "20231229"],
-                *calendar_rows,
-                [exchange, "20240104", 1, "20240103"],
+                [exchange, "20240102", 1, "20231229"],
+                [exchange, "20240103", 1, "20240102"],
             ]
-        store.ingest_tushare_response(
-            dataset="trade_cal",
-            partition_key=f"{exchange}:{calendar_start}:{calendar_end}",
-            endpoint="trade_cal",
-            params={
+            if calendar_sessions is not None:
+                calendar_start = str(calendar_sessions[0])
+                calendar_end = str(calendar_sessions[-1])
+                open_dates = set(calendar_sessions)
+                cursor = date.fromisoformat(calendar_start)
+                end = date.fromisoformat(calendar_end)
+                previous_open = cursor - timedelta(days=1)
+                calendar_rows = []
+                while cursor <= end:
+                    is_open = cursor.isoformat() in open_dates
+                    calendar_rows.append(
+                        [
+                            exchange,
+                            cursor.strftime("%Y%m%d"),
+                            int(is_open),
+                            previous_open.strftime("%Y%m%d"),
+                        ]
+                    )
+                    if is_open:
+                        previous_open = cursor
+                    cursor += timedelta(days=1)
+            elif calendar_padding:
+                calendar_rows = [
+                    [exchange, "20240101", 0, "20231229"],
+                    *calendar_rows,
+                    [exchange, "20240104", 1, "20240103"],
+                ]
+            calendar_params = {
                 "exchange": exchange,
                 "start_date": calendar_start.replace("-", ""),
                 "end_date": calendar_end.replace("-", ""),
-            },
-            raw_bytes=_calendar_response(calendar_rows),
-            http_status=200,
-            retrieved_at="2024-01-01T16:00:00+08:00",
-            row_cap=10000,
-        )
+            }
+            calendar_raw = _calendar_response(calendar_rows)
+            if controlled_authority:
+                _promote_controlled_receipt(
+                    store,
+                    dataset="trade_cal",
+                    partition_key=f"{exchange}:{calendar_start}:{calendar_end}",
+                    params=calendar_params,
+                    raw_bytes=calendar_raw,
+                    retrieved_at="2024-01-01T16:00:00+08:00",
+                    row_cap=10000,
+                    temporal_role=temporal_role,
+                    temporal_contract_sha256=temporal_contract_sha256,
+                )
+            else:
+                store.ingest_tushare_response(
+                    dataset="trade_cal",
+                    partition_key=f"{exchange}:{calendar_start}:{calendar_end}",
+                    endpoint="trade_cal",
+                    params=calendar_params,
+                    raw_bytes=calendar_raw,
+                    http_status=200,
+                    retrieved_at="2024-01-01T16:00:00+08:00",
+                    row_cap=10000,
+                )
     store.publish_stock_basic_generation(generation["generation_id"])
     first_rows = [["600001.SH", "A", "银行"]]
     if not omit_day_one_symbol:
@@ -877,42 +1504,86 @@ def _ingest_complete_two_day_fixture(
         first_rows.append(["920001.BJ", "北交所样本", "测试"])
     if include_current_code_migration:
         first_rows.append(["603999.SH", "待上市预备记录", "测试", "0"])
-    store.ingest_tushare_response(
-        dataset="bak_basic",
-        partition_key="2024-01-02",
-        endpoint="bak_basic",
-        params={"trade_date": "20240102"},
-        raw_bytes=_daily_response("20240102", first_rows),
-        http_status=200,
-        retrieved_at="2024-01-02T16:00:00+08:00",
-        row_cap=7000,
-    )
+    first_raw = _daily_response("20240102", first_rows)
+    if controlled_authority:
+        _promote_controlled_receipt(
+            store,
+            dataset="bak_basic",
+            partition_key="2024-01-02",
+            params={"trade_date": "20240102"},
+            raw_bytes=first_raw,
+            retrieved_at="2024-01-02T16:00:00+08:00",
+            row_cap=7000,
+            temporal_role=temporal_role,
+            temporal_contract_sha256=temporal_contract_sha256,
+        )
+    else:
+        store.ingest_tushare_response(
+            dataset="bak_basic",
+            partition_key="2024-01-02",
+            endpoint="bak_basic",
+            params={"trade_date": "20240102"},
+            raw_bytes=first_raw,
+            http_status=200,
+            retrieved_at="2024-01-02T16:00:00+08:00",
+            row_cap=7000,
+        )
     if not omit_day_two:
         second_rows = [["600001.SH", "A", "银行"]]
         if include_bse:
             second_rows.append(["920001.BJ", "北交所样本", "测试"])
-        store.ingest_tushare_response(
-            dataset="bak_basic",
-            partition_key="2024-01-03",
-            endpoint="bak_basic",
-            params={"trade_date": "20240103"},
-            raw_bytes=_daily_response("20240103", second_rows),
-            http_status=200,
-            retrieved_at="2024-01-03T16:00:00+08:00",
-            row_cap=7000,
-        )
+        second_raw = _daily_response("20240103", second_rows)
+        if controlled_authority:
+            _promote_controlled_receipt(
+                store,
+                dataset="bak_basic",
+                partition_key="2024-01-03",
+                params={"trade_date": "20240103"},
+                raw_bytes=second_raw,
+                retrieved_at="2024-01-03T16:00:00+08:00",
+                row_cap=7000,
+                temporal_role=temporal_role,
+                temporal_contract_sha256=temporal_contract_sha256,
+            )
+        else:
+            store.ingest_tushare_response(
+                dataset="bak_basic",
+                partition_key="2024-01-03",
+                endpoint="bak_basic",
+                params={"trade_date": "20240103"},
+                raw_bytes=second_raw,
+                http_status=200,
+                retrieved_at="2024-01-03T16:00:00+08:00",
+                row_cap=7000,
+            )
     # WHY: each complete open session must carry a published market generation
     # so coverage audit's per-session fail-closed gate has evidence to bind.
     _publish_market_session_for_audit(
-        store, "2024-01-02", datetime(2024, 1, 2, 16, 0, tzinfo=timezone.utc)
+        store,
+        "2024-01-02",
+        datetime(2024, 1, 2, 16, 0, tzinfo=timezone.utc),
+        source_profile="jiaoch" if controlled_authority else None,
+        temporal_role=temporal_role,
+        temporal_contract_sha256=temporal_contract_sha256,
     )
     if not omit_day_two:
         _publish_market_session_for_audit(
-            store, "2024-01-03", datetime(2024, 1, 3, 16, 0, tzinfo=timezone.utc)
+            store,
+            "2024-01-03",
+            datetime(2024, 1, 3, 16, 0, tzinfo=timezone.utc),
+            source_profile="jiaoch" if controlled_authority else None,
+            temporal_role=temporal_role,
+            temporal_contract_sha256=temporal_contract_sha256,
         )
 
 
-def _attach_controlled_attempts_to_all_receipts(store):
+def _attach_controlled_attempts_to_all_receipts(
+    store,
+    *,
+    source_profile=None,
+    temporal_role=None,
+    temporal_contract_sha256=None,
+):
     with sqlite3.connect(store.database_path) as connection:
         connection.row_factory = sqlite3.Row
         receipts = [dict(row) for row in connection.execute("SELECT * FROM receipts")]
@@ -935,6 +1606,18 @@ def _attach_controlled_attempts_to_all_receipts(store):
             "fields": list(fields),
             "row_cap": receipt["row_cap"],
         }
+        if source_profile is not None:
+            semantics.update(
+                {
+                    "url": f"http://jiaoch.site/{receipt['dataset']}",
+                    "source_profile": source_profile,
+                    "request_protocol": "tushare-path-per-interface/v1",
+                    "network_route": "direct",
+                    "proxy_endpoint": None,
+                    "temporal_role": temporal_role,
+                    "temporal_contract_sha256": temporal_contract_sha256,
+                }
+            )
         attempt = store.record_fetch_attempt(
             dataset=receipt["dataset"],
             partition_key=receipt["partition_key"],
@@ -1626,6 +2309,65 @@ def test_receipt_ingest_cli_preserves_native_response_bytes(tmp_path, capsys):
     output = json.loads(capsys.readouterr().out)
     assert output["raw_sha256"] == hashlib.sha256(raw).hexdigest()
     assert PITReceiptStore(str(store_dir)).verify_receipts()["verified_receipt_count"] == 1
+
+
+def test_pit_audit_cli_defaults_to_jiaoch_sse_calendar_scope(
+    tmp_path, monkeypatch, capsys
+):
+    captured = {}
+
+    class RecordingStore:
+        def __init__(self, path):
+            captured["store_dir"] = path
+
+        def audit_coverage(self, **kwargs):
+            captured.update(kwargs)
+            return {"status": "passed"}
+
+    monkeypatch.setattr(jobs, "PITReceiptStore", RecordingStore)
+    assert jobs.main(
+        [
+            "research-pit-audit-store",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--start-date",
+            "2024-01-02",
+            "--end-date",
+            "2024-01-03",
+        ]
+    ) == 0
+    assert captured["calendar_exchanges"] == ("SSE",)
+    assert json.loads(capsys.readouterr().out) == {"status": "passed"}
+
+
+def test_pit_audit_cli_preserves_explicit_exchange_override(
+    tmp_path, monkeypatch
+):
+    captured = {}
+
+    class RecordingStore:
+        def __init__(self, _path):
+            pass
+
+        def audit_coverage(self, **kwargs):
+            captured.update(kwargs)
+            return {"status": "passed"}
+
+    monkeypatch.setattr(jobs, "PITReceiptStore", RecordingStore)
+    assert jobs.main(
+        [
+            "research-pit-audit-store",
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--start-date",
+            "2024-01-02",
+            "--end-date",
+            "2024-01-03",
+            "--calendar-exchanges",
+            "SSE,SZSE",
+        ]
+    ) == 0
+    assert captured["calendar_exchanges"] == ("SSE", "SZSE")
 
 
 def test_concurrent_same_partition_same_bytes_is_idempotent(tmp_path):
@@ -2402,7 +3144,7 @@ def test_audited_bundle_publish_cli_rejects_legacy_unbound_attempts(tmp_path):
     _ingest_complete_two_day_fixture(store)
     audit = store.audit_coverage(start_date="2024-01-02", end_date="2024-01-03")
 
-    with pytest.raises(PITReceiptError, match="selected attempts"):
+    with pytest.raises(PITReceiptError, match="controlled receipt attempt authority"):
         jobs.main(
             [
                 "research-pit-publish-universe",
@@ -2419,6 +3161,84 @@ def test_audited_bundle_publish_cli_rejects_legacy_unbound_attempts(tmp_path):
                 "--output-dir",
                 str(tmp_path / "artifacts"),
             ]
+        )
+
+
+def test_bound_publish_rejects_reused_only_receipt_authority(tmp_path):
+    temporal_role = "contaminated_diagnostic"
+    temporal_contract_sha256 = "a" * 64
+    store = PITReceiptStore(str(tmp_path / "store"))
+    _ingest_complete_two_day_fixture(store)
+    _attach_controlled_attempts_to_all_receipts(
+        store,
+        source_profile="jiaoch",
+        temporal_role=temporal_role,
+        temporal_contract_sha256=temporal_contract_sha256,
+    )
+    audit = store.audit_coverage(start_date="2024-01-02", end_date="2024-01-03")
+
+    with pytest.raises(PITReceiptError, match="lacks a capture promotion"):
+        store.publish_universe_artifact(
+            str(tmp_path / "artifacts"),
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+            expected_coverage_audit_sha256=audit["coverage_audit_sha256"],
+            temporal_role=temporal_role,
+            temporal_contract_sha256=temporal_contract_sha256,
+        )
+
+
+@pytest.mark.parametrize(
+    ("tamper", "message"),
+    [("contract", "membership receipt authority"), ("source", "source profile authority")],
+)
+def test_bound_publish_rejects_bak_basic_attempt_authority_tamper(
+    tmp_path, tamper, message
+):
+    temporal_role = "contaminated_diagnostic"
+    temporal_contract_sha256 = "a" * 64
+    store = PITReceiptStore(str(tmp_path / "store"))
+    _ingest_complete_two_day_fixture(
+        store,
+        temporal_role=temporal_role,
+        temporal_contract_sha256=temporal_contract_sha256,
+    )
+    audit = store.audit_coverage(start_date="2024-01-02", end_date="2024-01-03")
+    with sqlite3.connect(store.database_path) as connection:
+        attempt_id, semantics_json = connection.execute(
+            "SELECT attempt_id, request_semantics_json FROM fetch_attempts "
+            "WHERE dataset='bak_basic' AND partition_key='2024-01-02'"
+        ).fetchone()
+        semantics = json.loads(semantics_json)
+        if tamper == "contract":
+            semantics["temporal_contract_sha256"] = "b" * 64
+        else:
+            semantics.update(
+                {
+                    "url": "https://api.tushare.pro",
+                    "source_profile": "official",
+                    "request_protocol": "tushare-root-post/v1",
+                }
+            )
+        canonical = research_pit_store._canonical_json(semantics)
+        connection.execute(
+            "UPDATE fetch_attempts SET request_semantics_json=?, "
+            "request_semantics_sha256=? WHERE attempt_id=?",
+            (
+                canonical,
+                hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+                attempt_id,
+            ),
+        )
+
+    with pytest.raises(PITReceiptError, match=message):
+        store.publish_universe_artifact(
+            str(tmp_path / "artifacts"),
+            start_date="2024-01-02",
+            end_date="2024-01-03",
+            expected_coverage_audit_sha256=audit["coverage_audit_sha256"],
+            temporal_role=temporal_role,
+            temporal_contract_sha256=temporal_contract_sha256,
         )
 
 
@@ -2564,6 +3384,30 @@ def _publish_two_day_bundle(tmp_path):
     return store, audit, artifact
 
 
+def _publish_bound_two_day_bundle(
+    tmp_path,
+    *,
+    temporal_role="contaminated_diagnostic",
+    temporal_contract_sha256="a" * 64,
+):
+    store = PITReceiptStore(str(tmp_path / "store"))
+    _ingest_complete_two_day_fixture(
+        store,
+        temporal_role=temporal_role,
+        temporal_contract_sha256=temporal_contract_sha256,
+    )
+    audit = store.audit_coverage(start_date="2024-01-02", end_date="2024-01-03")
+    artifact = store.publish_universe_artifact(
+        str(tmp_path / "artifacts"),
+        start_date="2024-01-02",
+        end_date="2024-01-03",
+        expected_coverage_audit_sha256=audit["coverage_audit_sha256"],
+        temporal_role=temporal_role,
+        temporal_contract_sha256=temporal_contract_sha256,
+    )
+    return store, audit, artifact
+
+
 def _resign_manifest(manifest_path):
     """Re-derive artifact_root / bundle / manifest hashes after a tamper.
 
@@ -2660,7 +3504,7 @@ def _fully_resign_temporal_binding(manifest_path, binding):
     return relocated / "metadata.sqlite3", manifest
 
 
-def test_bound_loader_external_authority_defeats_complete_local_resign(tmp_path):
+def test_bound_loader_rejects_resigned_label_without_capture_authority(tmp_path):
     _store, audit, artifact = _publish_two_day_bundle(tmp_path)
     binding = {
         "schema_version": "research-artifact-temporal-binding/v1",
@@ -2680,14 +3524,97 @@ def test_bound_loader_external_authority_defeats_complete_local_resign(tmp_path)
         "expected_temporal_contract_sha256": binding["contract_sha256"],
         "expected_temporal_role": binding["role"],
     }
+    with pytest.raises(PITReceiptError, match="authority"):
+        research_pit_store.AuditedPointInTimeUniverse.from_file(
+            str(database_path), **anchors
+        )
+
+
+def test_bound_loader_rejects_missing_bak_basic_attempt_authority(tmp_path):
+    temporal_role = "contaminated_diagnostic"
+    temporal_contract_sha256 = "a" * 64
+    store = PITReceiptStore(str(tmp_path / "store"))
+    _ingest_complete_two_day_fixture(
+        store,
+        temporal_role=temporal_role,
+        temporal_contract_sha256=temporal_contract_sha256,
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        attempt_ids = [
+            row[0]
+            for row in connection.execute(
+                "SELECT attempt_id FROM fetch_attempts WHERE dataset='bak_basic'"
+            )
+        ]
+        connection.executemany(
+            "DELETE FROM fetch_promotion_events WHERE attempt_id=?",
+            [(attempt_id,) for attempt_id in attempt_ids],
+        )
+        connection.executemany(
+            "DELETE FROM fetch_attempts WHERE attempt_id=?",
+            [(attempt_id,) for attempt_id in attempt_ids],
+        )
+    audit = store.audit_coverage(start_date="2024-01-02", end_date="2024-01-03")
+    artifact = store.publish_universe_artifact(
+        str(tmp_path / "artifacts"),
+        start_date="2024-01-02",
+        end_date="2024-01-03",
+        expected_coverage_audit_sha256=audit["coverage_audit_sha256"],
+    )
+    binding = {
+        "schema_version": "research-artifact-temporal-binding/v1",
+        "contract_sha256": temporal_contract_sha256,
+        "role": temporal_role,
+        "start_date": "2024-01-02",
+        "end_date": "2024-01-03",
+        "permitted_operation": "publish",
+        "promotion_eligible": False,
+    }
+    database_path, manifest = _fully_resign_temporal_binding(
+        Path(artifact["manifest_path"]), binding
+    )
+    with pytest.raises(PITReceiptError, match="controlled receipt attempt authority"):
+        research_pit_store.AuditedPointInTimeUniverse.from_file(
+            str(database_path),
+            expected_coverage_audit_sha256=audit["coverage_audit_sha256"],
+            expected_artifact_root_sha256=manifest["artifact_root_sha256"],
+            expected_temporal_contract_sha256=temporal_contract_sha256,
+            expected_temporal_role=temporal_role,
+        )
+
+
+def test_membership_receipt_authority_requires_every_calendar_session(tmp_path):
+    store = PITReceiptStore(str(tmp_path / "store"))
+    with sqlite3.connect(store.database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        with pytest.raises(PITReceiptError, match="controlled receipt authority is missing"):
+            store._assert_current_pool_membership_receipt_authority_on_connection(
+                connection,
+                sessions=["2024-01-02"],
+                temporal_contract_sha256="a" * 64,
+                temporal_role="development",
+                source_profile="jiaoch",
+            )
+
+
+def test_bound_loader_external_authority_defeats_complete_local_resign(tmp_path):
+    _store, audit, artifact = _publish_bound_two_day_bundle(tmp_path)
+    manifest = json.loads(Path(artifact["manifest_path"]).read_text(encoding="utf-8"))
+    binding = manifest["temporal_binding"]
+    anchors = {
+        "expected_coverage_audit_sha256": audit["coverage_audit_sha256"],
+        "expected_artifact_root_sha256": manifest["artifact_root_sha256"],
+        "expected_temporal_contract_sha256": binding["contract_sha256"],
+        "expected_temporal_role": binding["role"],
+    }
     universe = research_pit_store.AuditedPointInTimeUniverse.from_file(
-        str(database_path), **anchors
+        artifact["path"], **anchors
     )
     universe.close()
 
     tampered = {**binding, "role": "development"}
     database_path, _resigned = _fully_resign_temporal_binding(
-        database_path.parent / "manifest.json", tampered
+        Path(artifact["manifest_path"]), tampered
     )
     with pytest.raises(PITReceiptError, match="external anchor"):
         research_pit_store.AuditedPointInTimeUniverse.from_file(

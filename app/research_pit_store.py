@@ -53,7 +53,10 @@ from app.research_proxy_data import (
     FUND_DAILY_ROW_CAP,
     normalize_etf_proxy_rows,
 )
-from app.research_pit_sources import JIAOCH_ROW_CAP_OVERRIDES
+from app.research_pit_sources import (
+    JIAOCH_ROW_CAP_OVERRIDES,
+    _validate_loopback_http_proxy,
+)
 
 
 CNINFO_SUSPENSION_EVIDENCE_SCHEMA_VERSION = "cninfo-suspension-evidence/v1"
@@ -1341,6 +1344,31 @@ class PITReceiptStore:
         self.database_path = self.root / "metadata.sqlite3"
         self.raw_root.mkdir(parents=True, exist_ok=True)
         self._initialize()
+
+    @classmethod
+    @contextmanager
+    def readonly_snapshot(
+        cls, root: str | Path
+    ) -> Iterator[Tuple["PITReceiptStore", sqlite3.Connection]]:
+        instance = cls.__new__(cls)
+        instance.root = Path(root).resolve()
+        instance.raw_root = instance.root / "raw"
+        instance.database_path = instance.root / "metadata.sqlite3"
+        if not instance.database_path.is_file():
+            raise PITReceiptError("PIT receipt store is missing")
+        connection = sqlite3.connect(
+            f"file:{instance.database_path.as_posix()}?mode=ro", uri=True
+        )
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("BEGIN")
+            yield instance, connection
+        finally:
+            if connection.in_transaction:
+                connection.rollback()
+            connection.close()
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -3531,6 +3559,48 @@ class PITReceiptStore:
         authority["base_origin"] = cls._membership_url_origin(semantics.get("url"), "request URL")
         return authority
 
+    @staticmethod
+    def _assert_membership_source_profile(
+        authority: Mapping[str, Any], source_profile: str
+    ) -> None:
+        expected_profile = str(source_profile).strip()
+        if authority.get("source_profile") != expected_profile:
+            raise PITReceiptError("membership source profile authority differs from binding")
+        if expected_profile == "jiaoch":
+            if (
+                authority.get("base_origin")
+                not in {"http://jiaoch.site:80", "https://jiaoch.site:443"}
+                or authority.get("request_protocol")
+                != "tushare-path-per-interface/v1"
+                or authority.get("network_route")
+                not in {"direct", "loopback_http_proxy"}
+            ):
+                raise PITReceiptError("membership Jiaoch source authority is invalid")
+            route = authority["network_route"]
+            proxy = authority.get("proxy_endpoint")
+            if route == "direct" and proxy is not None:
+                raise PITReceiptError("membership Jiaoch direct route forbids a proxy")
+            if route == "loopback_http_proxy":
+                try:
+                    normalized_proxy = _validate_loopback_http_proxy(str(proxy or ""))
+                except ValueError as exc:
+                    raise PITReceiptError(
+                        "membership Jiaoch proxy authority is invalid"
+                    ) from exc
+                if normalized_proxy != proxy:
+                    raise PITReceiptError("membership Jiaoch proxy authority is not canonical")
+            return
+        if expected_profile == "official" and (
+            authority.get("base_origin")
+            not in {"http://api.tushare.pro:80", "https://api.tushare.pro:443"}
+            or authority.get("request_protocol") != "tushare-root-post/v1"
+            or authority.get("network_route") != "direct"
+            or authority.get("proxy_endpoint") is not None
+        ):
+            raise PITReceiptError("membership official source authority is invalid")
+        if expected_profile not in {"jiaoch", "official"}:
+            raise PITReceiptError("membership source profile is unsupported")
+
     @classmethod
     def _membership_attempt_authority(
         cls,
@@ -3606,6 +3676,123 @@ class PITReceiptStore:
             temporal_role,
             temporal_contract,
         )
+
+    def _controlled_receipt_authority_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        dataset: str,
+        partition_key: str,
+    ) -> Tuple[Dict[str, Any], str, str]:
+        receipt = connection.execute(
+            "SELECT * FROM receipts WHERE dataset = ? AND partition_key = ?",
+            (dataset, partition_key),
+        ).fetchone()
+        if receipt is None:
+            raise PITReceiptError("controlled receipt authority is missing")
+        rows = list(
+            connection.execute(
+                """
+                SELECT attempt.*, event.status AS promotion_status,
+                       event.details_json AS promotion_details_json
+                FROM fetch_attempts AS attempt
+                JOIN fetch_promotion_events AS event
+                  ON event.attempt_id = attempt.attempt_id
+                WHERE attempt.dataset = ? AND attempt.partition_key = ?
+                  AND attempt.raw_sha256 = ?
+                  AND event.status IN ('stored', 'reused')
+                ORDER BY attempt.attempt_sequence
+                """,
+                (dataset, partition_key, receipt["raw_sha256"]),
+            )
+        )
+        if not rows:
+            raise PITReceiptError("controlled receipt attempt authority is missing")
+        authorities: List[Tuple[Dict[str, Any], str, str]] = []
+        has_capture_promotion = False
+        for stored in rows:
+            attempt = dict(stored)
+            try:
+                details = json.loads(attempt.pop("promotion_details_json"))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise PITReceiptError(
+                    "controlled receipt promotion details are malformed"
+                ) from exc
+            if (
+                attempt["endpoint"] != dataset
+                or attempt["error_kind"] is not None
+                or int(attempt["body_complete"]) != 1
+                or attempt["http_status"] is None
+                or not 200 <= int(attempt["http_status"]) < 300
+                or attempt["raw_path"] != receipt["raw_path"]
+                or int(attempt["raw_bytes"]) != int(receipt["raw_bytes"])
+                or details.get("receipt_raw_sha256") != receipt["raw_sha256"]
+            ):
+                raise PITReceiptError("controlled receipt attempt is not promotable")
+            self._verify_raw_file(attempt)
+            has_capture_promotion = (
+                has_capture_promotion or attempt["promotion_status"] == "stored"
+            )
+            authorities.append(
+                self._membership_attempt_authority(
+                    attempt,
+                    dataset=dataset,
+                    partition_key=partition_key,
+                )
+            )
+        if any(authority != authorities[0] for authority in authorities[1:]):
+            raise PITReceiptError("controlled receipt authorities disagree")
+        if not has_capture_promotion:
+            raise PITReceiptError(
+                "controlled receipt authority lacks a capture promotion"
+            )
+        return authorities[0]
+
+    def _assert_current_pool_membership_receipt_authority_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        sessions: Sequence[str],
+        temporal_contract_sha256: str,
+        temporal_role: str,
+        source_profile: str,
+    ) -> None:
+        for session in sessions:
+            source, role, contract = self._controlled_receipt_authority_on_connection(
+                connection,
+                dataset="bak_basic",
+                partition_key=session,
+            )
+            if role != temporal_role or contract != temporal_contract_sha256:
+                raise PITReceiptError(
+                    "current-pool membership receipt authority does not match binding"
+                )
+            self._assert_membership_source_profile(source, source_profile)
+
+    @classmethod
+    def _assert_current_pool_attempt_authorities(
+        cls,
+        attempts: Iterable[Mapping[str, Any]],
+        *,
+        temporal_contract_sha256: str,
+        temporal_role: str,
+        source_profile: str,
+    ) -> None:
+        expected_contract = _require_sha256(
+            temporal_contract_sha256, "attempt temporal contract hash"
+        )
+        for stored in attempts:
+            attempt = dict(stored)
+            source, role, contract = cls._membership_attempt_authority(
+                attempt,
+                dataset=str(attempt["dataset"]),
+                partition_key=str(attempt["partition_key"]),
+            )
+            if role != temporal_role or contract != expected_contract:
+                raise PITReceiptError(
+                    "selected attempt authority does not match temporal binding"
+                )
+            cls._assert_membership_source_profile(source, source_profile)
 
     def _membership_market_authority_on_connection(
         self, connection: sqlite3.Connection, trade_date: str
@@ -7657,6 +7844,67 @@ class PITReceiptStore:
             result = self._verify_receipts_on_connection(connection)
             return {key: value for key, value in result.items() if key != "receipt_refs"}
 
+    def _common_open_sessions_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        start_date: str,
+        end_date: str,
+        exchanges: Sequence[str],
+    ) -> List[str]:
+        if not connection.in_transaction:
+            raise PITReceiptError("calendar verification requires an active transaction")
+        start = _iso_date(start_date, "start_date")
+        end = _iso_date(end_date, "end_date")
+        normalized_exchanges = tuple(
+            str(exchange).strip().upper() for exchange in exchanges
+        )
+        if end < start:
+            raise PITReceiptError("end_date precedes start_date")
+        if not normalized_exchanges or any(not exchange for exchange in normalized_exchanges):
+            raise PITReceiptError("calendar exchanges are invalid")
+        expected_days = (date.fromisoformat(end) - date.fromisoformat(start)).days + 1
+        open_sets = []
+        self._verify_receipts_on_connection(connection)
+        for exchange in normalized_exchanges:
+            count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM trade_sessions
+                    WHERE exchange = ? AND cal_date BETWEEN ? AND ?
+                    """,
+                    (exchange, start, end),
+                ).fetchone()[0]
+            )
+            if count != expected_days:
+                raise PITReceiptError(f"calendar date coverage is incomplete for {exchange}")
+            rows = list(
+                connection.execute(
+                    """
+                    SELECT cal_date, pretrade_date FROM trade_sessions
+                    WHERE exchange = ? AND is_open = 1 AND cal_date BETWEEN ? AND ?
+                    ORDER BY cal_date
+                    """,
+                    (exchange, start, end),
+                )
+            )
+            for index, row in enumerate(rows):
+                previous = row["pretrade_date"]
+                if not previous or previous >= row["cal_date"]:
+                    raise PITReceiptError(
+                        f"trade calendar pretrade chain is invalid for {exchange}"
+                    )
+                if index > 0 and previous != rows[index - 1]["cal_date"]:
+                    raise PITReceiptError(
+                        f"trade calendar pretrade chain is broken for {exchange}"
+                    )
+            open_sets.append({row["cal_date"] for row in rows})
+        if not open_sets[0]:
+            raise PITReceiptError("calendar coverage has no open sessions")
+        if any(sessions != open_sets[0] for sessions in open_sets[1:]):
+            raise PITReceiptError("exchange open-session calendars disagree")
+        return sorted(open_sets[0])
+
     def common_open_sessions(
         self,
         *,
@@ -7674,49 +7922,66 @@ class PITReceiptStore:
         end = _iso_date(end_date, "end_date")
         if end < start:
             raise PITReceiptError("end_date precedes start_date")
-        expected_days = (date.fromisoformat(end) - date.fromisoformat(start)).days + 1
-        open_sets = []
         with self._connect() as connection:
             connection.execute("BEGIN")
-            self._verify_receipts_on_connection(connection)
-            for exchange in exchanges:
-                count = int(
-                    connection.execute(
-                        """
-                        SELECT COUNT(*) FROM trade_sessions
-                        WHERE exchange = ? AND cal_date BETWEEN ? AND ?
-                        """,
-                        (exchange, start, end),
-                    ).fetchone()[0]
-                )
-                if count != expected_days:
-                    raise PITReceiptError(f"calendar date coverage is incomplete for {exchange}")
-                rows = list(
-                    connection.execute(
-                        """
-                        SELECT cal_date, pretrade_date FROM trade_sessions
-                        WHERE exchange = ? AND is_open = 1 AND cal_date BETWEEN ? AND ?
-                        ORDER BY cal_date
-                        """,
-                        (exchange, start, end),
-                    )
-                )
-                for index, row in enumerate(rows):
-                    previous = row["pretrade_date"]
-                    if not previous or previous >= row["cal_date"]:
-                        raise PITReceiptError(
-                            f"trade calendar pretrade chain is invalid for {exchange}"
-                        )
-                    if index > 0 and previous != rows[index - 1]["cal_date"]:
-                        raise PITReceiptError(
-                            f"trade calendar pretrade chain is broken for {exchange}"
-                        )
-                open_sets.append({row["cal_date"] for row in rows})
-        if not open_sets[0]:
-            raise PITReceiptError("calendar coverage has no open sessions")
-        if any(sessions != open_sets[0] for sessions in open_sets[1:]):
-            raise PITReceiptError("exchange open-session calendars disagree")
-        return sorted(open_sets[0])
+            return self._common_open_sessions_on_connection(
+                connection,
+                start_date=start,
+                end_date=end,
+                exchanges=exchanges,
+            )
+
+    def _current_pool_calendar_authority_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        start_date: str,
+        end_date: str,
+        temporal_contract_sha256: str,
+        temporal_role: str,
+        source_profile: str,
+    ) -> List[str]:
+        sessions = self._common_open_sessions_on_connection(
+            connection,
+            start_date=start_date,
+            end_date=end_date,
+            exchanges=CALENDAR_SOURCE_EXCHANGES,
+        )
+        calendar_partition = f"SSE:{start_date}:{end_date}"
+        calendar_partition_rows = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM trade_sessions
+                WHERE exchange = 'SSE' AND cal_date BETWEEN ? AND ?
+                  AND receipt_partition = ?
+                """,
+                (start_date, end_date, calendar_partition),
+            ).fetchone()[0]
+        )
+        calendar_day_count = (
+            date.fromisoformat(end_date) - date.fromisoformat(start_date)
+        ).days + 1
+        if calendar_partition_rows != calendar_day_count:
+            raise PITReceiptError(
+                "current-pool market binding lacks an exact calendar receipt"
+            )
+        calendar_source, calendar_role, calendar_contract = (
+            self._controlled_receipt_authority_on_connection(
+                connection,
+                dataset="trade_cal",
+                partition_key=calendar_partition,
+            )
+        )
+        if (
+            calendar_role != temporal_role
+            or calendar_contract != temporal_contract_sha256
+        ):
+            raise PITReceiptError(
+                "current-pool market calendar authority does not match binding"
+            )
+        self._assert_membership_source_profile(calendar_source, source_profile)
+        return sessions
 
     def bind_current_pool_market_collection(
         self,
@@ -7754,30 +8019,45 @@ class PITReceiptStore:
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            expected_sessions = self._current_pool_calendar_authority_on_connection(
+                connection,
+                start_date=start,
+                end_date=end,
+                temporal_contract_sha256=temporal_contract_sha256,
+                temporal_role=temporal_role,
+                source_profile=source_profile,
+            )
+            if normalized_sessions != expected_sessions:
+                raise PITReceiptError(
+                    "current-pool market binding sessions differ from verified calendar"
+                )
             refs = []
             for session in normalized_sessions:
-                head = connection.execute(
-                    """
-                    SELECT head.generation_id, head.manifest_sha256, generation.vintage
-                    FROM market_session_generation_head AS head
-                    JOIN market_session_generations AS generation
-                      ON generation.generation_id = head.generation_id
-                    WHERE head.trade_date = ?
-                    """,
-                    (session,),
-                ).fetchone()
-                if head is None:
-                    raise PITReceiptError("current-pool market binding is missing a session")
-                manifest = self._market_session_manifest_on_connection(
-                    connection, str(head["generation_id"])
+                generation, manifest, source, role, contract = (
+                    self._membership_market_authority_on_connection(connection, session)
                 )
+                stored_lineage = generation.get("lineage_sha256")
+                if not stored_lineage or not hmac.compare_digest(
+                    str(stored_lineage), str(manifest["lineage_sha256"])
+                ):
+                    raise PITReceiptError(
+                        "current-pool market binding generation lineage mismatch"
+                    )
+                if (
+                    contract != temporal_contract_sha256
+                    or role != temporal_role
+                ):
+                    raise PITReceiptError(
+                        "current-pool market binding authority does not match generation attempts"
+                    )
+                self._assert_membership_source_profile(source, source_profile)
                 refs.append(
                     {
                         "trade_date": session,
-                        "generation_id": str(head["generation_id"]),
-                        "manifest_sha256": str(head["manifest_sha256"]),
-                        "lineage_sha256": str(manifest["lineage_sha256"]),
-                        "vintage": str(head["vintage"]),
+                        "generation_id": str(generation["generation_id"]),
+                        "manifest_sha256": str(manifest["manifest_sha256"]),
+                        "lineage_sha256": str(stored_lineage),
+                        "vintage": str(generation["vintage"]),
                     }
                 )
             unsigned = {
@@ -8813,6 +9093,33 @@ class PITReceiptStore:
                         (audit["start_date"], audit["end_date"]),
                     )
                 )
+                if temporal_binding is not None:
+                    authoritative_sessions = (
+                        self._current_pool_calendar_authority_on_connection(
+                            source,
+                            start_date=audit["start_date"],
+                            end_date=audit["end_date"],
+                            temporal_contract_sha256=temporal_binding[
+                                "contract_sha256"
+                            ],
+                            temporal_role=temporal_binding["role"],
+                            source_profile="jiaoch",
+                        )
+                    )
+                    if authoritative_sessions != [
+                        str(ref["trade_date"])
+                        for ref in audit["market_generation_refs"]
+                    ]:
+                        raise PITReceiptError(
+                            "artifact market sessions differ from authoritative calendar"
+                        )
+                    self._assert_current_pool_membership_receipt_authority_on_connection(
+                        source,
+                        sessions=authoritative_sessions,
+                        temporal_contract_sha256=temporal_binding["contract_sha256"],
+                        temporal_role=temporal_binding["role"],
+                        source_profile="jiaoch",
+                    )
                 source.executemany(
                     "INSERT INTO artifact_selected_receipts VALUES (?, ?)",
                     sorted(selected_keys),
@@ -8906,22 +9213,19 @@ class PITReceiptStore:
                 )
 
                 if temporal_binding is not None:
-                    selected_attempts = source.execute(
+                    selected_attempts = list(source.execute(
                         """
-                        SELECT request_semantics_json FROM fetch_attempts
+                        SELECT * FROM fetch_attempts
                         WHERE attempt_id IN (SELECT attempt_id FROM artifact_selected_attempts)
+                        ORDER BY attempt_sequence
                         """
+                    ))
+                    self._assert_current_pool_attempt_authorities(
+                        selected_attempts,
+                        temporal_contract_sha256=temporal_binding["contract_sha256"],
+                        temporal_role=temporal_binding["role"],
+                        source_profile="jiaoch",
                     )
-                    for selected_attempt in selected_attempts:
-                        semantics = json.loads(selected_attempt["request_semantics_json"])
-                        if (
-                            semantics.get("temporal_contract_sha256")
-                            != temporal_binding["contract_sha256"]
-                            or semantics.get("temporal_role") != temporal_binding["role"]
-                        ):
-                            raise PITReceiptError(
-                                "selected attempts do not share artifact temporal binding"
-                            )
 
                 destination = sqlite3.connect(str(database_path))
                 destination.row_factory = sqlite3.Row
@@ -11441,6 +11745,39 @@ class AuditedPointInTimeUniverse:
             snapshot_store.root = bundle_root
             snapshot_store.raw_root = bundle_root / "raw"
             snapshot_store.database_path = database_path
+            if not is_legacy_unbound:
+                authoritative_sessions = (
+                    snapshot_store._current_pool_calendar_authority_on_connection(
+                        connection,
+                        start_date=manifest["coverage"]["start_date"],
+                        end_date=manifest["coverage"]["end_date"],
+                        temporal_contract_sha256=temporal["contract_sha256"],
+                        temporal_role=temporal["role"],
+                        source_profile="jiaoch",
+                    )
+                )
+                if authoritative_sessions != [
+                    str(ref["trade_date"])
+                    for ref in manifest["market_generations"]["refs"]
+                ]:
+                    raise PITReceiptError(
+                        "artifact market sessions differ from authoritative calendar"
+                    )
+                snapshot_store._assert_current_pool_membership_receipt_authority_on_connection(
+                    connection,
+                    sessions=authoritative_sessions,
+                    temporal_contract_sha256=temporal["contract_sha256"],
+                    temporal_role=temporal["role"],
+                    source_profile="jiaoch",
+                )
+                snapshot_store._assert_current_pool_attempt_authorities(
+                    connection.execute(
+                        "SELECT * FROM fetch_attempts ORDER BY attempt_sequence"
+                    ),
+                    temporal_contract_sha256=temporal["contract_sha256"],
+                    temporal_role=temporal["role"],
+                    source_profile="jiaoch",
+                )
             recomputed_audit = snapshot_store.audit_coverage(
                 start_date=manifest["coverage"]["start_date"],
                 end_date=manifest["coverage"]["end_date"],

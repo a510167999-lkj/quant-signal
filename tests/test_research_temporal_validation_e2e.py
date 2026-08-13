@@ -21,7 +21,7 @@ from app.research_validation import (
 from app.signals import evaluate_signal
 from app.strategy_signal_evidence import build_signal_snapshot
 from tests.test_research_pit import _write_verified_evidence
-from tests.test_research_pit_store import _fully_resign_temporal_binding, _publish_two_day_bundle
+from tests.test_research_pit_store import _publish_bound_two_day_bundle
 from tests.test_research_stock_only_backtest import _publish_long_real_artifact
 
 
@@ -317,20 +317,14 @@ def test_strict_bundle_cli_reports_development_only_not_live_proof(tmp_path, cap
 
 
 def test_bound_audited_artifact_and_v2_evidence_validate_end_to_end(tmp_path):
-    _store, audit, legacy = _publish_two_day_bundle(tmp_path / "store-fixture")
     temporal_contract_sha256 = "a" * 64
-    binding = {
-        "schema_version": "research-artifact-temporal-binding/v1",
-        "contract_sha256": temporal_contract_sha256,
-        "role": "development",
-        "start_date": "2024-01-02",
-        "end_date": "2024-01-03",
-        "permitted_operation": "publish",
-        "promotion_eligible": False,
-    }
-    database_path, manifest = _fully_resign_temporal_binding(
-        Path(legacy["manifest_path"]), binding
+    _store, audit, artifact = _publish_bound_two_day_bundle(
+        tmp_path / "store-fixture",
+        temporal_contract_sha256=temporal_contract_sha256,
+        temporal_role="development",
     )
+    database_path = Path(artifact["path"])
+    manifest = json.loads(Path(artifact["manifest_path"]).read_text(encoding="utf-8"))
     authority = {
         "artifact_root_sha256": manifest["artifact_root_sha256"],
         "coverage_audit_sha256": manifest["coverage_audit_sha256"],

@@ -347,7 +347,7 @@ def _validate_contract(contract: Any) -> None:
         raise PartitionContractError("unsupported policy_version")
 
 
-def _assert_v2_development_evidence(contract: Mapping[str, Any]) -> None:
+def _assert_current_pool_development_evidence(contract: Mapping[str, Any]) -> None:
     from app.current_pool_gate import CurrentPoolGateError, verify_current_pool_audit
 
     evidence = contract["development_evidence"]
@@ -403,10 +403,14 @@ def assert_range_allowed(
     if role not in role_names:
         raise PartitionContractError("unknown role or operation")
     if (
-        contract["policy_version"] == "current-pool-development-forward-oos/v2"
+        contract["policy_version"]
+        in {
+            "current-pool-development-forward-oos/v2",
+            "current-pool-development-forward-oos/v3",
+        }
         and role == "development"
     ):
-        _assert_v2_development_evidence(contract)
+        _assert_current_pool_development_evidence(contract)
     start_date = _parse_date(start)
     end_date = _parse_date(end)
     if start_date > end_date:

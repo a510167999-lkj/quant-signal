@@ -79,6 +79,18 @@ def test_audited_replay_end_to_end_binds_exact_membership(monkeypatch, tmp_path)
         return universe
 
     monkeypatch.setattr(
+        "app.current_pool_gate.verify_current_pool_audit",
+        lambda _path: {
+            "canonical_sha256": contract["development_evidence"][
+                "current_pool_coverage_audit"
+            ]["canonical_sha256"],
+            "source_as_of": contract["development_evidence"][
+                "current_pool_coverage_audit"
+            ]["source_as_of"],
+        },
+    )
+
+    monkeypatch.setattr(
         replay.AuditedPointInTimeUniverse,
         "from_file",
         open_universe,

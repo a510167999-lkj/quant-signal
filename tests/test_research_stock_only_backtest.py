@@ -14,7 +14,6 @@ provider/cache spy 允许 market='a'，任何 market='etf' 立即失败。
 import json
 from dataclasses import replace
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -37,10 +36,9 @@ from app.research_composite_universe import CompositeAuditedUniverse
 from app.research_pit_store import AuditedPointInTimeUniverse, PITReceiptStore
 from tests.test_research_composite_universe import _annual_segments, _bar
 from tests.test_research_pit_store import (
-    _calendar_response,
     _daily_response,
-    _fully_resign_temporal_binding,
     _ingest_complete_two_day_fixture,
+    _promote_controlled_receipt,
     _publish_market_session_for_audit,
 )
 import tests.test_research_pit_store as _pit_store_test_module
@@ -426,61 +424,56 @@ def _publish_long_real_artifact(
         return []
 
     store = PITReceiptStore(str(tmp_path / "long-store"))
+    controlled_authority = temporal_contract_sha256 is not None
+    if controlled_authority != (temporal_role is not None):
+        raise ValueError("temporal artifact fixture authority must be atomic")
     _pit_store_test_module._market_default_rows = trending_market_rows
     try:
-        _ingest_complete_two_day_fixture(store)
+        _ingest_complete_two_day_fixture(
+            store,
+            temporal_role=temporal_role,
+            temporal_contract_sha256=temporal_contract_sha256,
+            calendar_sessions=sessions,
+            calendar_exchanges=("SSE",) if controlled_authority else ("SSE", "SZSE"),
+        )
         extra_sessions = sessions[2:]
-        for exchange in ("SSE", "SZSE"):
-            calendar_rows = []
-            previous_open = sessions[1]
-            for calendar_day in pd.date_range(
-                extra_sessions[0], extra_sessions[-1], freq="D"
-            ):
-                session = calendar_day.strftime("%Y-%m-%d")
-                is_open = int(session in position_by_date)
-                calendar_rows.append(
-                    [
-                        exchange,
-                        session.replace("-", ""),
-                        is_open,
-                        previous_open.replace("-", ""),
-                    ]
-                )
-                if is_open:
-                    previous_open = session
-            store.ingest_tushare_response(
-                dataset="trade_cal",
-                partition_key=f"{exchange}:{extra_sessions[0]}:{extra_sessions[-1]}",
-                endpoint="trade_cal",
-                params={
-                    "exchange": exchange,
-                    "start_date": extra_sessions[0].replace("-", ""),
-                    "end_date": extra_sessions[-1].replace("-", ""),
-                },
-                raw_bytes=_calendar_response(calendar_rows),
-                http_status=200,
-                retrieved_at="2024-01-01T16:00:00+08:00",
-                row_cap=10000,
-            )
         for session in extra_sessions:
-            store.ingest_tushare_response(
-                dataset="bak_basic",
-                partition_key=session,
-                endpoint="bak_basic",
-                params={"trade_date": session.replace("-", "")},
-                raw_bytes=_daily_response(
-                    session.replace("-", ""), [["600001.SH", "A", "银行"]]
-                ),
-                http_status=200,
-                retrieved_at=f"{session}T16:00:00+08:00",
-                row_cap=7000,
+            params = {"trade_date": session.replace("-", "")}
+            raw = _daily_response(
+                session.replace("-", ""), [["600001.SH", "A", "银行"]]
             )
+            if controlled_authority:
+                _promote_controlled_receipt(
+                    store,
+                    dataset="bak_basic",
+                    partition_key=session,
+                    params=params,
+                    raw_bytes=raw,
+                    retrieved_at=f"{session}T16:00:00+08:00",
+                    row_cap=7000,
+                    temporal_role=temporal_role,
+                    temporal_contract_sha256=temporal_contract_sha256,
+                )
+            else:
+                store.ingest_tushare_response(
+                    dataset="bak_basic",
+                    partition_key=session,
+                    endpoint="bak_basic",
+                    params=params,
+                    raw_bytes=raw,
+                    http_status=200,
+                    retrieved_at=f"{session}T16:00:00+08:00",
+                    row_cap=7000,
+                )
             _publish_market_session_for_audit(
                 store,
                 session,
                 datetime.fromisoformat(f"{session}T16:00:00+00:00").replace(
                     tzinfo=timezone.utc
                 ),
+                source_profile="jiaoch" if controlled_authority else None,
+                temporal_role=temporal_role,
+                temporal_contract_sha256=temporal_contract_sha256,
             )
     finally:
         _pit_store_test_module._market_default_rows = original_defaults
@@ -491,26 +484,9 @@ def _publish_long_real_artifact(
         start_date=sessions[0],
         end_date=sessions[-1],
         expected_coverage_audit_sha256=audit["coverage_audit_sha256"],
+        temporal_contract_sha256=temporal_contract_sha256,
+        temporal_role=temporal_role,
     )
-    if temporal_contract_sha256 is not None:
-        database_path, manifest = _fully_resign_temporal_binding(
-            Path(artifact["manifest_path"]),
-            {
-                "schema_version": "research-artifact-temporal-binding/v1",
-                "contract_sha256": temporal_contract_sha256,
-                "role": temporal_role,
-                "start_date": sessions[0],
-                "end_date": sessions[-1],
-                "permitted_operation": "publish",
-                "promotion_eligible": False,
-            },
-        )
-        artifact = {
-            **artifact,
-            "path": str(database_path),
-            "manifest_path": str(database_path.parent / "manifest.json"),
-            "artifact_root_sha256": manifest["artifact_root_sha256"],
-        }
     return artifact, audit, sessions
 
 

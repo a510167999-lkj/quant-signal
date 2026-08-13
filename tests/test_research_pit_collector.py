@@ -812,6 +812,9 @@ def _collector(
     network_route="direct",
     proxy_endpoint=None,
     source_profile="official",
+    api_url="https://example.invalid/tushare",
+    allowed_hosts=("example.invalid",),
+    request_protocol="tushare-root-post/v1",
     temporal_role="contaminated_diagnostic",
     temporal_start_date="2024-01-01",
     temporal_end_date="2026-07-03",
@@ -823,14 +826,15 @@ def _collector(
     return api.ControlledTushareCollector(
         store=store,
         token=TOKEN,
-        api_url="https://example.invalid/tushare",
+        api_url=api_url,
         transport=transport,
         clock=clock,
         sleeper=sleeper,
-        allowed_hosts=("example.invalid",),
+        allowed_hosts=allowed_hosts,
         network_route=network_route,
         proxy_endpoint=proxy_endpoint,
         source_profile=source_profile,
+        request_protocol=request_protocol,
         row_cap_overrides=row_cap_overrides,
         temporal_contract=(contract := load_temporal_partition_contract(
             Path("data/research_partitions/frozen-v1.json")
@@ -2153,6 +2157,9 @@ def test_jiaoch_parallel_collect_supports_single_calendar_source():
         Store(),
         FakeTrustedClock(),
         source_profile="jiaoch",
+        api_url="http://jiaoch.site",
+        allowed_hosts=("jiaoch.site",),
+        request_protocol="tushare-path-per-interface/v1",
         workers=2,
     )
     calendar_partitions = []
@@ -3260,6 +3267,9 @@ def test_current_pool_market_only_real_store_calls_only_calendar_and_four_market
         store,
         FakeTrustedClock(),
         source_profile="jiaoch",
+        api_url="http://jiaoch.site",
+        allowed_hosts=("jiaoch.site",),
+        request_protocol="tushare-path-per-interface/v1",
         workers=2,
         row_cap_overrides={"stk_limit": 10_000},
     )
