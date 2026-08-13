@@ -10,9 +10,16 @@ from app import factor_v3_path_a_frozen_train_window_replay as train_replay
 from app import factor_v3_path_a_p0_drawdown_overlay as p0
 from app import research_goal_contract as goal
 from app.factor_v3_path_a_3y_book_round_specs import (
+    COMBO_ROUND_VARIANTS,
+    FAILED_BOOK_IDS,
+    FAILED_COMBO_IDS,
+    FAILED_COMBO_OVERLAY_IDS,
     FAILED_OVERLAY_IDS,
     STAGE_GOAL_ID,
     iter_book_round_variants,
+    iter_clip_round_variants,
+    iter_combo_overlay_variants,
+    iter_combo_round_variants,
     merged_kernel,
 )
 from app.storage import write_json
@@ -39,14 +46,17 @@ def score_book_round(
     train_trades: list[dict[str, Any]],
     *,
     variants: tuple[dict[str, Any], ...] | None = None,
+    excluded_ids: frozenset[str] | None = None,
+    stage_goal_id: str = STAGE_GOAL_ID,
 ) -> dict[str, Any]:
     """Score book kernels on already-loaded trades. No network I/O."""
 
     chosen = variants or iter_book_round_variants()
+    banned = excluded_ids if excluded_ids is not None else FAILED_OVERLAY_IDS
     ids = [str(row["candidate_id"]) for row in chosen]
-    overlap = set(ids) & set(FAILED_OVERLAY_IDS)
+    overlap = set(ids) & set(banned)
     if overlap:
-        raise PathA3yBookRoundError(f"book round reuses failed overlay ids: {sorted(overlap)}")
+        raise PathA3yBookRoundError(f"round reuses already-failed ids: {sorted(overlap)}")
     rows: list[dict[str, Any]] = []
     for variant in chosen:
         kernel = merged_kernel(variant)
@@ -99,14 +109,241 @@ def score_book_round(
     )
     return {
         "schema": REPORT_SCHEMA,
-        "stage_goal_id": STAGE_GOAL_ID,
+        "stage_goal_id": stage_goal_id,
         "development_only": True,
         "promotable": False,
         "automatic_trading_allowed": goal.AUTOMATIC_TRADING_ALLOWED,
         "target_rolling_12m_net_return_pct": goal.TARGET_ROLLING_12M_NET_RETURN_PCT,
         "target_max_drawdown_pct": goal.TARGET_MAX_DRAWDOWN_PCT,
         "variant_count": len(rows),
-        "failed_overlay_ids_excluded": sorted(FAILED_OVERLAY_IDS),
+        "failed_ids_excluded": sorted(banned),
+        "dual_pass_ids": [row["candidate_id"] for row in passed],
+        "current_development_candidate": (
+            passed[0]["candidate_id"] if passed else None
+        ),
+        "best_by_mdd_then_return": ranked[0]["candidate_id"] if ranked else None,
+        "fifty_fifteen_met": bool(passed),
+        "variants": rows,
+    }
+
+
+def _combo_base_variant(base_id: str) -> dict[str, Any]:
+    for row in COMBO_ROUND_VARIANTS:
+        if str(row["candidate_id"]) == base_id:
+            return row
+    raise PathA3yBookRoundError(f"unknown combo base: {base_id!r}")
+
+
+def score_combo_overlay_round(
+    train_trades: list[dict[str, Any]],
+    *,
+    variants: tuple[dict[str, Any], ...] | None = None,
+    excluded_ids: frozenset[str] | None = None,
+    stage_goal_id: str = "path-a-3y-combo-overlay-round/v1",
+    base_id: str = "combo_vol_t2_m1",
+) -> dict[str, Any]:
+    """Score overlays on the closest combo book. No network I/O."""
+
+    chosen = variants or iter_combo_overlay_variants()
+    banned = (
+        excluded_ids
+        if excluded_ids is not None
+        else (FAILED_OVERLAY_IDS | FAILED_BOOK_IDS | FAILED_COMBO_IDS)
+    )
+    ids = [str(row["candidate_id"]) for row in chosen]
+    overlap = set(ids) & set(banned)
+    if overlap:
+        raise PathA3yBookRoundError(f"round reuses already-failed ids: {sorted(overlap)}")
+    base = _combo_base_variant(base_id)
+    kernel = merged_kernel(base)
+    try:
+        selected = p0._select_kernel_trades(train_trades, kernel_override=kernel)
+        empty_base = False
+    except p0.PathAP0Error:
+        selected = []
+        empty_base = True
+
+    rows: list[dict[str, Any]] = []
+    for variant in chosen:
+        overlay = dict(variant["overlay"])
+        if empty_base:
+            applied = {
+                "accepted": [],
+                "blocked_new_count": 0,
+                "half_size_count": 0,
+            }
+            metrics = p0._metrics_bundle([])
+            empty = True
+        else:
+            applied = p0.apply_p0_overlay(
+                selected, overlay, kernel_selected=selected
+            )
+            metrics = p0._metrics_bundle(applied["accepted"])
+            empty = False
+        full_ret = metrics.get("portfolio_compounded_return_pct")
+        full_mdd = metrics.get("portfolio_max_drawdown_pct")
+        dual = False if empty else _dual_pass(full_ret, full_mdd)
+        rows.append(
+            {
+                "candidate_id": variant["candidate_id"],
+                "role": variant.get("role") or "combo_overlay",
+                "rationale": variant["rationale"],
+                "base_id": variant.get("base_id") or base_id,
+                "overlay": overlay,
+                "kernel": {
+                    "top_n": kernel["top_n"],
+                    "max_active_positions": kernel["max_active_positions"],
+                    "symbol_cooldown_days": kernel["symbol_cooldown_days"],
+                    "market_levels": list(kernel["market_levels"]),
+                    "required_signal_tags": list(kernel["required_signal_tags"]),
+                    "excluded_signal_tags": list(kernel["excluded_signal_tags"]),
+                },
+                "development_only": True,
+                "promotable": False,
+                "automatic_trading_allowed": goal.AUTOMATIC_TRADING_ALLOWED,
+                "empty_selection": empty,
+                "full_path_return_pct": full_ret,
+                "full_path_mdd_pct": full_mdd,
+                "latest_1y_return_pct": metrics.get("rolling_1y_latest_return_pct"),
+                "latest_1y_mdd_pct": metrics.get("rolling_1y_latest_max_drawdown_pct"),
+                "selected_trade_count": metrics.get("selected_trade_count"),
+                "dual_pass_50_15": dual,
+                "dual_pass_via": "research_goal_contract.meets_primary_performance_targets",
+                "overlay_audit": {
+                    "accepted_count": len(applied["accepted"]),
+                    "blocked_new_count": applied["blocked_new_count"],
+                    "half_size_count": applied["half_size_count"],
+                },
+            }
+        )
+
+    passed = [row for row in rows if row["dual_pass_50_15"]]
+    ranked = sorted(
+        rows,
+        key=lambda r: (
+            1 if r["empty_selection"] else 0,
+            abs(float(r["full_path_mdd_pct"] or 99.0)),
+            -float(r["full_path_return_pct"] or -999.0),
+        ),
+    )
+    return {
+        "schema": REPORT_SCHEMA,
+        "stage_goal_id": stage_goal_id,
+        "development_only": True,
+        "promotable": False,
+        "automatic_trading_allowed": goal.AUTOMATIC_TRADING_ALLOWED,
+        "target_rolling_12m_net_return_pct": goal.TARGET_ROLLING_12M_NET_RETURN_PCT,
+        "target_max_drawdown_pct": goal.TARGET_MAX_DRAWDOWN_PCT,
+        "variant_count": len(rows),
+        "failed_ids_excluded": sorted(banned),
+        "base_id": base_id,
+        "base_selected_count": len(selected),
+        "dual_pass_ids": [row["candidate_id"] for row in passed],
+        "current_development_candidate": (
+            passed[0]["candidate_id"] if passed else None
+        ),
+        "best_by_mdd_then_return": ranked[0]["candidate_id"] if ranked else None,
+        "fifty_fifteen_met": bool(passed),
+        "variants": rows,
+    }
+
+
+def score_clip_round(
+    train_trades: list[dict[str, Any]],
+    *,
+    variants: tuple[dict[str, Any], ...] | None = None,
+    excluded_ids: frozenset[str] | None = None,
+    stage_goal_id: str = "path-a-3y-clip-round/v1",
+) -> dict[str, Any]:
+    """Score tag-clip kernels / skip filters on already-loaded trades."""
+
+    chosen = variants or iter_clip_round_variants()
+    banned = (
+        excluded_ids
+        if excluded_ids is not None
+        else (
+            FAILED_OVERLAY_IDS
+            | FAILED_BOOK_IDS
+            | FAILED_COMBO_IDS
+            | FAILED_COMBO_OVERLAY_IDS
+        )
+    )
+    ids = [str(row["candidate_id"]) for row in chosen]
+    overlap = set(ids) & set(banned)
+    if overlap:
+        raise PathA3yBookRoundError(f"round reuses already-failed ids: {sorted(overlap)}")
+    rows: list[dict[str, Any]] = []
+    for variant in chosen:
+        kernel = merged_kernel(variant)
+        skip_tags = tuple(variant.get("skip_tags") or ())
+        try:
+            selected = p0._select_kernel_trades(train_trades, kernel_override=kernel)
+            if skip_tags:
+                skip = set(skip_tags)
+                selected = [
+                    trade
+                    for trade in selected
+                    if not (set(trade.get("signal_tags") or []) & skip)
+                ]
+            if not selected:
+                raise p0.PathAP0Error("clip selection empty")
+            metrics = p0._metrics_bundle(selected)
+            empty = False
+        except p0.PathAP0Error:
+            selected = []
+            metrics = p0._metrics_bundle([])
+            empty = True
+        full_ret = metrics.get("portfolio_compounded_return_pct")
+        full_mdd = metrics.get("portfolio_max_drawdown_pct")
+        dual = False if empty else _dual_pass(full_ret, full_mdd)
+        rows.append(
+            {
+                "candidate_id": variant["candidate_id"],
+                "role": variant["role"],
+                "rationale": variant["rationale"],
+                "base_id": variant.get("base_id"),
+                "skip_tags": list(skip_tags),
+                "kernel": {
+                    "top_n": kernel["top_n"],
+                    "max_active_positions": kernel["max_active_positions"],
+                    "symbol_cooldown_days": kernel["symbol_cooldown_days"],
+                    "market_levels": list(kernel["market_levels"]),
+                    "required_signal_tags": list(kernel["required_signal_tags"]),
+                    "excluded_signal_tags": list(kernel["excluded_signal_tags"]),
+                },
+                "development_only": True,
+                "promotable": False,
+                "automatic_trading_allowed": goal.AUTOMATIC_TRADING_ALLOWED,
+                "empty_selection": empty,
+                "full_path_return_pct": full_ret,
+                "full_path_mdd_pct": full_mdd,
+                "latest_1y_return_pct": metrics.get("rolling_1y_latest_return_pct"),
+                "latest_1y_mdd_pct": metrics.get("rolling_1y_latest_max_drawdown_pct"),
+                "selected_trade_count": metrics.get("selected_trade_count"),
+                "dual_pass_50_15": dual,
+                "dual_pass_via": "research_goal_contract.meets_primary_performance_targets",
+            }
+        )
+
+    passed = [row for row in rows if row["dual_pass_50_15"]]
+    ranked = sorted(
+        rows,
+        key=lambda r: (
+            1 if r["empty_selection"] else 0,
+            abs(float(r["full_path_mdd_pct"] or 99.0)),
+            -float(r["full_path_return_pct"] or -999.0),
+        ),
+    )
+    return {
+        "schema": REPORT_SCHEMA,
+        "stage_goal_id": stage_goal_id,
+        "development_only": True,
+        "promotable": False,
+        "automatic_trading_allowed": goal.AUTOMATIC_TRADING_ALLOWED,
+        "target_rolling_12m_net_return_pct": goal.TARGET_ROLLING_12M_NET_RETURN_PCT,
+        "target_max_drawdown_pct": goal.TARGET_MAX_DRAWDOWN_PCT,
+        "variant_count": len(rows),
+        "failed_ids_excluded": sorted(banned),
         "dual_pass_ids": [row["candidate_id"] for row in passed],
         "current_development_candidate": (
             passed[0]["candidate_id"] if passed else None
@@ -122,6 +359,7 @@ def build_path_a_3y_book_round(
     repo_root: Path | None = None,
     qualified_trades_path: Path | None = None,
     require_local_research: bool = True,
+    family: str = "book",
 ) -> dict[str, Any]:
     if require_local_research:
         role = os.getenv("VPS_RUNTIME_ROLE", "")
@@ -142,7 +380,22 @@ def build_path_a_3y_book_round(
     if meta.get("source_version") != "jiaoch-daily-bars/shares-cny/v2":
         raise PathA3yBookRoundError("3y QT is not Jiaoch stk_mins v2")
     train_trades = train_replay._filter_train_trades(list(qt.get("qualified_trades") or []))
-    report = score_book_round(train_trades)
+    chosen = str(family or "book").strip().casefold()
+    if chosen == "combo":
+        report = score_book_round(
+            train_trades,
+            variants=iter_combo_round_variants(),
+            excluded_ids=FAILED_OVERLAY_IDS | FAILED_BOOK_IDS,
+            stage_goal_id="path-a-3y-combo-round/v1",
+        )
+    elif chosen == "book":
+        report = score_book_round(train_trades)
+    elif chosen == "combo_overlay":
+        report = score_combo_overlay_round(train_trades)
+    elif chosen == "clip":
+        report = score_clip_round(train_trades)
+    else:
+        raise PathA3yBookRoundError(f"unknown family: {family!r}")
     report["qualified_trades_path"] = str(qt_path)
     report["source_policy"] = meta.get("source_policy")
     report["source_version"] = meta.get("source_version")

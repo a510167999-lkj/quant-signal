@@ -37,13 +37,14 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 - 2026-08-12 已用 Jiaoch `stk_mins` 合成日线回填约 733 个交易日 / 约 5284 只；不是“没采过”。
 - 单位、QFQ、frozen fail-closed、frozen-v3 coverage-audit 锚已修。coverage-audit 只证明“可以开采集门”，不等于 3 年研究输入已干净。
 
-**当前阶段 ID**：`path-a-3y-book-round/v1`（选股/仓位书变体已计分；**50/15 未达成**）
+**当前阶段 ID**：`path-a-3y-clip-round/v1`（未达成不结束；继续迭代直到滚动 12 月也双过）
 
 1. 隔离缓存 `data/research_cache/jiaoch_stk_mins_3y_v2/`：191/191 股票 v2 GREEN。
 2. 3 年 QT：`data/research_cache/qualified_hold5_stop5_3y_jiaoch.json`。
-3. Overlay-only 7 变体已失败。本轮改冻结 6 个 **book** 变体（top_n / 槽位 / 冷却 / favorable-only / volume_confirmed），id 与失败 overlay 七件套不相交。
-4. 双过一律走 `meets_primary_performance_targets`。**无一双过 50/15**。
-5. 最好 MDD：`book_t2_m1` / `book_t1_m1` 全路径 **41.82% / -19.24%**。`book_vol_confirm` 收益 70.21%，MDD -22.59%。development-only，非正式有效。
+3. Overlay-7、book-6、combo-6、combo_overlay-5 均未双过。硬回撤阻断会把收益打残，有时 MDD 更差。
+4. 最近的 combo 书是 `combo_vol_t2_m1`：全路径 **50.83% / -18.96%**。
+5. clip 轮：在该书上跳过信号日 `rsi_repair`（不补位）→ `clip_skip_rsi_repair` 全路径 **65.29% / -14.73%**，本轮计分器双过。`clip_skip_rsi_advlt50` 全路径 **71.12% / -14.73%** 也双过。
+6. **最新滚动 1y 仍未过 50%**（`clip_skip_rsi_repair` 26.87% / -14.73%）。development-only，191 只当前池切片，非正式有效，不自动交易。下一刀：抬最近 12 月收益，MDD 继续压在 15% 内。
 
 **明确不做**
 
