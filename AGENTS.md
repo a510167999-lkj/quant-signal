@@ -37,12 +37,14 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 - 2026-08-12 已用 Jiaoch `stk_mins` 合成日线回填约 733 个交易日 / 约 5284 只；不是“没采过”。
 - 单位、QFQ、frozen fail-closed、frozen-v3 coverage-audit 锚已修。coverage-audit 只证明“可以开采集门”，不等于 3 年研究输入已干净。
 
-**当前阶段 ID**：`path-a-3y-volclip-holdout-xl/v1`（1667 只 Jiaoch holdout，冻结规则仍 **未过**）
+**当前阶段 ID**：`path-a-locked-split/v1` + `path-a-protocol-baseline/v1`
 
-1. 冻结 `vol_skip_rsi_adv_s85` 规格未改。191 切片 100.64% / -14.65% 只是挖参样本。
-2. 397 只 holdout：11.73% / -20.44%。
-3. 扩到 **1667** 只（今日 Jiaoch 本地换算，拒绝 AKShare / 过期 SQLite）：**-34.50% / -38.07%**，最新 1y **-22.14% / -22.22%**，78 笔。
-4. 宇宙越大越差。不能再对着 191 调参。下一刀若继续，必须先划定训练集/holdout，再在 train 上找规则。禁止 AKShare，禁止改 50/15。
+计划已改序。50/15 未改。`vol_skip_rsi_adv_s85` 降级为 **rejected_slice_hypothesis**，禁止回 191 调参。
+
+1. **协议**（`app/factor_v3_path_a_research_protocol.py`）：train `2023-07-03..2025-06-30`，holdout `2025-07-01..2026-07-03`。搜索宇宙 = Jiaoch v2 holdout，不是 191 成交切片。双过 = **最新滚动 12 月收益 ≥50%** 且 **该分区 MDD ≤15%**。全路径收益只做诊断，不当年化。
+2. **预注册基线**（无事后 skip、无 0.85 仓）在 1667 只 holdout QT 上：**holdout 全灭**。`proto_t2_m1` 最好 MDD 仍 **-23.97%**，最新 1y **-20.61%**。
+3. 过期 Jiaoch SQLite 补拉仍在跑（约 2043 只），只当宇宙建设，不拿来救 s85。
+4. 禁止 AKShare。不自动交易。非正式有效。下一刀若挖规则：只准看 train，holdout 密封到写进协议的变体打完再开。
 
 **明确不做**
 
