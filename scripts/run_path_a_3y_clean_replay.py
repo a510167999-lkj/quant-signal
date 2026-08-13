@@ -325,8 +325,18 @@ def cmd_qualified(repo: Path, output_root: Path, args: argparse.Namespace) -> in
         for row in targets
         if cache_ok(cache_path(cache_dir, "a", row["symbol"])) is None
     ]
-    if missing:
+    if missing and not args.skip_missing:
         print("REFILL incomplete, missing", len(missing), "e.g.", missing[:8], flush=True)
+        return 3
+    if missing:
+        print("WARN skip missing Jiaoch v2 cache:", len(missing), missing, flush=True)
+        targets = [
+            row
+            for row in targets
+            if cache_ok(cache_path(cache_dir, "a", row["symbol"])) is not None
+        ]
+    if not targets:
+        print("no cache_ok targets", flush=True)
         return 3
     provider = JiaochMarketDataProvider()
     settings = Settings()
@@ -408,6 +418,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--qualified-trades-output", type=Path, default=DEFAULT_QT_PATH)
     parser.add_argument("--qualified-trades-path", type=Path, default=DEFAULT_QT_PATH)
     parser.add_argument("--allow-any-role", action="store_true")
+    parser.add_argument(
+        "--skip-missing",
+        action="store_true",
+        help="Drop names without Jiaoch v2 cache instead of failing qualified.",
+    )
     parser.add_argument(
         "command",
         choices=("diagnose", "refill", "qualified", "replay-p0"),
