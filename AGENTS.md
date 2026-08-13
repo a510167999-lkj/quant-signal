@@ -37,14 +37,12 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 - 2026-08-12 已用 Jiaoch `stk_mins` 合成日线回填约 733 个交易日 / 约 5284 只；不是“没采过”。
 - 单位、QFQ、frozen fail-closed、frozen-v3 coverage-audit 锚已修。coverage-audit 只证明“可以开采集门”，不等于 3 年研究输入已干净。
 
-**当前阶段 ID**：`path-a-3y-volclip-round/v1`（全路径 + 最新 12 月首次同时双过；非正式有效）
+**当前阶段 ID**：`path-a-3y-volclip-freeze/v1`（规则已冻；shadow OOS 空仓；holdout 补拉进行中）
 
-1. 隔离缓存 `data/research_cache/jiaoch_stk_mins_3y_v2/`：191/191 股票 v2 GREEN。
-2. 3 年 QT：`data/research_cache/qualified_hold5_stop5_3y_jiaoch.json`。
-3. Overlay / 硬回撤阻断失败。clip 轮 `clip_skip_rsi_repair` 全路径双过，但最新 12 月只有 26.9%。
-4. volclip：在 `book_vol_confirm` 上跳过 `rsi_repair` + `breadth_advancing_lt_50`（不补位），再乘固定仓位 0.85。
-5. 当前 development 候选 **`vol_skip_rsi_adv_s85`**：全路径 **100.64% / -14.65%**，最新 1y **62.62% / -13.72%**。双胞胎 `s87` 也双过。
-6. 198 个滚动窗 MDD 全过 15%；收益双过率约 43%。最差 12 月窗（2023-09..2024-09）约 **-6%**，不是每年都 50%。191 只切片、development-only、非正式有效、不自动交易。下一阶段才是独立 OOS / 更大宇宙。
+1. 冻结候选 **`vol_skip_rsi_adv_s85`**。zero-refit 复放全路径 **100.64% / -14.65%**，最新 1y **62.62% / -13.72%**，89 笔。spec sha `619c1e63…953d37`。
+2. Shadow OOS（17 笔，2026-07-06..07-29）**selected=0**：全部 cautious/defensive，规则要求 favorable/neutral。非正式 final-OOS。
+3. 更大宇宙：从当前池 4185 只非 191 切片名字里补拉 400 只 Jiaoch v2 holdout（`--slice holdout`）。补完再 QT + 同一冻结规格 zero-refit。
+4. 仍是 development-only。不注册生产 profile，不自动交易，不称有效。
 
 **明确不做**
 

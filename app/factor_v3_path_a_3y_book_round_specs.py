@@ -446,6 +446,14 @@ def iter_volclip_round_variants() -> tuple[dict[str, Any], ...]:
     return VOLCLIP_ROUND_VARIANTS
 
 
+FROZEN_VOLCLIP_CANDIDATE_ID = "vol_skip_rsi_adv_s85"
+FROZEN_VOLCLIP_VARIANT = next(
+    row
+    for row in VOLCLIP_ROUND_VARIANTS
+    if row["candidate_id"] == FROZEN_VOLCLIP_CANDIDATE_ID
+)
+
+
 def merged_kernel(variant: dict[str, Any]) -> dict[str, Any]:
     kernel = dict(SIGNAL_KERNEL)
     kernel["market_levels"] = list(SIGNAL_KERNEL["market_levels"])
@@ -467,6 +475,8 @@ __all__ = [
     "FAILED_COMBO_IDS",
     "FAILED_COMBO_OVERLAY_IDS",
     "FAILED_OVERLAY_IDS",
+    "FROZEN_VOLCLIP_CANDIDATE_ID",
+    "FROZEN_VOLCLIP_VARIANT",
     "SIGNAL_KERNEL",
     "STAGE_GOAL_ID",
     "VOLCLIP_ROUND_VARIANTS",

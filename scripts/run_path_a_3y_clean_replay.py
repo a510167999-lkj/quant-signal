@@ -132,6 +132,9 @@ def select_targets(
         missing = [symbol for symbol in traded if symbol not in by_symbol]
         if missing:
             print("WARN traded symbols dropped by goal filter:", len(missing), flush=True)
+    elif slice_name == "holdout":
+        traded_set = set(traded)
+        selected = [row for row in eligible if row["symbol"] not in traded_set]
     else:
         selected = list(eligible)
     if max_symbols > 0:
@@ -395,7 +398,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo-root", type=Path, default=ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
-    parser.add_argument("--slice", choices=("traded", "eligible"), default="traded")
+    parser.add_argument(
+        "--slice", choices=("traded", "eligible", "holdout"), default="traded"
+    )
     parser.add_argument("--max-symbols", type=int, default=0)
     parser.add_argument("--qualified-trades-output", type=Path, default=DEFAULT_QT_PATH)
     parser.add_argument("--qualified-trades-path", type=Path, default=DEFAULT_QT_PATH)
