@@ -37,13 +37,13 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 - 2026-08-12 已用 Jiaoch `stk_mins` 合成日线回填约 733 个交易日 / 约 5284 只；不是“没采过”。
 - 单位、QFQ、frozen fail-closed、frozen-v3 coverage-audit 锚已修。coverage-audit 只证明“可以开采集门”，不等于 3 年研究输入已干净。
 
-**当前阶段 ID**：`path-a-3y-drawdown-round/v1`（有限降回撤轮已计分；**50/15 未达成**）
+**当前阶段 ID**：`path-a-3y-book-round/v1`（选股/仓位书变体已计分；**50/15 未达成**）
 
 1. 隔离缓存 `data/research_cache/jiaoch_stk_mins_3y_v2/`：191/191 股票 v2 GREEN。
-2. 3 年 QT：`data/research_cache/qualified_hold5_stop5_3y_jiaoch.json`。Jiaoch ETF 分钟线只到 2020，market_level 用股票池宽度。
-3. `p0_loss_streak_3` 3 年复验未过（-28.23% / -33.90%）。
-4. 本轮 7 个冻结变体（e4 + 2 个 P0 锚 + 4 个新闸门）在同一 3 年 QT 上计分，双过一律走 `meets_primary_performance_targets`。**无一双过 50/15**。
-5. 本组最好 MDD：`p0_dd_block_15` 全路径 27.46% / **-21.78%**。e4 核 56.62% / -24.46%。`loss_streak_5` 收益 58.29%，回撤仍 -24.46%。development-only，非正式有效。
+2. 3 年 QT：`data/research_cache/qualified_hold5_stop5_3y_jiaoch.json`。
+3. Overlay-only 7 变体已失败。本轮改冻结 6 个 **book** 变体（top_n / 槽位 / 冷却 / favorable-only / volume_confirmed），id 与失败 overlay 七件套不相交。
+4. 双过一律走 `meets_primary_performance_targets`。**无一双过 50/15**。
+5. 最好 MDD：`book_t2_m1` / `book_t1_m1` 全路径 **41.82% / -19.24%**。`book_vol_confirm` 收益 70.21%，MDD -22.59%。development-only，非正式有效。
 
 **明确不做**
 
