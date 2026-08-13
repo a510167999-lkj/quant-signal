@@ -37,12 +37,12 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 - 2026-08-12 已用 Jiaoch `stk_mins` 合成日线回填约 733 个交易日 / 约 5284 只；不是“没采过”。
 - 单位、QFQ、frozen fail-closed、frozen-v3 coverage-audit 锚已修。coverage-audit 只证明“可以开采集门”，不等于 3 年研究输入已干净。
 
-**当前阶段 ID**：`path-a-3y-volclip-holdout/v1`（冻结规则在 397 只 Jiaoch holdout 上 **未过**）
+**当前阶段 ID**：`path-a-3y-volclip-holdout-xl/v1`（1667 只 Jiaoch holdout，冻结规则仍 **未过**）
 
-1. 冻结候选 **`vol_skip_rsi_adv_s85`** 在 191 只切片上 zero-refit：100.64% / -14.65%，最新 1y 62.62% / -13.72%。
-2. Shadow OOS 仍 selected=0（无 favorable/neutral）。
-3. Holdout：397 只与 191 不相交的 Jiaoch v2 名字。冻结规则 **11.73% / -20.44%**，最新 1y **-3.54% / -15.54%**，60 笔。全族 volclip / book **无一双过**。最好 MDD 是 `book_t2_m1` 30.86% / -17.31%。
-4. 结论：191 切片上的 50/15 **不能外推**。development-only，非正式有效。下一刀必须换更稳的规则或更大、仍 Jiaoch-only 的宇宙，禁止用 AKShare，禁止改 50/15。
+1. 冻结 `vol_skip_rsi_adv_s85` 规格未改。191 切片 100.64% / -14.65% 只是挖参样本。
+2. 397 只 holdout：11.73% / -20.44%。
+3. 扩到 **1667** 只（今日 Jiaoch 本地换算，拒绝 AKShare / 过期 SQLite）：**-34.50% / -38.07%**，最新 1y **-22.14% / -22.22%**，78 笔。
+4. 宇宙越大越差。不能再对着 191 调参。下一刀若继续，必须先划定训练集/holdout，再在 train 上找规则。禁止 AKShare，禁止改 50/15。
 
 **明确不做**
 

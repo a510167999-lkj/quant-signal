@@ -146,6 +146,46 @@ def cache_path(cache_dir: Path, market: str, symbol: str) -> Path:
     return cache_dir / f"{market}_{symbol}_{LOOKBACK_DAYS}_qfq.json"
 
 
+def _legacy_index(legacy_dir: Path) -> dict[str, Path]:
+    out: dict[str, Path] = {}
+    for path in legacy_dir.glob("a_*_*_qfq.json"):
+        parts = path.name.split("_")
+        if len(parts) < 3:
+            continue
+        symbol = parts[1]
+        if symbol not in out:
+            out[symbol] = path
+    return out
+
+
+def convert_legacy_jiaoch_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Rescale today's Jiaoch files to shares-cny/v2. Refuse AKShare/stale."""
+
+    source = str(payload.get("source") or "")
+    if "akshare" in source.casefold():
+        return None
+    if "stale" in source.casefold():
+        return None
+    if is_jiaoch_stk_mins_v2_source(source):
+        return payload
+    if "Jiaoch stk_mins daily qfq" not in source:
+        return None
+    records = []
+    for row in payload.get("records") or []:
+        item = dict(row)
+        if item.get("volume") is not None:
+            item["volume"] = float(item["volume"]) / 100.0
+        if item.get("amount") is not None:
+            item["amount"] = float(item["amount"]) / 1000.0
+        records.append(item)
+    return {
+        "source": f"Jiaoch stk_mins daily qfq; {JIAOCH_DAILY_CACHE_SOURCE_VERSION}",
+        "converted_from": source,
+        "unit_scale": {"volume": 0.01, "amount": 0.001},
+        "records": records,
+    }
+
+
 def cache_ok(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
@@ -307,6 +347,65 @@ def cmd_refill(repo: Path, output_root: Path, args: argparse.Namespace) -> int:
     return 0 if summary["error"] == 0 else 2
 
 
+def cmd_import_jiaoch(repo: Path, output_root: Path, args: argparse.Namespace) -> int:
+    cache_dir = (repo / args.cache_dir).resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    output_root.mkdir(parents=True, exist_ok=True)
+    eligible = load_eligible_universe(repo)
+    traded = load_traded_symbols(repo)
+    targets = select_targets(
+        eligible,
+        slice_name=args.slice,
+        max_symbols=args.max_symbols,
+        traded=traded,
+    )
+    legacy = _legacy_index(repo / "data/research_cache")
+    summary = {
+        "stage": STAGE_GOAL_ID,
+        "command": "import-jiaoch",
+        "slice": args.slice,
+        "planned": len(targets),
+        "already_ok": 0,
+        "converted": 0,
+        "copied_v2": 0,
+        "refused_akshare": 0,
+        "refused_other": 0,
+        "no_legacy": 0,
+        "cover_fail": 0,
+    }
+    for item in targets:
+        symbol = item["symbol"]
+        dest = cache_path(cache_dir, "a", symbol)
+        if cache_ok(dest) is not None:
+            summary["already_ok"] += 1
+            continue
+        src_path = legacy.get(symbol)
+        if src_path is None:
+            summary["no_legacy"] += 1
+            continue
+        payload = json.loads(src_path.read_text(encoding="utf-8"))
+        source = str(payload.get("source") or "")
+        if "akshare" in source.casefold():
+            summary["refused_akshare"] += 1
+            continue
+        converted = convert_legacy_jiaoch_payload(payload)
+        if converted is None:
+            summary["refused_other"] += 1
+            continue
+        dest.write_text(json.dumps(converted, ensure_ascii=False), encoding="utf-8")
+        if cache_ok(dest) is None:
+            dest.unlink(missing_ok=True)
+            summary["cover_fail"] += 1
+            continue
+        if is_jiaoch_stk_mins_v2_source(source):
+            summary["copied_v2"] += 1
+        else:
+            summary["converted"] += 1
+    write_json(str(output_root / "IMPORT_JIAOCHI.json"), summary)
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_qualified(repo: Path, output_root: Path, args: argparse.Namespace) -> int:
     os.environ.setdefault("VPS_RUNTIME_ROLE", "local_research")
     os.environ["RESEARCH_REQUIRE_JIAOCHI_STK_MINS_V2"] = "1"
@@ -425,7 +524,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "command",
-        choices=("diagnose", "refill", "qualified", "replay-p0"),
+        choices=("diagnose", "refill", "import-jiaoch", "qualified", "replay-p0"),
     )
     args = parser.parse_args(argv)
     repo = args.repo_root.resolve()
@@ -434,6 +533,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_diagnose(repo, output_root)
     if args.command == "refill":
         return cmd_refill(repo, output_root, args)
+    if args.command == "import-jiaoch":
+        return cmd_import_jiaoch(repo, output_root, args)
     if args.command == "qualified":
         return cmd_qualified(repo, output_root, args)
     return cmd_replay_p0(repo, output_root, args)

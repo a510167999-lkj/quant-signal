@@ -31,6 +31,29 @@ def test_frozen_volclip_spec_is_s85_and_immutable() -> None:
     ]
 
 
+def test_convert_legacy_jiaoch_refuses_akshare_and_rescales() -> None:
+    from scripts.run_path_a_3y_clean_replay import convert_legacy_jiaoch_payload
+
+    assert convert_legacy_jiaoch_payload(
+        {"source": "AKShare stock_zh_a_daily fallback", "records": []}
+    ) is None
+    assert convert_legacy_jiaoch_payload(
+        {"source": "Jiaoch SQLite daily cache stale fallback", "records": []}
+    ) is None
+    converted = convert_legacy_jiaoch_payload(
+        {
+            "source": "Jiaoch stk_mins daily qfq",
+            "records": [
+                {"date": "2023-07-03", "close": 4.42, "volume": 1000.0, "amount": 2000.0}
+            ],
+        }
+    )
+    assert converted is not None
+    assert converted["records"][0]["volume"] == 10.0
+    assert converted["records"][0]["amount"] == 2.0
+    assert "jiaoch-daily-bars/shares-cny/v2" in converted["source"]
+
+
 def test_holdout_slice_excludes_traded_names() -> None:
     eligible = [
         {"symbol": "000001", "name": "a"},
