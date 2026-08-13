@@ -75,6 +75,16 @@ def _daily_cache_source(adjust: str, *, stale: bool = False) -> str:
     return f"Jiaoch {transport} {basis}; {JIAOCH_DAILY_CACHE_SOURCE_VERSION}"
 
 
+def is_jiaoch_stk_mins_v2_source(source: str) -> bool:
+    text = str(source or "")
+    return (
+        "Jiaoch stk_mins daily" in text
+        and JIAOCH_DAILY_CACHE_SOURCE_VERSION in text
+        and "stale" not in text
+        and "AKShare" not in text
+    )
+
+
 def _canonical_json(value: Any) -> bytes:
     try:
         return json.dumps(
@@ -568,7 +578,10 @@ class JiaochMarketDataProvider:
                     },
                     fields=ADJ_FACTOR_FIELDS,
                 )
-                frame = _apply_qfq(frame, factor_rows, expected_code=ts_code)
+                if factor_rows:
+                    frame = _apply_qfq(frame, factor_rows, expected_code=ts_code)
+                elif market != "etf":
+                    raise JiaochLiveMarketError("Jiaoch adj_factor returned no rows")
             frame = _trim_frame(frame, start_date, end_date)
             source = _daily_cache_source(adjust)
             self._write_cache(normalized, market, adjust, frame, source)

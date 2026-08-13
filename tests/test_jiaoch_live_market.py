@@ -157,6 +157,54 @@ def test_history_uses_causal_qfq_and_jiaoch_source_only(monkeypatch):
     assert source == _daily_cache_source("qfq")
     assert frame.iloc[0]["close"] < frame.iloc[-1]["close"]
     assert frame.iloc[0]["volume"] == 1234
+
+
+def test_history_allows_identity_qfq_when_etf_adj_factor_is_empty(monkeypatch):
+    minutes = _minute_rows(code="510300.SH")
+
+    class Client:
+        def fetch_stk_mins(self, *, ts_code, start_date, end_date, freq):
+            assert ts_code == "510300.SH"
+            return minutes
+
+        def fetch(self, api_name, *, params, fields):
+            assert api_name == "adj_factor"
+            return []
+
+    monkeypatch.setattr("app.jiaoch_live_market._date_strings", lambda _: ("20250101", "20250430"))
+    provider = JiaochMarketDataProvider(
+        client=Client(),
+        now_provider=lambda: datetime(2025, 5, 1, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    frame, source = provider.history("510300", "etf", lookback_days=90, adjust="qfq")
+    assert len(frame) == 80
+    assert source == _daily_cache_source("qfq")
+    assert float(frame.iloc[-1]["close"]) == pytest.approx(10.2 + 79 * 0.01)
+
+
+def test_history_allows_identity_qfq_when_etf_adj_factor_is_empty(monkeypatch):
+    minutes = _minute_rows(code="510300.SH")
+
+    class Client:
+        def fetch_stk_mins(self, *, ts_code, start_date, end_date, freq):
+            assert ts_code == "510300.SH"
+            return minutes
+
+        def fetch(self, api_name, *, params, fields):
+            assert api_name == "adj_factor"
+            return []
+
+    monkeypatch.setattr("app.jiaoch_live_market._date_strings", lambda _: ("20250101", "20250430"))
+    provider = JiaochMarketDataProvider(
+        client=Client(),
+        now_provider=lambda: datetime(2025, 5, 1, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    frame, source = provider.history("510300", "etf", lookback_days=90, adjust="qfq")
+    assert len(frame) == 80
+    assert source == _daily_cache_source("qfq")
+    assert float(frame.iloc[-1]["close"]) == pytest.approx(10.2 + 79 * 0.01)
     assert frame.iloc[0]["amount"] == pytest.approx(100_001.25)
 
 

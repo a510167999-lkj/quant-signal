@@ -37,12 +37,12 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 - 2026-08-12 已用 Jiaoch `stk_mins` 合成日线回填约 733 个交易日 / 约 5284 只；不是“没采过”。
 - 单位、QFQ、frozen fail-closed、frozen-v3 coverage-audit 锚已修。coverage-audit 只证明“可以开采集门”，不等于 3 年研究输入已干净。
 
-**当前阶段 ID**：`path-a-3y-clean-replay/v1`
+**当前阶段 ID**：`path-a-3y-clean-replay/v1`（traded 切片已完成）
 
-1. 研究缓存只保留 Jiaoch `stk_mins` 合成日线；AKShare / stale SQLite 退出正式研究路径。
-2. 对缺 2023–2025 覆盖的标的限频补拉，目标是研究能用的日覆盖（约 95%）。**不建全新 v3 store，不复制旧 attempts，不做 offline rebind。**
-3. 用修好的单位/QFQ 重出 3 年 qualified trades。
-4. 只复验 `p0_loss_streak_3`。过了就冻住；不过再开一小轮降回撤，不再开新权威链。
+1. 隔离缓存 `data/research_cache/jiaoch_stk_mins_3y_v2/`：191/191 股票 v2 GREEN。
+2. 3 年 QT：`data/research_cache/qualified_hold5_stop5_3y_jiaoch.json`。Jiaoch ETF 分钟线只到 2020，market_level 用股票池宽度。
+3. `p0_loss_streak_3` 3 年复验 **未过**（-28.2% / -33.9%）。e4 核 56.6% / -24.5%。
+4. 下一步只做一小轮降回撤，不再开新权威链。
 
 **明确不做**
 

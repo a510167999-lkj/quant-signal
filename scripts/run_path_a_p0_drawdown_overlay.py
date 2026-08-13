@@ -26,6 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo-root", type=Path, default=ROOT)
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--allow-any-role", action="store_true")
+    parser.add_argument("--qualified-trades-path", type=Path, default=None)
     args = parser.parse_args(argv)
 
     repo = args.repo_root.resolve()
@@ -34,6 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     report = build_path_a_p0_drawdown_overlay(
         repo_root=repo,
         require_local_research=not args.allow_any_role,
+        qualified_trades_path=args.qualified_trades_path,
     )
     output_root = (
         args.output_root

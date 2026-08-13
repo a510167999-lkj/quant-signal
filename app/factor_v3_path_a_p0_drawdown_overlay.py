@@ -455,6 +455,7 @@ def build_path_a_p0_drawdown_overlay(
     *,
     repo_root: Path | None = None,
     require_local_research: bool = True,
+    qualified_trades_path: Path | None = None,
 ) -> dict[str, Any]:
     if require_local_research:
         role = _require_local_research()
@@ -487,7 +488,11 @@ def build_path_a_p0_drawdown_overlay(
     if list(card_spec.get("market_levels") or []) != kernel["market_levels"]:
         raise PathAP0Error("signal kernel market_levels drifted from frozen card")
 
-    qt_path = root / DEFAULT_QUALIFIED_TRADES
+    qt_path = (
+        Path(qualified_trades_path).resolve()
+        if qualified_trades_path is not None
+        else (root / DEFAULT_QUALIFIED_TRADES)
+    )
     qt = train_replay._load_json(qt_path)
     if qt is None:
         raise PathAP0Error("qualified trades missing")

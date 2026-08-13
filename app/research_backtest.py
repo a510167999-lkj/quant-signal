@@ -994,27 +994,40 @@ def run_candidate_research_backtest(
     max_prior_avg_adverse: float = None,
     use_margin_eligibility_context: bool = False,
     include_qualified_trades: bool = False,
+    universe_items: List[Dict[str, Any]] | None = None,
+    end_date: str | None = None,
+    require_jiaoch_stk_mins_v2: bool = False,
+    market_context_mode: str = "etf_proxy",
 ) -> Dict[str, Any]:
-    snapshot = _load_snapshot(settings, use_live_snapshot)
-    candidates = select_deep_scan_candidates(
-        snapshot=snapshot,
-        max_deep=max_deep,
-        min_amount=settings.scan_min_amount,
-        min_price=settings.scan_min_price,
-        max_price=settings.scan_max_price,
-    )
+    if universe_items is not None:
+        candidates = list(universe_items)
+    else:
+        snapshot = _load_snapshot(settings, use_live_snapshot)
+        candidates = select_deep_scan_candidates(
+            snapshot=snapshot,
+            max_deep=max_deep,
+            min_amount=settings.scan_min_amount,
+            min_price=settings.scan_min_price,
+            max_price=settings.scan_max_price,
+        )
+
+    if market_context_mode not in {"etf_proxy", "stock_breadth"}:
+        raise ValueError(f"unsupported market_context_mode: {market_context_mode}")
+    use_stock_breadth = market_context_mode == "stock_breadth"
 
     proxy_frames = []
-    for proxy in MARKET_PROXY_SYMBOLS:
-        frame, _source = _history_with_file_cache(
-            provider,
-            proxy["market"],
-            proxy["symbol"],
-            lookback_days,
-            "qfq",
-            cache_dir,
-        )
-        proxy_frames.append(add_indicators(frame))
+    if not use_stock_breadth:
+        for proxy in MARKET_PROXY_SYMBOLS:
+            frame, _source = _history_with_file_cache(
+                provider,
+                proxy["market"],
+                proxy["symbol"],
+                lookback_days,
+                "qfq",
+                cache_dir,
+                require_jiaoch_stk_mins_v2=require_jiaoch_stk_mins_v2,
+            )
+            proxy_frames.append(add_indicators(frame))
 
     all_trades: List[Dict[str, Any]] = []
     by_signal_date: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -1047,14 +1060,41 @@ def run_candidate_research_backtest(
             margin_fetch_errors += 1
             errors.append({"stage": "margin_eligibility_context", "message": str(exc)})
 
+    prepared: List[tuple[int, Dict[str, Any], pd.DataFrame]] = []
     for position, candidate in enumerate(candidates, 1):
         symbol = candidate.get("symbol")
         try:
             frame, _source = _history_with_file_cache(
-                provider, "a", symbol, lookback_days, "qfq", cache_dir
+                provider,
+                "a",
+                symbol,
+                lookback_days,
+                "qfq",
+                cache_dir,
+                require_jiaoch_stk_mins_v2=require_jiaoch_stk_mins_v2,
             )
             frame = add_indicators(frame)
             fetched_symbols += 1
+            prepared.append((position, candidate, frame))
+        except Exception as exc:
+            errors.append({"symbol": symbol, "name": candidate.get("name"), "message": str(exc)})
+
+    breadth_by_date: Dict[str, Dict[str, Any]] = {}
+    if use_stock_breadth:
+        symbol_frames = {
+            str(candidate.get("symbol")): {"frame": frame, "base": candidate}
+            for _, candidate, frame in prepared
+        }
+        breadth_by_date = _historical_market_breadth(
+            symbol_frames,
+            start_date,
+            hold_days,
+            universe_source=None,
+        )
+
+    for position, candidate, frame in prepared:
+        symbol = candidate.get("symbol")
+        try:
             announcement_items: List[Dict[str, Any]] = []
             if use_announcement_context:
                 announcement_start = (
@@ -1114,6 +1154,8 @@ def run_candidate_research_backtest(
                 prior_outcomes.append(realized)
                 if signal_date < start_date:
                     continue
+                if end_date is not None and signal_date > end_date:
+                    continue
 
                 matured_prior = [item for item in prior_outcomes if item["exit_date"] < signal_date]
                 quality = _quality_from_prior(matured_prior, settings)
@@ -1132,17 +1174,30 @@ def run_candidate_research_backtest(
                 ):
                     continue
                 if signal_date not in market_cache:
-                    market_cache[signal_date] = _historical_market_context(
-                        proxy_frames, signal_date
-                    )
+                    if use_stock_breadth:
+                        market_cache[signal_date] = _stock_breadth_market_context(
+                            breadth_by_date.get(signal_date) or {}
+                        )
+                    else:
+                        market_cache[signal_date] = _historical_market_context(
+                            proxy_frames, signal_date
+                        )
                 market_context = market_cache[signal_date]
-                if signal_date not in proxy_return_cache:
-                    proxy_return_cache[signal_date] = _historical_proxy_returns(
-                        proxy_frames, signal_date
+                if market_context.get("allow_buy") is False:
+                    continue
+                if use_stock_breadth:
+                    relative_strength = _stock_relative_strength_context(
+                        frame.iloc[index],
+                        _stock_market_returns(breadth_by_date.get(signal_date) or {}),
                     )
-                relative_strength = _relative_strength_context(
-                    frame.iloc[index], proxy_return_cache[signal_date]
-                )
+                else:
+                    if signal_date not in proxy_return_cache:
+                        proxy_return_cache[signal_date] = _historical_proxy_returns(
+                            proxy_frames, signal_date
+                        )
+                    relative_strength = _relative_strength_context(
+                        frame.iloc[index], proxy_return_cache[signal_date]
+                    )
                 if required_market_levels and market_context["level"] not in required_market_levels:
                     continue
                 allowed_actions = {"BUY"} if buy_only else {"BUY", "WATCH"}
@@ -1163,6 +1218,11 @@ def run_candidate_research_backtest(
                     set(
                         _signal_tags(signal)
                         + list(relative_strength.get("tags") or [])
+                        + list(
+                            (breadth_by_date.get(signal_date) or {}).get("tags") or []
+                            if use_stock_breadth
+                            else []
+                        )
                         + build_candidate_context_tags(candidate_for_tags, quality)
                     )
                 )
@@ -1378,12 +1438,13 @@ def run_candidate_research_backtest(
         else None,
         "portfolio_max_drawdown_pct": _max_drawdown_pct(equity_curve) if basket_returns else None,
         "rolling_1y": rolling_1y,
-        "hs300etf_buy_hold_pct": round(
-            _benchmark_return(provider, "510300", start_date, lookback_days), 2
-        ),
-        "cybetf_buy_hold_pct": round(
-            _benchmark_return(provider, "159915", start_date, lookback_days), 2
-        ),
+        "market_context_mode": market_context_mode,
+        "hs300etf_buy_hold_pct": None
+        if use_stock_breadth
+        else round(_benchmark_return(provider, "510300", start_date, lookback_days), 2),
+        "cybetf_buy_hold_pct": None
+        if use_stock_breadth
+        else round(_benchmark_return(provider, "159915", start_date, lookback_days), 2),
     }
     return {
         "summary": summary,
