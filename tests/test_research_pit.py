@@ -936,6 +936,9 @@ def test_historical_candidate_map_uses_one_batch_membership_query_per_date():
 def test_historical_candidate_map_fails_closed_on_audited_batch_membership_error():
     class BrokenAuditedMembership:
         is_audited_store_artifact = True
+
+        def close(self):
+            pass
         start_date = "2024-01-01"
 
         def items_as_of(self, _signal_date):
@@ -1208,6 +1211,72 @@ def test_audited_backtest_closes_universe_when_history_fetch_fails(tmp_path, mon
             expected_temporal_role="development",
         )
     assert universe.closed is True
+
+
+def test_indicator_failure_is_not_mislabeled_as_pit_history_gap(tmp_path, monkeypatch):
+    class Universe:
+        start_date = "2023-08-25"
+        end_date = "2024-01-04"
+        is_audited_store_artifact = True
+
+        def close(self):
+            pass
+
+        def items_as_of(self, signal_date):
+            return []
+
+        def open_sessions(self, start_date, end_date):
+            return pd.bdate_range(start_date, end_date).strftime("%Y-%m-%d").tolist()
+
+    universe = Universe()
+
+    class ArtifactAdapter:
+        def __init__(self, value, **kwargs):
+            assert value is universe
+
+        def signal_frame(self, symbol, start_date, as_of_date):
+            return _frame()
+
+    monkeypatch.setattr(research_backtest, "ArtifactNativeReplayAdapter", ArtifactAdapter)
+    monkeypatch.setattr(
+        research_backtest,
+        "_resolve_historical_universe",
+        lambda *args, **kwargs: (
+            [{"symbol": "600001", "market": "a", "name": "历史股票"}],
+            universe,
+        ),
+    )
+    monkeypatch.setattr(
+        research_backtest,
+        "load_temporal_partition_contract",
+        lambda path: {"contract_sha256": "c" * 64},
+    )
+    monkeypatch.setattr(research_backtest, "assert_range_allowed", lambda *args: None)
+    monkeypatch.setattr(
+        research_backtest,
+        "add_indicators",
+        lambda frame: (_ for _ in ()).throw(RuntimeError("indicator fixture failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="indicator fixture failed"):
+        run_historical_universe_research_backtest(
+            settings=_Settings(),
+            provider=object(),
+            start_date="2024-01-02",
+            end_date="2024-01-04",
+            max_deep=10,
+            top_n=1,
+            hold_days=1,
+            lookback_days=20,
+            max_universe_symbols=0,
+            cache_dir=str(tmp_path / "cache"),
+            audited_pit_universe_path="unused-by-monkeypatch",
+            expected_coverage_audit_sha256="a" * 64,
+            expected_artifact_root_sha256="b" * 64,
+            temporal_contract_path="synthetic-contract",
+            expected_temporal_contract_sha256="c" * 64,
+            expected_temporal_role="development",
+        )
 
 
 def test_prior_quality_membership_rejects_uncovered_nonmember_and_historical_st():

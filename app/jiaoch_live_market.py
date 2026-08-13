@@ -51,6 +51,7 @@ ADJ_FACTOR_FIELDS = ("ts_code", "trade_date", "adj_factor")
 BAK_BASIC_FIELDS = ("trade_date", "ts_code", "name", "industry", "list_date")
 # stk_mins minute bars (used to synthesize daily OHLCV when /daily is empty).
 STK_MINS_FIELDS = ("ts_code", "trade_time", "open", "close", "high", "low", "vol", "amount")
+JIAOCH_DAILY_CACHE_SOURCE_VERSION = "jiaoch-daily-bars/shares-cny/v2"
 _MAX_BODY_BYTES = 32 * 1024 * 1024
 _MAX_ROWS = 10_000
 _TOKEN_ENV_BY_SLOT = {
@@ -66,6 +67,12 @@ _API_SLOT = {
 
 class JiaochLiveMarketError(MarketDataError):
     """Stable fail-closed error for the runtime Jiaoch adapter."""
+
+
+def _daily_cache_source(adjust: str, *, stale: bool = False) -> str:
+    basis = "qfq" if adjust == "qfq" else "raw"
+    transport = "SQLite daily cache stale fallback" if stale else "stk_mins daily"
+    return f"Jiaoch {transport} {basis}; {JIAOCH_DAILY_CACHE_SOURCE_VERSION}"
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -379,7 +386,9 @@ def _aggregate_daily_from_minutes(
     """Aggregate stk_mins 5-minute bars into daily OHLCV rows (DAILY_FIELDS format).
 
     For each trading day: open = first bar's open, close = last bar's close,
-    high/low = max/min across all bars, vol/amount = sum.
+    high/low = max/min across all bars. ``stk_mins`` shares/CNY totals are
+    converted to the lots/thousand-CNY input contract consumed by
+    :func:`_daily_frame`.
     """
 
     by_date: dict[str, list[dict[str, Any]]] = {}
@@ -423,8 +432,10 @@ def _aggregate_daily_from_minutes(
             "pre_close": pre_close,
             "change": change,
             "pct_chg": pct_chg,
-            "vol": sum(vols),
-            "amount": sum(amounts),
+            # _daily_frame consumes the Tushare daily units (lots and thousand
+            # CNY), while stk_mins exposes shares and CNY.
+            "vol": sum(vols) / 100.0,
+            "amount": sum(amounts) / 1000.0,
         })
         prev_close = day_close
     return daily
@@ -559,7 +570,7 @@ class JiaochMarketDataProvider:
                 )
                 frame = _apply_qfq(frame, factor_rows, expected_code=ts_code)
             frame = _trim_frame(frame, start_date, end_date)
-            source = "Jiaoch stk_mins daily qfq" if adjust == "qfq" else "Jiaoch stk_mins daily raw"
+            source = _daily_cache_source(adjust)
             self._write_cache(normalized, market, adjust, frame, source)
         except Exception as exc:
             cached = self._read_cache(
@@ -574,7 +585,7 @@ class JiaochMarketDataProvider:
                     raise
                 raise JiaochLiveMarketError("Jiaoch live history request failed") from exc
             frame, source = cached
-            source = "Jiaoch SQLite daily cache stale fallback"
+            source = _daily_cache_source(adjust, stale=True)
         with self._memory_lock:
             self._cache[key] = (
                 frame.copy(),
@@ -720,7 +731,7 @@ class JiaochMarketDataProvider:
         if len(rows) < 60:
             return None
         sources = {str(row[7] or "").strip() for row in rows}
-        if not sources or any(not value.lower().startswith("jiaoch") for value in sources):
+        if sources != {_daily_cache_source(adjust)}:
             return None
         frame = pd.DataFrame(
             [row[:7] for row in rows],
@@ -786,6 +797,7 @@ __all__ = (
     "ADJ_FACTOR_FIELDS",
     "BAK_BASIC_FIELDS",
     "DAILY_FIELDS",
+    "JIAOCH_DAILY_CACHE_SOURCE_VERSION",
     "JiaochHttpClient",
     "JiaochLiveMarketError",
     "JiaochMarketDataProvider",

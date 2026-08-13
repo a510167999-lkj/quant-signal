@@ -1533,13 +1533,15 @@ def _run_historical_universe_research_backtest_resolved(
                 )
                 if analysis_end_date:
                     frame = frame[frame["date"] <= analysis_end_date].copy()
+        except Exception as exc:
+            if pit_universe is not None:
+                raise ValueError(
+                    f"PIT universe history is incomplete for {symbol}: {exc}"
+                ) from exc
+            errors.append({"symbol": symbol, "name": item.get("name"), "message": str(exc)})
+        else:
             symbol_frames[str(symbol)] = {"base": item, "frame": add_indicators(frame)}
             fetched_symbols += 1
-        except Exception as exc:
-            # Tolerate individual symbol history gaps (e.g. newly listed stocks
-            # without full lookback coverage) in PIT mode too — record and skip
-            # rather than aborting the entire sweep.
-            errors.append({"symbol": symbol, "name": item.get("name"), "message": str(exc)})
         if progress_every and position % progress_every == 0:
             _emit_progress(
                 {
@@ -2311,17 +2313,12 @@ def run_historical_universe_research_backtest(*args: Any, **kwargs: Any) -> Dict
     bound.apply_defaults()
     _require_positive_hold_days(bound.arguments["hold_days"])
     if bound.arguments["pit_universe_path"]:
-        # Legacy flat-JSON PIT universe is allowed for extended-window research
-        # (e.g. backfilling development to ~3y). The PointInTimeUniverse still
-        # enforces per-day PIT membership; the data is not a current snapshot.
-        # The audited-artifact path remains required for formal/promotion runs.
-        pass
+        raise ValueError("legacy PIT universe is not allowed for frozen development")
     audited_path = bound.arguments["audited_pit_universe_path"]
     composite_path = bound.arguments["composite_pit_descriptor_path"]
-    legacy_path = bound.arguments["pit_universe_path"]
     if audited_path and composite_path:
         raise ValueError("only one audited or composite PIT artifact may be used")
-    if not audited_path and not composite_path and not legacy_path:
+    if not audited_path and not composite_path:
         raise ValueError("historical backtest requires a PIT artifact")
     if audited_path and not bound.arguments["expected_artifact_root_sha256"]:
         raise ValueError("audited backtest requires expected_artifact_root_sha256")

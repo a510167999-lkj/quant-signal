@@ -13,6 +13,9 @@ from app.jiaoch_live_market import (
     JiaochHttpClient,
     JiaochLiveMarketError,
     JiaochMarketDataProvider,
+    _apply_qfq,
+    _aggregate_daily_from_minutes,
+    _daily_cache_source,
     _daily_frame,
 )
 from app.config import Settings, get_settings
@@ -62,6 +65,37 @@ def _factor_rows(days=80, code="600519.SH"):
     return [[code, day.strftime("%Y%m%d"), 1.0 + index * 0.01] for index, day in enumerate(dates)]
 
 
+def _minute_rows(days=80, code="600519.SH"):
+    dates = pd.bdate_range("2025-01-01", periods=days)
+    rows = []
+    for index, day in enumerate(dates):
+        rows.extend(
+            [
+                {
+                    "ts_code": code,
+                    "trade_time": f"{day:%Y-%m-%d} 15:00:00",
+                    "open": 10.1 + index * 0.01,
+                    "close": 10.2 + index * 0.01,
+                    "high": 10.5 + index * 0.01,
+                    "low": 10.0 + index * 0.01,
+                    "vol": 734,
+                    "amount": 60_000.75,
+                },
+                {
+                    "ts_code": code,
+                    "trade_time": f"{day:%Y-%m-%d} 09:30:00",
+                    "open": 10.0 + index * 0.01,
+                    "close": 10.1 + index * 0.01,
+                    "high": 10.2 + index * 0.01,
+                    "low": 9.8 + index * 0.01,
+                    "vol": 500,
+                    "amount": 40_000.5,
+                },
+            ]
+        )
+    return rows
+
+
 def test_client_requires_exact_jiaoch_response_contract_and_keeps_token_out_of_rows():
     transport = _Transport(_envelope(ADJ_FACTOR_FIELDS, [["600519.SH", "20250101", 1.0]]))
     client = JiaochHttpClient(transport=transport, points_token="points-secret")
@@ -93,14 +127,23 @@ def test_client_rejects_credential_echo_or_duplicate_json(body):
 
 
 def test_history_uses_causal_qfq_and_jiaoch_source_only(monkeypatch):
-    daily = _daily_rows()
+    minutes = _minute_rows()
     factors = _factor_rows()
 
     class Client:
+        def fetch_stk_mins(self, *, ts_code, start_date, end_date, freq):
+            assert (ts_code, start_date, end_date, freq) == (
+                "600519.SH",
+                "20250101",
+                "20250430",
+                "5min",
+            )
+            return minutes
+
         def fetch(self, api_name, *, params, fields):
-            assert fields == (DAILY_FIELDS if api_name == "daily" else ADJ_FACTOR_FIELDS)
-            rows = daily if api_name == "daily" else factors
-            return [dict(zip(fields, row, strict=True)) for row in rows]
+            assert api_name == "adj_factor"
+            assert fields == ADJ_FACTOR_FIELDS
+            return [dict(zip(fields, row, strict=True)) for row in factors]
 
     monkeypatch.setattr("app.jiaoch_live_market._date_strings", lambda _: ("20250101", "20250430"))
     provider = JiaochMarketDataProvider(
@@ -111,9 +154,57 @@ def test_history_uses_causal_qfq_and_jiaoch_source_only(monkeypatch):
     frame, source = provider.history("600519", "a", lookback_days=90, adjust="qfq")
 
     assert len(frame) == 80
-    assert source == "Jiaoch daily qfq"
+    assert source == _daily_cache_source("qfq")
     assert frame.iloc[0]["close"] < frame.iloc[-1]["close"]
-    assert frame.iloc[0]["amount"] == 100_000_000
+    assert frame.iloc[0]["volume"] == 1234
+    assert frame.iloc[0]["amount"] == pytest.approx(100_001.25)
+
+
+def test_aggregate_daily_from_minutes_orders_bars_and_converts_units_once():
+    rows = _minute_rows(days=2)
+
+    daily = _aggregate_daily_from_minutes(rows)
+
+    assert list(daily[0]) == list(DAILY_FIELDS)
+    assert daily[0] == {
+        "ts_code": "600519.SH",
+        "trade_date": "20250101",
+        "open": 10.0,
+        "high": 10.5,
+        "low": 9.8,
+        "close": 10.2,
+        "pre_close": 10.0,
+        "change": pytest.approx(0.2),
+        "pct_chg": pytest.approx(2.0),
+        "vol": 12.34,
+        "amount": pytest.approx(100.00125),
+    }
+    assert daily[1]["pre_close"] == 10.2
+    frame = _daily_frame(daily, symbol="600519", market="a")
+    assert frame.iloc[0]["volume"] == 1234.0
+    assert frame.iloc[0]["amount"] == pytest.approx(100_001.25)
+
+
+def test_qfq_uses_one_unrounded_causal_factor_ratio():
+    raw = _daily_frame(
+        [dict(zip(DAILY_FIELDS, _daily_rows(days=2)[index], strict=True)) for index in range(2)],
+        symbol="600519",
+        market="a",
+    )
+    factors = [
+        {"ts_code": "600519.SH", "trade_date": "20250101", "adj_factor": 1.234567},
+        {"ts_code": "600519.SH", "trade_date": "20250102", "adj_factor": 2.345678},
+        {"ts_code": "600519.SH", "trade_date": "20250103", "adj_factor": 99.0},
+    ]
+
+    adjusted = _apply_qfq(raw, factors, expected_code="600519.SH")
+
+    for column in ("open", "high", "low", "close"):
+        expected = raw.iloc[0][column] * 1.234567 / 2.345678
+        assert adjusted.iloc[0][column] == pytest.approx(expected)
+        assert adjusted.iloc[0][column] != round(expected, 2)
+        assert adjusted.iloc[1][column] == raw.iloc[1][column]
+    assert adjusted.attrs["adjustment_as_of_date"] == "2025-01-02"
 
 
 def test_snapshot_uses_jiaoch_daily_and_identity_rows():
@@ -188,3 +279,45 @@ def test_non_jiaoch_disk_cache_is_not_a_runtime_fallback(tmp_path, monkeypatch):
 
     with pytest.raises(JiaochLiveMarketError):
         provider.history("600519", "a", lookback_days=90, adjust="qfq")
+
+
+def test_jiaoch_disk_cache_rejects_legacy_units_and_accepts_versioned_units(tmp_path):
+    provider = JiaochMarketDataProvider(
+        disk_cache_path=str(tmp_path / "cache.sqlite"),
+        now_provider=lambda: datetime(2025, 5, 1, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    frame = _daily_frame(
+        [dict(zip(DAILY_FIELDS, row, strict=True)) for row in _daily_rows()],
+        symbol="600519",
+        market="a",
+    )
+    provider._write_cache("600519", "a", "qfq", frame, "Jiaoch stk_mins daily qfq")
+
+    assert provider._read_cache("600519", "a", "qfq") is None
+
+    source = _daily_cache_source("qfq")
+    provider._write_cache("600519", "a", "qfq", frame, source)
+    cached = provider._read_cache("600519", "a", "qfq")
+
+    assert cached is not None
+    cached_frame, cached_source = cached
+    assert cached_source == source
+    assert cached_frame.iloc[0]["volume"] == frame.iloc[0]["volume"]
+    assert cached_frame.iloc[0]["amount"] == frame.iloc[0]["amount"]
+
+
+def test_jiaoch_disk_cache_rejects_basis_mismatch_and_partial_legacy_overlap(tmp_path):
+    provider = JiaochMarketDataProvider(disk_cache_path=str(tmp_path / "cache.sqlite"))
+    frame = _daily_frame(
+        [dict(zip(DAILY_FIELDS, row, strict=True)) for row in _daily_rows()],
+        symbol="600519",
+        market="a",
+    )
+    provider._write_cache("600519", "a", "qfq", frame, _daily_cache_source("raw"))
+
+    assert provider._read_cache("600519", "a", "qfq") is None
+
+    recent = frame.iloc[20:].copy()
+    provider._write_cache("600519", "a", "qfq", recent, _daily_cache_source("qfq"))
+
+    assert provider._read_cache("600519", "a", "qfq") is None
