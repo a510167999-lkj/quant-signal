@@ -4,6 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 个人 A 股 / A 股 ETF 量化信号研究平台。FastAPI 后端 + 静态 Web 前端，部署在个人 VPS。**仅供个人研究，不构成投资建议。**
 
+**研究目标已写死**：真实成本后滚动 12 个月净年化 ≥ 50%、最大回撤 ≤ 15%；只做沪主板 / 深主板 / 创业板；不考虑 ST、科创板、北交所；不自动交易。权威常量见 `app/research_goal_contract.py`，会话口径见 `AGENTS.md` 与 `项目进度.md`。禁止另起一套门槛或把 Factor V3 / 新 store 重采当成交付物。
+
 ## Commands
 
 虚拟环境与依赖：

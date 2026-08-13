@@ -4,28 +4,51 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 个人 A 股量化信号研究平台。FastAPI 后端 + 静态 Web 前端，部署在个人 VPS。**仅供个人研究，不构成投资建议。**
 
-## Research goal（硬约束）
+## Research goal（硬约束，写死）
 
-权威常量见 `app/research_goal_contract.py`。改市场范围或绩效门槛必须先改该模块并补测试，禁止在业务代码里另起一套口径。
+用户目标只有一条，禁止被工程任务改写：
+
+> 做一条可复现的 A 股策略：真实成本后滚动 12 个月净年化 **≥ 50%**，最大回撤 **≤ 15%**；只做沪主板、深主板、创业板；**不考虑 ST、科创板、北交所**；**不自动交易**。
+
+权威常量见 `app/research_goal_contract.py`。改市场范围、名称排除或绩效门槛必须先改该模块并补测试，禁止在业务代码或会话里另起一套口径。
 
 | 维度 | 约束 |
 |------|------|
-| **数据** | **Jiaoch-only**（Tushare 镜像站）。正式训练/回测/证据链不得混未授权数据源。 |
-| **市场** | **仅沪深**：`SSE_MAIN`（沪主板）、`SZSE_MAIN`（深主板）、`SZSE_CHINEXT`（创业板）。**排除北证 `BSE` 与科创板 `SSE_STAR`（688/689）**。上游账本可先保留五板块用于 PIT 证明，下游策略宇宙必须过滤。 |
-| **主绩效** | 真实成本/滑点后：**滚动 12 个月净年化 ≥ 50%**，**最大回撤 ≤ 15%**。 |
+| **交付物** | 一条规则清楚、可复现的策略证据。不是交易系统，也不是 Factor V3 / PIT 权威链本身。 |
+| **数据** | **Jiaoch-only**（Tushare 镜像站）。正式训练/回测/证据链不得混 AKShare 或其他未授权源。 |
+| **市场** | 仅 `SSE_MAIN`（沪主板）、`SZSE_MAIN`（深主板）、`SZSE_CHINEXT`（创业板）。 |
+| **明确排除** | **ST / \*ST**、**退市**、**科创板 `SSE_STAR`（688/689）**、**北证 `BSE`**。上游账本可先保留五板块做 PIT 证明，下游策略宇宙必须过滤。 |
+| **主绩效** | 真实成本/滑点后：**滚动 12 个月净年化 ≥ 50%**，**最大回撤 ≤ 15%**。两线同时过才算过。 |
 | **辅助诊断** | Profit Factor ≥ 1.3、Calmar ≥ 1.5；胜率观察约 52%–60%。辅助指标不能替代主绩效。 |
 | **分区** | `development → embargo → final-OOS` 严格隔离；development 结果不得直接注册生产 profile。 |
-| **产出** | 每日最多 **0–3** 只研究建议；**禁止自动下单**；未通过权威链与 OOS 门槛不得注册 production profile。 |
+| **产出** | 每日最多 **0–3** 只研究建议；**禁止自动下单**。 |
 
-当前阶段（Factor V3）：先闭合 Jiaoch 权威输入链与 formal materializer，再谈 OOF 训练与冲刺 50%/15%。**没有正式权威训练集之前，任何收益数字都只是不可晋级的假设筛选。**
+development 数字只是不可晋级的假设筛选。正式承认“有效”仍要独立 OOS；这不改变当前主线是先找到能过 50/15 的规则。
 
-### Factor V3 当前停点（2026-08-13）
+### 当前主线（2026-08-13，以 Codex `codex/main` 为准）
 
-- frozen-v3 引用的 current-pool coverage audit 已从本机已验证的激活副本 `data/current_pool_audit.json` 原字节恢复到 `data/research_artifacts/current_pool_audits/6de58a9b42ef6134219ea2b155afa43836cde24cc86bafeb2f71f3653830cf55.json`。
-- 恢复件的 canonical SHA256 为 `6de58a9b42ef6134219ea2b155afa43836cde24cc86bafeb2f71f3653830cf55`、`source_as_of=2026-07-22`，且与激活副本字节一致；`data/research_partitions/frozen-v3.json` 已作为不可变契约纳入版本控制，其内容及 contract SHA256 `de6eb76a6f9e4aba312874745df389e2ea6cd3be6f078a9d56b3ca2162dbdbbe` 未改动。coverage-audit 大文件仍是本机 gitignored 运行时证据，禁止把“契约已跟踪”误写成“audit 已随 Git 分发”。
-- frozen-v3 development 的 `collect/publish/train/validate/backtest` evidence 门禁已验证为 GREEN；这只闭合 coverage-audit 锚可用性，不代表 728-session Jiaoch 权威输入链或 audited artifact 已完成。
-- **按用户要求停在这里。** 后续会话取得明确指令后，才从独立全新 store 开始 Jiaoch-only 重采；禁止续写旧 store、复制旧 attempts、离线 rebind 或以 `reused` 冒充 capture-time authority。
-- 下一阶段仍限定 development-only：完整 SSE calendar、728 个 membership、728×4 market shards，并把 CNINFO 停牌证据作为单列 official evidence；不得进入 embargo、final-OOS、production、qualified-trades 重跑或自动交易。
+Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。后续会话以本文件 + `项目进度.md` 为准，不要回到“必须先采全新 v3 store”当主线。
+
+**已完成、仍有效**
+
+- 池子口径已对齐：主板 + 创业板，排除 ST / 科创 / 北证。
+- 路径 A 策略矩阵完成；当前最佳 development 候选是 `p0_loss_streak_3`（约 2 年窗：收益 85.6%，回撤 -14.7%）。
+- 冻结主候选全路径 MDD **-21.5%**，所以才要看约 3 年窗。
+- 2026-08-12 已用 Jiaoch `stk_mins` 合成日线回填约 733 个交易日 / 约 5284 只；不是“没采过”。
+- 单位、QFQ、frozen fail-closed、frozen-v3 coverage-audit 锚已修。coverage-audit 只证明“可以开采集门”，不等于 3 年研究输入已干净。
+
+**当前阶段 ID**：`path-a-3y-clean-replay/v1`
+
+1. 研究缓存只保留 Jiaoch `stk_mins` 合成日线；AKShare / stale SQLite 退出正式研究路径。
+2. 对缺 2023–2025 覆盖的标的限频补拉，目标是研究能用的日覆盖（约 95%）。**不建全新 v3 store，不复制旧 attempts，不做 offline rebind。**
+3. 用修好的单位/QFQ 重出 3 年 qualified trades。
+4. 只复验 `p0_loss_streak_3`。过了就冻住；不过再开一小轮降回撤，不再开新权威链。
+
+**明确不做**
+
+- 不自动交易；不改 50/15；不放宽 market_level 去凑短 OOS。
+- 不把 TCB / formal materializer / 728-session v3 capture lineage 当本阶段门槛。
+- 不把 development 数字写成已证实有效。
 
 ## Commands
 

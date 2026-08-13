@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from app.akshare_client import akshare_call
+from app.research_goal_contract import DOWNSTREAM_EXCLUDED_NAME_TOKENS
 from app.storage import read_json, write_json
 
 
@@ -38,8 +39,10 @@ def _plain_code(value: Any) -> str:
 
 def _is_excluded_name(name: str) -> bool:
     upper = name.upper()
-    excluded_tokens = ["ST", "*ST", "退", "退市", "N "]
-    return any(token in upper for token in excluded_tokens)
+    extra_tokens = ("N ",)
+    return any(
+        token in upper for token in (*DOWNSTREAM_EXCLUDED_NAME_TOKENS, *extra_tokens)
+    )
 
 
 class AShareUniverseProvider:

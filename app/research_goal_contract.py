@@ -12,9 +12,9 @@ from types import MappingProxyType
 # --- Mission ---
 RESEARCH_GOAL_SCHEMA = "quant-signal-lkj-research-goal/v1"
 RESEARCH_GOAL_SUMMARY = (
-    "基于 Jiaoch（Tushare 镜像）迭代沪深 A 股策略："
+    "基于 Jiaoch（Tushare 镜像）迭代一条可复现的沪深 A 股策略："
     "真实成本后滚动 12 个月净年化 ≥50%，最大回撤 ≤15%；"
-    "不含北证与科创板；不自动交易。"
+    "仅沪主板、深主板、创业板；不含 ST、科创板、北证；不自动交易。"
 )
 
 # --- Data authority ---
@@ -26,7 +26,8 @@ DATA_SOURCE_DESCRIPTION = (
 
 # --- Market scope (downstream tradeable) ---
 # Upstream may retain full-board ledgers for PIT proof; strategy universe is
-# Shanghai/Shenzhen only — main boards + ChiNext. Explicitly exclude BSE and STAR.
+# Shanghai/Shenzhen only — main boards + ChiNext. Explicitly exclude BSE, STAR,
+# ST / *ST names, and delisting names.
 UPSTREAM_SOURCE_SEGMENTS = (
     "BSE",
     "SSE_MAIN",
@@ -52,6 +53,10 @@ SEGMENT_CLASSIFICATION_CONTRACT = MappingProxyType(
         "SZSE_MAIN": ("prefix_and_suffix", ("00", ".SZ")),
     }
 )
+# Name tokens are matched as substrings against the uppercased display name.
+DOWNSTREAM_EXCLUDED_NAME_TOKENS = ("*ST", "ST", "退市", "退")
+DOWNSTREAM_EXCLUDE_ST = True
+DOWNSTREAM_EXCLUDE_DELISTED = True
 
 # --- Performance acceptance (formal advancement) ---
 # Net of declared cost/slippage. Rolling windows are exact-session calendar
@@ -71,6 +76,9 @@ PRODUCTION_PROFILE_REQUIRES = MappingProxyType(
         "data_source_policy": DATA_SOURCE_POLICY,
         "downstream_eligible_segments": DOWNSTREAM_ELIGIBLE_SEGMENTS,
         "downstream_excluded_segments": DOWNSTREAM_EXCLUDED_SEGMENTS,
+        "downstream_excluded_name_tokens": DOWNSTREAM_EXCLUDED_NAME_TOKENS,
+        "downstream_exclude_st": DOWNSTREAM_EXCLUDE_ST,
+        "downstream_exclude_delisted": DOWNSTREAM_EXCLUDE_DELISTED,
         "target_rolling_12m_net_return_pct": TARGET_ROLLING_12M_NET_RETURN_PCT,
         "target_max_drawdown_pct": TARGET_MAX_DRAWDOWN_PCT,
         "target_profit_factor_min": TARGET_PROFIT_FACTOR_MIN,
@@ -92,6 +100,9 @@ def research_goal_descriptor() -> dict[str, object]:
         "upstream_source_segments": list(UPSTREAM_SOURCE_SEGMENTS),
         "downstream_eligible_segments": list(DOWNSTREAM_ELIGIBLE_SEGMENTS),
         "downstream_excluded_segments": list(DOWNSTREAM_EXCLUDED_SEGMENTS),
+        "downstream_excluded_name_tokens": list(DOWNSTREAM_EXCLUDED_NAME_TOKENS),
+        "downstream_exclude_st": DOWNSTREAM_EXCLUDE_ST,
+        "downstream_exclude_delisted": DOWNSTREAM_EXCLUDE_DELISTED,
         "target_rolling_12m_net_return_pct": TARGET_ROLLING_12M_NET_RETURN_PCT,
         "target_max_drawdown_pct": TARGET_MAX_DRAWDOWN_PCT,
         "target_profit_factor_min": TARGET_PROFIT_FACTOR_MIN,
@@ -109,6 +120,13 @@ def assert_segment_is_downstream_eligible(segment: str) -> None:
             f"(eligible={DOWNSTREAM_ELIGIBLE_SEGMENTS}, "
             f"excluded={DOWNSTREAM_EXCLUDED_SEGMENTS})"
         )
+
+
+def name_is_downstream_excluded(name: str) -> bool:
+    """True when the display name is ST / *ST or delisting-related."""
+
+    upper = str(name or "").upper()
+    return any(token in upper for token in DOWNSTREAM_EXCLUDED_NAME_TOKENS)
 
 
 def meets_primary_performance_targets(
