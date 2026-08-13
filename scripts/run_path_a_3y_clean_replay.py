@@ -132,7 +132,7 @@ def select_targets(
         missing = [symbol for symbol in traded if symbol not in by_symbol]
         if missing:
             print("WARN traded symbols dropped by goal filter:", len(missing), flush=True)
-    elif slice_name == "holdout":
+    elif slice_name in {"holdout", "holdout_stale"}:
         traded_set = set(traded)
         selected = [row for row in eligible if row["symbol"] not in traded_set]
     else:
@@ -156,6 +156,14 @@ def _legacy_index(legacy_dir: Path) -> dict[str, Path]:
         if symbol not in out:
             out[symbol] = path
     return out
+
+
+def is_legacy_stale_jiaoch_source(source: str) -> bool:
+    text = str(source or "")
+    return (
+        "Jiaoch SQLite daily cache stale" in text
+        and "akshare" not in text.casefold()
+    )
 
 
 def convert_legacy_jiaoch_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -307,11 +315,30 @@ def cmd_refill(repo: Path, output_root: Path, args: argparse.Namespace) -> int:
         max_symbols=args.max_symbols,
         traded=traded,
     )
+    if args.slice == "holdout_stale":
+        legacy = _legacy_index(repo / "data/research_cache")
+        stale: list[dict[str, Any]] = []
+        for row in targets:
+            path = legacy.get(row["symbol"])
+            if path is None:
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if is_legacy_stale_jiaoch_source(str(payload.get("source") or "")):
+                stale.append(row)
+        targets = stale
+        targets = [
+            row
+            for row in targets
+            if cache_ok(cache_path(cache_dir, "a", row["symbol"])) is None
+        ]
     proxies = [
         {"symbol": row["symbol"], "market": row["market"], "name": row["name"]}
         for row in MARKET_PROXY_SYMBOLS
     ]
-    work = proxies + targets
+    work = targets if args.slice == "holdout_stale" else (proxies + targets)
     provider = JiaochMarketDataProvider()
     log_path = output_root / "REFILL.jsonl"
     summary = {
@@ -511,7 +538,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument(
-        "--slice", choices=("traded", "eligible", "holdout"), default="traded"
+        "--slice",
+        choices=("traded", "eligible", "holdout", "holdout_stale"),
+        default="traded",
     )
     parser.add_argument("--max-symbols", type=int, default=0)
     parser.add_argument("--qualified-trades-output", type=Path, default=DEFAULT_QT_PATH)

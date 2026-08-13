@@ -31,6 +31,14 @@ def test_frozen_volclip_spec_is_s85_and_immutable() -> None:
     ]
 
 
+def test_stale_jiaoch_source_is_not_akshare() -> None:
+    from scripts.run_path_a_3y_clean_replay import is_legacy_stale_jiaoch_source
+
+    assert is_legacy_stale_jiaoch_source("Jiaoch SQLite daily cache stale fallback")
+    assert not is_legacy_stale_jiaoch_source("AKShare stock_zh_a_daily fallback")
+    assert not is_legacy_stale_jiaoch_source("Jiaoch stk_mins daily qfq")
+
+
 def test_convert_legacy_jiaoch_refuses_akshare_and_rescales() -> None:
     from scripts.run_path_a_3y_clean_replay import convert_legacy_jiaoch_payload
 
