@@ -30,7 +30,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allow-any-role", action="store_true")
     parser.add_argument(
         "--family",
-        choices=("book", "combo", "combo_overlay", "clip"),
+        choices=("book", "combo", "combo_overlay", "clip", "volclip"),
         default="book",
     )
     args = parser.parse_args(argv)
@@ -48,6 +48,7 @@ def main(argv: list[str] | None = None) -> int:
         "combo": Path("data/research_runs/path_a_3y_combo_round"),
         "combo_overlay": Path("data/research_runs/path_a_3y_combo_overlay_round"),
         "clip": Path("data/research_runs/path_a_3y_clip_round"),
+        "volclip": Path("data/research_runs/path_a_3y_volclip_round"),
     }
     chosen_root = args.output_root or family_roots[args.family]
     output_root = (

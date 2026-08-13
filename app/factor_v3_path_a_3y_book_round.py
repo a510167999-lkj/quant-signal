@@ -12,6 +12,7 @@ from app import research_goal_contract as goal
 from app.factor_v3_path_a_3y_book_round_specs import (
     COMBO_ROUND_VARIANTS,
     FAILED_BOOK_IDS,
+    FAILED_CLIP_IDS,
     FAILED_COMBO_IDS,
     FAILED_COMBO_OVERLAY_IDS,
     FAILED_OVERLAY_IDS,
@@ -20,6 +21,7 @@ from app.factor_v3_path_a_3y_book_round_specs import (
     iter_clip_round_variants,
     iter_combo_overlay_variants,
     iter_combo_round_variants,
+    iter_volclip_round_variants,
     merged_kernel,
 )
 from app.storage import write_json
@@ -248,6 +250,19 @@ def score_combo_overlay_round(
     }
 
 
+def _clip_should_skip(trade: dict[str, Any], variant: dict[str, Any]) -> bool:
+    tags = set(trade.get("signal_tags") or [])
+    skip_tags = set(variant.get("skip_tags") or ())
+    if skip_tags and tags & skip_tags:
+        return True
+    skip_if = variant.get("skip_if") or {}
+    needed = set(skip_if.get("all") or ())
+    none = set(skip_if.get("none") or ())
+    if needed and needed.issubset(tags) and not (tags & none):
+        return True
+    return False
+
+
 def score_clip_round(
     train_trades: list[dict[str, Any]],
     *,
@@ -276,14 +291,16 @@ def score_clip_round(
     for variant in chosen:
         kernel = merged_kernel(variant)
         skip_tags = tuple(variant.get("skip_tags") or ())
+        skip_if = dict(variant.get("skip_if") or {})
+        entry_scale = variant.get("entry_scale")
         try:
             selected = p0._select_kernel_trades(train_trades, kernel_override=kernel)
-            if skip_tags:
-                skip = set(skip_tags)
+            selected = [
+                trade for trade in selected if not _clip_should_skip(trade, variant)
+            ]
+            if entry_scale is not None:
                 selected = [
-                    trade
-                    for trade in selected
-                    if not (set(trade.get("signal_tags") or []) & skip)
+                    p0._scale_trade(trade, float(entry_scale)) for trade in selected
                 ]
             if not selected:
                 raise p0.PathAP0Error("clip selection empty")
@@ -295,7 +312,10 @@ def score_clip_round(
             empty = True
         full_ret = metrics.get("portfolio_compounded_return_pct")
         full_mdd = metrics.get("portfolio_max_drawdown_pct")
+        latest_ret = metrics.get("rolling_1y_latest_return_pct")
+        latest_mdd = metrics.get("rolling_1y_latest_max_drawdown_pct")
         dual = False if empty else _dual_pass(full_ret, full_mdd)
+        latest_dual = False if empty else _dual_pass(latest_ret, latest_mdd)
         rows.append(
             {
                 "candidate_id": variant["candidate_id"],
@@ -303,6 +323,8 @@ def score_clip_round(
                 "rationale": variant["rationale"],
                 "base_id": variant.get("base_id"),
                 "skip_tags": list(skip_tags),
+                "skip_if": skip_if,
+                "entry_scale": entry_scale,
                 "kernel": {
                     "top_n": kernel["top_n"],
                     "max_active_positions": kernel["max_active_positions"],
@@ -317,15 +339,27 @@ def score_clip_round(
                 "empty_selection": empty,
                 "full_path_return_pct": full_ret,
                 "full_path_mdd_pct": full_mdd,
-                "latest_1y_return_pct": metrics.get("rolling_1y_latest_return_pct"),
-                "latest_1y_mdd_pct": metrics.get("rolling_1y_latest_max_drawdown_pct"),
+                "latest_1y_return_pct": latest_ret,
+                "latest_1y_mdd_pct": latest_mdd,
                 "selected_trade_count": metrics.get("selected_trade_count"),
                 "dual_pass_50_15": dual,
+                "latest_dual_pass_50_15": latest_dual,
                 "dual_pass_via": "research_goal_contract.meets_primary_performance_targets",
             }
         )
 
     passed = [row for row in rows if row["dual_pass_50_15"]]
+    both = sorted(
+        [
+            row
+            for row in rows
+            if row["dual_pass_50_15"] and row["latest_dual_pass_50_15"]
+        ],
+        key=lambda r: (
+            abs(float(r["full_path_mdd_pct"] or 99.0)),
+            -float(r["latest_1y_return_pct"] or -999.0),
+        ),
+    )
     ranked = sorted(
         rows,
         key=lambda r: (
@@ -345,11 +379,15 @@ def score_clip_round(
         "variant_count": len(rows),
         "failed_ids_excluded": sorted(banned),
         "dual_pass_ids": [row["candidate_id"] for row in passed],
+        "latest_dual_pass_ids": [row["candidate_id"] for row in both],
         "current_development_candidate": (
-            passed[0]["candidate_id"] if passed else None
+            both[0]["candidate_id"]
+            if both
+            else (passed[0]["candidate_id"] if passed else None)
         ),
         "best_by_mdd_then_return": ranked[0]["candidate_id"] if ranked else None,
         "fifty_fifteen_met": bool(passed),
+        "fifty_fifteen_latest_met": bool(both),
         "variants": rows,
     }
 
@@ -394,6 +432,19 @@ def build_path_a_3y_book_round(
         report = score_combo_overlay_round(train_trades)
     elif chosen == "clip":
         report = score_clip_round(train_trades)
+    elif chosen == "volclip":
+        report = score_clip_round(
+            train_trades,
+            variants=iter_volclip_round_variants(),
+            excluded_ids=(
+                FAILED_OVERLAY_IDS
+                | FAILED_BOOK_IDS
+                | FAILED_COMBO_IDS
+                | FAILED_COMBO_OVERLAY_IDS
+                | FAILED_CLIP_IDS
+            ),
+            stage_goal_id="path-a-3y-volclip-round/v1",
+        )
     else:
         raise PathA3yBookRoundError(f"unknown family: {family!r}")
     report["qualified_trades_path"] = str(qt_path)
@@ -409,10 +460,12 @@ def format_book_round_table(report: dict[str, Any]) -> str:
         f"window={report.get('window')}",
         f"source={report.get('source_version')}",
         f"fifty_fifteen_met={report.get('fifty_fifteen_met')}",
+        f"fifty_fifteen_latest_met={report.get('fifty_fifteen_latest_met')}",
         f"dual_pass_ids={report.get('dual_pass_ids')}",
+        f"latest_dual_pass_ids={report.get('latest_dual_pass_ids')}",
         f"best_by_mdd_then_return={report.get('best_by_mdd_then_return')}",
         f"current_development_candidate={report.get('current_development_candidate')}",
-        "id\tfull_ret\tfull_mdd\tlatest_1y_ret\tlatest_1y_mdd\tselected\tdual_pass_50_15",
+        "id\tfull_ret\tfull_mdd\tlatest_1y_ret\tlatest_1y_mdd\tselected\tdual_pass_50_15\tlatest_dual_pass_50_15",
     ]
     for row in report.get("variants") or []:
         lines.append(
@@ -425,6 +478,7 @@ def format_book_round_table(report: dict[str, Any]) -> str:
                     f"{row['latest_1y_mdd_pct']}",
                     str(row["selected_trade_count"]),
                     str(row["dual_pass_50_15"]).lower(),
+                    str(row.get("latest_dual_pass_50_15")).lower(),
                 ]
             )
         )

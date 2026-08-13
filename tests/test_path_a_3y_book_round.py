@@ -4,6 +4,7 @@ from app import factor_v3_path_a_3y_book_round as rnd
 from app import research_goal_contract as goal
 from app.factor_v3_path_a_3y_book_round_specs import (
     FAILED_BOOK_IDS,
+    FAILED_CLIP_IDS,
     FAILED_COMBO_IDS,
     FAILED_COMBO_OVERLAY_IDS,
     FAILED_OVERLAY_IDS,
@@ -11,6 +12,7 @@ from app.factor_v3_path_a_3y_book_round_specs import (
     iter_clip_round_variants,
     iter_combo_overlay_variants,
     iter_combo_round_variants,
+    iter_volclip_round_variants,
     merged_kernel,
 )
 
@@ -70,6 +72,15 @@ def test_book_ids_are_disjoint_from_failed_overlay_seven() -> None:
         | FAILED_BOOK_IDS
         | FAILED_COMBO_IDS
         | FAILED_COMBO_OVERLAY_IDS
+    )
+    volclip_ids = [row["candidate_id"] for row in iter_volclip_round_variants()]
+    assert volclip_ids
+    assert set(volclip_ids).isdisjoint(
+        FAILED_OVERLAY_IDS
+        | FAILED_BOOK_IDS
+        | FAILED_COMBO_IDS
+        | FAILED_COMBO_OVERLAY_IDS
+        | FAILED_CLIP_IDS
     )
 
 
@@ -204,3 +215,46 @@ def test_clip_skip_drops_tagged_trades_without_refill() -> None:
         "research_goal_contract.meets_primary_performance_targets"
     )
     assert row["promotable"] is False
+
+
+def test_volclip_skip_if_and_entry_scale() -> None:
+    vol = ("breadth_ma20_gte_60", "breakout_20d", "volume_confirmed")
+    hot = vol + ("breadth_median_ret20_gte_10",)
+    leader = hot + ("stock_rs20_gte_10",)
+    trades = [
+        _trade("000001", "2024-01-02", "2024-01-03", "2024-01-10", 12.0, tags=vol),
+        _trade("000002", "2024-02-02", "2024-02-05", "2024-02-12", -5.0, tags=hot),
+        _trade("000003", "2024-03-04", "2024-03-05", "2024-03-12", 12.0, tags=leader),
+        _trade("000004", "2024-04-02", "2024-04-03", "2024-04-10", 12.0, tags=vol),
+        _trade("000005", "2024-05-06", "2024-05-07", "2024-05-14", 12.0, tags=vol),
+        _trade("000006", "2024-06-03", "2024-06-04", "2024-06-11", 12.0, tags=vol),
+        _trade("000007", "2024-07-02", "2024-07-03", "2024-07-10", 12.0, tags=vol),
+        _trade("000008", "2024-08-02", "2024-08-05", "2024-08-12", 12.0, tags=vol),
+    ]
+    skip_if = (
+        {
+            "candidate_id": "vol_skip_med10_nors10",
+            "role": "volclip_skip_if",
+            "base_id": "book_vol_confirm",
+            "kernel": {
+                "top_n": 3,
+                "max_active_positions": 2,
+                "symbol_cooldown_days": 5,
+                "market_levels": ("favorable", "neutral"),
+                "required_signal_tags": vol,
+                "excluded_signal_tags": ("price_gap_down",),
+            },
+            "skip_tags": ("rsi_repair",),
+            "skip_if": {
+                "all": ("breadth_median_ret20_gte_10",),
+                "none": ("stock_rs20_gte_10",),
+            },
+            "entry_scale": 0.87,
+            "rationale": "test",
+        },
+    )
+    report = rnd.score_clip_round(trades, variants=skip_if)
+    row = report["variants"][0]
+    assert row["selected_trade_count"] == 7
+    assert row["entry_scale"] == 0.87
+    assert "latest_dual_pass_50_15" in row

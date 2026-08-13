@@ -37,14 +37,14 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 - 2026-08-12 已用 Jiaoch `stk_mins` 合成日线回填约 733 个交易日 / 约 5284 只；不是“没采过”。
 - 单位、QFQ、frozen fail-closed、frozen-v3 coverage-audit 锚已修。coverage-audit 只证明“可以开采集门”，不等于 3 年研究输入已干净。
 
-**当前阶段 ID**：`path-a-3y-clip-round/v1`（未达成不结束；继续迭代直到滚动 12 月也双过）
+**当前阶段 ID**：`path-a-3y-volclip-round/v1`（全路径 + 最新 12 月首次同时双过；非正式有效）
 
 1. 隔离缓存 `data/research_cache/jiaoch_stk_mins_3y_v2/`：191/191 股票 v2 GREEN。
 2. 3 年 QT：`data/research_cache/qualified_hold5_stop5_3y_jiaoch.json`。
-3. Overlay-7、book-6、combo-6、combo_overlay-5 均未双过。硬回撤阻断会把收益打残，有时 MDD 更差。
-4. 最近的 combo 书是 `combo_vol_t2_m1`：全路径 **50.83% / -18.96%**。
-5. clip 轮：在该书上跳过信号日 `rsi_repair`（不补位）→ `clip_skip_rsi_repair` 全路径 **65.29% / -14.73%**，本轮计分器双过。`clip_skip_rsi_advlt50` 全路径 **71.12% / -14.73%** 也双过。
-6. **最新滚动 1y 仍未过 50%**（`clip_skip_rsi_repair` 26.87% / -14.73%）。development-only，191 只当前池切片，非正式有效，不自动交易。下一刀：抬最近 12 月收益，MDD 继续压在 15% 内。
+3. Overlay / 硬回撤阻断失败。clip 轮 `clip_skip_rsi_repair` 全路径双过，但最新 12 月只有 26.9%。
+4. volclip：在 `book_vol_confirm` 上跳过 `rsi_repair` + `breadth_advancing_lt_50`（不补位），再乘固定仓位 0.85。
+5. 当前 development 候选 **`vol_skip_rsi_adv_s85`**：全路径 **100.64% / -14.65%**，最新 1y **62.62% / -13.72%**。双胞胎 `s87` 也双过。
+6. 198 个滚动窗 MDD 全过 15%；收益双过率约 43%。最差 12 月窗（2023-09..2024-09）约 **-6%**，不是每年都 50%。191 只切片、development-only、非正式有效、不自动交易。下一阶段才是独立 OOS / 更大宇宙。
 
 **明确不做**
 

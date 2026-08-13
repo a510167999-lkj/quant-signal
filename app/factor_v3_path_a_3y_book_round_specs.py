@@ -363,6 +363,89 @@ def iter_clip_round_variants() -> tuple[dict[str, Any], ...]:
     return CLIP_ROUND_VARIANTS
 
 
+FAILED_CLIP_IDS = frozenset(row["candidate_id"] for row in CLIP_ROUND_VARIANTS)
+
+_VOL_CONFIRM_KERNEL: dict[str, Any] = {
+    "top_n": 3,
+    "max_active_positions": 2,
+    "symbol_cooldown_days": 5,
+    "market_levels": ("favorable", "neutral"),
+    "required_signal_tags": (
+        "breadth_ma20_gte_60",
+        "breakout_20d",
+        "volume_confirmed",
+    ),
+    "excluded_signal_tags": ("price_gap_down",),
+}
+
+# Denser book than combo_vol_t2_m1. Skip is no-refill. Size haircut is
+# constant entry scale, not a DD-triggered block (those made MDD worse).
+VOLCLIP_ROUND_VARIANTS: tuple[dict[str, Any], ...] = (
+    {
+        "candidate_id": "vol_skip_rsi",
+        "role": "volclip_skip",
+        "base_id": "book_vol_confirm",
+        "kernel": dict(_VOL_CONFIRM_KERNEL),
+        "skip_tags": ("rsi_repair",),
+        "rationale": "book_vol_confirm, skip rsi_repair, no refill.",
+    },
+    {
+        "candidate_id": "vol_skip_rsi_adv",
+        "role": "volclip_skip",
+        "base_id": "book_vol_confirm",
+        "kernel": dict(_VOL_CONFIRM_KERNEL),
+        "skip_tags": ("rsi_repair", "breadth_advancing_lt_50"),
+        "rationale": "Also skip advancing<50 (8% win on this book).",
+    },
+    {
+        "candidate_id": "vol_skip_rsi_adv_s87",
+        "role": "volclip_scale",
+        "base_id": "book_vol_confirm",
+        "kernel": dict(_VOL_CONFIRM_KERNEL),
+        "skip_tags": ("rsi_repair", "breadth_advancing_lt_50"),
+        "entry_scale": 0.87,
+        "rationale": "Same skips + constant 0.87 entry size to clip leftover MDD.",
+    },
+    {
+        "candidate_id": "vol_skip_rsi_adv_s85",
+        "role": "volclip_scale",
+        "base_id": "book_vol_confirm",
+        "kernel": dict(_VOL_CONFIRM_KERNEL),
+        "skip_tags": ("rsi_repair", "breadth_advancing_lt_50"),
+        "entry_scale": 0.85,
+        "rationale": "Nearby 0.85 scale; less tight to 15% than 0.87.",
+    },
+    {
+        "candidate_id": "vol_skip_med10_or_adv",
+        "role": "volclip_skip",
+        "base_id": "book_vol_confirm",
+        "kernel": dict(_VOL_CONFIRM_KERNEL),
+        "skip_tags": (
+            "rsi_repair",
+            "breadth_median_ret20_gte_10",
+            "breadth_advancing_lt_50",
+        ),
+        "rationale": "Skip rsi_repair, overheated median-ret20, and advancing<50.",
+    },
+    {
+        "candidate_id": "vol_skip_med10_nors10",
+        "role": "volclip_skip_if",
+        "base_id": "book_vol_confirm",
+        "kernel": dict(_VOL_CONFIRM_KERNEL),
+        "skip_tags": ("rsi_repair",),
+        "skip_if": {
+            "all": ("breadth_median_ret20_gte_10",),
+            "none": ("stock_rs20_gte_10",),
+        },
+        "rationale": "Skip overheated median-ret20 unless rs20>=10 (keep leaders).",
+    },
+)
+
+
+def iter_volclip_round_variants() -> tuple[dict[str, Any], ...]:
+    return VOLCLIP_ROUND_VARIANTS
+
+
 def merged_kernel(variant: dict[str, Any]) -> dict[str, Any]:
     kernel = dict(SIGNAL_KERNEL)
     kernel["market_levels"] = list(SIGNAL_KERNEL["market_levels"])
@@ -380,14 +463,17 @@ __all__ = [
     "COMBO_OVERLAY_VARIANTS",
     "COMBO_ROUND_VARIANTS",
     "FAILED_BOOK_IDS",
+    "FAILED_CLIP_IDS",
     "FAILED_COMBO_IDS",
     "FAILED_COMBO_OVERLAY_IDS",
     "FAILED_OVERLAY_IDS",
     "SIGNAL_KERNEL",
     "STAGE_GOAL_ID",
+    "VOLCLIP_ROUND_VARIANTS",
     "iter_book_round_variants",
     "iter_clip_round_variants",
     "iter_combo_overlay_variants",
     "iter_combo_round_variants",
+    "iter_volclip_round_variants",
     "merged_kernel",
 ]
