@@ -174,6 +174,136 @@ def iter_protocol_factor_variants() -> tuple[dict[str, Any], ...]:
     return PROTOCOL_FACTOR_VARIANTS
 
 
+# Train-only diagnosis on the 1667-name QT (holdout sealed):
+# breakout_20d raw expectancy is <= 0; moderate / RS-negative / anti-chase
+# rank have the only positive books. These six change identity or rank
+# factor. They are not more quality filters on e4.
+ALLOWED_RANK_KEYS = frozenset({"rank_score", "neg_ext20", "rs20"})
+
+PROTOCOL_ALT_VARIANTS: tuple[dict[str, Any], ...] = (
+    {
+        "candidate_id": "alt_rs_leader",
+        "role": "protocol_alt",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": ("stock_rs20_market_leader",),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Drop breakout. Cross-section 20d market leader.",
+    },
+    {
+        "candidate_id": "alt_rs_leader_xvol",
+        "role": "protocol_alt",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": ("stock_rs20_market_leader",),
+            "excluded_signal_tags": ("price_gap_down", "high_volatility"),
+        },
+        "rationale": "20d leader, skip chaotic vol>=45 names.",
+    },
+    {
+        "candidate_id": "alt_rs60_strong_2s",
+        "role": "protocol_alt",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 3,
+            "max_active_positions": 2,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": ("stock_rs60_strong", "ma_structure"),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Slower 60d relative strength, two slots for occupancy.",
+    },
+    {
+        "candidate_id": "alt_rs_neg",
+        "role": "protocol_alt",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": ("stock_rs20_lt_0", "ma_structure"),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "A-share short-horizon reversal: 20d relative weakness.",
+    },
+    {
+        "candidate_id": "alt_negext",
+        "role": "protocol_alt",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": ("breadth_ma20_gte_60", "breakout_20d"),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "e4 tags remain; rank by least-extended 20d return.",
+    },
+    {
+        "candidate_id": "alt_pull_negext_2s",
+        "role": "protocol_alt",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 3,
+            "max_active_positions": 2,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": ("ma_structure", "moderate_20d_momentum"),
+            "excluded_signal_tags": ("price_gap_down", "extended_20d_momentum"),
+        },
+        "rationale": "Drop breakout. Moderate-momentum pullback, anti-chase rank, two slots.",
+    },
+)
+
+
+def iter_protocol_alt_variants() -> tuple[dict[str, Any], ...]:
+    return PROTOCOL_ALT_VARIANTS
+
+
+def apply_rank_key(
+    trades: list[dict[str, Any]],
+    rank_key: str | None,
+) -> list[dict[str, Any]]:
+    """Copy trades and overwrite rank_score. Does not mutate the input list."""
+
+    key = str(rank_key or "rank_score").strip() or "rank_score"
+    if key not in ALLOWED_RANK_KEYS:
+        raise ValueError(f"unknown rank_key: {rank_key!r}")
+    if key == "rank_score":
+        return list(trades)
+
+    out: list[dict[str, Any]] = []
+    for trade in trades:
+        copy = dict(trade)
+        relative = trade.get("relative_strength") or {}
+        if key == "neg_ext20":
+            raw = relative.get("stock_return_20d_pct")
+            try:
+                copy["rank_score"] = -float(raw)
+            except (TypeError, ValueError):
+                copy["rank_score"] = 0.0
+        elif key == "rs20":
+            raw = relative.get("relative_strength_20d_pct")
+            try:
+                copy["rank_score"] = float(raw)
+            except (TypeError, ValueError):
+                copy["rank_score"] = -1e9
+        out.append(copy)
+    return out
+
+
 def assert_variants_obey_protocol(
     variants: tuple[dict[str, Any], ...] | None = None,
 ) -> None:
@@ -188,3 +318,6 @@ def assert_variants_obey_protocol(
         excluded = set((row.get("kernel") or {}).get("excluded_signal_tags") or ())
         if excluded & banned:
             raise ValueError(f"{row['candidate_id']} excludes a banned post-hoc tag")
+        rank_key = row.get("rank_key")
+        if rank_key not in (None, *ALLOWED_RANK_KEYS):
+            raise ValueError(f"{row['candidate_id']} uses unknown rank_key {rank_key!r}")

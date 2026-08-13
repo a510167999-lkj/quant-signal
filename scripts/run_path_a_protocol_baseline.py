@@ -30,7 +30,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allow-any-role", action="store_true")
     parser.add_argument(
         "--family",
-        choices=("baseline", "factor"),
+        choices=("baseline", "factor", "alt"),
         default="baseline",
     )
     args = parser.parse_args(argv)
@@ -46,6 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     family_roots = {
         "baseline": DEFAULT_OUTPUT_ROOT,
         "factor": Path("data/research_runs/path_a_protocol_factor"),
+        "alt": Path("data/research_runs/path_a_protocol_alt"),
     }
     chosen_root = args.output_root
     if chosen_root == DEFAULT_OUTPUT_ROOT:

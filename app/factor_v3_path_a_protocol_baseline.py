@@ -13,7 +13,9 @@ from app import research_goal_contract as goal
 from app.factor_v3_path_a_3y_book_round_specs import merged_kernel
 from app.factor_v3_path_a_protocol_baseline_specs import (
     STAGE_GOAL_ID,
+    apply_rank_key,
     assert_variants_obey_protocol,
+    iter_protocol_alt_variants,
     iter_protocol_baseline_variants,
     iter_protocol_factor_variants,
 )
@@ -33,12 +35,13 @@ def _score_partition(
     variant: dict[str, Any],
 ) -> dict[str, Any]:
     kernel = merged_kernel(variant)
-    if not trades:
+    ranked = apply_rank_key(trades, variant.get("rank_key"))
+    if not ranked:
         metrics = p0._metrics_bundle([])
         empty = True
     else:
         try:
-            selected = p0._select_kernel_trades(trades, kernel_override=kernel)
+            selected = p0._select_kernel_trades(ranked, kernel_override=kernel)
             metrics = p0._metrics_bundle(selected)
             empty = False
         except p0.PathAP0Error:
@@ -92,6 +95,7 @@ def score_protocol_baseline(
                 "candidate_id": variant["candidate_id"],
                 "role": variant["role"],
                 "rationale": variant["rationale"],
+                "rank_key": variant.get("rank_key") or "rank_score",
                 "kernel": variant["kernel"],
                 "development_only": True,
                 "promotable": False,
@@ -163,6 +167,13 @@ def build_path_a_protocol_baseline(
             holdout_trades,
             variants=iter_protocol_factor_variants(),
             stage_goal_id="path-a-protocol-factor/v1",
+        )
+    elif chosen == "alt":
+        report = score_protocol_baseline(
+            train_trades,
+            holdout_trades,
+            variants=iter_protocol_alt_variants(),
+            stage_goal_id="path-a-protocol-alt/v1",
         )
     elif chosen == "baseline":
         report = score_protocol_baseline(train_trades, holdout_trades)

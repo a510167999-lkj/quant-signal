@@ -4,7 +4,9 @@ from app import factor_v3_path_a_protocol_baseline as baseline
 from app import factor_v3_path_a_research_protocol as proto
 from app import research_goal_contract as goal
 from app.factor_v3_path_a_protocol_baseline_specs import (
+    apply_rank_key,
     assert_variants_obey_protocol,
+    iter_protocol_alt_variants,
     iter_protocol_baseline_variants,
     iter_protocol_factor_variants,
 )
@@ -61,6 +63,51 @@ def test_baseline_variants_are_clean_and_disjoint() -> None:
     for row in iter_protocol_factor_variants():
         assert "rsi_repair" not in (row["kernel"].get("required_signal_tags") or ())
         assert "rsi_repair" not in (row["kernel"].get("excluded_signal_tags") or ())
+    alt = iter_protocol_alt_variants()
+    alt_ids = [row["candidate_id"] for row in alt]
+    assert alt_ids == [
+        "alt_rs_leader",
+        "alt_rs_leader_xvol",
+        "alt_rs60_strong_2s",
+        "alt_rs_neg",
+        "alt_negext",
+        "alt_pull_negext_2s",
+    ]
+    assert set(alt_ids).isdisjoint(proto.CONTAMINATED_CANDIDATE_IDS)
+    assert_variants_obey_protocol(alt)
+    drop_breakout = 0
+    for row in alt:
+        assert not row.get("skip_tags")
+        assert row.get("entry_scale") in (None, 1, 1.0)
+        required = set((row.get("kernel") or {}).get("required_signal_tags") or ())
+        excluded = set((row.get("kernel") or {}).get("excluded_signal_tags") or ())
+        assert "rsi_repair" not in required
+        assert "rsi_repair" not in excluded
+        if "breakout_20d" not in required:
+            drop_breakout += 1
+    assert drop_breakout >= 4
+    assert any(row.get("rank_key") == "neg_ext20" for row in alt)
+
+
+def test_apply_rank_key_neg_ext_does_not_mutate() -> None:
+    trades = [
+        {
+            "symbol": "000001",
+            "rank_score": 9.0,
+            "relative_strength": {"stock_return_20d_pct": 20.0},
+        },
+        {
+            "symbol": "000002",
+            "rank_score": 1.0,
+            "relative_strength": {"stock_return_20d_pct": 4.0},
+        },
+    ]
+    ranked = apply_rank_key(trades, "neg_ext20")
+    assert trades[0]["rank_score"] == 9.0
+    assert ranked[0]["rank_score"] == -20.0
+    assert ranked[1]["rank_score"] == -4.0
+    same = apply_rank_key(trades, "rank_score")
+    assert same[0]["rank_score"] == 9.0
 
 
 def test_baseline_scorer_flags_holdout_via_protocol() -> None:
