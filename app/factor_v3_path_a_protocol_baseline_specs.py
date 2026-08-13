@@ -61,9 +61,125 @@ def iter_protocol_baseline_variants() -> tuple[dict[str, Any], ...]:
     return PROTOCOL_BASELINE_VARIANTS
 
 
-def assert_variants_obey_protocol() -> None:
+# Train-only diagnosis on the 1667-name holdout QT (holdout sealed):
+# quality filters compress MDD toward 15% but latest-1y stays ~2-12%.
+# These six are written down before holdout is scored.
+PROTOCOL_FACTOR_VARIANTS: tuple[dict[str, Any], ...] = (
+    {
+        "candidate_id": "factor_buy",
+        "role": "protocol_factor",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (
+                "breadth_ma20_gte_60",
+                "breakout_20d",
+                "action_buy",
+            ),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "One slot; BUY only, skip watch-grade signals.",
+    },
+    {
+        "candidate_id": "factor_cvol",
+        "role": "protocol_factor",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (
+                "breadth_ma20_gte_60",
+                "breakout_20d",
+                "controlled_volatility",
+            ),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Avoid chaotic breakouts; require controlled 20d vol.",
+    },
+    {
+        "candidate_id": "factor_rsi_bal",
+        "role": "protocol_factor",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (
+                "breadth_ma20_gte_60",
+                "breakout_20d",
+                "balanced_rsi",
+            ),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Require balanced RSI. Not the banned rsi_repair skip.",
+    },
+    {
+        "candidate_id": "factor_ma70",
+        "role": "protocol_factor",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (
+                "breadth_ma20_gte_60",
+                "breakout_20d",
+                "breadth_ma20_gte_70",
+            ),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Stronger breadth: 70% of names above MA20.",
+    },
+    {
+        "candidate_id": "factor_score5",
+        "role": "protocol_factor",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (
+                "breadth_ma20_gte_60",
+                "breakout_20d",
+                "score_gte_5",
+            ),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Higher composite score; fewer, cleaner entries.",
+    },
+    {
+        "candidate_id": "factor_cvol_2slot",
+        "role": "protocol_factor",
+        "kernel": {
+            "top_n": 3,
+            "max_active_positions": 2,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (
+                "breadth_ma20_gte_60",
+                "breakout_20d",
+                "controlled_volatility",
+            ),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "controlled_vol with two slots for more return density.",
+    },
+)
+
+
+def iter_protocol_factor_variants() -> tuple[dict[str, Any], ...]:
+    return PROTOCOL_FACTOR_VARIANTS
+
+
+def assert_variants_obey_protocol(
+    variants: tuple[dict[str, Any], ...] | None = None,
+) -> None:
     banned = set(BANNED_POSTHOC_SKIP_TAGS)
-    for row in PROTOCOL_BASELINE_VARIANTS:
+    chosen = variants or PROTOCOL_BASELINE_VARIANTS
+    for row in chosen:
         skip = set(row.get("skip_tags") or ())
         if skip & banned:
             raise ValueError(f"{row['candidate_id']} uses banned post-hoc skip")

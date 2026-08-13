@@ -15,6 +15,7 @@ from app.factor_v3_path_a_protocol_baseline_specs import (
     STAGE_GOAL_ID,
     assert_variants_obey_protocol,
     iter_protocol_baseline_variants,
+    iter_protocol_factor_variants,
 )
 from app.storage import write_json
 
@@ -72,9 +73,10 @@ def score_protocol_baseline(
     holdout_trades: list[dict[str, Any]],
     *,
     variants: tuple[dict[str, Any], ...] | None = None,
+    stage_goal_id: str = STAGE_GOAL_ID,
 ) -> dict[str, Any]:
-    assert_variants_obey_protocol()
     chosen = variants or iter_protocol_baseline_variants()
+    assert_variants_obey_protocol(chosen)
     ids = [str(row["candidate_id"]) for row in chosen]
     overlap = set(ids) & proto.CONTAMINATED_CANDIDATE_IDS
     if overlap:
@@ -102,7 +104,7 @@ def score_protocol_baseline(
     passed = [row for row in rows if row["holdout_dual_pass_50_15"]]
     return {
         "schema": REPORT_SCHEMA,
-        "stage_goal_id": STAGE_GOAL_ID,
+        "stage_goal_id": stage_goal_id,
         "protocol": proto.protocol_descriptor(),
         "development_only": True,
         "promotable": False,
@@ -125,6 +127,7 @@ def build_path_a_protocol_baseline(
     repo_root: Path | None = None,
     qualified_trades_path: Path | None = None,
     require_local_research: bool = True,
+    family: str = "baseline",
 ) -> dict[str, Any]:
     if require_local_research:
         role = os.getenv("VPS_RUNTIME_ROLE", "")
@@ -153,7 +156,18 @@ def build_path_a_protocol_baseline(
     )
     train_trades = proto.filter_trades_for_partition(all_trades, "train")
     holdout_trades = proto.filter_trades_for_partition(all_trades, "holdout")
-    report = score_protocol_baseline(train_trades, holdout_trades)
+    chosen = str(family or "baseline").strip().casefold()
+    if chosen == "factor":
+        report = score_protocol_baseline(
+            train_trades,
+            holdout_trades,
+            variants=iter_protocol_factor_variants(),
+            stage_goal_id="path-a-protocol-factor/v1",
+        )
+    elif chosen == "baseline":
+        report = score_protocol_baseline(train_trades, holdout_trades)
+    else:
+        raise PathAProtocolBaselineError(f"unknown family: {family!r}")
     report["qualified_trades_path"] = str(qt_path)
     report["source_version"] = meta.get("source_version")
     report["slice"] = meta.get("slice")

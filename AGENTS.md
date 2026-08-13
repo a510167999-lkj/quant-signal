@@ -42,9 +42,9 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 计划已改序。50/15 未改。`vol_skip_rsi_adv_s85` 降级为 **rejected_slice_hypothesis**，禁止回 191 调参。
 
 1. **协议**（`app/factor_v3_path_a_research_protocol.py`）：train `2023-07-03..2025-06-30`，holdout `2025-07-01..2026-07-03`。搜索宇宙 = Jiaoch v2 holdout，不是 191 成交切片。双过 = **最新滚动 12 月收益 ≥50%** 且 **该分区 MDD ≤15%**。全路径收益只做诊断，不当年化。
-2. **预注册基线**（无事后 skip、无 0.85 仓）在 1667 只 holdout QT 上：**holdout 全灭**。`proto_t2_m1` 最好 MDD 仍 **-23.97%**，最新 1y **-20.61%**。
-3. 过期 Jiaoch SQLite 补拉仍在跑（约 2043 只），只当宇宙建设，不拿来救 s85。
-4. 禁止 AKShare。不自动交易。非正式有效。下一刀若挖规则：只准看 train，holdout 密封到写进协议的变体打完再开。
+2. **预注册基线** holdout 全灭。`proto_t2_m1` 最好 MDD **-23.97%**。
+3. **因子刀**（train 上看完再预注册）：`action_buy` / `controlled_volatility` / `balanced_rsi` / `ma20_gte_70` / `score_gte_5` / 双槽控波。train 上 MDD 能压到 8%–16%，最新 1y 只有 **2%–12%**。holdout 仍全灭；最接近 15% 的是 `factor_ma70` **-12.0% / -15.96%**。
+4. 过期 Jiaoch 补拉仍在跑，只扩宇宙。禁止 AKShare。不回 191。50/15 未改。
 
 **明确不做**
 

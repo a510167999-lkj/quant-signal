@@ -28,6 +28,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--qualified-trades-path", type=Path, default=DEFAULT_QT)
     parser.add_argument("--allow-any-role", action="store_true")
+    parser.add_argument(
+        "--family",
+        choices=("baseline", "factor"),
+        default="baseline",
+    )
     args = parser.parse_args(argv)
     repo = args.repo_root.resolve()
     os.environ.setdefault("VPS_RUNTIME_ROLE", "local_research")
@@ -36,9 +41,17 @@ def main(argv: list[str] | None = None) -> int:
         repo_root=repo,
         qualified_trades_path=qt if qt.is_absolute() else (repo / qt),
         require_local_research=not args.allow_any_role,
+        family=args.family,
     )
+    family_roots = {
+        "baseline": DEFAULT_OUTPUT_ROOT,
+        "factor": Path("data/research_runs/path_a_protocol_factor"),
+    }
+    chosen_root = args.output_root
+    if chosen_root == DEFAULT_OUTPUT_ROOT:
+        chosen_root = family_roots[args.family]
     output_root = (
-        args.output_root if args.output_root.is_absolute() else (repo / args.output_root)
+        chosen_root if chosen_root.is_absolute() else (repo / chosen_root)
     ).resolve()
     pointer = write_path_a_protocol_baseline(report, output_root=output_root)
     print(format_protocol_baseline_table(report), end="")

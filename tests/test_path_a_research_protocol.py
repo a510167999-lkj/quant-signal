@@ -6,6 +6,7 @@ from app import research_goal_contract as goal
 from app.factor_v3_path_a_protocol_baseline_specs import (
     assert_variants_obey_protocol,
     iter_protocol_baseline_variants,
+    iter_protocol_factor_variants,
 )
 
 
@@ -53,6 +54,13 @@ def test_baseline_variants_are_clean_and_disjoint() -> None:
     for row in iter_protocol_baseline_variants():
         assert not row.get("skip_tags")
         assert row.get("entry_scale") in (None, 1, 1.0)
+    factor_ids = [row["candidate_id"] for row in iter_protocol_factor_variants()]
+    assert len(factor_ids) == 6
+    assert set(factor_ids).isdisjoint(proto.CONTAMINATED_CANDIDATE_IDS)
+    assert_variants_obey_protocol(iter_protocol_factor_variants())
+    for row in iter_protocol_factor_variants():
+        assert "rsi_repair" not in (row["kernel"].get("required_signal_tags") or ())
+        assert "rsi_repair" not in (row["kernel"].get("excluded_signal_tags") or ())
 
 
 def test_baseline_scorer_flags_holdout_via_protocol() -> None:
