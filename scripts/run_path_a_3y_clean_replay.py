@@ -226,8 +226,11 @@ def refill_one(
             frame, source = provider.history(
                 symbol, market, lookback_days=LOOKBACK_DAYS, adjust="qfq"
             )
-            if not is_jiaoch_stk_mins_v2_source(str(source)):
-                raise RuntimeError(f"refill produced non-v2 source: {source}")
+            source_text = str(source)
+            if "akshare" in source_text.casefold():
+                raise RuntimeError(f"AKShare is forbidden: {source_text}")
+            if not is_jiaoch_stk_mins_v2_source(source_text):
+                raise RuntimeError(f"refill produced non-v2 source: {source_text}")
             write_json(
                 str(path),
                 {"source": source, "records": frame.to_dict(orient="records")},
