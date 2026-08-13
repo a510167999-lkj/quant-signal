@@ -389,6 +389,10 @@ def _aggregate_daily_from_minutes(
         if not trade_date:
             continue
         by_date.setdefault(trade_date, []).append(row)
+    # stk_mins returns bars in reverse chronological order; sort ascending so
+    # opens[0] is the first (open) bar and closes[-1] is the last (close) bar.
+    for trade_date in by_date:
+        by_date[trade_date].sort(key=lambda b: str(b.get("trade_time") or ""))
     daily: list[dict[str, Any]] = []
     prev_close: float | None = None
     for trade_date in sorted(by_date):
