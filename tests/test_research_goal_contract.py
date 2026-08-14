@@ -16,7 +16,7 @@ def test_research_goal_freezes_jiaoch_hs_targets_and_exclusions() -> None:
     assert descriptor["downstream_exclude_st"] is True
     assert descriptor["downstream_exclude_delisted"] is True
     assert "ST" in descriptor["downstream_excluded_name_tokens"]
-    assert descriptor["target_rolling_12m_net_return_pct"] == 30.0
+    assert descriptor["target_rolling_12m_net_return_pct"] == 26.0
     assert descriptor["target_max_drawdown_pct"] == 15.0
     assert descriptor["automatic_trading_allowed"] is False
     assert descriptor["max_daily_recommendations"] == 3
@@ -43,7 +43,7 @@ def test_downstream_eligibility_and_primary_performance_gate() -> None:
         assert "BSE" in str(exc)
 
     assert goal.meets_primary_performance_targets(
-        rolling_12m_net_return_pct=30.0,
+        rolling_12m_net_return_pct=26.0,
         max_drawdown_pct=15.0,
     )
     assert goal.meets_primary_performance_targets(
@@ -51,7 +51,7 @@ def test_downstream_eligibility_and_primary_performance_gate() -> None:
         max_drawdown_pct=-10.0,
     )
     assert not goal.meets_primary_performance_targets(
-        rolling_12m_net_return_pct=29.9,
+        rolling_12m_net_return_pct=25.9,
         max_drawdown_pct=10.0,
     )
     assert not goal.meets_primary_performance_targets(

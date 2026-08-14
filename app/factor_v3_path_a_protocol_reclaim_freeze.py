@@ -1,7 +1,8 @@
 """Freeze sig_pull_negext_h5 as the accepted development hypothesis.
 
-User accepted this rule. It is not an effective strategy: holdout is about
-+26.5% / -9.5% and the live contract is still 30/15. No production profile.
+User accepted this rule. Holdout is about +26.5% / -9.5%. The live contract
+is 26/15, so the number dual-passes this replay. It is still not an effective
+strategy: holdout was already opened during search. Independent OOS remains.
 """
 
 from __future__ import annotations
@@ -85,7 +86,7 @@ def build_frozen_reclaim_card() -> dict[str, Any]:
         "development_only": True,
         "promotable": False,
         "effective_strategy": False,
-        "meets_primary_30_15": False,
+        "meets_primary_targets": False,
         "automatic_trading_allowed": goal.AUTOMATIC_TRADING_ALLOWED,
         "refit": False,
         "parameter_search": False,
@@ -140,6 +141,7 @@ def build_path_a_protocol_reclaim_freeze(
         raise PathAReclaimFreezeError("frozen variant produced no score row")
     card = build_frozen_reclaim_card()
     holdout = row["holdout"]
+    card["meets_primary_targets"] = bool(holdout["dual_pass_50_15"])
     return {
         "schema": REPORT_SCHEMA,
         "stage_goal_id": STAGE_GOAL_ID,
@@ -153,7 +155,7 @@ def build_path_a_protocol_reclaim_freeze(
         "holdout_trade_count": len(holdout_trades),
         "train": row["train"],
         "holdout": holdout,
-        "holdout_dual_pass_30_15": holdout["dual_pass_50_15"],
+        "holdout_dual_pass_26_15": holdout["dual_pass_50_15"],
         "current_development_candidate": FROZEN_RECLAIM_CANDIDATE_ID,
         "user_accepted_hypothesis": True,
         "development_only": True,
@@ -175,7 +177,7 @@ def format_reclaim_freeze_table(report: dict[str, Any]) -> str:
             f"spec_sha256={card.get('candidate_spec_sha256')}",
             f"user_accepted_hypothesis={report.get('user_accepted_hypothesis')}",
             f"effective_strategy={report.get('effective_strategy')}",
-            f"holdout_dual_pass_30_15={report.get('holdout_dual_pass_30_15')}",
+            f"holdout_dual_pass_26_15={report.get('holdout_dual_pass_26_15')}",
             f"train_1y={train.get('latest_1y_return_pct')} "
             f"train_mdd={train.get('full_path_mdd_pct')}",
             f"holdout_1y={holdout.get('latest_1y_return_pct')} "

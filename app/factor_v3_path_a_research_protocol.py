@@ -1,7 +1,8 @@
 """Locked Path-A search protocol after the 191-slice false positive.
 
-50/15 is unchanged. This module only locks *how* we search so we cannot
-retune on the mined 191-name book or treat full-path return as 12-month net.
+Performance thresholds come from research_goal_contract (currently 26/15).
+This module only locks *how* we search so we cannot retune on the mined
+191-name book or treat full-path return as 12-month net.
 """
 
 from __future__ import annotations

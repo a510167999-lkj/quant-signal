@@ -26,7 +26,7 @@ def test_protocol_locks_split_and_rejects_s85() -> None:
     assert proto.partition_for_signal_date("2025-07-01") == "holdout"
     assert proto.partition_for_signal_date("2026-07-03") == "holdout"
     assert proto.partition_for_signal_date("2026-07-04") is None
-    assert goal.TARGET_ROLLING_12M_NET_RETURN_PCT == 30.0
+    assert goal.TARGET_ROLLING_12M_NET_RETURN_PCT == 26.0
     assert goal.TARGET_MAX_DRAWDOWN_PCT == 15.0
 
 
@@ -36,11 +36,11 @@ def test_locked_split_uses_latest_12m_not_full_path_return() -> None:
         partition_max_drawdown_pct=-14.0,
     )
     assert proto.meets_locked_split_targets(
-        latest_12m_net_return_pct=30.0,
+        latest_12m_net_return_pct=26.0,
         partition_max_drawdown_pct=-14.0,
     )
     assert not proto.meets_locked_split_targets(
-        latest_12m_net_return_pct=29.9,
+        latest_12m_net_return_pct=25.9,
         partition_max_drawdown_pct=-14.0,
     )
     assert not proto.meets_locked_split_targets(

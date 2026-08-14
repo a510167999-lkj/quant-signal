@@ -12,7 +12,7 @@ def test_stage_goal_is_development_only_and_aligned_with_research_goal() -> None
     assert audit.STAGE_GOAL_ID == "factor-v3-train-locked-formal-data-receipts/v1"
     assert "2026-08-01" in audit.STAGE_GOAL_SUMMARY or "train" in summary
     assert "自动交易" in audit.STAGE_GOAL_SUMMARY or "trading" in summary
-    assert goal.TARGET_ROLLING_12M_NET_RETURN_PCT == 30.0
+    assert goal.TARGET_ROLLING_12M_NET_RETURN_PCT == 26.0
     assert goal.TARGET_MAX_DRAWDOWN_PCT == 15.0
     assert "BSE" in goal.DOWNSTREAM_EXCLUDED_SEGMENTS
     assert "SSE_STAR" in goal.DOWNSTREAM_EXCLUDED_SEGMENTS

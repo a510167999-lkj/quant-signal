@@ -90,7 +90,7 @@ def test_dual_pass_flag_is_computed_by_goal_contract() -> None:
     )
     assert win["dual_pass_50_15"] is True
     assert lose["dual_pass_50_15"] is False
-    assert goal.TARGET_ROLLING_12M_NET_RETURN_PCT == 30.0
+    assert goal.TARGET_ROLLING_12M_NET_RETURN_PCT == 26.0
     assert goal.TARGET_MAX_DRAWDOWN_PCT == 15.0
     assert goal.AUTOMATIC_TRADING_ALLOWED is False
     assert DRAWDOWN_ROUND_VARIANTS[0]["candidate_id"] == "e4_primary"

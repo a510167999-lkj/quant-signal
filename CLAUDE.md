@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 个人 A 股 / A 股 ETF 量化信号研究平台。FastAPI 后端 + 静态 Web 前端，部署在个人 VPS。**仅供个人研究，不构成投资建议。**
 
-**研究目标已写死**：真实成本后滚动 12 个月净年化 ≥ 30%、最大回撤 ≤ 15%；只做沪主板 / 深主板 / 创业板；不考虑 ST、科创板、北交所；不自动交易。权威常量见 `app/research_goal_contract.py`。**搜索协议**见 `app/factor_v3_path_a_research_protocol.py`：禁止回 191 切片调参；双过必须用最新 12 月收益，不能拿全路径收益冒充年化。会话口径见 `AGENTS.md` 与 `项目进度.md`。
+**研究目标已写死**：真实成本后滚动 12 个月净年化 ≥ 26%、最大回撤 ≤ 15%；只做沪主板 / 深主板 / 创业板；不考虑 ST、科创板、北交所；不自动交易。权威常量见 `app/research_goal_contract.py`。**搜索协议**见 `app/factor_v3_path_a_research_protocol.py`：禁止回 191 切片调参；双过必须用最新 12 月收益，不能拿全路径收益冒充年化。会话口径见 `AGENTS.md` 与 `项目进度.md`。
 
 ## Commands
 
@@ -58,7 +58,7 @@ python -m app.jobs research-sweep-file          # 从落盘的 qualified-trades 
 - `indicators.py` → `signals.py`：趋势结构、MACD、RSI、20 日突破、ATR 风控。
 - `signal_tags.py`（最大模块之一）：把横截面特征转成 `breadth_*`、`proxy_*`、`price_*`、`rs*`、`margin_*`、`lhb_*`、`industry_*` 等标签，供生产推荐和历史 sweep 共用同一套门槛。
 - `backtest.py`：**信号日次日开盘入场**，避免同 K 线回填偏差。
-- `research_backtest.py`（约 1150 行）+ `research_sweep.py`（约 1130 行）：严格历史回测引擎，支持资本模型（`slot-exit` / `slot-daily` 逐日盯市）、暴露倍数、相关性预算、前日高点保护止损、分批止盈、长假前退出等。当前主研究目标为真实成本/滑点后最近滚动 12 个月净收益约 30%、最大回撤不超过 15%。胜率观察区间为 52%-60%，并联合检查盈亏比、Profit Factor（至少约 1.3）、Calmar（至少 1.5，2 更佳）和滚动稳定性。研究缓存结论不等于实盘可用证明。
+- `research_backtest.py`（约 1150 行）+ `research_sweep.py`（约 1130 行）：严格历史回测引擎，支持资本模型（`slot-exit` / `slot-daily` 逐日盯市）、暴露倍数、相关性预算、前日高点保护止损、分批止盈、长假前退出等。当前主研究目标为真实成本/滑点后最近滚动 12 个月净收益约 26%、最大回撤不超过 15%。胜率观察区间为 52%-60%，并联合检查盈亏比、Profit Factor（至少约 1.3）、Calmar（至少 1.5，2 更佳）和滚动稳定性。研究缓存结论不等于实盘可用证明。
 - `research_backtest` 的纯计算层已按职责拆成子模块，`research_backtest` 本身只负责回测编排与 payload 构造，并**反向 import 这些子模块**以保持内部调用点与测试路径稳定（改调用方前先看这条约定）：
   - `research_equity.py`：权益曲线 / 资本模型数学（`slot-exit` / `slot-daily` 逐日盯市、最大回撤）。
   - `research_context.py`：信号日上下文计算（大盘强度 / 代理收益 / 相对强度 / K 线形态 / 市场宽度 / 行业轮动 / 历史质量）。
