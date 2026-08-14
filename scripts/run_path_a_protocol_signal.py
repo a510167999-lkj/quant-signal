@@ -14,10 +14,15 @@ if str(ROOT) not in sys.path:
 
 from app.factor_v3_path_a_protocol_signal import (  # noqa: E402
     DEFAULT_CACHE_DIR,
+    DEFAULT_HOLD_QT_PATH,
     DEFAULT_QT_PATH,
     STAGE_GOAL_ID,
     build_path_a_protocol_signal_qt,
     write_path_a_protocol_signal_qt,
+)
+from app.factor_v3_path_a_protocol_signal_specs import (  # noqa: E402
+    SIGNAL_FAMILY,
+    SIGNAL_HOLD_FAMILY,
 )
 
 
@@ -25,8 +30,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=STAGE_GOAL_ID)
     parser.add_argument("--repo-root", type=Path, default=ROOT)
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
-    parser.add_argument("--qualified-trades-output", type=Path, default=DEFAULT_QT_PATH)
+    parser.add_argument("--qualified-trades-output", type=Path, default=None)
     parser.add_argument("--max-symbols", type=int, default=0)
+    parser.add_argument(
+        "--family",
+        choices=("signal", "hold"),
+        default="signal",
+    )
     parser.add_argument("--allow-any-role", action="store_true")
     args = parser.parse_args(argv)
     repo = args.repo_root.resolve()
@@ -34,13 +44,23 @@ def main(argv: list[str] | None = None) -> int:
     cache = args.cache_dir
     if not cache.is_absolute():
         cache = repo / cache
+    if args.family == "hold":
+        hold_horizons = (5, 10)
+        signal_family = SIGNAL_HOLD_FAMILY
+        default_qt = DEFAULT_HOLD_QT_PATH
+    else:
+        hold_horizons = (5,)
+        signal_family = SIGNAL_FAMILY
+        default_qt = DEFAULT_QT_PATH
     payload = build_path_a_protocol_signal_qt(
         repo_root=repo,
         cache_dir=cache,
         max_symbols=args.max_symbols,
         require_local_research=not args.allow_any_role,
+        hold_horizons=hold_horizons,
+        signal_family=signal_family,
     )
-    qt_path = args.qualified_trades_output
+    qt_path = args.qualified_trades_output or default_qt
     if not qt_path.is_absolute():
         qt_path = repo / qt_path
     wrote = write_path_a_protocol_signal_qt(payload, qt_path=qt_path)

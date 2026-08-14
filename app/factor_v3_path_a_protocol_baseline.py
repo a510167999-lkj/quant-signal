@@ -19,9 +19,14 @@ from app.factor_v3_path_a_protocol_baseline_specs import (
     iter_protocol_baseline_variants,
     iter_protocol_factor_variants,
 )
-from app.factor_v3_path_a_protocol_signal import DEFAULT_QT_PATH as SIGNAL_QT
+from app.factor_v3_path_a_protocol_signal import (
+    DEFAULT_HOLD_QT_PATH as SIGNAL_HOLD_QT,
+    DEFAULT_QT_PATH as SIGNAL_QT,
+)
 from app.factor_v3_path_a_protocol_signal_specs import (
     SIGNAL_FAMILY,
+    SIGNAL_HOLD_FAMILY,
+    iter_protocol_signal_hold_variants,
     iter_protocol_signal_variants,
 )
 from app.storage import write_json
@@ -146,7 +151,12 @@ def build_path_a_protocol_baseline(
             )
     root = (repo_root or Path.cwd()).resolve()
     chosen = str(family or "baseline").strip().casefold()
-    default_qt = SIGNAL_QT if chosen == "signal" else DEFAULT_QT
+    if chosen == "signal_hold":
+        default_qt = SIGNAL_HOLD_QT
+    elif chosen == "signal":
+        default_qt = SIGNAL_QT
+    else:
+        default_qt = DEFAULT_QT
     qt_path = (
         Path(qualified_trades_path).resolve()
         if qualified_trades_path is not None
@@ -164,6 +174,8 @@ def build_path_a_protocol_baseline(
         )
     if chosen == "signal" and meta.get("signal_family") != SIGNAL_FAMILY:
         raise PathAProtocolBaselineError("QT is not the protocol signal book")
+    if chosen == "signal_hold" and meta.get("signal_family") != SIGNAL_HOLD_FAMILY:
+        raise PathAProtocolBaselineError("QT is not the protocol signal-hold book")
     all_trades = train_replay._filter_train_trades(
         list(qt.get("qualified_trades") or [])
     )
@@ -189,6 +201,13 @@ def build_path_a_protocol_baseline(
             holdout_trades,
             variants=iter_protocol_signal_variants(),
             stage_goal_id="path-a-protocol-signal/v1",
+        )
+    elif chosen == "signal_hold":
+        report = score_protocol_baseline(
+            train_trades,
+            holdout_trades,
+            variants=iter_protocol_signal_hold_variants(),
+            stage_goal_id="path-a-protocol-signal-hold/v1",
         )
     elif chosen == "baseline":
         report = score_protocol_baseline(train_trades, holdout_trades)

@@ -14,6 +14,8 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     PULLBACK_TAG,
     RECLAIM_TAG,
     SIGNAL_FAMILY,
+    SIGNAL_HOLD_FAMILY,
+    SIGNAL_HOLD_STAGE_GOAL_ID,
     STAGE_GOAL_ID,
 )
 from app.indicators import add_indicators
@@ -40,6 +42,9 @@ STOP_LOSS_PCT = 5.0
 DEFAULT_CACHE_DIR = Path("data/research_cache/jiaoch_stk_mins_3y_v2_holdout")
 DEFAULT_QT_PATH = Path(
     "data/research_cache/qualified_hold5_stop5_3y_jiaoch_signal.json"
+)
+DEFAULT_HOLD_QT_PATH = Path(
+    "data/research_cache/qualified_hold5_10_stop5_3y_jiaoch_signal.json"
 )
 
 
@@ -138,8 +143,11 @@ def build_signal_trades(
     start_date: str = START_DATE,
     end_date: str = END_DATE,
     hold_days: int = HOLD_DAYS,
+    hold_horizons: tuple[int, ...] | None = None,
     stop_loss_pct: float = STOP_LOSS_PCT,
 ) -> list[dict[str, Any]]:
+    horizons = tuple(hold_horizons) if hold_horizons is not None else (int(hold_days),)
+    max_hold = max(int(item) for item in horizons)
     symbol_frames = {
         str(item["symbol"]): {"frame": frame, "base": item}
         for item, frame in prepared
@@ -147,7 +155,7 @@ def build_signal_trades(
     breadth_by_date = _historical_market_breadth(
         symbol_frames,
         start_date,
-        hold_days,
+        max_hold,
         universe_source=None,
     )
     trades: list[dict[str, Any]] = []
@@ -156,10 +164,10 @@ def build_signal_trades(
         masks = signal_masks(frame)
         fire = masks["reclaim"]
         for index in fire[fire].index.tolist():
-            if int(index) + 1 + hold_days >= len(frame):
-                continue
             signal_date = str(frame.at[index, "date"])[:10]
             if signal_date < start_date or signal_date > end_date:
+                continue
+            if int(index) + 1 >= len(frame):
                 continue
             signal_bar = frame.iloc[int(index)]
             entry_bar = frame.iloc[int(index) + 1]
@@ -174,12 +182,6 @@ def build_signal_trades(
             )
             if executable.get("executable") is not True:
                 continue
-            realized = _realized_trade_from_future(
-                frame,
-                int(index) + 1,
-                int(index) + 1 + hold_days,
-                stop_loss_pct=stop_loss_pct,
-            )
             amount = _num(signal_bar.get("amount"), 0.0) or 0.0
             if amount <= 0:
                 close = _num(signal_bar.get("close"), 0.0) or 0.0
@@ -191,38 +193,56 @@ def build_signal_trades(
                 signal_bar,
                 _stock_market_returns(breadth),
             )
-            tags = set(_bar_tags(signal_bar, masks.iloc[int(index)]))
-            tags.update(relative.get("tags") or [])
-            tags.update(build_market_breadth_tags(breadth))
-            tags.update(build_price_action_tags(executable))
+            base_tags = set(_bar_tags(signal_bar, masks.iloc[int(index)]))
+            base_tags.update(relative.get("tags") or [])
+            base_tags.update(build_market_breadth_tags(breadth))
+            base_tags.update(build_price_action_tags(executable))
             candidate = {
                 "symbol": symbol,
                 "name": item.get("name"),
                 "amount": amount,
                 "change_pct": _num(signal_bar.get("change_pct")),
             }
-            tags.update(build_candidate_context_tags(candidate))
-            trades.append(
-                {
-                    **realized,
-                    "symbol": symbol,
-                    "name": item.get("name"),
-                    "signal_date": signal_date,
-                    "action": "BUY",
-                    "score": 4.0,
-                    "rank_score": round(float(amount), 4),
-                    "candidate_amount": amount,
-                    "market_level": market.get("level"),
-                    "signal_tags": sorted(tags),
-                    "relative_strength": {
-                        key: value
-                        for key, value in relative.items()
-                        if key != "tags"
-                    },
-                    "entry_executability": executable,
-                }
-            )
-    trades.sort(key=lambda row: (str(row["signal_date"]), str(row["symbol"])))
+            base_tags.update(build_candidate_context_tags(candidate))
+            for horizon in horizons:
+                hold = int(horizon)
+                if int(index) + 1 + hold >= len(frame):
+                    continue
+                realized = _realized_trade_from_future(
+                    frame,
+                    int(index) + 1,
+                    int(index) + 1 + hold,
+                    stop_loss_pct=stop_loss_pct,
+                )
+                tags = set(base_tags)
+                tags.add(f"hold{hold}")
+                trades.append(
+                    {
+                        **realized,
+                        "symbol": symbol,
+                        "name": item.get("name"),
+                        "signal_date": signal_date,
+                        "action": "BUY",
+                        "score": 4.0,
+                        "rank_score": round(float(amount), 4),
+                        "candidate_amount": amount,
+                        "market_level": market.get("level"),
+                        "signal_tags": sorted(tags),
+                        "relative_strength": {
+                            key: value
+                            for key, value in relative.items()
+                            if key != "tags"
+                        },
+                        "entry_executability": executable,
+                    }
+                )
+    trades.sort(
+        key=lambda row: (
+            str(row["signal_date"]),
+            str(row["symbol"]),
+            str(row.get("exit_date") or ""),
+        )
+    )
     return trades
 
 
@@ -233,6 +253,8 @@ def build_path_a_protocol_signal_qt(
     max_symbols: int = 0,
     require_local_research: bool = True,
     progress_every: int = 100,
+    hold_horizons: tuple[int, ...] = (5,),
+    signal_family: str = SIGNAL_FAMILY,
 ) -> dict[str, Any]:
     if require_local_research:
         role = os.getenv("VPS_RUNTIME_ROLE", "")
@@ -274,20 +296,27 @@ def build_path_a_protocol_signal_qt(
     if not prepared:
         raise PathAProtocolSignalError("no Jiaoch v2 cache_ok holdout names")
     print(f"building trades names={len(prepared)} skipped={skipped}", flush=True)
-    trades = build_signal_trades(prepared)
+    trades = build_signal_trades(prepared, hold_horizons=hold_horizons)
+    family = str(signal_family)
+    stage = (
+        SIGNAL_HOLD_STAGE_GOAL_ID
+        if family == SIGNAL_HOLD_FAMILY
+        else STAGE_GOAL_ID
+    )
     payload = {
         "qualified_trades": trades,
         "summary": {
             "path_a_3y_clean_replay": {
-                "stage": STAGE_GOAL_ID,
+                "stage": stage,
                 "slice": "holdout",
                 "development_only": True,
                 "promotable": False,
                 "source_policy": DATA_SOURCE_POLICY,
                 "source_version": JIAOCH_DAILY_CACHE_SOURCE_VERSION,
-                "signal_family": SIGNAL_FAMILY,
+                "signal_family": family,
                 "window": {"start": START_DATE, "end": END_DATE},
                 "hold_days": HOLD_DAYS,
+                "hold_horizons": list(hold_horizons),
                 "stop_loss_pct": STOP_LOSS_PCT,
                 "name_count": len(prepared),
                 "skipped_missing_cache": skipped,
