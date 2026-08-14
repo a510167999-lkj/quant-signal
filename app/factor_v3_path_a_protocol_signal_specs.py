@@ -205,6 +205,14 @@ def iter_protocol_signal_hold_variants() -> tuple[dict[str, Any], ...]:
     return PROTOCOL_SIGNAL_HOLD_VARIANTS
 
 
+FROZEN_RECLAIM_CANDIDATE_ID = "sig_pull_negext_h5"
+FROZEN_RECLAIM_VARIANT = next(
+    row
+    for row in PROTOCOL_SIGNAL_HOLD_VARIANTS
+    if row["candidate_id"] == FROZEN_RECLAIM_CANDIDATE_ID
+)
+
+
 LIMIT_FOLLOW_TAG = "limit_up_next_day_confirm"
 MA60_RECLAIM_TAG = "trend_ma60_reclaim"
 BREAKOUT_60D_TAG = "breakout_60d"

@@ -37,7 +37,7 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 - 2026-08-12 已用 Jiaoch `stk_mins` 合成日线回填约 733 个交易日 / 约 5284 只；不是“没采过”。
 - 单位、QFQ、frozen fail-closed、frozen-v3 coverage-audit 锚已修。coverage-audit 只证明“可以开采集门”，不等于 3 年研究输入已干净。
 
-**当前阶段 ID**：`path-a-locked-split/v1` + `path-a-protocol-signal-entry/v1`
+**当前阶段 ID**：`path-a-protocol-reclaim-freeze/v1`
 
 计划已改序。**2026-08-14 用户把收益门槛从 50% 调到 30%**，回撤仍是 15%。`vol_skip_rsi_adv_s85` 降级为 **rejected_slice_hypothesis**，禁止回 191 调参。
 
@@ -47,7 +47,8 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 4. **身份刀**：holdout 最好 `alt_rs_leader` **+11.95% / -14.16%**。
 5. **信号刀**：2774 只上 `sig_pull_negext` **+16.34% / -14.15%**。
 6. **持有期 + 大宇宙**：`sig_pull_negext_h5` **+26.45% / -9.48%**，仍是 holdout 最近。
-7. **第三种入场**（涨停次日确认 / MA60 收回 / 60 日突破）：train 上涨停跟随很肥，holdout 全灭。30/15 未过。当前仍以回踩抗追高为最近假设。禁止 AKShare。不回 191。
+7. **第三种入场** holdout 全灭。
+8. **用户接受当前假设并冻结**：`sig_pull_negext_h5`。holdout **+26.5% / -9.5%**。**不是有效策略**（30/15 未过），不注册生产 profile，不自动交易。规格禁止再改参。
 
 **明确不做**
 
