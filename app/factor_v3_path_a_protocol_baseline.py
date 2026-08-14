@@ -19,6 +19,11 @@ from app.factor_v3_path_a_protocol_baseline_specs import (
     iter_protocol_baseline_variants,
     iter_protocol_factor_variants,
 )
+from app.factor_v3_path_a_protocol_signal import DEFAULT_QT_PATH as SIGNAL_QT
+from app.factor_v3_path_a_protocol_signal_specs import (
+    SIGNAL_FAMILY,
+    iter_protocol_signal_variants,
+)
 from app.storage import write_json
 
 DEFAULT_QT = Path("data/research_cache/qualified_hold5_stop5_3y_jiaoch_holdout_xl.json")
@@ -140,10 +145,12 @@ def build_path_a_protocol_baseline(
                 f"requires VPS_RUNTIME_ROLE=local_research (got {role!r})"
             )
     root = (repo_root or Path.cwd()).resolve()
+    chosen = str(family or "baseline").strip().casefold()
+    default_qt = SIGNAL_QT if chosen == "signal" else DEFAULT_QT
     qt_path = (
         Path(qualified_trades_path).resolve()
         if qualified_trades_path is not None
-        else (root / DEFAULT_QT)
+        else (root / default_qt)
     )
     qt = train_replay._load_json(qt_path)
     if qt is None:
@@ -155,12 +162,13 @@ def build_path_a_protocol_baseline(
         raise PathAProtocolBaselineError(
             "refuses the contaminated 191-name traded slice"
         )
+    if chosen == "signal" and meta.get("signal_family") != SIGNAL_FAMILY:
+        raise PathAProtocolBaselineError("QT is not the protocol signal book")
     all_trades = train_replay._filter_train_trades(
         list(qt.get("qualified_trades") or [])
     )
     train_trades = proto.filter_trades_for_partition(all_trades, "train")
     holdout_trades = proto.filter_trades_for_partition(all_trades, "holdout")
-    chosen = str(family or "baseline").strip().casefold()
     if chosen == "factor":
         report = score_protocol_baseline(
             train_trades,
@@ -174,6 +182,13 @@ def build_path_a_protocol_baseline(
             holdout_trades,
             variants=iter_protocol_alt_variants(),
             stage_goal_id="path-a-protocol-alt/v1",
+        )
+    elif chosen == "signal":
+        report = score_protocol_baseline(
+            train_trades,
+            holdout_trades,
+            variants=iter_protocol_signal_variants(),
+            stage_goal_id="path-a-protocol-signal/v1",
         )
     elif chosen == "baseline":
         report = score_protocol_baseline(train_trades, holdout_trades)

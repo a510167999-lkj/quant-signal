@@ -37,15 +37,16 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 - 2026-08-12 已用 Jiaoch `stk_mins` 合成日线回填约 733 个交易日 / 约 5284 只；不是“没采过”。
 - 单位、QFQ、frozen fail-closed、frozen-v3 coverage-audit 锚已修。coverage-audit 只证明“可以开采集门”，不等于 3 年研究输入已干净。
 
-**当前阶段 ID**：`path-a-locked-split/v1` + `path-a-protocol-alt/v1`
+**当前阶段 ID**：`path-a-locked-split/v1` + `path-a-protocol-signal/v1`
 
 计划已改序。50/15 未改。`vol_skip_rsi_adv_s85` 降级为 **rejected_slice_hypothesis**，禁止回 191 调参。
 
 1. **协议**（`app/factor_v3_path_a_research_protocol.py`）：train `2023-07-03..2025-06-30`，holdout `2025-07-01..2026-07-03`。搜索宇宙 = Jiaoch v2 holdout，不是 191 成交切片。双过 = **最新滚动 12 月收益 ≥50%** 且 **该分区 MDD ≤15%**。全路径收益只做诊断，不当年化。
 2. **预注册基线** holdout 全灭。`proto_t2_m1` 最好 MDD **-23.97%**。
 3. **因子刀**（仍在 e4 突破核上叠质量过滤）：train 上 MDD 能压到 8%–16%，最新 1y 只有 **2%–12%**。holdout 全灭；最接近 15% 的是 `factor_ma70` **-12.0% / -15.96%**。
-4. **身份刀**（换经济逻辑，不再给 e4 加过滤）：train 上 `breakout_20d` 原始期望 ≤0。预注册相对强弱领先 / 相对弱势反转 / 抗追高排序。holdout 仍无一双过；**MDD 第一次转到 15% 以内**（`alt_negext` **-7.37%**，`alt_rs_leader` **-14.16%**），最好收益是 `alt_rs_leader` **+11.95%**。50% 收益密度仍没有。
-5. 过期 Jiaoch 补拉仍在跑，只扩宇宙。禁止 AKShare。不回 191。50/15 未改。
+4. **身份刀**（换经济逻辑，不再给 e4 加过滤）：holdout 最好 `alt_rs_leader` **+11.95% / -14.16%**。
+5. **信号刀**：丢掉 `evaluate_signal` 突破书，按预注册 MA20 回踩收回重新出 QT（2774 只 / 49170 笔）。holdout 仍无一双过；最接近是 `sig_pull_negext` **+16.34% / -14.15%**。5 日回踩也没有 50% 密度。
+6. 过期 Jiaoch 补拉仍在跑，只扩宇宙。禁止 AKShare。不回 191。50/15 未改。
 
 **明确不做**
 

@@ -20,6 +20,9 @@ from app.factor_v3_path_a_protocol_baseline import (  # noqa: E402
     format_protocol_baseline_table,
     write_path_a_protocol_baseline,
 )
+from app.factor_v3_path_a_protocol_signal import (  # noqa: E402
+    DEFAULT_QT_PATH as SIGNAL_QT,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -30,13 +33,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allow-any-role", action="store_true")
     parser.add_argument(
         "--family",
-        choices=("baseline", "factor", "alt"),
+        choices=("baseline", "factor", "alt", "signal"),
         default="baseline",
     )
     args = parser.parse_args(argv)
     repo = args.repo_root.resolve()
     os.environ.setdefault("VPS_RUNTIME_ROLE", "local_research")
     qt = args.qualified_trades_path
+    if args.family == "signal" and qt == DEFAULT_QT:
+        qt = SIGNAL_QT
     report = build_path_a_protocol_baseline(
         repo_root=repo,
         qualified_trades_path=qt if qt.is_absolute() else (repo / qt),
@@ -47,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
         "baseline": DEFAULT_OUTPUT_ROOT,
         "factor": Path("data/research_runs/path_a_protocol_factor"),
         "alt": Path("data/research_runs/path_a_protocol_alt"),
+        "signal": Path("data/research_runs/path_a_protocol_signal"),
     }
     chosen_root = args.output_root
     if chosen_root == DEFAULT_OUTPUT_ROOT:

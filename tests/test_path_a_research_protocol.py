@@ -10,6 +10,7 @@ from app.factor_v3_path_a_protocol_baseline_specs import (
     iter_protocol_baseline_variants,
     iter_protocol_factor_variants,
 )
+from app.factor_v3_path_a_protocol_signal_specs import iter_protocol_signal_variants
 
 
 def test_protocol_locks_split_and_rejects_s85() -> None:
@@ -87,6 +88,10 @@ def test_baseline_variants_are_clean_and_disjoint() -> None:
             drop_breakout += 1
     assert drop_breakout >= 4
     assert any(row.get("rank_key") == "neg_ext20" for row in alt)
+    signal_ids = [row["candidate_id"] for row in iter_protocol_signal_variants()]
+    assert len(signal_ids) == 6
+    assert set(signal_ids).isdisjoint(proto.CONTAMINATED_CANDIDATE_IDS)
+    assert_variants_obey_protocol(iter_protocol_signal_variants())
 
 
 def test_apply_rank_key_neg_ext_does_not_mutate() -> None:
