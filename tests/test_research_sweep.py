@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 import app.research_sweep as research_sweep
+from app import research_goal_contract as goal
 from app.jobs import (
     _compact_hold_sweep_result,
     _compact_research_sweep_payload,
@@ -606,7 +607,7 @@ def test_sweep_qualified_trades_defaults_to_current_50pct_return_target():
         max_filter_size=1,
     )
 
-    assert result["target_one_year_return_pct"] == 50.0
+    assert result["target_one_year_return_pct"] == goal.TARGET_ROLLING_12M_NET_RETURN_PCT
 
 
 def test_sweep_qualified_trades_fixed_spec_never_selects_a_better_market_subset():

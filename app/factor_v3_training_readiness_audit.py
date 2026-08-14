@@ -142,9 +142,9 @@ def audit_research_goal_contract() -> list[CheckResult]:
     )
     checks.append(
         CheckResult(
-            id="performance_targets_50_15",
+            id="performance_targets_30_15",
             ok=(
-                goal.TARGET_ROLLING_12M_NET_RETURN_PCT == 50.0
+                goal.TARGET_ROLLING_12M_NET_RETURN_PCT == 30.0
                 and goal.TARGET_MAX_DRAWDOWN_PCT == 15.0
             ),
             detail=(

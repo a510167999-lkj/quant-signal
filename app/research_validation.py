@@ -21,6 +21,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Tuple
 
+from app import research_goal_contract as goal
 from app.research_sweep import sweep_qualified_trades
 from app.research_pit import verify_research_evidence_bundle
 from app.research_scope import verify_trade_market_scope
@@ -786,7 +787,12 @@ def _fixed_sweep(trades: List[Dict[str, Any]], strategy: Dict[str, Any]) -> Dict
         max_filter_size=0,
         target_win_rate_pct=float(strategy.get("target_win_rate_pct", 52.0)),
         target_drawdown_pct=float(strategy.get("target_drawdown_pct", 15.0)),
-        target_one_year_return_pct=float(strategy.get("target_one_year_return_pct", 50.0)),
+        target_one_year_return_pct=float(
+            strategy.get(
+                "target_one_year_return_pct",
+                goal.TARGET_ROLLING_12M_NET_RETURN_PCT,
+            )
+        ),
         target_profit_factor=float(strategy.get("target_profit_factor", 1.3)),
         target_calmar=float(strategy.get("target_calmar", 1.5)),
         exposure_multipliers=[exposure],

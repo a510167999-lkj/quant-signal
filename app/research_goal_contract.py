@@ -13,7 +13,7 @@ from types import MappingProxyType
 RESEARCH_GOAL_SCHEMA = "quant-signal-lkj-research-goal/v1"
 RESEARCH_GOAL_SUMMARY = (
     "基于 Jiaoch（Tushare 镜像）迭代一条可复现的沪深 A 股策略："
-    "真实成本后滚动 12 个月净年化 ≥50%，最大回撤 ≤15%；"
+    "真实成本后滚动 12 个月净年化 ≥30%，最大回撤 ≤15%；"
     "仅沪主板、深主板、创业板；不含 ST、科创板、北证；不自动交易。"
 )
 
@@ -61,7 +61,7 @@ DOWNSTREAM_EXCLUDE_DELISTED = True
 # --- Performance acceptance (formal advancement) ---
 # Net of declared cost/slippage. Rolling windows are exact-session calendar
 # windows on the frozen development/embargo/final-OOS partitions — never mixed.
-TARGET_ROLLING_12M_NET_RETURN_PCT = 50.0
+TARGET_ROLLING_12M_NET_RETURN_PCT = 30.0
 TARGET_MAX_DRAWDOWN_PCT = 15.0
 # Supporting diagnostics (do not replace the two primary targets above).
 TARGET_PROFIT_FACTOR_MIN = 1.3

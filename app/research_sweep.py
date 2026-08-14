@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Sequence, Set
 
 import pandas as pd
 
+from app import research_goal_contract as goal
 from app.research_common import _date_value
 from app.research_equity import (
     _equity_points_from_basket_returns,
@@ -1228,8 +1229,8 @@ def sweep_qualified_trades(
     min_trades: int = 20,
     max_filter_size: int = 3,
     target_win_rate_pct: float = 52.0,
-    target_drawdown_pct: float = 15.0,
-    target_one_year_return_pct: float = 50.0,
+    target_drawdown_pct: float = goal.TARGET_MAX_DRAWDOWN_PCT,
+    target_one_year_return_pct: float = goal.TARGET_ROLLING_12M_NET_RETURN_PCT,
     target_profit_factor: float = 1.3,
     target_calmar: float = 1.5,
     exposure_multipliers: List[float] = None,

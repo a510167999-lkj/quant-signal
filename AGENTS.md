@@ -8,7 +8,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 用户目标只有一条，禁止被工程任务改写：
 
-> 做一条可复现的 A 股策略：真实成本后滚动 12 个月净年化 **≥ 50%**，最大回撤 **≤ 15%**；只做沪主板、深主板、创业板；**不考虑 ST、科创板、北交所**；**不自动交易**。
+> 做一条可复现的 A 股策略：真实成本后滚动 12 个月净年化 **≥ 30%**，最大回撤 **≤ 15%**；只做沪主板、深主板、创业板；**不考虑 ST、科创板、北交所**；**不自动交易**。
 
 权威常量见 `app/research_goal_contract.py`。改市场范围、名称排除或绩效门槛必须先改该模块并补测试，禁止在业务代码或会话里另起一套口径。
 
@@ -18,12 +18,12 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 | **数据** | **Jiaoch-only**（Tushare 镜像站）。正式训练/回测/证据链不得混 AKShare 或其他未授权源。 |
 | **市场** | 仅 `SSE_MAIN`（沪主板）、`SZSE_MAIN`（深主板）、`SZSE_CHINEXT`（创业板）。 |
 | **明确排除** | **ST / \*ST**、**退市**、**科创板 `SSE_STAR`（688/689）**、**北证 `BSE`**。上游账本可先保留五板块做 PIT 证明，下游策略宇宙必须过滤。 |
-| **主绩效** | 真实成本/滑点后：**滚动 12 个月净年化 ≥ 50%**，**最大回撤 ≤ 15%**。两线同时过才算过。 |
+| **主绩效** | 真实成本/滑点后：**滚动 12 个月净年化 ≥ 30%**，**最大回撤 ≤ 15%**。两线同时过才算过。 |
 | **辅助诊断** | Profit Factor ≥ 1.3、Calmar ≥ 1.5；胜率观察约 52%–60%。辅助指标不能替代主绩效。 |
 | **分区** | `development → embargo → final-OOS` 严格隔离；development 结果不得直接注册生产 profile。 |
 | **产出** | 每日最多 **0–3** 只研究建议；**禁止自动下单**。 |
 
-development 数字只是不可晋级的假设筛选。正式承认“有效”仍要独立 OOS；这不改变当前主线是先找到能过 50/15 的规则。
+development 数字只是不可晋级的假设筛选。正式承认“有效”仍要独立 OOS；这不改变当前主线是先找到能过 30/15 的规则。
 
 ### 当前主线（2026-08-13，以 Codex `codex/main` 为准）
 
@@ -39,18 +39,18 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 
 **当前阶段 ID**：`path-a-locked-split/v1` + `path-a-protocol-signal/v1`
 
-计划已改序。50/15 未改。`vol_skip_rsi_adv_s85` 降级为 **rejected_slice_hypothesis**，禁止回 191 调参。
+计划已改序。**2026-08-14 用户把收益门槛从 50% 调到 30%**，回撤仍是 15%。`vol_skip_rsi_adv_s85` 降级为 **rejected_slice_hypothesis**，禁止回 191 调参。
 
-1. **协议**（`app/factor_v3_path_a_research_protocol.py`）：train `2023-07-03..2025-06-30`，holdout `2025-07-01..2026-07-03`。搜索宇宙 = Jiaoch v2 holdout，不是 191 成交切片。双过 = **最新滚动 12 月收益 ≥50%** 且 **该分区 MDD ≤15%**。全路径收益只做诊断，不当年化。
+1. **协议**（`app/factor_v3_path_a_research_protocol.py`）：train `2023-07-03..2025-06-30`，holdout `2025-07-01..2026-07-03`。搜索宇宙 = Jiaoch v2 holdout，不是 191 成交切片。双过 = **最新滚动 12 月收益 ≥30%** 且 **该分区 MDD ≤15%**。全路径收益只做诊断，不当年化。
 2. **预注册基线** holdout 全灭。`proto_t2_m1` 最好 MDD **-23.97%**。
-3. **因子刀**（仍在 e4 突破核上叠质量过滤）：train 上 MDD 能压到 8%–16%，最新 1y 只有 **2%–12%**。holdout 全灭；最接近 15% 的是 `factor_ma70` **-12.0% / -15.96%**。
-4. **身份刀**（换经济逻辑，不再给 e4 加过滤）：holdout 最好 `alt_rs_leader` **+11.95% / -14.16%**。
-5. **信号刀**：丢掉 `evaluate_signal` 突破书，按预注册 MA20 回踩收回重新出 QT（2774 只 / 49170 笔）。holdout 仍无一双过；最接近是 `sig_pull_negext` **+16.34% / -14.15%**。5 日回踩也没有 50% 密度。
-6. 过期 Jiaoch 补拉仍在跑，只扩宇宙。禁止 AKShare。不回 191。50/15 未改。
+3. **因子刀**（仍在 e4 突破核上叠质量过滤）：holdout 全灭；最接近 15% 的是 `factor_ma70` **-12.0% / -15.96%**。
+4. **身份刀**：holdout 最好 `alt_rs_leader` **+11.95% / -14.16%**。
+5. **信号刀**：MA20 回踩书 holdout 最好 `sig_pull_negext` **+16.34% / -14.15%**。按新口径 30/15 仍未双过。
+6. 过期 Jiaoch 补拉已跑完一轮；holdout cache_ok 约 3497。禁止 AKShare。不回 191。30/15 之后不再改门槛，除非用户再拍板。
 
 **明确不做**
 
-- 不自动交易；不改 50/15；不放宽 market_level 去凑短 OOS。
+- 不自动交易；不放宽 market_level 去凑短 OOS。
 - 不把 TCB / formal materializer / 728-session v3 capture lineage 当本阶段门槛。
 - 不把 development 数字写成已证实有效。
 
@@ -106,7 +106,7 @@ python -m app.jobs research-sweep-file          # 从落盘的 qualified-trades 
 - `indicators.py` → `signals.py`：趋势结构、MACD、RSI、20 日突破、ATR 风控。
 - `signal_tags.py`（最大模块之一）：把横截面特征转成 `breadth_*`、`proxy_*`、`price_*`、`rs*`、`margin_*`、`lhb_*`、`industry_*` 等标签，供生产推荐和历史 sweep 共用同一套门槛。
 - `backtest.py`：**信号日次日开盘入场**，避免同 K 线回填偏差。
-- `research_backtest.py`（约 1150 行）+ `research_sweep.py`（约 1130 行）：严格历史回测引擎，支持资本模型（`slot-exit` / `slot-daily` 逐日盯市）、暴露倍数、相关性预算、前日高点保护止损、分批止盈、长假前退出等。当前主研究目标为真实成本/滑点后最近滚动 12 个月净收益约 50%、最大回撤不超过 15%。胜率观察区间为 52%-60%，并联合检查盈亏比、Profit Factor（至少约 1.3）、Calmar（至少 1.5，2 更佳）和滚动稳定性。研究缓存结论不等于实盘可用证明。
+- `research_backtest.py`（约 1150 行）+ `research_sweep.py`（约 1130 行）：严格历史回测引擎，支持资本模型（`slot-exit` / `slot-daily` 逐日盯市）、暴露倍数、相关性预算、前日高点保护止损、分批止盈、长假前退出等。当前主研究目标为真实成本/滑点后最近滚动 12 个月净收益约 30%、最大回撤不超过 15%。胜率观察区间为 52%-60%，并联合检查盈亏比、Profit Factor（至少约 1.3）、Calmar（至少 1.5，2 更佳）和滚动稳定性。研究缓存结论不等于实盘可用证明。
 - `research_backtest` 的纯计算层已按职责拆成子模块，`research_backtest` 本身只负责回测编排与 payload 构造，并**反向 import 这些子模块**以保持内部调用点与测试路径稳定（改调用方前先看这条约定）：
   - `research_equity.py`：权益曲线 / 资本模型数学（`slot-exit` / `slot-daily` 逐日盯市、最大回撤）。
   - `research_context.py`：信号日上下文计算（大盘强度 / 代理收益 / 相对强度 / K 线形态 / 市场宽度 / 行业轮动 / 历史质量）。
