@@ -205,8 +205,113 @@ def iter_protocol_signal_hold_variants() -> tuple[dict[str, Any], ...]:
     return PROTOCOL_SIGNAL_HOLD_VARIANTS
 
 
+LIMIT_FOLLOW_TAG = "limit_up_next_day_confirm"
+MA60_RECLAIM_TAG = "trend_ma60_reclaim"
+BREAKOUT_60D_TAG = "breakout_60d"
+SIGNAL_ENTRY_FAMILY = "path-a-protocol-signal-entry/v1"
+SIGNAL_ENTRY_STAGE_GOAL_ID = "path-a-protocol-signal-entry/v1"
+
+# Third entry book. Not MA20 reclaim and not 20d breakout.
+# limit_follow: yesterday limit-up, today holds the close and is not another board.
+# ma60_reclaim: slower trend turn. breakout_60d: slower breakout.
+PROTOCOL_SIGNAL_ENTRY_VARIANTS: tuple[dict[str, Any], ...] = (
+    {
+        "candidate_id": "ent_lim_follow",
+        "role": "protocol_signal_entry",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (LIMIT_FOLLOW_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Limit-up yesterday, today confirms without another board.",
+    },
+    {
+        "candidate_id": "ent_lim_follow_2s",
+        "role": "protocol_signal_entry",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 3,
+            "max_active_positions": 2,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (LIMIT_FOLLOW_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Limit-follow, two slots.",
+    },
+    {
+        "candidate_id": "ent_lim_follow_liq",
+        "role": "protocol_signal_entry",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (LIMIT_FOLLOW_TAG, "amount_gte_100m"),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Limit-follow on 100m yuan bars.",
+    },
+    {
+        "candidate_id": "ent_ma60",
+        "role": "protocol_signal_entry",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (MA60_RECLAIM_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Reclaim MA60 in a 20/60 uptrend. Slower than MA20 reclaim.",
+    },
+    {
+        "candidate_id": "ent_bo60",
+        "role": "protocol_signal_entry",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (BREAKOUT_60D_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "60-day high breakout. Slower than the failed 20d breakout.",
+    },
+    {
+        "candidate_id": "ent_lim_negext",
+        "role": "protocol_signal_entry",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (LIMIT_FOLLOW_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Limit-follow, rank by least-extended 20d return.",
+    },
+)
+
+
+def iter_protocol_signal_entry_variants() -> tuple[dict[str, Any], ...]:
+    return PROTOCOL_SIGNAL_ENTRY_VARIANTS
+
+
 def assert_signal_variants_obey_protocol() -> None:
-    for variants in (PROTOCOL_SIGNAL_VARIANTS, PROTOCOL_SIGNAL_HOLD_VARIANTS):
+    for variants in (
+        PROTOCOL_SIGNAL_VARIANTS,
+        PROTOCOL_SIGNAL_HOLD_VARIANTS,
+        PROTOCOL_SIGNAL_ENTRY_VARIANTS,
+    ):
         assert_variants_obey_protocol(variants)
         for row in variants:
             required = set((row.get("kernel") or {}).get("required_signal_tags") or ())

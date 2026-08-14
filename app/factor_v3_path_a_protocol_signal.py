@@ -11,8 +11,13 @@ import pandas as pd
 
 from app.execution import assess_entry_executability
 from app.factor_v3_path_a_protocol_signal_specs import (
+    BREAKOUT_60D_TAG,
+    LIMIT_FOLLOW_TAG,
+    MA60_RECLAIM_TAG,
     PULLBACK_TAG,
     RECLAIM_TAG,
+    SIGNAL_ENTRY_FAMILY,
+    SIGNAL_ENTRY_STAGE_GOAL_ID,
     SIGNAL_FAMILY,
     SIGNAL_HOLD_FAMILY,
     SIGNAL_HOLD_STAGE_GOAL_ID,
@@ -45,6 +50,9 @@ DEFAULT_QT_PATH = Path(
 )
 DEFAULT_HOLD_QT_PATH = Path(
     "data/research_cache/qualified_hold5_10_stop5_3y_jiaoch_signal.json"
+)
+DEFAULT_ENTRY_QT_PATH = Path(
+    "data/research_cache/qualified_hold5_stop5_3y_jiaoch_entry.json"
 )
 
 
@@ -81,6 +89,56 @@ def signal_masks(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def limit_threshold_pct(symbol: str) -> float:
+    """Near-limit threshold: main 10% board, ChiNext 20% board, minus 0.5."""
+
+    return 19.5 if str(symbol).startswith("30") else 9.5
+
+
+def entry_exec_limits(symbol: str) -> tuple[float, float]:
+    """max_gap_up, locked_limit_gap. ChiNext boards are 20%."""
+
+    if str(symbol).startswith("30"):
+        return 12.0, 19.3
+    return 6.0, 9.3
+
+
+def entry_masks(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """Limit-follow, MA60 reclaim, and 60d breakout. Not the MA20 reclaim book."""
+
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    high = pd.to_numeric(frame["high"], errors="coerce")
+    ma20 = close.rolling(20, min_periods=20).mean()
+    ma60 = close.rolling(60, min_periods=60).mean()
+    prior_high60 = high.shift(1).rolling(60, min_periods=60).max()
+    history = ma60.notna()
+    prior_close = close.shift(1)
+    prior_ma60 = ma60.shift(1)
+    change_pct = (close / prior_close - 1.0) * 100.0
+    threshold = limit_threshold_pct(symbol)
+    limit_today = (change_pct >= threshold).fillna(False)
+    limit_prior = limit_today.shift(1).fillna(False)
+    limit_follow = (
+        history
+        & limit_prior
+        & (~limit_today)
+        & (close >= prior_close)
+    ).fillna(False)
+    ma60_reclaim = (
+        history
+        & (ma20 > ma60)
+        & (prior_close < prior_ma60)
+        & (close >= ma60)
+    ).fillna(False)
+    breakout_60d = (history & (close > prior_high60)).fillna(False)
+    out = pd.DataFrame(index=frame.index)
+    out["limit_follow"] = limit_follow
+    out["ma60_reclaim"] = ma60_reclaim
+    out["breakout_60d"] = breakout_60d
+    out["fire"] = (limit_follow | ma60_reclaim | breakout_60d).fillna(False)
+    return out
+
+
 def _num(value: Any, default: float | None = None) -> float | None:
     try:
         number = float(value)
@@ -91,12 +149,23 @@ def _num(value: Any, default: float | None = None) -> float | None:
     return number
 
 
-def _bar_tags(row: pd.Series, masks: pd.Series) -> list[str]:
-    tags = {RECLAIM_TAG, "ma_structure", "action_buy"}
-    if bool(masks["pullback"]):
-        tags.add(PULLBACK_TAG)
-    if bool(masks["breakout"]):
-        tags.add("breakout_20d")
+def _bar_tags(row: pd.Series, masks: pd.Series, *, book: str = "reclaim") -> list[str]:
+    tags = {"action_buy"}
+    if book == "entry":
+        if bool(masks.get("limit_follow")):
+            tags.add(LIMIT_FOLLOW_TAG)
+        if bool(masks.get("ma60_reclaim")):
+            tags.add(MA60_RECLAIM_TAG)
+            tags.add("ma_structure")
+        if bool(masks.get("breakout_60d")):
+            tags.add(BREAKOUT_60D_TAG)
+    else:
+        tags.add(RECLAIM_TAG)
+        tags.add("ma_structure")
+        if bool(masks.get("pullback")):
+            tags.add(PULLBACK_TAG)
+        if bool(masks.get("breakout")):
+            tags.add("breakout_20d")
     volume_ratio = _num(row.get("volume_ratio"))
     if volume_ratio is not None and volume_ratio >= 1.2:
         tags.add("volume_confirmed")
@@ -145,6 +214,7 @@ def build_signal_trades(
     hold_days: int = HOLD_DAYS,
     hold_horizons: tuple[int, ...] | None = None,
     stop_loss_pct: float = STOP_LOSS_PCT,
+    book: str = "reclaim",
 ) -> list[dict[str, Any]]:
     horizons = tuple(hold_horizons) if hold_horizons is not None else (int(hold_days),)
     max_hold = max(int(item) for item in horizons)
@@ -161,8 +231,14 @@ def build_signal_trades(
     trades: list[dict[str, Any]] = []
     for item, frame in prepared:
         symbol = str(item["symbol"])
-        masks = signal_masks(frame)
-        fire = masks["reclaim"]
+        if book == "entry":
+            masks = entry_masks(frame, symbol)
+            fire = masks["fire"]
+            gap_up, locked_gap = entry_exec_limits(symbol)
+        else:
+            masks = signal_masks(frame)
+            fire = masks["reclaim"]
+            gap_up, locked_gap = 6.0, 9.3
         for index in fire[fire].index.tolist():
             signal_date = str(frame.at[index, "date"])[:10]
             if signal_date < start_date or signal_date > end_date:
@@ -174,9 +250,9 @@ def build_signal_trades(
             executable = assess_entry_executability(
                 signal_bar,
                 entry_bar,
-                max_gap_up_pct=6.0,
+                max_gap_up_pct=gap_up,
                 max_gap_down_pct=7.0,
-                locked_limit_gap_pct=9.3,
+                locked_limit_gap_pct=locked_gap,
                 max_intraday_range_pct=8.0,
                 decision_cutoff="next_open",
             )
@@ -193,7 +269,7 @@ def build_signal_trades(
                 signal_bar,
                 _stock_market_returns(breadth),
             )
-            base_tags = set(_bar_tags(signal_bar, masks.iloc[int(index)]))
+            base_tags = set(_bar_tags(signal_bar, masks.iloc[int(index)], book=book))
             base_tags.update(relative.get("tags") or [])
             base_tags.update(build_market_breadth_tags(breadth))
             base_tags.update(build_price_action_tags(executable))
@@ -255,6 +331,7 @@ def build_path_a_protocol_signal_qt(
     progress_every: int = 100,
     hold_horizons: tuple[int, ...] = (5,),
     signal_family: str = SIGNAL_FAMILY,
+    book: str = "reclaim",
 ) -> dict[str, Any]:
     if require_local_research:
         role = os.getenv("VPS_RUNTIME_ROLE", "")
@@ -296,13 +373,18 @@ def build_path_a_protocol_signal_qt(
     if not prepared:
         raise PathAProtocolSignalError("no Jiaoch v2 cache_ok holdout names")
     print(f"building trades names={len(prepared)} skipped={skipped}", flush=True)
-    trades = build_signal_trades(prepared, hold_horizons=hold_horizons)
-    family = str(signal_family)
-    stage = (
-        SIGNAL_HOLD_STAGE_GOAL_ID
-        if family == SIGNAL_HOLD_FAMILY
-        else STAGE_GOAL_ID
+    trades = build_signal_trades(
+        prepared,
+        hold_horizons=hold_horizons,
+        book=book,
     )
+    family = str(signal_family)
+    if family == SIGNAL_HOLD_FAMILY:
+        stage = SIGNAL_HOLD_STAGE_GOAL_ID
+    elif family == SIGNAL_ENTRY_FAMILY:
+        stage = SIGNAL_ENTRY_STAGE_GOAL_ID
+    else:
+        stage = STAGE_GOAL_ID
     payload = {
         "qualified_trades": trades,
         "summary": {

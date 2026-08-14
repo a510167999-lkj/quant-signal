@@ -21,6 +21,7 @@ from app.factor_v3_path_a_protocol_baseline import (  # noqa: E402
     write_path_a_protocol_baseline,
 )
 from app.factor_v3_path_a_protocol_signal import (  # noqa: E402
+    DEFAULT_ENTRY_QT_PATH as SIGNAL_ENTRY_QT,
     DEFAULT_HOLD_QT_PATH as SIGNAL_HOLD_QT,
     DEFAULT_QT_PATH as SIGNAL_QT,
 )
@@ -34,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allow-any-role", action="store_true")
     parser.add_argument(
         "--family",
-        choices=("baseline", "factor", "alt", "signal", "signal_hold"),
+        choices=("baseline", "factor", "alt", "signal", "signal_hold", "signal_entry"),
         default="baseline",
     )
     args = parser.parse_args(argv)
@@ -45,6 +46,8 @@ def main(argv: list[str] | None = None) -> int:
         qt = SIGNAL_QT
     if args.family == "signal_hold" and qt == DEFAULT_QT:
         qt = SIGNAL_HOLD_QT
+    if args.family == "signal_entry" and qt == DEFAULT_QT:
+        qt = SIGNAL_ENTRY_QT
     report = build_path_a_protocol_baseline(
         repo_root=repo,
         qualified_trades_path=qt if qt.is_absolute() else (repo / qt),
@@ -57,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         "alt": Path("data/research_runs/path_a_protocol_alt"),
         "signal": Path("data/research_runs/path_a_protocol_signal"),
         "signal_hold": Path("data/research_runs/path_a_protocol_signal_hold"),
+        "signal_entry": Path("data/research_runs/path_a_protocol_signal_entry"),
     }
     chosen_root = args.output_root
     if chosen_root == DEFAULT_OUTPUT_ROOT:

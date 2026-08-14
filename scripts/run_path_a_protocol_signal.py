@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from app.factor_v3_path_a_protocol_signal import (  # noqa: E402
     DEFAULT_CACHE_DIR,
+    DEFAULT_ENTRY_QT_PATH,
     DEFAULT_HOLD_QT_PATH,
     DEFAULT_QT_PATH,
     STAGE_GOAL_ID,
@@ -21,6 +22,7 @@ from app.factor_v3_path_a_protocol_signal import (  # noqa: E402
     write_path_a_protocol_signal_qt,
 )
 from app.factor_v3_path_a_protocol_signal_specs import (  # noqa: E402
+    SIGNAL_ENTRY_FAMILY,
     SIGNAL_FAMILY,
     SIGNAL_HOLD_FAMILY,
 )
@@ -34,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-symbols", type=int, default=0)
     parser.add_argument(
         "--family",
-        choices=("signal", "hold"),
+        choices=("signal", "hold", "entry"),
         default="signal",
     )
     parser.add_argument("--allow-any-role", action="store_true")
@@ -48,10 +50,17 @@ def main(argv: list[str] | None = None) -> int:
         hold_horizons = (5, 10)
         signal_family = SIGNAL_HOLD_FAMILY
         default_qt = DEFAULT_HOLD_QT_PATH
+        book = "reclaim"
+    elif args.family == "entry":
+        hold_horizons = (5,)
+        signal_family = SIGNAL_ENTRY_FAMILY
+        default_qt = DEFAULT_ENTRY_QT_PATH
+        book = "entry"
     else:
         hold_horizons = (5,)
         signal_family = SIGNAL_FAMILY
         default_qt = DEFAULT_QT_PATH
+        book = "reclaim"
     payload = build_path_a_protocol_signal_qt(
         repo_root=repo,
         cache_dir=cache,
@@ -59,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
         require_local_research=not args.allow_any_role,
         hold_horizons=hold_horizons,
         signal_family=signal_family,
+        book=book,
     )
     qt_path = args.qualified_trades_output or default_qt
     if not qt_path.is_absolute():

@@ -20,12 +20,15 @@ from app.factor_v3_path_a_protocol_baseline_specs import (
     iter_protocol_factor_variants,
 )
 from app.factor_v3_path_a_protocol_signal import (
+    DEFAULT_ENTRY_QT_PATH as SIGNAL_ENTRY_QT,
     DEFAULT_HOLD_QT_PATH as SIGNAL_HOLD_QT,
     DEFAULT_QT_PATH as SIGNAL_QT,
 )
 from app.factor_v3_path_a_protocol_signal_specs import (
+    SIGNAL_ENTRY_FAMILY,
     SIGNAL_FAMILY,
     SIGNAL_HOLD_FAMILY,
+    iter_protocol_signal_entry_variants,
     iter_protocol_signal_hold_variants,
     iter_protocol_signal_variants,
 )
@@ -153,6 +156,8 @@ def build_path_a_protocol_baseline(
     chosen = str(family or "baseline").strip().casefold()
     if chosen == "signal_hold":
         default_qt = SIGNAL_HOLD_QT
+    elif chosen == "signal_entry":
+        default_qt = SIGNAL_ENTRY_QT
     elif chosen == "signal":
         default_qt = SIGNAL_QT
     else:
@@ -176,6 +181,8 @@ def build_path_a_protocol_baseline(
         raise PathAProtocolBaselineError("QT is not the protocol signal book")
     if chosen == "signal_hold" and meta.get("signal_family") != SIGNAL_HOLD_FAMILY:
         raise PathAProtocolBaselineError("QT is not the protocol signal-hold book")
+    if chosen == "signal_entry" and meta.get("signal_family") != SIGNAL_ENTRY_FAMILY:
+        raise PathAProtocolBaselineError("QT is not the protocol signal-entry book")
     all_trades = train_replay._filter_train_trades(
         list(qt.get("qualified_trades") or [])
     )
@@ -208,6 +215,13 @@ def build_path_a_protocol_baseline(
             holdout_trades,
             variants=iter_protocol_signal_hold_variants(),
             stage_goal_id="path-a-protocol-signal-hold/v1",
+        )
+    elif chosen == "signal_entry":
+        report = score_protocol_baseline(
+            train_trades,
+            holdout_trades,
+            variants=iter_protocol_signal_entry_variants(),
+            stage_goal_id="path-a-protocol-signal-entry/v1",
         )
     elif chosen == "baseline":
         report = score_protocol_baseline(train_trades, holdout_trades)
