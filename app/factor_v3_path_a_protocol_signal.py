@@ -332,6 +332,9 @@ def build_path_a_protocol_signal_qt(
     hold_horizons: tuple[int, ...] = (5,),
     signal_family: str = SIGNAL_FAMILY,
     book: str = "reclaim",
+    start_date: str = START_DATE,
+    end_date: str = END_DATE,
+    slice_name: str = "holdout",
 ) -> dict[str, Any]:
     if require_local_research:
         role = os.getenv("VPS_RUNTIME_ROLE", "")
@@ -375,6 +378,8 @@ def build_path_a_protocol_signal_qt(
     print(f"building trades names={len(prepared)} skipped={skipped}", flush=True)
     trades = build_signal_trades(
         prepared,
+        start_date=start_date,
+        end_date=end_date,
         hold_horizons=hold_horizons,
         book=book,
     )
@@ -390,13 +395,13 @@ def build_path_a_protocol_signal_qt(
         "summary": {
             "path_a_3y_clean_replay": {
                 "stage": stage,
-                "slice": "holdout",
+                "slice": slice_name,
                 "development_only": True,
                 "promotable": False,
                 "source_policy": DATA_SOURCE_POLICY,
                 "source_version": JIAOCH_DAILY_CACHE_SOURCE_VERSION,
                 "signal_family": family,
-                "window": {"start": START_DATE, "end": END_DATE},
+                "window": {"start": start_date, "end": end_date},
                 "hold_days": HOLD_DAYS,
                 "hold_horizons": list(hold_horizons),
                 "stop_loss_pct": STOP_LOSS_PCT,

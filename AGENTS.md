@@ -37,7 +37,7 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 - 2026-08-12 已用 Jiaoch `stk_mins` 合成日线回填约 733 个交易日 / 约 5284 只；不是“没采过”。
 - 单位、QFQ、frozen fail-closed、frozen-v3 coverage-audit 锚已修。coverage-audit 只证明“可以开采集门”，不等于 3 年研究输入已干净。
 
-**当前阶段 ID**：`path-a-protocol-reclaim-freeze/v1`
+**当前阶段 ID**：`path-a-protocol-reclaim-oos/v1`
 
 计划已改序。**2026-08-15 用户把收益门槛从 30% 调到 26%**，回撤仍是 15%，对齐冻结假设 holdout +26.5%。`vol_skip_rsi_adv_s85` 仍是 **rejected_slice_hypothesis**，禁止回 191 调参。
 
@@ -48,7 +48,8 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 5. **信号刀**：2774 只上 `sig_pull_negext` **+16.34% / -14.15%**。
 6. **持有期 + 大宇宙**：`sig_pull_negext_h5` **+26.45% / -9.48%**，仍是 holdout 最近。
 7. **第三种入场** holdout 全灭。
-8. **冻结假设** `sig_pull_negext_h5` holdout **+26.5% / -9.5%**，按新口径 **26/15 数字双过**。**仍不是有效策略**：这段 holdout 选规则时已经看过。正式有效要独立 OOS。不注册生产 profile，不自动交易。
+8. **冻结假设** `sig_pull_negext_h5` holdout **+26.5% / -9.5%**，按新口径 **26/15 数字双过**。**仍不是有效策略**：这段 holdout 选规则时已经看过。
+9. **独立 OOS** `2026-07-04..2026-08-13`：同一 3497 只宇宙，zero-refit，**raw 314 / selected 0**。23 个信号日全是 defensive/cautious，规则按设计空仓。窗口太短，**不能评 12 月 26/15**。非正式 final-OOS。不改 `market_level`，不改参，不注册生产 profile，不自动交易。
 
 **明确不做**
 
