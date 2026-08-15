@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from app import factor_v3_path_a_protocol_monthly_switch as switch
 from app import factor_v3_path_a_protocol_monthly_switch_specs as specs
 from app import research_goal_contract as goal
@@ -12,6 +14,11 @@ def test_three_arms_include_cash_bounce_reclaim() -> None:
     assert specs.MAX_ABS_MDD_PCT == goal.TARGET_MAX_DRAWDOWN_PCT == 15.0
     assert specs.SELECTION_CRITERION == "max_window_return_among_mdd_le_15_else_cash"
     assert specs.ESTIMATION_WINDOW_TRADING_DAYS == 126
+    assert specs.SHORT_ESTIMATION_WINDOW_TRADING_DAYS == 21
+    assert specs.SHORT_WINDOW_STAGE_GOAL_ID == "path-a-protocol-short-window-switch/v1"
+    assert switch.SHORT_WINDOW_OUTPUT_ROOT == Path(
+        "data/research_runs/path_a_protocol_short_window_switch"
+    )
 
 
 def test_select_live_arm_requires_mdd_gate_then_return() -> None:
@@ -157,3 +164,50 @@ def test_weekly_cadence_uses_week_points() -> None:
     )
     assert len(ledger) == 4
     assert ledger[0]["selected_arm"] == "cash"
+
+
+def _synthetic_trade(day: str, symbol: str, ret: float, adverse: float) -> dict:
+    return {
+        "signal_date": day,
+        "symbol": symbol,
+        "return_pct": ret,
+        "max_adverse_pct": adverse,
+        "entry_date": day,
+        "exit_date": day,
+        "mark_to_market_path": [
+            {"date": day, "close_return_pct": 0.0, "low_return_pct": 0.0},
+            {"date": day, "close_return_pct": ret, "low_return_pct": adverse},
+        ],
+    }
+
+
+def test_shared_calendar_short_window_can_flip_after_regime_change() -> None:
+    dates = [f"2024-01-{day:02d}" for day in range(2, 30)]
+    bounce = [
+        _synthetic_trade(day, f"b{index}", 5.0 if index < 10 else -6.0, -2.0)
+        for index, day in enumerate(dates)
+        if index % 3 == 0
+    ]
+    reclaim = [
+        _synthetic_trade(day, f"r{index}", -6.0 if index < 16 else 5.0, -2.0)
+        for index, day in enumerate(dates)
+        if index % 3 == 1
+    ]
+    ledger, _periods = switch.simulate_monthly_switch(
+        arm_trades_by_id={
+            "bounce_dn2_negext": bounce,
+            "sig_pull_negext_h5": reclaim,
+            "cash": [],
+        },
+        calendar_dates=dates,
+        window_days=21,
+        cooldown_days=5,
+        initial_arm="cash",
+        cadence="week",
+        window_calendar=dates,
+    )
+    selected = [row["selected_arm"] for row in ledger]
+    assert selected[0] == "cash"
+    assert "bounce_dn2_negext" in selected
+    assert "sig_pull_negext_h5" in selected
+    assert any(row.get("switched") for row in ledger)

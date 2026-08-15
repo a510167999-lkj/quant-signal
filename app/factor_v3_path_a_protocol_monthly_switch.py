@@ -29,13 +29,59 @@ from app.storage import write_json
 
 STAGE_GOAL_ID = specs.STAGE_GOAL_ID
 WEEKLY_STAGE_GOAL_ID = specs.WEEKLY_STAGE_GOAL_ID
+SHORT_WINDOW_STAGE_GOAL_ID = specs.SHORT_WINDOW_STAGE_GOAL_ID
 REPORT_SCHEMA = "path-a-protocol-monthly-switch-report/v1"
 DEFAULT_OUTPUT_ROOT = Path("data/research_runs/path_a_protocol_monthly_switch")
 WEEKLY_OUTPUT_ROOT = Path("data/research_runs/path_a_protocol_weekly_switch")
+SHORT_WINDOW_OUTPUT_ROOT = Path(
+    "data/research_runs/path_a_protocol_short_window_switch"
+)
 
 
 class PathAMonthlySwitchError(ValueError):
     """Raised when the monthly identity switch cannot be scored."""
+
+
+def _empty_window_score() -> dict[str, Any]:
+    return {
+        "abs_mdd": 1e9,
+        "compounded_return_pct": -1e9,
+        "both_pass_rate": 0.0,
+        "trade_count": 0,
+    }
+
+
+def window_score_on_calendar(
+    arm_trades: list[dict[str, Any]],
+    *,
+    calendar_dates: list[str],
+    window_end: str,
+    window_days: int,
+    kernel: dict[str, Any],
+) -> dict[str, Any]:
+    """Score an arm on the last `window_days` shared calendar dates.
+
+    Unlike P3's arm-own signal-date window, this is ~21 trading days even
+    when an identity only fires a handful of times a year.
+    """
+
+    prior = [day for day in calendar_dates if day <= window_end]
+    if not prior:
+        return _empty_window_score()
+    window_dates = set(prior[-window_days:])
+    window_trades = [
+        trade
+        for trade in arm_trades
+        if str(trade.get("signal_date") or "")[:10] in window_dates
+    ]
+    if not window_trades:
+        return _empty_window_score()
+    return p3._window_score(
+        window_trades,
+        window_end=window_end,
+        window_days=max(window_days, len(window_trades)),
+        kernel=kernel,
+    )
 
 
 def select_live_arm(scores: dict[str, dict[str, Any]]) -> str:
@@ -107,7 +153,7 @@ def _load_selected_arm(
     *,
     variant: dict[str, Any],
     expected_family: str,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
     payload = train_replay._load_json(path)
     if payload is None:
         raise PathAMonthlySwitchError(f"qualified trades missing: {path}")
@@ -121,7 +167,14 @@ def _load_selected_arm(
             f"QT family {meta.get('signal_family')!r} != {expected_family!r}"
         )
     locked = _locked_dates(list(payload.get("qualified_trades") or []))
-    return _select_arm_trades(locked, variant), meta
+    raw_dates = sorted(
+        {
+            str(trade.get("signal_date") or "")[:10]
+            for trade in locked
+            if str(trade.get("signal_date") or "")
+        }
+    )
+    return _select_arm_trades(locked, variant), meta, raw_dates
 
 
 def simulate_monthly_switch(
@@ -132,6 +185,7 @@ def simulate_monthly_switch(
     cooldown_days: int = specs.SWITCH_COOLDOWN_TRADING_DAYS,
     initial_arm: str = specs.INITIAL_ARM_ID,
     cadence: str = "month",
+    window_calendar: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     kernel = p0._kernel_dict()
     if cadence == "week":
@@ -172,15 +226,27 @@ def simulate_monthly_switch(
             )
             continue
         cutoff = prior[-1]
-        scores = {
-            arm_id: p3._window_score(
-                arm_trades_by_id.get(arm_id) or [],
-                window_end=cutoff,
-                window_days=window_days,
-                kernel=kernel,
-            )
-            for arm_id in live_ids
-        }
+        if window_calendar is not None:
+            scores = {
+                arm_id: window_score_on_calendar(
+                    arm_trades_by_id.get(arm_id) or [],
+                    calendar_dates=window_calendar,
+                    window_end=cutoff,
+                    window_days=window_days,
+                    kernel=kernel,
+                )
+                for arm_id in live_ids
+            }
+        else:
+            scores = {
+                arm_id: p3._window_score(
+                    arm_trades_by_id.get(arm_id) or [],
+                    window_end=cutoff,
+                    window_days=window_days,
+                    kernel=kernel,
+                )
+                for arm_id in live_ids
+            }
         best = select_live_arm(scores)
         switched = False
         days_since = idx - last_switch_idx
@@ -246,6 +312,7 @@ def build_path_a_protocol_monthly_switch(
     reclaim_qt_path: Path | None = None,
     require_local_research: bool = True,
     cadence: str = "month",
+    window_days: int | None = None,
 ) -> dict[str, Any]:
     if require_local_research:
         role = os.getenv("VPS_RUNTIME_ROLE", "")
@@ -264,12 +331,12 @@ def build_path_a_protocol_monthly_switch(
         if reclaim_qt_path is not None
         else (root / DEFAULT_HOLD_QT_PATH)
     )
-    bounce_selected, bounce_meta = _load_selected_arm(
+    bounce_selected, bounce_meta, bounce_dates = _load_selected_arm(
         bounce_path,
         variant=specs.BOUNCE_VARIANT,
         expected_family="path-a-protocol-signal-bounce/v1",
     )
-    reclaim_selected, reclaim_meta = _load_selected_arm(
+    reclaim_selected, reclaim_meta, reclaim_dates = _load_selected_arm(
         reclaim_path,
         variant=specs.RECLAIM_VARIANT,
         expected_family="path-a-protocol-signal-hold/v1",
@@ -294,11 +361,24 @@ def build_path_a_protocol_monthly_switch(
         if chosen == "week"
         else specs.SWITCH_COOLDOWN_TRADING_DAYS
     )
+    lookback = (
+        int(window_days)
+        if window_days is not None
+        else specs.ESTIMATION_WINDOW_TRADING_DAYS
+    )
+    if lookback <= 0:
+        raise PathAMonthlySwitchError(f"window_days must be positive, got {lookback}")
+    use_shared_calendar = lookback == specs.SHORT_ESTIMATION_WINDOW_TRADING_DAYS
+    window_calendar = (
+        sorted(set(bounce_dates) | set(reclaim_dates)) if use_shared_calendar else None
+    )
     ledger, periods = simulate_monthly_switch(
         arm_trades_by_id=arm_trades,
         calendar_dates=calendar,
+        window_days=lookback,
         cooldown_days=cooldown,
         cadence=chosen,
+        window_calendar=window_calendar,
     )
     spliced = p3._period_trades(periods, arm_trades)
     train = proto.filter_trades_for_partition(spliced, "train")
@@ -312,9 +392,18 @@ def build_path_a_protocol_monthly_switch(
     return {
         "schema": REPORT_SCHEMA,
         "stage_goal_id": (
-            WEEKLY_STAGE_GOAL_ID if chosen == "week" else STAGE_GOAL_ID
+            SHORT_WINDOW_STAGE_GOAL_ID
+            if lookback == specs.SHORT_ESTIMATION_WINDOW_TRADING_DAYS
+            else (WEEKLY_STAGE_GOAL_ID if chosen == "week" else STAGE_GOAL_ID)
         ),
         "cadence": chosen,
+        "estimation_window_trading_days": lookback,
+        "estimation_window_basis": (
+            "shared_raw_signal_dates" if use_shared_calendar else "arm_own_signal_dates"
+        ),
+        "estimation_calendar_days": (
+            len(window_calendar) if window_calendar is not None else None
+        ),
         "cooldown_trading_days": cooldown,
         "selection_criterion": specs.SELECTION_CRITERION,
         "initial_arm": specs.INITIAL_ARM_ID,
@@ -364,6 +453,8 @@ def format_monthly_switch_table(report: dict[str, Any]) -> str:
         [
             f"stage={report.get('stage_goal_id')}",
             f"cadence={report.get('cadence')}",
+            f"window_days={report.get('estimation_window_trading_days')} "
+            f"basis={report.get('estimation_window_basis')}",
             f"rule={report.get('selection_criterion')}",
             f"decisions={report.get('decision_point_count')} "
             f"switches={report.get('switch_count')} "
@@ -405,7 +496,7 @@ def write_path_a_protocol_monthly_switch(
     )
     return {
         "ok": True,
-        "stage_goal_id": STAGE_GOAL_ID,
+        "stage_goal_id": report.get("stage_goal_id") or STAGE_GOAL_ID,
         "effective_strategy": False,
         "table_path": str(output_root / "TABLE.txt"),
         "report_path": str(output_root / "LATEST.json"),
