@@ -10,7 +10,7 @@ judge the 26/15 rolling-12m contract. effective_strategy stays false.
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +38,9 @@ SIGNAL_FAMILY = "path-a-protocol-signal-reclaim-oos/v1"
 INDEPENDENT_OOS_START = "2026-07-04"
 DEFAULT_OOS_END = "2026-08-13"
 MIN_CALENDAR_DAYS_FOR_12M = 365
+TWELVE_MONTH_DUE_DATE = (
+    date.fromisoformat(INDEPENDENT_OOS_START) + timedelta(days=MIN_CALENDAR_DAYS_FOR_12M)
+).isoformat()
 DEFAULT_QT_PATH = Path(
     "data/research_cache/qualified_hold5_stop5_oos_jiaoch_reclaim.json"
 )
@@ -53,6 +56,12 @@ def twelve_month_window_evaluable(start: str, end: str) -> bool:
     first = date.fromisoformat(str(start)[:10])
     last = date.fromisoformat(str(end)[:10])
     return (last - first).days >= MIN_CALENDAR_DAYS_FOR_12M
+
+
+def days_until_twelve_month_evaluable(as_of: str) -> int:
+    due = date.fromisoformat(TWELVE_MONTH_DUE_DATE)
+    today = date.fromisoformat(str(as_of)[:10])
+    return max(0, (due - today).days)
 
 
 def filter_independent_oos_trades(
@@ -149,6 +158,10 @@ def build_reclaim_oos_report(
         "formal_final_oos": False,
         "formal_final_oos_still_sealed": True,
         "twelve_month_evaluable": evaluable,
+        "twelve_month_due_date": TWELVE_MONTH_DUE_DATE,
+        "days_until_twelve_month_evaluable": days_until_twelve_month_evaluable(
+            oos_end
+        ),
         "independent_oos_dual_pass_26_15": dual,
         "effective_strategy": False,
         "promotable": False,
@@ -185,6 +198,8 @@ def format_reclaim_oos_table(report: dict[str, Any]) -> str:
             f"independent_oos={report.get('independent_oos')}",
             f"formal_final_oos={report.get('formal_final_oos')}",
             f"twelve_month_evaluable={report.get('twelve_month_evaluable')}",
+            f"twelve_month_due_date={report.get('twelve_month_due_date')}",
+            f"days_until_12m={report.get('days_until_twelve_month_evaluable')}",
             f"independent_oos_dual_pass_26_15="
             f"{report.get('independent_oos_dual_pass_26_15')}",
             f"effective_strategy={report.get('effective_strategy')}",
@@ -291,6 +306,7 @@ __all__ = [
     "DEFAULT_OUTPUT_ROOT",
     "DEFAULT_QT_PATH",
     "INDEPENDENT_OOS_START",
+    "TWELVE_MONTH_DUE_DATE",
     "SIGNAL_FAMILY",
     "STAGE_GOAL_ID",
     "PathAReclaimOosError",
@@ -299,6 +315,7 @@ __all__ = [
     "build_reclaim_oos_report",
     "filter_independent_oos_trades",
     "format_reclaim_oos_table",
+    "days_until_twelve_month_evaluable",
     "twelve_month_window_evaluable",
     "write_reclaim_oos_report",
 ]

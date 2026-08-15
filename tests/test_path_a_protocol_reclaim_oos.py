@@ -51,6 +51,7 @@ def test_independent_oos_starts_after_locked_holdout() -> None:
         oos.INDEPENDENT_OOS_START, oos.DEFAULT_OOS_END
     ) is False
     assert oos.twelve_month_window_evaluable("2025-07-04", "2026-07-04") is True
+    assert oos.TWELVE_MONTH_DUE_DATE == "2027-07-04"
 
 
 def test_filter_drops_train_and_holdout_dates() -> None:
@@ -92,5 +93,6 @@ def test_short_oos_cannot_be_effective_or_formal() -> None:
     assert report["target_rolling_12m_net_return_pct"] == 26.0
     table = oos.format_reclaim_oos_table(report)
     assert "twelve_month_evaluable=False" in table
+    assert "twelve_month_due_date=2027-07-04" in table
     assert "effective_strategy=False" in table
     assert "independent_oos_dual_pass_26_15=False" in table
