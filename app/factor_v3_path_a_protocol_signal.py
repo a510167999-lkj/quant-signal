@@ -12,16 +12,22 @@ import pandas as pd
 from app.execution import assess_entry_executability
 from app.factor_v3_path_a_protocol_signal_specs import (
     BREAKOUT_60D_TAG,
+    DN2_BOUNCE_TAG,
+    DN3_BOUNCE_TAG,
+    INSIDE_UP_TAG,
     LIMIT_FOLLOW_TAG,
     MA60_RECLAIM_TAG,
     PULLBACK_TAG,
     RECLAIM_TAG,
+    SIGNAL_BOUNCE_FAMILY,
+    SIGNAL_BOUNCE_STAGE_GOAL_ID,
     SIGNAL_ENTRY_FAMILY,
     SIGNAL_ENTRY_STAGE_GOAL_ID,
     SIGNAL_FAMILY,
     SIGNAL_HOLD_FAMILY,
     SIGNAL_HOLD_STAGE_GOAL_ID,
     STAGE_GOAL_ID,
+    TIGHT5_UP_TAG,
 )
 from app.indicators import add_indicators
 from app.jiaoch_live_market import JIAOCH_DAILY_CACHE_SOURCE_VERSION
@@ -53,6 +59,9 @@ DEFAULT_HOLD_QT_PATH = Path(
 )
 DEFAULT_ENTRY_QT_PATH = Path(
     "data/research_cache/qualified_hold5_stop5_3y_jiaoch_entry.json"
+)
+DEFAULT_BOUNCE_QT_PATH = Path(
+    "data/research_cache/qualified_hold5_stop5_3y_jiaoch_bounce.json"
 )
 
 
@@ -139,6 +148,47 @@ def entry_masks(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return out
 
 
+def bounce_masks(frame: pd.DataFrame) -> pd.DataFrame:
+    """Down-day bounce, inside-bar break, compressed-range break. Not reclaim."""
+
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    high = pd.to_numeric(frame["high"], errors="coerce")
+    low = pd.to_numeric(frame["low"], errors="coerce")
+    ma20 = close.rolling(20, min_periods=20).mean()
+    ma60 = close.rolling(60, min_periods=60).mean()
+    prior_high20 = high.shift(1).rolling(20, min_periods=20).max()
+    history = ma60.notna()
+    uptrend = history & (ma20 > ma60)
+    not_breakout = (close <= prior_high20).fillna(False)
+    delta = close.diff()
+    today_up = (delta > 0).fillna(False)
+    down1 = (delta.shift(1) < 0).fillna(False)
+    down2 = (delta.shift(2) < 0).fillna(False)
+    down3 = (delta.shift(3) < 0).fillna(False)
+    dn2 = (uptrend & down1 & down2 & today_up & not_breakout).fillna(False)
+    dn3 = (uptrend & down1 & down2 & down3 & today_up & not_breakout).fillna(False)
+    inside_yest = (
+        (high.shift(1) < high.shift(2)) & (low.shift(1) > low.shift(2))
+    ).fillna(False)
+    inside_up = (
+        uptrend & inside_yest & (close > high.shift(1)) & not_breakout
+    ).fillna(False)
+    range5 = high.rolling(5, min_periods=5).max() - low.rolling(5, min_periods=5).min()
+    range20 = (
+        high.rolling(20, min_periods=20).max() - low.rolling(20, min_periods=20).min()
+    )
+    compressed = ((range20 > 0) & ((range5 / range20) < 0.5)).fillna(False)
+    break5 = (close > high.shift(1).rolling(5, min_periods=5).max()).fillna(False)
+    tight5_up = (uptrend & compressed & break5).fillna(False)
+    out = pd.DataFrame(index=frame.index)
+    out["dn2"] = dn2
+    out["dn3"] = dn3
+    out["inside_up"] = inside_up
+    out["tight5_up"] = tight5_up
+    out["fire"] = (dn2 | inside_up | tight5_up).fillna(False)
+    return out
+
+
 def _num(value: Any, default: float | None = None) -> float | None:
     try:
         number = float(value)
@@ -159,6 +209,16 @@ def _bar_tags(row: pd.Series, masks: pd.Series, *, book: str = "reclaim") -> lis
             tags.add("ma_structure")
         if bool(masks.get("breakout_60d")):
             tags.add(BREAKOUT_60D_TAG)
+    elif book == "bounce":
+        tags.add("ma_structure")
+        if bool(masks.get("dn2")):
+            tags.add(DN2_BOUNCE_TAG)
+        if bool(masks.get("dn3")):
+            tags.add(DN3_BOUNCE_TAG)
+        if bool(masks.get("inside_up")):
+            tags.add(INSIDE_UP_TAG)
+        if bool(masks.get("tight5_up")):
+            tags.add(TIGHT5_UP_TAG)
     else:
         tags.add(RECLAIM_TAG)
         tags.add("ma_structure")
@@ -235,6 +295,10 @@ def build_signal_trades(
             masks = entry_masks(frame, symbol)
             fire = masks["fire"]
             gap_up, locked_gap = entry_exec_limits(symbol)
+        elif book == "bounce":
+            masks = bounce_masks(frame)
+            fire = masks["fire"]
+            gap_up, locked_gap = 6.0, 9.3
         else:
             masks = signal_masks(frame)
             fire = masks["reclaim"]
@@ -388,6 +452,8 @@ def build_path_a_protocol_signal_qt(
         stage = SIGNAL_HOLD_STAGE_GOAL_ID
     elif family == SIGNAL_ENTRY_FAMILY:
         stage = SIGNAL_ENTRY_STAGE_GOAL_ID
+    elif family == SIGNAL_BOUNCE_FAMILY:
+        stage = SIGNAL_BOUNCE_STAGE_GOAL_ID
     else:
         stage = STAGE_GOAL_ID
     payload = {

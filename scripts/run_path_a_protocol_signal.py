@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.factor_v3_path_a_protocol_signal import (  # noqa: E402
+    DEFAULT_BOUNCE_QT_PATH,
     DEFAULT_CACHE_DIR,
     DEFAULT_ENTRY_QT_PATH,
     DEFAULT_HOLD_QT_PATH,
@@ -22,6 +23,7 @@ from app.factor_v3_path_a_protocol_signal import (  # noqa: E402
     write_path_a_protocol_signal_qt,
 )
 from app.factor_v3_path_a_protocol_signal_specs import (  # noqa: E402
+    SIGNAL_BOUNCE_FAMILY,
     SIGNAL_ENTRY_FAMILY,
     SIGNAL_FAMILY,
     SIGNAL_HOLD_FAMILY,
@@ -36,7 +38,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-symbols", type=int, default=0)
     parser.add_argument(
         "--family",
-        choices=("signal", "hold", "entry"),
+        choices=("signal", "hold", "entry", "bounce"),
         default="signal",
     )
     parser.add_argument("--allow-any-role", action="store_true")
@@ -56,6 +58,11 @@ def main(argv: list[str] | None = None) -> int:
         signal_family = SIGNAL_ENTRY_FAMILY
         default_qt = DEFAULT_ENTRY_QT_PATH
         book = "entry"
+    elif args.family == "bounce":
+        hold_horizons = (5,)
+        signal_family = SIGNAL_BOUNCE_FAMILY
+        default_qt = DEFAULT_BOUNCE_QT_PATH
+        book = "bounce"
     else:
         hold_horizons = (5,)
         signal_family = SIGNAL_FAMILY

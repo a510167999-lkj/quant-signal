@@ -314,11 +314,114 @@ def iter_protocol_signal_entry_variants() -> tuple[dict[str, Any], ...]:
     return PROTOCOL_SIGNAL_ENTRY_VARIANTS
 
 
+DN2_BOUNCE_TAG = "down2_bounce_uptrend"
+DN3_BOUNCE_TAG = "down3_bounce_uptrend"
+INSIDE_UP_TAG = "inside_bar_break_up"
+TIGHT5_UP_TAG = "tight5_range_break_up"
+SIGNAL_BOUNCE_FAMILY = "path-a-protocol-signal-bounce/v1"
+SIGNAL_BOUNCE_STAGE_GOAL_ID = "path-a-protocol-signal-bounce/v1"
+
+# Fourth identity book. Not MA20 reclaim, not 20d/60d breakout, not limit-follow.
+# Written before the bounce QT is scored. Dual-partition gate: train AND
+# holdout must both pass 26/15. Do not retune sig_pull_negext_h5.
+PROTOCOL_SIGNAL_BOUNCE_VARIANTS: tuple[dict[str, Any], ...] = (
+    {
+        "candidate_id": "bounce_dn2",
+        "role": "protocol_signal_bounce",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (DN2_BOUNCE_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Two down closes then an up close in a 20/60 uptrend.",
+    },
+    {
+        "candidate_id": "bounce_dn3",
+        "role": "protocol_signal_bounce",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (DN3_BOUNCE_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Three down closes then an up close. Stricter bounce.",
+    },
+    {
+        "candidate_id": "bounce_dn2_negext",
+        "role": "protocol_signal_bounce",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (DN2_BOUNCE_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Two-day bounce, anti-chase rank.",
+    },
+    {
+        "candidate_id": "bounce_inside",
+        "role": "protocol_signal_bounce",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (INSIDE_UP_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Yesterday inside bar, today closes above that high.",
+    },
+    {
+        "candidate_id": "bounce_tight5",
+        "role": "protocol_signal_bounce",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (TIGHT5_UP_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "5-day range compressed vs 20-day, then close breaks 5-day high.",
+    },
+    {
+        "candidate_id": "bounce_dn2_liq",
+        "role": "protocol_signal_bounce",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (DN2_BOUNCE_TAG, "amount_gte_100m"),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Two-day bounce on 100m yuan bars.",
+    },
+)
+
+
+def iter_protocol_signal_bounce_variants() -> tuple[dict[str, Any], ...]:
+    return PROTOCOL_SIGNAL_BOUNCE_VARIANTS
+
+
 def assert_signal_variants_obey_protocol() -> None:
     for variants in (
         PROTOCOL_SIGNAL_VARIANTS,
         PROTOCOL_SIGNAL_HOLD_VARIANTS,
         PROTOCOL_SIGNAL_ENTRY_VARIANTS,
+        PROTOCOL_SIGNAL_BOUNCE_VARIANTS,
     ):
         assert_variants_obey_protocol(variants)
         for row in variants:

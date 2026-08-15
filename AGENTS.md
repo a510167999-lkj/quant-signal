@@ -37,7 +37,7 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 - 2026-08-12 已用 Jiaoch `stk_mins` 合成日线回填约 733 个交易日 / 约 5284 只；不是“没采过”。
 - 单位、QFQ、frozen fail-closed、frozen-v3 coverage-audit 锚已修。coverage-audit 只证明“可以开采集门”，不等于 3 年研究输入已干净。
 
-**当前阶段 ID**：`path-a-protocol-reclaim-oos-roll/v1`
+**当前阶段 ID**：`path-a-protocol-signal-bounce/v1`
 
 计划已改序。**2026-08-15 用户把收益门槛从 30% 调到 26%**，回撤仍是 15%，对齐冻结假设 holdout +26.5%。`vol_skip_rsi_adv_s85` 仍是 **rejected_slice_hypothesis**，禁止回 191 调参。
 
@@ -51,7 +51,8 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 8. **冻结假设** `sig_pull_negext_h5` holdout **+26.5% / -9.5%**，按新口径 **26/15 数字双过**。**仍不是有效策略**：这段 holdout 选规则时已经看过。
 9. **独立 OOS** `2026-07-04` 起：同一 3497 只宇宙，zero-refit。当前 Jiaoch 只到 **2026-08-14**，**selected=0**（全 cautious/defensive）。**12 月满窗日 = 2027-07-04**，现在还差约 **323** 天，不能评 26/15。
 10. **日滚已装**：工作日 18:30 任务 `quant-signal-lkj-path-a-reclaim-oos-roll`。有新 K 线就追加缓存并 zero-refit；没新数据就记还差多少天。不改规则，不放宽 `market_level`，非正式 final-OOS，不注册生产 profile，不自动交易。
-11. **诊断切分** `2025-01-01`：冻结规则 zero-refit。train `2023-07-03..2024-12-31` = +7.7% / -12.3%；eval `2025-01-01..2026-08-14` 最新 12 月 **-3.5%**、分区 MDD **-16.9%**，**26/15 不过**。这段和当初 holdout 重叠，**不是独立 OOS**，不能据此改参。
+11. **诊断切分** `2025-01-01`：冻结回踩 zero-refit。eval 最新 12 月 **-3.5%** / **-16.9%**，26/15 不过。不是独立 OOS。
+12. **反弹身份族**（不是拧回踩）：`bounce_dn2_negext` 锁定切分 **train+holdout 双过**（train +51.5% / -11.4%；holdout +26.4% / -14.1%，20 笔）。2025-01-01 诊断 eval **+17.4% / -14.1%**，收益不够。**仍非正式有效**。不改参，不注册生产 profile。
 
 **明确不做**
 

@@ -20,14 +20,17 @@ from app.factor_v3_path_a_protocol_baseline_specs import (
     iter_protocol_factor_variants,
 )
 from app.factor_v3_path_a_protocol_signal import (
+    DEFAULT_BOUNCE_QT_PATH as SIGNAL_BOUNCE_QT,
     DEFAULT_ENTRY_QT_PATH as SIGNAL_ENTRY_QT,
     DEFAULT_HOLD_QT_PATH as SIGNAL_HOLD_QT,
     DEFAULT_QT_PATH as SIGNAL_QT,
 )
 from app.factor_v3_path_a_protocol_signal_specs import (
+    SIGNAL_BOUNCE_FAMILY,
     SIGNAL_ENTRY_FAMILY,
     SIGNAL_FAMILY,
     SIGNAL_HOLD_FAMILY,
+    iter_protocol_signal_bounce_variants,
     iter_protocol_signal_entry_variants,
     iter_protocol_signal_hold_variants,
     iter_protocol_signal_variants,
@@ -119,6 +122,12 @@ def score_protocol_baseline(
             }
         )
     passed = [row for row in rows if row["holdout_dual_pass_50_15"]]
+    train_passed = [row for row in rows if row["train"]["dual_pass_50_15"]]
+    both_passed = [
+        row
+        for row in rows
+        if row["train"]["dual_pass_50_15"] and row["holdout_dual_pass_50_15"]
+    ]
     return {
         "schema": REPORT_SCHEMA,
         "stage_goal_id": stage_goal_id,
@@ -129,10 +138,17 @@ def score_protocol_baseline(
         "automatic_trading_allowed": goal.AUTOMATIC_TRADING_ALLOWED,
         "variant_count": len(rows),
         "holdout_dual_pass_ids": [row["candidate_id"] for row in passed],
+        "train_dual_pass_ids": [row["candidate_id"] for row in train_passed],
+        "both_partition_dual_pass_ids": [
+            row["candidate_id"] for row in both_passed
+        ],
         "current_development_candidate": (
-            passed[0]["candidate_id"] if passed else None
+            both_passed[0]["candidate_id"]
+            if both_passed
+            else (passed[0]["candidate_id"] if passed else None)
         ),
         "fifty_fifteen_holdout_met": bool(passed),
+        "both_partition_26_15_met": bool(both_passed),
         "rejected_slice_candidate_id": proto.REJECTED_SLICE_CANDIDATE_ID,
         "rejected_slice_status": proto.REJECTED_SLICE_STATUS,
         "variants": rows,
@@ -158,6 +174,8 @@ def build_path_a_protocol_baseline(
         default_qt = SIGNAL_HOLD_QT
     elif chosen == "signal_entry":
         default_qt = SIGNAL_ENTRY_QT
+    elif chosen == "signal_bounce":
+        default_qt = SIGNAL_BOUNCE_QT
     elif chosen == "signal":
         default_qt = SIGNAL_QT
     else:
@@ -183,6 +201,8 @@ def build_path_a_protocol_baseline(
         raise PathAProtocolBaselineError("QT is not the protocol signal-hold book")
     if chosen == "signal_entry" and meta.get("signal_family") != SIGNAL_ENTRY_FAMILY:
         raise PathAProtocolBaselineError("QT is not the protocol signal-entry book")
+    if chosen == "signal_bounce" and meta.get("signal_family") != SIGNAL_BOUNCE_FAMILY:
+        raise PathAProtocolBaselineError("QT is not the protocol signal-bounce book")
     all_trades = train_replay._filter_train_trades(
         list(qt.get("qualified_trades") or [])
     )
@@ -223,6 +243,13 @@ def build_path_a_protocol_baseline(
             variants=iter_protocol_signal_entry_variants(),
             stage_goal_id="path-a-protocol-signal-entry/v1",
         )
+    elif chosen == "signal_bounce":
+        report = score_protocol_baseline(
+            train_trades,
+            holdout_trades,
+            variants=iter_protocol_signal_bounce_variants(),
+            stage_goal_id="path-a-protocol-signal-bounce/v1",
+        )
     elif chosen == "baseline":
         report = score_protocol_baseline(train_trades, holdout_trades)
     else:
@@ -245,6 +272,8 @@ def format_protocol_baseline_table(report: dict[str, Any]) -> str:
         f"holdout_trades={report.get('holdout_trade_count')}",
         f"fifty_fifteen_holdout_met={report.get('fifty_fifteen_holdout_met')}",
         f"holdout_dual_pass_ids={report.get('holdout_dual_pass_ids')}",
+        f"train_dual_pass_ids={report.get('train_dual_pass_ids')}",
+        f"both_partition_dual_pass_ids={report.get('both_partition_dual_pass_ids')}",
         f"rejected={report.get('rejected_slice_candidate_id')} "
         f"{report.get('rejected_slice_status')}",
         "id\ttrain_1y\ttrain_mdd\ttrain_dual\tholdout_1y\tholdout_mdd\tholdout_dual\tselected_h",
