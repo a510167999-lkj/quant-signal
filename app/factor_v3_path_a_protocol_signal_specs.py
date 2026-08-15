@@ -416,12 +416,115 @@ def iter_protocol_signal_bounce_variants() -> tuple[dict[str, Any], ...]:
     return PROTOCOL_SIGNAL_BOUNCE_VARIANTS
 
 
+ENGULF_TAG = "bullish_engulf_uptrend"
+HAMMER_TAG = "hammer_bounce_uptrend"
+MA10_RECLAIM_TAG = "trend_ma10_reclaim"
+LO20_BOUNCE_TAG = "bounce_off_20d_low"
+NR7_UP_TAG = "nr7_break_uptrend"
+SIGNAL_SHAPE_FAMILY = "path-a-protocol-signal-shape/v1"
+SIGNAL_SHAPE_STAGE_GOAL_ID = "path-a-protocol-signal-shape/v1"
+
+# Fifth identity book. Not MA20 reclaim, not down2 bounce, not limit-follow.
+# Written before the shape QT is scored. Dual-partition 26/15 still required.
+PROTOCOL_SIGNAL_SHAPE_VARIANTS: tuple[dict[str, Any], ...] = (
+    {
+        "candidate_id": "shape_engulf",
+        "role": "protocol_signal_shape",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (ENGULF_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Bullish engulfing in a 20/60 uptrend. Not a 20d breakout.",
+    },
+    {
+        "candidate_id": "shape_engulf_negext",
+        "role": "protocol_signal_shape",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (ENGULF_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Bullish engulfing, anti-chase rank.",
+    },
+    {
+        "candidate_id": "shape_hammer",
+        "role": "protocol_signal_shape",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (HAMMER_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Long lower wick in an uptrend after a dip.",
+    },
+    {
+        "candidate_id": "shape_ma10",
+        "role": "protocol_signal_shape",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (MA10_RECLAIM_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Faster MA10 reclaim with MA10>MA20>MA60. Not MA20 reclaim.",
+    },
+    {
+        "candidate_id": "shape_lo20",
+        "role": "protocol_signal_shape",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (LO20_BOUNCE_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Bounce after a close near the 20-day low. Mean reversion.",
+    },
+    {
+        "candidate_id": "shape_nr7",
+        "role": "protocol_signal_shape",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (NR7_UP_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Narrowest range in 7 days, then close above prior high.",
+    },
+)
+
+
+def iter_protocol_signal_shape_variants() -> tuple[dict[str, Any], ...]:
+    return PROTOCOL_SIGNAL_SHAPE_VARIANTS
+
+
 def assert_signal_variants_obey_protocol() -> None:
     for variants in (
         PROTOCOL_SIGNAL_VARIANTS,
         PROTOCOL_SIGNAL_HOLD_VARIANTS,
         PROTOCOL_SIGNAL_ENTRY_VARIANTS,
         PROTOCOL_SIGNAL_BOUNCE_VARIANTS,
+        PROTOCOL_SIGNAL_SHAPE_VARIANTS,
     ):
         assert_variants_obey_protocol(variants)
         for row in variants:

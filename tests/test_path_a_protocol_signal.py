@@ -6,17 +6,23 @@ from app.factor_v3_path_a_protocol_signal import (
     bounce_masks,
     build_signal_trades,
     entry_masks,
+    shape_masks,
     signal_masks,
 )
 from app.factor_v3_path_a_protocol_signal_specs import (
     BREAKOUT_60D_TAG,
     DN2_BOUNCE_TAG,
     DN3_BOUNCE_TAG,
+    ENGULF_TAG,
+    HAMMER_TAG,
     HOLD10_TAG,
     HOLD5_TAG,
     INSIDE_UP_TAG,
     LIMIT_FOLLOW_TAG,
+    LO20_BOUNCE_TAG,
+    MA10_RECLAIM_TAG,
     MA60_RECLAIM_TAG,
+    NR7_UP_TAG,
     PULLBACK_TAG,
     RECLAIM_TAG,
     TIGHT5_UP_TAG,
@@ -24,6 +30,7 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     iter_protocol_signal_bounce_variants,
     iter_protocol_signal_entry_variants,
     iter_protocol_signal_hold_variants,
+    iter_protocol_signal_shape_variants,
     iter_protocol_signal_variants,
 )
 from app.factor_v3_path_a_research_protocol import CONTAMINATED_CANDIDATE_IDS
@@ -115,6 +122,28 @@ def test_signal_variants_are_new_identity() -> None:
         assert "breakout_20d" not in required
         assert PULLBACK_TAG not in required
         assert required & {DN2_BOUNCE_TAG, DN3_BOUNCE_TAG, INSIDE_UP_TAG, TIGHT5_UP_TAG}
+    shape_ids = [row["candidate_id"] for row in iter_protocol_signal_shape_variants()]
+    assert shape_ids == [
+        "shape_engulf",
+        "shape_engulf_negext",
+        "shape_hammer",
+        "shape_ma10",
+        "shape_lo20",
+        "shape_nr7",
+    ]
+    assert set(shape_ids).isdisjoint(CONTAMINATED_CANDIDATE_IDS)
+    for row in iter_protocol_signal_shape_variants():
+        required = set((row.get("kernel") or {}).get("required_signal_tags") or ())
+        assert "breakout_20d" not in required
+        assert PULLBACK_TAG not in required
+        assert DN2_BOUNCE_TAG not in required
+        assert required & {
+            ENGULF_TAG,
+            HAMMER_TAG,
+            MA10_RECLAIM_TAG,
+            LO20_BOUNCE_TAG,
+            NR7_UP_TAG,
+        }
 
 
 def test_bounce_masks_fire_two_day_down_then_up() -> None:
@@ -146,6 +175,39 @@ def test_bounce_masks_fire_two_day_down_then_up() -> None:
     assert DN2_BOUNCE_TAG in trades[0]["signal_tags"]
     assert RECLAIM_TAG not in trades[0]["signal_tags"]
     assert PULLBACK_TAG not in trades[0]["signal_tags"]
+
+
+def test_shape_masks_fire_bullish_engulfing() -> None:
+    closes = [80.0] * 40 + [100.0] * 19 + [99.0, 101.4] + [101.4] * 6
+    opens = [80.0] * 40 + [100.0] * 19 + [100.5, 98.6] + [101.4] * 6
+    highs = [max(o, c) + 0.1 for o, c in zip(opens, closes)]
+    lows = [min(o, c) - 0.1 for o, c in zip(opens, closes)]
+    for index in range(40, 59):
+        highs[index] = 104.0
+    dates = pd.bdate_range("2023-08-01", periods=len(closes)).strftime("%Y-%m-%d")
+    frame = pd.DataFrame(
+        {
+            "date": dates,
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": [1_000_000.0] * len(closes),
+            "amount": [200_000_000.0] * len(closes),
+        }
+    )
+    masks = shape_masks(frame)
+    assert bool(masks.at[60, "engulf"]) is True
+    trades = build_signal_trades(
+        [({"symbol": "000001", "name": "test"}, frame)],
+        start_date=str(frame.at[60, "date"]),
+        end_date=str(frame.at[60, "date"]),
+        book="shape",
+    )
+    assert trades
+    assert ENGULF_TAG in trades[0]["signal_tags"]
+    assert RECLAIM_TAG not in trades[0]["signal_tags"]
+    assert DN2_BOUNCE_TAG not in trades[0]["signal_tags"]
 
 
 def test_build_signal_trades_emits_reclaim_tags() -> None:

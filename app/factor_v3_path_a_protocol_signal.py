@@ -14,9 +14,14 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     BREAKOUT_60D_TAG,
     DN2_BOUNCE_TAG,
     DN3_BOUNCE_TAG,
+    ENGULF_TAG,
+    HAMMER_TAG,
     INSIDE_UP_TAG,
     LIMIT_FOLLOW_TAG,
+    LO20_BOUNCE_TAG,
+    MA10_RECLAIM_TAG,
     MA60_RECLAIM_TAG,
+    NR7_UP_TAG,
     PULLBACK_TAG,
     RECLAIM_TAG,
     SIGNAL_BOUNCE_FAMILY,
@@ -26,6 +31,8 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     SIGNAL_FAMILY,
     SIGNAL_HOLD_FAMILY,
     SIGNAL_HOLD_STAGE_GOAL_ID,
+    SIGNAL_SHAPE_FAMILY,
+    SIGNAL_SHAPE_STAGE_GOAL_ID,
     STAGE_GOAL_ID,
     TIGHT5_UP_TAG,
 )
@@ -62,6 +69,9 @@ DEFAULT_ENTRY_QT_PATH = Path(
 )
 DEFAULT_BOUNCE_QT_PATH = Path(
     "data/research_cache/qualified_hold5_stop5_3y_jiaoch_bounce.json"
+)
+DEFAULT_SHAPE_QT_PATH = Path(
+    "data/research_cache/qualified_hold5_stop5_3y_jiaoch_shape.json"
 )
 
 
@@ -189,6 +199,70 @@ def bounce_masks(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def shape_masks(frame: pd.DataFrame) -> pd.DataFrame:
+    """Candlestick / faster-MA / 20d-low identities. Not reclaim or down2 bounce."""
+
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    high = pd.to_numeric(frame["high"], errors="coerce")
+    low = pd.to_numeric(frame["low"], errors="coerce")
+    open_px = pd.to_numeric(frame["open"], errors="coerce")
+    ma10 = close.rolling(10, min_periods=10).mean()
+    ma20 = close.rolling(20, min_periods=20).mean()
+    ma60 = close.rolling(60, min_periods=60).mean()
+    prior_high20 = high.shift(1).rolling(20, min_periods=20).max()
+    prior_low20 = low.shift(1).rolling(20, min_periods=20).min()
+    history = ma60.notna()
+    uptrend = history & (ma20 > ma60)
+    not_breakout = (close <= prior_high20).fillna(False)
+    prior_open = open_px.shift(1)
+    prior_close = close.shift(1)
+    engulf = (
+        uptrend
+        & (prior_close < prior_open)
+        & (close > open_px)
+        & (open_px <= prior_close)
+        & (close > prior_open)
+        & not_breakout
+    ).fillna(False)
+    body = (close - open_px).abs()
+    lower_wick = pd.concat([open_px, close], axis=1).min(axis=1) - low
+    upper_wick = high - pd.concat([open_px, close], axis=1).max(axis=1)
+    day_range = (high - low).clip(lower=1e-6)
+    hammer = (
+        uptrend
+        & (lower_wick >= (2.0 * body))
+        & (lower_wick >= (0.5 * day_range))
+        & (upper_wick <= (0.25 * day_range))
+        & (close >= prior_close)
+        & not_breakout
+    ).fillna(False)
+    ma10_reclaim = (
+        history
+        & (ma10 > ma20)
+        & (ma20 > ma60)
+        & (prior_close < ma10.shift(1))
+        & (close >= ma10)
+        & not_breakout
+    ).fillna(False)
+    lo20 = (
+        history
+        & (prior_close <= (prior_low20 * 1.02))
+        & (close > prior_close)
+        & not_breakout
+    ).fillna(False)
+    rng = high - low
+    nr7 = rng < rng.shift(1).rolling(6, min_periods=6).min()
+    nr7_up = (uptrend & nr7 & (close > high.shift(1)) & not_breakout).fillna(False)
+    out = pd.DataFrame(index=frame.index)
+    out["engulf"] = engulf
+    out["hammer"] = hammer
+    out["ma10_reclaim"] = ma10_reclaim
+    out["lo20"] = lo20
+    out["nr7_up"] = nr7_up
+    out["fire"] = (engulf | hammer | ma10_reclaim | lo20 | nr7_up).fillna(False)
+    return out
+
+
 def _num(value: Any, default: float | None = None) -> float | None:
     try:
         number = float(value)
@@ -219,6 +293,21 @@ def _bar_tags(row: pd.Series, masks: pd.Series, *, book: str = "reclaim") -> lis
             tags.add(INSIDE_UP_TAG)
         if bool(masks.get("tight5_up")):
             tags.add(TIGHT5_UP_TAG)
+    elif book == "shape":
+        if bool(masks.get("engulf")):
+            tags.add(ENGULF_TAG)
+            tags.add("ma_structure")
+        if bool(masks.get("hammer")):
+            tags.add(HAMMER_TAG)
+            tags.add("ma_structure")
+        if bool(masks.get("ma10_reclaim")):
+            tags.add(MA10_RECLAIM_TAG)
+            tags.add("ma_structure")
+        if bool(masks.get("lo20")):
+            tags.add(LO20_BOUNCE_TAG)
+        if bool(masks.get("nr7_up")):
+            tags.add(NR7_UP_TAG)
+            tags.add("ma_structure")
     else:
         tags.add(RECLAIM_TAG)
         tags.add("ma_structure")
@@ -297,6 +386,10 @@ def build_signal_trades(
             gap_up, locked_gap = entry_exec_limits(symbol)
         elif book == "bounce":
             masks = bounce_masks(frame)
+            fire = masks["fire"]
+            gap_up, locked_gap = 6.0, 9.3
+        elif book == "shape":
+            masks = shape_masks(frame)
             fire = masks["fire"]
             gap_up, locked_gap = 6.0, 9.3
         else:
@@ -454,6 +547,8 @@ def build_path_a_protocol_signal_qt(
         stage = SIGNAL_ENTRY_STAGE_GOAL_ID
     elif family == SIGNAL_BOUNCE_FAMILY:
         stage = SIGNAL_BOUNCE_STAGE_GOAL_ID
+    elif family == SIGNAL_SHAPE_FAMILY:
+        stage = SIGNAL_SHAPE_STAGE_GOAL_ID
     else:
         stage = STAGE_GOAL_ID
     payload = {

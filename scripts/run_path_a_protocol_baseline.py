@@ -25,6 +25,7 @@ from app.factor_v3_path_a_protocol_signal import (  # noqa: E402
     DEFAULT_ENTRY_QT_PATH as SIGNAL_ENTRY_QT,
     DEFAULT_HOLD_QT_PATH as SIGNAL_HOLD_QT,
     DEFAULT_QT_PATH as SIGNAL_QT,
+    DEFAULT_SHAPE_QT_PATH as SIGNAL_SHAPE_QT,
 )
 
 
@@ -44,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
             "signal_hold",
             "signal_entry",
             "signal_bounce",
+            "signal_shape",
         ),
         default="baseline",
     )
@@ -59,6 +61,8 @@ def main(argv: list[str] | None = None) -> int:
         qt = SIGNAL_ENTRY_QT
     if args.family == "signal_bounce" and qt == DEFAULT_QT:
         qt = SIGNAL_BOUNCE_QT
+    if args.family == "signal_shape" and qt == DEFAULT_QT:
+        qt = SIGNAL_SHAPE_QT
     report = build_path_a_protocol_baseline(
         repo_root=repo,
         qualified_trades_path=qt if qt.is_absolute() else (repo / qt),
@@ -73,6 +77,7 @@ def main(argv: list[str] | None = None) -> int:
         "signal_hold": Path("data/research_runs/path_a_protocol_signal_hold"),
         "signal_entry": Path("data/research_runs/path_a_protocol_signal_entry"),
         "signal_bounce": Path("data/research_runs/path_a_protocol_signal_bounce"),
+        "signal_shape": Path("data/research_runs/path_a_protocol_signal_shape"),
     }
     chosen_root = args.output_root
     if chosen_root == DEFAULT_OUTPUT_ROOT:

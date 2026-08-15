@@ -24,15 +24,18 @@ from app.factor_v3_path_a_protocol_signal import (
     DEFAULT_ENTRY_QT_PATH as SIGNAL_ENTRY_QT,
     DEFAULT_HOLD_QT_PATH as SIGNAL_HOLD_QT,
     DEFAULT_QT_PATH as SIGNAL_QT,
+    DEFAULT_SHAPE_QT_PATH as SIGNAL_SHAPE_QT,
 )
 from app.factor_v3_path_a_protocol_signal_specs import (
     SIGNAL_BOUNCE_FAMILY,
     SIGNAL_ENTRY_FAMILY,
     SIGNAL_FAMILY,
     SIGNAL_HOLD_FAMILY,
+    SIGNAL_SHAPE_FAMILY,
     iter_protocol_signal_bounce_variants,
     iter_protocol_signal_entry_variants,
     iter_protocol_signal_hold_variants,
+    iter_protocol_signal_shape_variants,
     iter_protocol_signal_variants,
 )
 from app.storage import write_json
@@ -176,6 +179,8 @@ def build_path_a_protocol_baseline(
         default_qt = SIGNAL_ENTRY_QT
     elif chosen == "signal_bounce":
         default_qt = SIGNAL_BOUNCE_QT
+    elif chosen == "signal_shape":
+        default_qt = SIGNAL_SHAPE_QT
     elif chosen == "signal":
         default_qt = SIGNAL_QT
     else:
@@ -203,6 +208,8 @@ def build_path_a_protocol_baseline(
         raise PathAProtocolBaselineError("QT is not the protocol signal-entry book")
     if chosen == "signal_bounce" and meta.get("signal_family") != SIGNAL_BOUNCE_FAMILY:
         raise PathAProtocolBaselineError("QT is not the protocol signal-bounce book")
+    if chosen == "signal_shape" and meta.get("signal_family") != SIGNAL_SHAPE_FAMILY:
+        raise PathAProtocolBaselineError("QT is not the protocol signal-shape book")
     all_trades = train_replay._filter_train_trades(
         list(qt.get("qualified_trades") or [])
     )
@@ -249,6 +256,13 @@ def build_path_a_protocol_baseline(
             holdout_trades,
             variants=iter_protocol_signal_bounce_variants(),
             stage_goal_id="path-a-protocol-signal-bounce/v1",
+        )
+    elif chosen == "signal_shape":
+        report = score_protocol_baseline(
+            train_trades,
+            holdout_trades,
+            variants=iter_protocol_signal_shape_variants(),
+            stage_goal_id="path-a-protocol-signal-shape/v1",
         )
     elif chosen == "baseline":
         report = score_protocol_baseline(train_trades, holdout_trades)
