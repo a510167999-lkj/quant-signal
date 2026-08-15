@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 from app.factor_v3_path_a_protocol_monthly_switch import (  # noqa: E402
     DEFAULT_OUTPUT_ROOT,
     STAGE_GOAL_ID,
+    WEEKLY_OUTPUT_ROOT,
     build_path_a_protocol_monthly_switch,
     format_monthly_switch_table,
     write_path_a_protocol_monthly_switch,
@@ -28,7 +29,12 @@ from app.factor_v3_path_a_protocol_signal import (  # noqa: E402
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=STAGE_GOAL_ID)
     parser.add_argument("--repo-root", type=Path, default=ROOT)
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--output-root", type=Path, default=None)
+    parser.add_argument(
+        "--cadence",
+        choices=("month", "week"),
+        default="month",
+    )
     parser.add_argument("--bounce-qt-path", type=Path, default=DEFAULT_BOUNCE_QT_PATH)
     parser.add_argument("--reclaim-qt-path", type=Path, default=DEFAULT_HOLD_QT_PATH)
     parser.add_argument("--allow-any-role", action="store_true")
@@ -50,9 +56,12 @@ def main(argv: list[str] | None = None) -> int:
         bounce_qt_path=bounce,
         reclaim_qt_path=reclaim,
         require_local_research=not args.allow_any_role,
+        cadence=args.cadence,
     )
+    default_root = WEEKLY_OUTPUT_ROOT if args.cadence == "week" else DEFAULT_OUTPUT_ROOT
+    chosen_root = args.output_root or default_root
     output_root = (
-        args.output_root if args.output_root.is_absolute() else (repo / args.output_root)
+        chosen_root if chosen_root.is_absolute() else (repo / chosen_root)
     ).resolve()
     pointer = write_path_a_protocol_monthly_switch(report, output_root=output_root)
     print(format_monthly_switch_table(report), end="")

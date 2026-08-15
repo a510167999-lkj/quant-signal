@@ -105,3 +105,55 @@ def test_simulation_starts_in_cash_and_can_switch() -> None:
     assert any(row["selected_arm"] == "bounce_dn2_negext" for row in ledger[1:])
     assert periods
     assert periods[0]["arm_id"] == "cash"
+
+
+def test_week_decision_points_one_per_iso_week() -> None:
+    dates = [
+        "2025-01-06",
+        "2025-01-08",
+        "2025-01-10",
+        "2025-01-13",
+        "2025-01-17",
+    ]
+    assert switch.week_decision_points(dates) == ["2025-01-06", "2025-01-13"]
+
+
+def test_weekly_cadence_uses_week_points() -> None:
+    dates = [
+        "2024-01-02",
+        "2024-01-03",
+        "2024-01-08",
+        "2024-01-09",
+        "2024-01-15",
+        "2024-01-16",
+        "2024-01-22",
+    ]
+    bounce = [
+        {
+            "signal_date": day,
+            "symbol": f"b{index}",
+            "return_pct": 4.0,
+            "max_adverse_pct": -2.0,
+            "entry_date": day,
+            "exit_date": day,
+            "mark_to_market_path": [
+                {"date": day, "close_return_pct": 0.0, "low_return_pct": 0.0},
+                {"date": day, "close_return_pct": 4.0, "low_return_pct": -1.0},
+            ],
+        }
+        for index, day in enumerate(dates)
+    ]
+    ledger, _periods = switch.simulate_monthly_switch(
+        arm_trades_by_id={
+            "bounce_dn2_negext": bounce,
+            "sig_pull_negext_h5": [],
+            "cash": [],
+        },
+        calendar_dates=dates,
+        window_days=2,
+        cooldown_days=5,
+        initial_arm="cash",
+        cadence="week",
+    )
+    assert len(ledger) == 4
+    assert ledger[0]["selected_arm"] == "cash"

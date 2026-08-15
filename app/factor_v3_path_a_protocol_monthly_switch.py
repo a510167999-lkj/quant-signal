@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from copy import deepcopy
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -27,8 +28,10 @@ from app.jiaoch_live_market import JIAOCH_DAILY_CACHE_SOURCE_VERSION
 from app.storage import write_json
 
 STAGE_GOAL_ID = specs.STAGE_GOAL_ID
+WEEKLY_STAGE_GOAL_ID = specs.WEEKLY_STAGE_GOAL_ID
 REPORT_SCHEMA = "path-a-protocol-monthly-switch-report/v1"
 DEFAULT_OUTPUT_ROOT = Path("data/research_runs/path_a_protocol_monthly_switch")
+WEEKLY_OUTPUT_ROOT = Path("data/research_runs/path_a_protocol_weekly_switch")
 
 
 class PathAMonthlySwitchError(ValueError):
@@ -59,6 +62,23 @@ def select_live_arm(scores: dict[str, dict[str, Any]]) -> str:
         )
     )
     return eligible[0][0]
+
+
+def week_decision_points(signal_dates: list[str]) -> list[str]:
+    """First available signal_date in each ISO week."""
+
+    points: list[str] = []
+    seen: set[tuple[int, int]] = set()
+    for day in sorted(signal_dates):
+        if len(day) < 10:
+            continue
+        iso = date.fromisoformat(day).isocalendar()
+        key = (int(iso.year), int(iso.week))
+        if key in seen:
+            continue
+        seen.add(key)
+        points.append(day)
+    return points
 
 
 def _locked_dates(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -111,9 +131,13 @@ def simulate_monthly_switch(
     window_days: int = specs.ESTIMATION_WINDOW_TRADING_DAYS,
     cooldown_days: int = specs.SWITCH_COOLDOWN_TRADING_DAYS,
     initial_arm: str = specs.INITIAL_ARM_ID,
+    cadence: str = "month",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     kernel = p0._kernel_dict()
-    decision_points = p3._month_decision_points(calendar_dates)
+    if cadence == "week":
+        decision_points = week_decision_points(calendar_dates)
+    else:
+        decision_points = p3._month_decision_points(calendar_dates)
     if not decision_points:
         return [], []
     ledger: list[dict[str, Any]] = []
@@ -221,6 +245,7 @@ def build_path_a_protocol_monthly_switch(
     bounce_qt_path: Path | None = None,
     reclaim_qt_path: Path | None = None,
     require_local_research: bool = True,
+    cadence: str = "month",
 ) -> dict[str, Any]:
     if require_local_research:
         role = os.getenv("VPS_RUNTIME_ROLE", "")
@@ -261,9 +286,19 @@ def build_path_a_protocol_monthly_switch(
             if str(trade.get("signal_date") or "")
         }
     )
+    chosen = str(cadence or "month").strip().casefold()
+    if chosen not in {"month", "week"}:
+        raise PathAMonthlySwitchError(f"unknown cadence: {cadence!r}")
+    cooldown = (
+        specs.WEEKLY_SWITCH_COOLDOWN_TRADING_DAYS
+        if chosen == "week"
+        else specs.SWITCH_COOLDOWN_TRADING_DAYS
+    )
     ledger, periods = simulate_monthly_switch(
         arm_trades_by_id=arm_trades,
         calendar_dates=calendar,
+        cooldown_days=cooldown,
+        cadence=chosen,
     )
     spliced = p3._period_trades(periods, arm_trades)
     train = proto.filter_trades_for_partition(spliced, "train")
@@ -276,7 +311,11 @@ def build_path_a_protocol_monthly_switch(
     holdout_score = _score_book(holdout)
     return {
         "schema": REPORT_SCHEMA,
-        "stage_goal_id": STAGE_GOAL_ID,
+        "stage_goal_id": (
+            WEEKLY_STAGE_GOAL_ID if chosen == "week" else STAGE_GOAL_ID
+        ),
+        "cadence": chosen,
+        "cooldown_trading_days": cooldown,
         "selection_criterion": specs.SELECTION_CRITERION,
         "initial_arm": specs.INITIAL_ARM_ID,
         "arms": [
@@ -324,6 +363,7 @@ def format_monthly_switch_table(report: dict[str, Any]) -> str:
     return "\n".join(
         [
             f"stage={report.get('stage_goal_id')}",
+            f"cadence={report.get('cadence')}",
             f"rule={report.get('selection_criterion')}",
             f"decisions={report.get('decision_point_count')} "
             f"switches={report.get('switch_count')} "
