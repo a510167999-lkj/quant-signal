@@ -18,6 +18,7 @@ from app.factor_v3_path_a_protocol_signal import (  # noqa: E402
     DEFAULT_ENTRY_QT_PATH,
     DEFAULT_HOLD_QT_PATH,
     DEFAULT_QT_PATH,
+    DEFAULT_CLASSIC_QT_PATH,
     DEFAULT_SHAPE_QT_PATH,
     STAGE_GOAL_ID,
     build_path_a_protocol_signal_qt,
@@ -28,6 +29,7 @@ from app.factor_v3_path_a_protocol_signal_specs import (  # noqa: E402
     SIGNAL_ENTRY_FAMILY,
     SIGNAL_FAMILY,
     SIGNAL_HOLD_FAMILY,
+    SIGNAL_CLASSIC_FAMILY,
     SIGNAL_SHAPE_FAMILY,
 )
 
@@ -40,7 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-symbols", type=int, default=0)
     parser.add_argument(
         "--family",
-        choices=("signal", "hold", "entry", "bounce", "shape"),
+        choices=("signal", "hold", "entry", "bounce", "shape", "classic"),
         default="signal",
     )
     parser.add_argument("--allow-any-role", action="store_true")
@@ -70,6 +72,11 @@ def main(argv: list[str] | None = None) -> int:
         signal_family = SIGNAL_SHAPE_FAMILY
         default_qt = DEFAULT_SHAPE_QT_PATH
         book = "shape"
+    elif args.family == "classic":
+        hold_horizons = (5,)
+        signal_family = SIGNAL_CLASSIC_FAMILY
+        default_qt = DEFAULT_CLASSIC_QT_PATH
+        book = "classic"
     else:
         hold_horizons = (5,)
         signal_family = SIGNAL_FAMILY

@@ -518,6 +518,106 @@ def iter_protocol_signal_shape_variants() -> tuple[dict[str, Any], ...]:
     return PROTOCOL_SIGNAL_SHAPE_VARIANTS
 
 
+MACD_GOLD_TAG = "macd_gold_uptrend"
+KDJ_OVERSOLD_TAG = "kdj_oversold_cross"
+BOLL_RECLAIM_TAG = "boll_lower_reclaim"
+SIGNAL_CLASSIC_FAMILY = "path-a-protocol-signal-classic/v1"
+SIGNAL_CLASSIC_STAGE_GOAL_ID = "path-a-protocol-signal-classic/v1"
+
+# Sixth identity book. Textbook MACD / KDJ / BOLL events, not tag filters
+# on reclaim or bounce. Written before the classic QT is scored.
+PROTOCOL_SIGNAL_CLASSIC_VARIANTS: tuple[dict[str, Any], ...] = (
+    {
+        "candidate_id": "classic_macd",
+        "role": "protocol_signal_classic",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (MACD_GOLD_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "12/26/9 DIF crosses above DEA while MA20>MA60.",
+    },
+    {
+        "candidate_id": "classic_macd_negext",
+        "role": "protocol_signal_classic",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (MACD_GOLD_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "MACD golden cross, anti-chase rank.",
+    },
+    {
+        "candidate_id": "classic_kdj",
+        "role": "protocol_signal_classic",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (KDJ_OVERSOLD_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "9/3/3 K crosses D after J or K was <= 20. Reversal.",
+    },
+    {
+        "candidate_id": "classic_kdj_negext",
+        "role": "protocol_signal_classic",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (KDJ_OVERSOLD_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "KDJ oversold golden cross, anti-chase rank.",
+    },
+    {
+        "candidate_id": "classic_boll",
+        "role": "protocol_signal_classic",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (BOLL_RECLAIM_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Close was below the 20,2 lower band and reclaims it.",
+    },
+    {
+        "candidate_id": "classic_boll_negext",
+        "role": "protocol_signal_classic",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (BOLL_RECLAIM_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Bollinger lower-band reclaim, anti-chase rank.",
+    },
+)
+
+
+def iter_protocol_signal_classic_variants() -> tuple[dict[str, Any], ...]:
+    return PROTOCOL_SIGNAL_CLASSIC_VARIANTS
+
+
 def assert_signal_variants_obey_protocol() -> None:
     for variants in (
         PROTOCOL_SIGNAL_VARIANTS,
@@ -525,6 +625,7 @@ def assert_signal_variants_obey_protocol() -> None:
         PROTOCOL_SIGNAL_ENTRY_VARIANTS,
         PROTOCOL_SIGNAL_BOUNCE_VARIANTS,
         PROTOCOL_SIGNAL_SHAPE_VARIANTS,
+        PROTOCOL_SIGNAL_CLASSIC_VARIANTS,
     ):
         assert_variants_obey_protocol(variants)
         for row in variants:

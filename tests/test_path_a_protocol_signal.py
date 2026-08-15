@@ -5,11 +5,13 @@ import pandas as pd
 from app.factor_v3_path_a_protocol_signal import (
     bounce_masks,
     build_signal_trades,
+    classic_masks,
     entry_masks,
     shape_masks,
     signal_masks,
 )
 from app.factor_v3_path_a_protocol_signal_specs import (
+    BOLL_RECLAIM_TAG,
     BREAKOUT_60D_TAG,
     DN2_BOUNCE_TAG,
     DN3_BOUNCE_TAG,
@@ -18,21 +20,25 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     HOLD10_TAG,
     HOLD5_TAG,
     INSIDE_UP_TAG,
+    KDJ_OVERSOLD_TAG,
     LIMIT_FOLLOW_TAG,
     LO20_BOUNCE_TAG,
     MA10_RECLAIM_TAG,
     MA60_RECLAIM_TAG,
+    MACD_GOLD_TAG,
     NR7_UP_TAG,
     PULLBACK_TAG,
     RECLAIM_TAG,
     TIGHT5_UP_TAG,
     assert_signal_variants_obey_protocol,
     iter_protocol_signal_bounce_variants,
+    iter_protocol_signal_classic_variants,
     iter_protocol_signal_entry_variants,
     iter_protocol_signal_hold_variants,
     iter_protocol_signal_shape_variants,
     iter_protocol_signal_variants,
 )
+from app.indicators import add_indicators
 from app.factor_v3_path_a_research_protocol import CONTAMINATED_CANDIDATE_IDS
 
 
@@ -144,6 +150,22 @@ def test_signal_variants_are_new_identity() -> None:
             LO20_BOUNCE_TAG,
             NR7_UP_TAG,
         }
+    classic_ids = [row["candidate_id"] for row in iter_protocol_signal_classic_variants()]
+    assert classic_ids == [
+        "classic_macd",
+        "classic_macd_negext",
+        "classic_kdj",
+        "classic_kdj_negext",
+        "classic_boll",
+        "classic_boll_negext",
+    ]
+    assert set(classic_ids).isdisjoint(CONTAMINATED_CANDIDATE_IDS)
+    for row in iter_protocol_signal_classic_variants():
+        required = set((row.get("kernel") or {}).get("required_signal_tags") or ())
+        assert "breakout_20d" not in required
+        assert PULLBACK_TAG not in required
+        assert DN2_BOUNCE_TAG not in required
+        assert required & {MACD_GOLD_TAG, KDJ_OVERSOLD_TAG, BOLL_RECLAIM_TAG}
 
 
 def test_bounce_masks_fire_two_day_down_then_up() -> None:
@@ -208,6 +230,79 @@ def test_shape_masks_fire_bullish_engulfing() -> None:
     assert ENGULF_TAG in trades[0]["signal_tags"]
     assert RECLAIM_TAG not in trades[0]["signal_tags"]
     assert DN2_BOUNCE_TAG not in trades[0]["signal_tags"]
+
+
+def _classic_recovery_frame() -> pd.DataFrame:
+    closes = (
+        [80.0 + index * 0.4 for index in range(50)]
+        + [100.0] * 15
+        + [99.0, 98.0, 97.0, 96.5, 97.5, 99.0, 101.0, 102.0]
+        + [102.0] * 10
+        + [100.0, 96.0, 90.0, 84.0, 80.0]
+        + [81.5, 83.0, 85.0, 87.0, 89.0, 91.0, 93.0]
+        + [93.0] * 8
+    )
+    dates = pd.bdate_range("2023-08-01", periods=len(closes)).strftime("%Y-%m-%d")
+    opens = [closes[0]] + closes[:-1]
+    highs = [max(o, c) + 0.4 for o, c in zip(opens, closes)]
+    lows = [min(o, c) - 0.4 for o, c in zip(opens, closes)]
+    return pd.DataFrame(
+        {
+            "date": dates,
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": [1_000_000.0] * len(closes),
+            "amount": [200_000_000.0] * len(closes),
+        }
+    )
+
+
+def test_classic_masks_match_textbook_events() -> None:
+    frame = _classic_recovery_frame()
+    work = add_indicators(frame)
+    masks = classic_masks(frame)
+    close = work["close"]
+    prior_high20 = work["high"].shift(1).rolling(20, min_periods=20).max()
+    uptrend = work["ma60"].notna() & (work["ma20"] > work["ma60"])
+    not_breakout = close <= prior_high20
+    macd_expected = (
+        uptrend
+        & (work["macd"].shift(1) <= work["macd_signal"].shift(1))
+        & (work["macd"] > work["macd_signal"])
+    ).fillna(False)
+    kdj_expected = (
+        work["ma60"].notna()
+        & (work["kdj_k"].shift(1) <= work["kdj_d"].shift(1))
+        & (work["kdj_k"] > work["kdj_d"])
+        & ((work["kdj_j"].shift(1) <= 20.0) | (work["kdj_k"].shift(1) <= 20.0))
+    ).fillna(False)
+    boll_expected = (
+        work["ma60"].notna()
+        & (close.shift(1) < work["boll_lower"].shift(1))
+        & (close >= work["boll_lower"])
+        & not_breakout
+    ).fillna(False)
+    assert masks["macd_cross"].astype(bool).tolist() == macd_expected.astype(bool).tolist()
+    assert masks["kdj_cross"].astype(bool).tolist() == kdj_expected.astype(bool).tolist()
+    assert masks["boll_reclaim"].astype(bool).tolist() == boll_expected.astype(bool).tolist()
+    assert bool(masks["macd_cross"].any()) is True
+    assert bool(masks["kdj_cross"].any()) is True
+    assert bool(masks["boll_reclaim"].any()) is True
+    fire_idx = int(masks.index[masks["fire"]][0])
+    trades = build_signal_trades(
+        [({"symbol": "000001", "name": "test"}, frame)],
+        start_date=str(frame.at[fire_idx, "date"]),
+        end_date=str(frame.at[fire_idx, "date"]),
+        book="classic",
+    )
+    assert trades
+    tags = set(trades[0]["signal_tags"])
+    assert tags & {MACD_GOLD_TAG, KDJ_OVERSOLD_TAG, BOLL_RECLAIM_TAG}
+    assert RECLAIM_TAG not in tags
+    assert DN2_BOUNCE_TAG not in tags
+    assert ENGULF_TAG not in tags
 
 
 def test_build_signal_trades_emits_reclaim_tags() -> None:

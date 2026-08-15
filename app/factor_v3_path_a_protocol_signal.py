@@ -11,21 +11,26 @@ import pandas as pd
 
 from app.execution import assess_entry_executability
 from app.factor_v3_path_a_protocol_signal_specs import (
+    BOLL_RECLAIM_TAG,
     BREAKOUT_60D_TAG,
     DN2_BOUNCE_TAG,
     DN3_BOUNCE_TAG,
     ENGULF_TAG,
     HAMMER_TAG,
     INSIDE_UP_TAG,
+    KDJ_OVERSOLD_TAG,
     LIMIT_FOLLOW_TAG,
     LO20_BOUNCE_TAG,
     MA10_RECLAIM_TAG,
     MA60_RECLAIM_TAG,
+    MACD_GOLD_TAG,
     NR7_UP_TAG,
     PULLBACK_TAG,
     RECLAIM_TAG,
     SIGNAL_BOUNCE_FAMILY,
     SIGNAL_BOUNCE_STAGE_GOAL_ID,
+    SIGNAL_CLASSIC_FAMILY,
+    SIGNAL_CLASSIC_STAGE_GOAL_ID,
     SIGNAL_ENTRY_FAMILY,
     SIGNAL_ENTRY_STAGE_GOAL_ID,
     SIGNAL_FAMILY,
@@ -72,6 +77,9 @@ DEFAULT_BOUNCE_QT_PATH = Path(
 )
 DEFAULT_SHAPE_QT_PATH = Path(
     "data/research_cache/qualified_hold5_stop5_3y_jiaoch_shape.json"
+)
+DEFAULT_CLASSIC_QT_PATH = Path(
+    "data/research_cache/qualified_hold5_stop5_3y_jiaoch_classic.json"
 )
 
 
@@ -263,6 +271,51 @@ def shape_masks(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def classic_masks(frame: pd.DataFrame) -> pd.DataFrame:
+    """Textbook MACD / KDJ / BOLL events. Not reclaim, bounce, or shape."""
+
+    work = frame
+    if "macd" not in frame.columns or "kdj_k" not in frame.columns:
+        work = add_indicators(frame)
+    close = pd.to_numeric(work["close"], errors="coerce")
+    high = pd.to_numeric(work["high"], errors="coerce")
+    ma20 = pd.to_numeric(work["ma20"], errors="coerce")
+    ma60 = pd.to_numeric(work["ma60"], errors="coerce")
+    macd = pd.to_numeric(work["macd"], errors="coerce")
+    macd_signal = pd.to_numeric(work["macd_signal"], errors="coerce")
+    kdj_k = pd.to_numeric(work["kdj_k"], errors="coerce")
+    kdj_d = pd.to_numeric(work["kdj_d"], errors="coerce")
+    kdj_j = pd.to_numeric(work["kdj_j"], errors="coerce")
+    boll_lower = pd.to_numeric(work["boll_lower"], errors="coerce")
+    prior_high20 = high.shift(1).rolling(20, min_periods=20).max()
+    history = ma60.notna()
+    uptrend = history & (ma20 > ma60)
+    not_breakout = (close <= prior_high20).fillna(False)
+    macd_cross = (
+        uptrend
+        & (macd.shift(1) <= macd_signal.shift(1))
+        & (macd > macd_signal)
+    ).fillna(False)
+    kdj_cross = (
+        history
+        & (kdj_k.shift(1) <= kdj_d.shift(1))
+        & (kdj_k > kdj_d)
+        & ((kdj_j.shift(1) <= 20.0) | (kdj_k.shift(1) <= 20.0))
+    ).fillna(False)
+    boll_reclaim = (
+        history
+        & (close.shift(1) < boll_lower.shift(1))
+        & (close >= boll_lower)
+        & not_breakout
+    ).fillna(False)
+    out = pd.DataFrame(index=frame.index)
+    out["macd_cross"] = macd_cross
+    out["kdj_cross"] = kdj_cross
+    out["boll_reclaim"] = boll_reclaim
+    out["fire"] = (macd_cross | kdj_cross | boll_reclaim).fillna(False)
+    return out
+
+
 def _num(value: Any, default: float | None = None) -> float | None:
     try:
         number = float(value)
@@ -308,6 +361,15 @@ def _bar_tags(row: pd.Series, masks: pd.Series, *, book: str = "reclaim") -> lis
         if bool(masks.get("nr7_up")):
             tags.add(NR7_UP_TAG)
             tags.add("ma_structure")
+    elif book == "classic":
+        if bool(masks.get("macd_cross")):
+            tags.add(MACD_GOLD_TAG)
+            tags.add("ma_structure")
+        if bool(masks.get("kdj_cross")):
+            tags.add(KDJ_OVERSOLD_TAG)
+            tags.add("ma_structure")
+        if bool(masks.get("boll_reclaim")):
+            tags.add(BOLL_RECLAIM_TAG)
     else:
         tags.add(RECLAIM_TAG)
         tags.add("ma_structure")
@@ -390,6 +452,10 @@ def build_signal_trades(
             gap_up, locked_gap = 6.0, 9.3
         elif book == "shape":
             masks = shape_masks(frame)
+            fire = masks["fire"]
+            gap_up, locked_gap = 6.0, 9.3
+        elif book == "classic":
+            masks = classic_masks(frame)
             fire = masks["fire"]
             gap_up, locked_gap = 6.0, 9.3
         else:
@@ -549,6 +615,8 @@ def build_path_a_protocol_signal_qt(
         stage = SIGNAL_BOUNCE_STAGE_GOAL_ID
     elif family == SIGNAL_SHAPE_FAMILY:
         stage = SIGNAL_SHAPE_STAGE_GOAL_ID
+    elif family == SIGNAL_CLASSIC_FAMILY:
+        stage = SIGNAL_CLASSIC_STAGE_GOAL_ID
     else:
         stage = STAGE_GOAL_ID
     payload = {
