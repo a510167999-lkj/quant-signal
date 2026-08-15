@@ -39,6 +39,8 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 
 **当前阶段 ID**：`path-a-protocol-signal-bounce/v1`
 
+假设用 `hyp/<candidate_id>` 分支记账，`codex/main` 仍是当前工作线。新假设开新 `hyp/` 分支，不要在别人的假设分支上改参。见 `项目进度.md` §1.25。
+
 计划已改序。**2026-08-15 用户把收益门槛从 30% 调到 26%**，回撤仍是 15%，对齐冻结假设 holdout +26.5%。`vol_skip_rsi_adv_s85` 仍是 **rejected_slice_hypothesis**，禁止回 191 调参。
 
 1. **协议**（`app/factor_v3_path_a_research_protocol.py`）：train `2023-07-03..2025-06-30`，holdout `2025-07-01..2026-07-03`。搜索宇宙 = Jiaoch v2 holdout，不是 191 成交切片。双过 = **最新滚动 12 月收益 ≥26%** 且 **该分区 MDD ≤15%**。全路径收益只做诊断，不当年化。
