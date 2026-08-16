@@ -7,6 +7,7 @@ from app.factor_v3_path_a_protocol_signal import (
     build_signal_trades,
     classic_masks,
     entry_masks,
+    gap_masks,
     shape_masks,
     signal_masks,
 )
@@ -16,6 +17,9 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     DN2_BOUNCE_TAG,
     DN3_BOUNCE_TAG,
     ENGULF_TAG,
+    GAP_DELAY_TAG,
+    GAP_OPEN_TAG,
+    GAP_TRUE_TAG,
     HAMMER_TAG,
     HOLD10_TAG,
     HOLD5_TAG,
@@ -34,6 +38,7 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     iter_protocol_signal_bounce_variants,
     iter_protocol_signal_classic_variants,
     iter_protocol_signal_entry_variants,
+    iter_protocol_signal_gap_variants,
     iter_protocol_signal_hold_variants,
     iter_protocol_signal_shape_variants,
     iter_protocol_signal_variants,
@@ -166,6 +171,22 @@ def test_signal_variants_are_new_identity() -> None:
         assert PULLBACK_TAG not in required
         assert DN2_BOUNCE_TAG not in required
         assert required & {MACD_GOLD_TAG, KDJ_OVERSOLD_TAG, BOLL_RECLAIM_TAG}
+    gap_ids = [row["candidate_id"] for row in iter_protocol_signal_gap_variants()]
+    assert gap_ids == [
+        "gap_true",
+        "gap_true_negext",
+        "gap_open",
+        "gap_open_negext",
+        "gap_delay",
+        "gap_delay_negext",
+    ]
+    assert set(gap_ids).isdisjoint(CONTAMINATED_CANDIDATE_IDS)
+    for row in iter_protocol_signal_gap_variants():
+        required = set((row.get("kernel") or {}).get("required_signal_tags") or ())
+        assert "breakout_20d" not in required
+        assert PULLBACK_TAG not in required
+        assert DN2_BOUNCE_TAG not in required
+        assert required & {GAP_TRUE_TAG, GAP_OPEN_TAG, GAP_DELAY_TAG}
 
 
 def test_bounce_masks_fire_two_day_down_then_up() -> None:
@@ -303,6 +324,84 @@ def test_classic_masks_match_textbook_events() -> None:
     assert RECLAIM_TAG not in tags
     assert DN2_BOUNCE_TAG not in tags
     assert ENGULF_TAG not in tags
+
+
+def _gap_event_frame() -> pd.DataFrame:
+    n = 70
+    closes = [80.0 + index * 0.3 for index in range(n)]
+    opens = [closes[0]] + closes[:-1]
+    highs = [104.0] * n
+    lows = [value - 0.3 for value in closes]
+    # 70: true gap fill. prior low ~ 100.4, prior close ~ 100.7
+    opens.append(99.5)
+    closes.append(100.6)
+    highs.append(100.8)
+    lows.append(99.3)
+    # 71-73 quiet
+    for _ in range(3):
+        opens.append(100.6)
+        closes.append(100.6)
+        highs.append(100.8)
+        lows.append(100.3)
+    # 74 origin, 75 unfilled down gap, 76 next-day fill
+    opens.extend([100.6, 99.0, 98.9])
+    closes.extend([100.6, 98.8, 100.5])
+    highs.extend([100.8, 99.2, 100.6])
+    lows.extend([100.3, 98.5, 98.7])
+    # 77-79 quiet with a deep prior low so 80 is not a true gap
+    for _ in range(2):
+        opens.append(100.5)
+        closes.append(100.5)
+        highs.append(100.7)
+        lows.append(100.2)
+    opens.append(100.5)
+    closes.append(100.5)
+    highs.append(100.7)
+    lows.append(96.0)
+    # 80: 3% low-open reclaim, open still above prior low
+    opens.append(96.8)
+    closes.append(100.6)
+    highs.append(100.7)
+    lows.append(96.5)
+    for _ in range(8):
+        opens.append(100.6)
+        closes.append(100.6)
+        highs.append(100.8)
+        lows.append(100.3)
+    dates = pd.bdate_range("2023-08-01", periods=len(closes)).strftime("%Y-%m-%d")
+    return pd.DataFrame(
+        {
+            "date": dates,
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": [1_000_000.0] * len(closes),
+            "amount": [200_000_000.0] * len(closes),
+        }
+    )
+
+
+def test_gap_masks_fire_three_fill_identities() -> None:
+    frame = _gap_event_frame()
+    masks = gap_masks(frame)
+    assert bool(masks.at[70, "gap_true"]) is True
+    assert bool(masks.at[76, "gap_delay"]) is True
+    assert bool(masks.at[80, "gap_open"]) is True
+    assert bool(masks.at[80, "gap_true"]) is False
+    trades = build_signal_trades(
+        [({"symbol": "000001", "name": "test"}, frame)],
+        start_date=str(frame.at[70, "date"]),
+        end_date=str(frame.at[80, "date"]),
+        book="gap",
+    )
+    tags = {tag for trade in trades for tag in trade["signal_tags"]}
+    assert GAP_TRUE_TAG in tags
+    assert GAP_OPEN_TAG in tags
+    assert GAP_DELAY_TAG in tags
+    assert RECLAIM_TAG not in tags
+    assert DN2_BOUNCE_TAG not in tags
+    assert MACD_GOLD_TAG not in tags
 
 
 def test_build_signal_trades_emits_reclaim_tags() -> None:

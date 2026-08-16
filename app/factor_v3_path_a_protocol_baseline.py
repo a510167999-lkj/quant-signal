@@ -25,6 +25,7 @@ from app.factor_v3_path_a_protocol_signal import (
     DEFAULT_HOLD_QT_PATH as SIGNAL_HOLD_QT,
     DEFAULT_QT_PATH as SIGNAL_QT,
     DEFAULT_CLASSIC_QT_PATH as SIGNAL_CLASSIC_QT,
+    DEFAULT_GAP_QT_PATH as SIGNAL_GAP_QT,
     DEFAULT_SHAPE_QT_PATH as SIGNAL_SHAPE_QT,
 )
 from app.factor_v3_path_a_protocol_signal_specs import (
@@ -33,9 +34,11 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     SIGNAL_FAMILY,
     SIGNAL_HOLD_FAMILY,
     SIGNAL_CLASSIC_FAMILY,
+    SIGNAL_GAP_FAMILY,
     SIGNAL_SHAPE_FAMILY,
     iter_protocol_signal_bounce_variants,
     iter_protocol_signal_classic_variants,
+    iter_protocol_signal_gap_variants,
     iter_protocol_signal_entry_variants,
     iter_protocol_signal_hold_variants,
     iter_protocol_signal_shape_variants,
@@ -186,6 +189,8 @@ def build_path_a_protocol_baseline(
         default_qt = SIGNAL_SHAPE_QT
     elif chosen == "signal_classic":
         default_qt = SIGNAL_CLASSIC_QT
+    elif chosen == "signal_gap":
+        default_qt = SIGNAL_GAP_QT
     elif chosen == "signal":
         default_qt = SIGNAL_QT
     else:
@@ -217,6 +222,8 @@ def build_path_a_protocol_baseline(
         raise PathAProtocolBaselineError("QT is not the protocol signal-shape book")
     if chosen == "signal_classic" and meta.get("signal_family") != SIGNAL_CLASSIC_FAMILY:
         raise PathAProtocolBaselineError("QT is not the protocol signal-classic book")
+    if chosen == "signal_gap" and meta.get("signal_family") != SIGNAL_GAP_FAMILY:
+        raise PathAProtocolBaselineError("QT is not the protocol signal-gap book")
     all_trades = train_replay._filter_train_trades(
         list(qt.get("qualified_trades") or [])
     )
@@ -277,6 +284,13 @@ def build_path_a_protocol_baseline(
             holdout_trades,
             variants=iter_protocol_signal_classic_variants(),
             stage_goal_id="path-a-protocol-signal-classic/v1",
+        )
+    elif chosen == "signal_gap":
+        report = score_protocol_baseline(
+            train_trades,
+            holdout_trades,
+            variants=iter_protocol_signal_gap_variants(),
+            stage_goal_id="path-a-protocol-signal-gap/v1",
         )
     elif chosen == "baseline":
         report = score_protocol_baseline(train_trades, holdout_trades)

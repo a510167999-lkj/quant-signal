@@ -618,6 +618,107 @@ def iter_protocol_signal_classic_variants() -> tuple[dict[str, Any], ...]:
     return PROTOCOL_SIGNAL_CLASSIC_VARIANTS
 
 
+GAP_TRUE_TAG = "gap_down_fill_same_day"
+GAP_OPEN_TAG = "low_open_reclaim_3pct"
+GAP_DELAY_TAG = "gap_down_fill_next_day"
+GAP_OPEN_RECLAIM_FRAC = 0.03
+SIGNAL_GAP_FAMILY = "path-a-protocol-signal-gap/v1"
+SIGNAL_GAP_STAGE_GOAL_ID = "path-a-protocol-signal-gap/v1"
+
+# Seventh identity book. Gap-fill events, not reclaim / bounce / shape / MACD.
+# Written before the gap QT is scored. Dual-partition 26/15 still required.
+PROTOCOL_SIGNAL_GAP_VARIANTS: tuple[dict[str, Any], ...] = (
+    {
+        "candidate_id": "gap_true",
+        "role": "protocol_signal_gap",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (GAP_TRUE_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Open below prior low, close back through it. MA20>MA60.",
+    },
+    {
+        "candidate_id": "gap_true_negext",
+        "role": "protocol_signal_gap",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (GAP_TRUE_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Same-day true gap fill, anti-chase rank.",
+    },
+    {
+        "candidate_id": "gap_open",
+        "role": "protocol_signal_gap",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (GAP_OPEN_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Open at least 3% below prior close, close reclaims it.",
+    },
+    {
+        "candidate_id": "gap_open_negext",
+        "role": "protocol_signal_gap",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (GAP_OPEN_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "3% low-open reclaim, anti-chase rank.",
+    },
+    {
+        "candidate_id": "gap_delay",
+        "role": "protocol_signal_gap",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (GAP_DELAY_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Yesterday left an unfilled down gap; today closes it.",
+    },
+    {
+        "candidate_id": "gap_delay_negext",
+        "role": "protocol_signal_gap",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (GAP_DELAY_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Next-day gap fill, anti-chase rank.",
+    },
+)
+
+
+def iter_protocol_signal_gap_variants() -> tuple[dict[str, Any], ...]:
+    return PROTOCOL_SIGNAL_GAP_VARIANTS
+
+
 def assert_signal_variants_obey_protocol() -> None:
     for variants in (
         PROTOCOL_SIGNAL_VARIANTS,
@@ -626,6 +727,7 @@ def assert_signal_variants_obey_protocol() -> None:
         PROTOCOL_SIGNAL_BOUNCE_VARIANTS,
         PROTOCOL_SIGNAL_SHAPE_VARIANTS,
         PROTOCOL_SIGNAL_CLASSIC_VARIANTS,
+        PROTOCOL_SIGNAL_GAP_VARIANTS,
     ):
         assert_variants_obey_protocol(variants)
         for row in variants:

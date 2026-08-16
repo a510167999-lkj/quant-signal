@@ -16,6 +16,10 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     DN2_BOUNCE_TAG,
     DN3_BOUNCE_TAG,
     ENGULF_TAG,
+    GAP_DELAY_TAG,
+    GAP_OPEN_RECLAIM_FRAC,
+    GAP_OPEN_TAG,
+    GAP_TRUE_TAG,
     HAMMER_TAG,
     INSIDE_UP_TAG,
     KDJ_OVERSOLD_TAG,
@@ -34,6 +38,8 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     SIGNAL_ENTRY_FAMILY,
     SIGNAL_ENTRY_STAGE_GOAL_ID,
     SIGNAL_FAMILY,
+    SIGNAL_GAP_FAMILY,
+    SIGNAL_GAP_STAGE_GOAL_ID,
     SIGNAL_HOLD_FAMILY,
     SIGNAL_HOLD_STAGE_GOAL_ID,
     SIGNAL_SHAPE_FAMILY,
@@ -80,6 +86,9 @@ DEFAULT_SHAPE_QT_PATH = Path(
 )
 DEFAULT_CLASSIC_QT_PATH = Path(
     "data/research_cache/qualified_hold5_stop5_3y_jiaoch_classic.json"
+)
+DEFAULT_GAP_QT_PATH = Path(
+    "data/research_cache/qualified_hold5_stop5_3y_jiaoch_gap.json"
 )
 
 
@@ -316,6 +325,54 @@ def classic_masks(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def gap_masks(frame: pd.DataFrame) -> pd.DataFrame:
+    """Same-day true gap fill, 3% low-open reclaim, next-day gap fill."""
+
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    high = pd.to_numeric(frame["high"], errors="coerce")
+    low = pd.to_numeric(frame["low"], errors="coerce")
+    open_px = pd.to_numeric(frame["open"], errors="coerce")
+    ma20 = close.rolling(20, min_periods=20).mean()
+    ma60 = close.rolling(60, min_periods=60).mean()
+    prior_high = high.shift(1)
+    prior_low = low.shift(1)
+    prior_close = close.shift(1)
+    prior_prior_low = low.shift(2)
+    prior_high20 = high.shift(1).rolling(20, min_periods=20).max()
+    history = ma60.notna()
+    uptrend = history & (ma20 > ma60)
+    not_breakout = (close <= prior_high20).fillna(False)
+    recovered = (close > open_px).fillna(False)
+    gap_true = (
+        uptrend
+        & (open_px < prior_low)
+        & (close >= prior_low)
+        & recovered
+        & not_breakout
+    ).fillna(False)
+    gap_open = (
+        history
+        & (open_px <= (prior_close * (1.0 - GAP_OPEN_RECLAIM_FRAC)))
+        & (close >= prior_close)
+        & recovered
+        & not_breakout
+    ).fillna(False)
+    unfilled_yesterday = prior_high < prior_prior_low
+    gap_delay = (
+        uptrend
+        & unfilled_yesterday
+        & (close >= prior_prior_low)
+        & recovered
+        & not_breakout
+    ).fillna(False)
+    out = pd.DataFrame(index=frame.index)
+    out["gap_true"] = gap_true
+    out["gap_open"] = gap_open
+    out["gap_delay"] = gap_delay
+    out["fire"] = (gap_true | gap_open | gap_delay).fillna(False)
+    return out
+
+
 def _num(value: Any, default: float | None = None) -> float | None:
     try:
         number = float(value)
@@ -370,6 +427,15 @@ def _bar_tags(row: pd.Series, masks: pd.Series, *, book: str = "reclaim") -> lis
             tags.add("ma_structure")
         if bool(masks.get("boll_reclaim")):
             tags.add(BOLL_RECLAIM_TAG)
+    elif book == "gap":
+        if bool(masks.get("gap_true")):
+            tags.add(GAP_TRUE_TAG)
+            tags.add("ma_structure")
+        if bool(masks.get("gap_open")):
+            tags.add(GAP_OPEN_TAG)
+        if bool(masks.get("gap_delay")):
+            tags.add(GAP_DELAY_TAG)
+            tags.add("ma_structure")
     else:
         tags.add(RECLAIM_TAG)
         tags.add("ma_structure")
@@ -456,6 +522,10 @@ def build_signal_trades(
             gap_up, locked_gap = 6.0, 9.3
         elif book == "classic":
             masks = classic_masks(frame)
+            fire = masks["fire"]
+            gap_up, locked_gap = 6.0, 9.3
+        elif book == "gap":
+            masks = gap_masks(frame)
             fire = masks["fire"]
             gap_up, locked_gap = 6.0, 9.3
         else:
@@ -617,6 +687,8 @@ def build_path_a_protocol_signal_qt(
         stage = SIGNAL_SHAPE_STAGE_GOAL_ID
     elif family == SIGNAL_CLASSIC_FAMILY:
         stage = SIGNAL_CLASSIC_STAGE_GOAL_ID
+    elif family == SIGNAL_GAP_FAMILY:
+        stage = SIGNAL_GAP_STAGE_GOAL_ID
     else:
         stage = STAGE_GOAL_ID
     payload = {
