@@ -2,6 +2,9 @@
 
 Separate from the frozen Factor-V3 733 collection, which does not ask for
 valuation fields. Not a v3 store. Not TCB.
+
+Null PE / PE_TTM means no positive-earnings multiple. The user rule is
+that loss-making names may still be bought; do not drop them.
 """
 
 from __future__ import annotations
@@ -30,6 +33,8 @@ VALUE_FIELDS = (
     "total_mv",
     "circ_mv",
 )
+# User rule: missing PE is not a reason to drop the name.
+NULL_PE_IS_NOT_EXCLUSION = True
 DEFAULT_OUTPUT_ROOT = Path("data/research_cache/jiaoch_daily_basic_value_path_a")
 DEFAULT_CALENDAR_SPEC = Path(
     "data/research_runs/audited_pit_factor_v3_daily_basic_collection_v2_development_733_http_publish/run-spec.json"

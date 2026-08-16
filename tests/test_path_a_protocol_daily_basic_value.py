@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 
 from app.factor_v3_path_a_protocol_daily_basic_value import (
+    NULL_PE_IS_NOT_EXCLUSION,
     SOURCE_VERSION,
     VALUE_FIELDS,
     day_is_complete,
@@ -24,6 +25,7 @@ def test_value_fields_are_valuation_and_size() -> None:
         "circ_mv",
     )
     assert SOURCE_VERSION == "jiaoch-daily-basic-value/v1"
+    assert NULL_PE_IS_NOT_EXCLUSION is True
 
 
 def test_scrub_nonfinite_maps_nan_to_none() -> None:
