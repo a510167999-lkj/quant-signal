@@ -19,6 +19,9 @@ from app.factor_v3_path_a_protocol_baseline_specs import (
     iter_protocol_baseline_variants,
     iter_protocol_factor_variants,
 )
+from app.factor_v3_path_a_protocol_daily_basic_value import (
+    DEFAULT_OUTPUT_ROOT as VALUE_CACHE_ROOT,
+)
 from app.factor_v3_path_a_protocol_signal import (
     DEFAULT_BOUNCE_QT_PATH as SIGNAL_BOUNCE_QT,
     DEFAULT_ENTRY_QT_PATH as SIGNAL_ENTRY_QT,
@@ -36,13 +39,20 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     SIGNAL_CLASSIC_FAMILY,
     SIGNAL_GAP_FAMILY,
     SIGNAL_SHAPE_FAMILY,
+    SIGNAL_VALUE_FAMILY,
     iter_protocol_signal_bounce_variants,
     iter_protocol_signal_classic_variants,
     iter_protocol_signal_gap_variants,
     iter_protocol_signal_entry_variants,
     iter_protocol_signal_hold_variants,
     iter_protocol_signal_shape_variants,
+    iter_protocol_signal_value_variants,
     iter_protocol_signal_variants,
+)
+from app.factor_v3_path_a_protocol_value import (
+    attach_value_fields,
+    load_value_index,
+    symbol_to_ts_code,
 )
 from app.storage import write_json
 
@@ -53,6 +63,43 @@ REPORT_SCHEMA = "path-a-protocol-baseline-report/v1"
 
 class PathAProtocolBaselineError(ValueError):
     """Raised when the locked-split baseline cannot be scored."""
+
+
+def _require_jiaoch_book(path: Path, expected_family: str) -> list[dict[str, Any]]:
+    payload = train_replay._load_json(path)
+    if payload is None:
+        raise PathAProtocolBaselineError(f"qualified trades missing: {path}")
+    meta = (payload.get("summary") or {}).get("path_a_3y_clean_replay") or {}
+    if meta.get("source_version") != "jiaoch-daily-bars/shares-cny/v2":
+        raise PathAProtocolBaselineError(f"QT is not Jiaoch stk_mins v2: {path}")
+    if meta.get("slice") == "traded":
+        raise PathAProtocolBaselineError("refuses the contaminated 191-name traded slice")
+    if meta.get("signal_family") != expected_family:
+        raise PathAProtocolBaselineError(
+            f"QT family {meta.get('signal_family')!r} != {expected_family!r}"
+        )
+    return train_replay._filter_train_trades(list(payload.get("qualified_trades") or []))
+
+
+def _load_value_attached_trades(root: Path) -> list[dict[str, Any]]:
+    from scripts.run_path_a_3y_clean_replay import load_eligible_universe
+
+    bounce = _require_jiaoch_book(root / SIGNAL_BOUNCE_QT, SIGNAL_BOUNCE_FAMILY)
+    reclaim = _require_jiaoch_book(root / SIGNAL_HOLD_QT, SIGNAL_HOLD_FAMILY)
+    gap = _require_jiaoch_book(root / SIGNAL_GAP_QT, SIGNAL_GAP_FAMILY)
+    merged = bounce + reclaim + gap
+    dates = {
+        str(trade.get("signal_date") or "")[:10]
+        for trade in merged
+        if str(trade.get("signal_date") or "")
+    }
+    value_index = load_value_index(root / VALUE_CACHE_ROOT, dates)
+    if not value_index:
+        raise PathAProtocolBaselineError("valuation cache is empty")
+    ts_by_symbol = symbol_to_ts_code(load_eligible_universe(root))
+    return attach_value_fields(
+        merged, value_index=value_index, ts_by_symbol=ts_by_symbol
+    )
 
 
 def _score_partition(
@@ -191,6 +238,8 @@ def build_path_a_protocol_baseline(
         default_qt = SIGNAL_CLASSIC_QT
     elif chosen == "signal_gap":
         default_qt = SIGNAL_GAP_QT
+    elif chosen == "signal_value":
+        default_qt = SIGNAL_BOUNCE_QT
     elif chosen == "signal":
         default_qt = SIGNAL_QT
     else:
@@ -224,9 +273,12 @@ def build_path_a_protocol_baseline(
         raise PathAProtocolBaselineError("QT is not the protocol signal-classic book")
     if chosen == "signal_gap" and meta.get("signal_family") != SIGNAL_GAP_FAMILY:
         raise PathAProtocolBaselineError("QT is not the protocol signal-gap book")
-    all_trades = train_replay._filter_train_trades(
-        list(qt.get("qualified_trades") or [])
-    )
+    if chosen == "signal_value":
+        all_trades = _load_value_attached_trades(root)
+    else:
+        all_trades = train_replay._filter_train_trades(
+            list(qt.get("qualified_trades") or [])
+        )
     train_trades = proto.filter_trades_for_partition(all_trades, "train")
     holdout_trades = proto.filter_trades_for_partition(all_trades, "holdout")
     if chosen == "factor":
@@ -292,6 +344,14 @@ def build_path_a_protocol_baseline(
             variants=iter_protocol_signal_gap_variants(),
             stage_goal_id="path-a-protocol-signal-gap/v1",
         )
+    elif chosen == "signal_value":
+        report = score_protocol_baseline(
+            train_trades,
+            holdout_trades,
+            variants=iter_protocol_signal_value_variants(),
+            stage_goal_id="path-a-protocol-signal-value/v1",
+        )
+        report["signal_family"] = SIGNAL_VALUE_FAMILY
     elif chosen == "baseline":
         report = score_protocol_baseline(train_trades, holdout_trades)
     else:

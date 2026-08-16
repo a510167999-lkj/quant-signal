@@ -39,6 +39,7 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     iter_protocol_signal_classic_variants,
     iter_protocol_signal_entry_variants,
     iter_protocol_signal_gap_variants,
+    iter_protocol_signal_value_variants,
     iter_protocol_signal_hold_variants,
     iter_protocol_signal_shape_variants,
     iter_protocol_signal_variants,
@@ -187,6 +188,16 @@ def test_signal_variants_are_new_identity() -> None:
         assert PULLBACK_TAG not in required
         assert DN2_BOUNCE_TAG not in required
         assert required & {GAP_TRUE_TAG, GAP_OPEN_TAG, GAP_DELAY_TAG}
+    value_ids = [row["candidate_id"] for row in iter_protocol_signal_value_variants()]
+    assert value_ids == [
+        "val_bounce_pb",
+        "val_bounce_pe",
+        "val_bounce_unprof_pb",
+        "val_bounce_small",
+        "val_reclaim_pb",
+        "val_gap_pb",
+    ]
+    assert set(value_ids).isdisjoint(CONTAMINATED_CANDIDATE_IDS)
 
 
 def test_bounce_masks_fire_two_day_down_then_up() -> None:

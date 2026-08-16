@@ -178,7 +178,16 @@ def iter_protocol_factor_variants() -> tuple[dict[str, Any], ...]:
 # breakout_20d raw expectancy is <= 0; moderate / RS-negative / anti-chase
 # rank have the only positive books. These six change identity or rank
 # factor. They are not more quality filters on e4.
-ALLOWED_RANK_KEYS = frozenset({"rank_score", "neg_ext20", "rs20"})
+ALLOWED_RANK_KEYS = frozenset(
+    {
+        "rank_score",
+        "neg_ext20",
+        "rs20",
+        "pb_asc",
+        "pe_ttm_asc",
+        "circ_mv_asc",
+    }
+)
 
 PROTOCOL_ALT_VARIANTS: tuple[dict[str, Any], ...] = (
     {
@@ -298,6 +307,16 @@ def apply_rank_key(
             raw = relative.get("relative_strength_20d_pct")
             try:
                 copy["rank_score"] = float(raw)
+            except (TypeError, ValueError):
+                copy["rank_score"] = -1e9
+        elif key in {"pb_asc", "pe_ttm_asc", "circ_mv_asc"}:
+            field = {"pb_asc": "pb", "pe_ttm_asc": "pe_ttm", "circ_mv_asc": "circ_mv"}[key]
+            raw = copy.get(field)
+            try:
+                if raw is None:
+                    copy["rank_score"] = -1e9
+                else:
+                    copy["rank_score"] = -float(raw)
             except (TypeError, ValueError):
                 copy["rank_score"] = -1e9
         out.append(copy)

@@ -719,6 +719,106 @@ def iter_protocol_signal_gap_variants() -> tuple[dict[str, Any], ...]:
     return PROTOCOL_SIGNAL_GAP_VARIANTS
 
 
+VALUE_PE_NULL_TAG = "value_pe_null"
+VALUE_PE_TTM_OK_TAG = "value_pe_ttm_ok"
+VALUE_PB_OK_TAG = "value_pb_ok"
+SIGNAL_VALUE_FAMILY = "path-a-protocol-signal-value/v1"
+SIGNAL_VALUE_STAGE_GOAL_ID = "path-a-protocol-signal-value/v1"
+
+# Value ranks on already-scored entry books. Bounce / reclaim / gap fires
+# stay frozen. Null PE is a valid state, not an exclusion.
+PROTOCOL_SIGNAL_VALUE_VARIANTS: tuple[dict[str, Any], ...] = (
+    {
+        "candidate_id": "val_bounce_pb",
+        "role": "protocol_signal_value",
+        "rank_key": "pb_asc",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (DN2_BOUNCE_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Down2 bounce, buy cheapest PB. Null PE stays eligible.",
+    },
+    {
+        "candidate_id": "val_bounce_pe",
+        "role": "protocol_signal_value",
+        "rank_key": "pe_ttm_asc",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (DN2_BOUNCE_TAG, VALUE_PE_TTM_OK_TAG),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Down2 bounce among names with a PE_TTM, cheapest first.",
+    },
+    {
+        "candidate_id": "val_bounce_unprof_pb",
+        "role": "protocol_signal_value",
+        "rank_key": "pb_asc",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (DN2_BOUNCE_TAG, VALUE_PE_NULL_TAG),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Down2 bounce on loss-making names, cheapest PB. Not an exclusion.",
+    },
+    {
+        "candidate_id": "val_bounce_small",
+        "role": "protocol_signal_value",
+        "rank_key": "circ_mv_asc",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (DN2_BOUNCE_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Down2 bounce, smallest circulating cap.",
+    },
+    {
+        "candidate_id": "val_reclaim_pb",
+        "role": "protocol_signal_value",
+        "rank_key": "pb_asc",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (PULLBACK_TAG, HOLD5_TAG),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "MA20 reclaim, cheapest PB. Reclaim fire not retuned.",
+    },
+    {
+        "candidate_id": "val_gap_pb",
+        "role": "protocol_signal_value",
+        "rank_key": "pb_asc",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (GAP_TRUE_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Same-day true gap fill, cheapest PB.",
+    },
+)
+
+
+def iter_protocol_signal_value_variants() -> tuple[dict[str, Any], ...]:
+    return PROTOCOL_SIGNAL_VALUE_VARIANTS
+
+
 def assert_signal_variants_obey_protocol() -> None:
     for variants in (
         PROTOCOL_SIGNAL_VARIANTS,
@@ -728,6 +828,7 @@ def assert_signal_variants_obey_protocol() -> None:
         PROTOCOL_SIGNAL_SHAPE_VARIANTS,
         PROTOCOL_SIGNAL_CLASSIC_VARIANTS,
         PROTOCOL_SIGNAL_GAP_VARIANTS,
+        PROTOCOL_SIGNAL_VALUE_VARIANTS,
     ):
         assert_variants_obey_protocol(variants)
         for row in variants:

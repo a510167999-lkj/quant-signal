@@ -50,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
             "signal_shape",
             "signal_classic",
             "signal_gap",
+            "signal_value",
         ),
         default="baseline",
     )
@@ -88,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
         "signal_shape": Path("data/research_runs/path_a_protocol_signal_shape"),
         "signal_classic": Path("data/research_runs/path_a_protocol_signal_classic"),
         "signal_gap": Path("data/research_runs/path_a_protocol_signal_gap"),
+        "signal_value": Path("data/research_runs/path_a_protocol_signal_value"),
     }
     chosen_root = args.output_root
     if chosen_root == DEFAULT_OUTPUT_ROOT:
