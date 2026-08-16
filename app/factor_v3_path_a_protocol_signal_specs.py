@@ -106,7 +106,10 @@ def iter_protocol_signal_variants() -> tuple[dict[str, Any], ...]:
     return PROTOCOL_SIGNAL_VARIANTS
 
 
+HOLD1_TAG = "hold1"
+HOLD3_TAG = "hold3"
 HOLD5_TAG = "hold5"
+HOLD7_TAG = "hold7"
 HOLD10_TAG = "hold10"
 SIGNAL_HOLD_FAMILY = "path-a-protocol-signal-hold/v1"
 SIGNAL_HOLD_STAGE_GOAL_ID = "path-a-protocol-signal-hold/v1"
@@ -994,6 +997,132 @@ def iter_protocol_signal_industry_variants() -> tuple[dict[str, Any], ...]:
     return PROTOCOL_SIGNAL_INDUSTRY_VARIANTS
 
 
+SIGNAL_HORIZON_FAMILY = "path-a-protocol-signal-horizon/v1"
+SIGNAL_HORIZON_STAGE_GOAL_ID = "path-a-protocol-signal-horizon/v1"
+
+# Hold and cooldown are free execution shells, not user constraints.
+# Same dn2 + negext identity. Do not include bounce_dn2_negext (hold5/cd5).
+# Written before the horizon QT is scored. Dual-partition gate.
+PROTOCOL_SIGNAL_HORIZON_VARIANTS: tuple[dict[str, Any], ...] = (
+    {
+        "candidate_id": "bounce_dn2_h1_negext",
+        "role": "protocol_signal_horizon",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (DN2_BOUNCE_TAG, HOLD1_TAG),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Two-day bounce, anti-chase, 1-day hold.",
+    },
+    {
+        "candidate_id": "bounce_dn2_h3_negext",
+        "role": "protocol_signal_horizon",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (DN2_BOUNCE_TAG, HOLD3_TAG),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Two-day bounce, anti-chase, 3-day hold.",
+    },
+    {
+        "candidate_id": "bounce_dn2_h7_negext",
+        "role": "protocol_signal_horizon",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (DN2_BOUNCE_TAG, HOLD7_TAG),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Two-day bounce, anti-chase, 7-day hold.",
+    },
+    {
+        "candidate_id": "bounce_dn2_h10_negext",
+        "role": "protocol_signal_horizon",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (DN2_BOUNCE_TAG, HOLD10_TAG),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Two-day bounce, anti-chase, 10-day hold.",
+    },
+    {
+        "candidate_id": "bounce_dn2_cd0_negext",
+        "role": "protocol_signal_horizon",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 0,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (DN2_BOUNCE_TAG, HOLD5_TAG),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Two-day bounce, anti-chase, no symbol cooldown.",
+    },
+    {
+        "candidate_id": "bounce_dn2_cd1_negext",
+        "role": "protocol_signal_horizon",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 1,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (DN2_BOUNCE_TAG, HOLD5_TAG),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Two-day bounce, anti-chase, 1-day cooldown.",
+    },
+    {
+        "candidate_id": "bounce_dn2_cd3_negext",
+        "role": "protocol_signal_horizon",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 3,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (DN2_BOUNCE_TAG, HOLD5_TAG),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Two-day bounce, anti-chase, 3-day cooldown.",
+    },
+    {
+        "candidate_id": "bounce_dn2_cd10_negext",
+        "role": "protocol_signal_horizon",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 10,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (DN2_BOUNCE_TAG, HOLD5_TAG),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Two-day bounce, anti-chase, 10-day cooldown.",
+    },
+)
+
+
+def iter_protocol_signal_horizon_variants() -> tuple[dict[str, Any], ...]:
+    return PROTOCOL_SIGNAL_HORIZON_VARIANTS
+
+
 def assert_signal_variants_obey_protocol() -> None:
     for variants in (
         PROTOCOL_SIGNAL_VARIANTS,
@@ -1007,6 +1136,7 @@ def assert_signal_variants_obey_protocol() -> None:
         PROTOCOL_SIGNAL_TURN_VARIANTS,
         PROTOCOL_SIGNAL_FLOW_VARIANTS,
         PROTOCOL_SIGNAL_INDUSTRY_VARIANTS,
+        PROTOCOL_SIGNAL_HORIZON_VARIANTS,
     ):
         assert_variants_obey_protocol(variants)
         for row in variants:

@@ -26,6 +26,7 @@ from app.factor_v3_path_a_protocol_signal import (
     DEFAULT_BOUNCE_QT_PATH as SIGNAL_BOUNCE_QT,
     DEFAULT_ENTRY_QT_PATH as SIGNAL_ENTRY_QT,
     DEFAULT_HOLD_QT_PATH as SIGNAL_HOLD_QT,
+    DEFAULT_HORIZON_QT_PATH as SIGNAL_HORIZON_QT,
     DEFAULT_QT_PATH as SIGNAL_QT,
     DEFAULT_CLASSIC_QT_PATH as SIGNAL_CLASSIC_QT,
     DEFAULT_FLOW_QT_PATH as SIGNAL_FLOW_QT,
@@ -39,6 +40,7 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     SIGNAL_ENTRY_FAMILY,
     SIGNAL_FAMILY,
     SIGNAL_HOLD_FAMILY,
+    SIGNAL_HORIZON_FAMILY,
     SIGNAL_CLASSIC_FAMILY,
     SIGNAL_FLOW_FAMILY,
     SIGNAL_GAP_FAMILY,
@@ -53,6 +55,7 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     iter_protocol_signal_industry_variants,
     iter_protocol_signal_entry_variants,
     iter_protocol_signal_hold_variants,
+    iter_protocol_signal_horizon_variants,
     iter_protocol_signal_shape_variants,
     iter_protocol_signal_turn_variants,
     iter_protocol_signal_value_variants,
@@ -255,6 +258,8 @@ def build_path_a_protocol_baseline(
         default_qt = SIGNAL_FLOW_QT
     elif chosen == "signal_industry":
         default_qt = SIGNAL_INDUSTRY_QT
+    elif chosen == "signal_horizon":
+        default_qt = SIGNAL_HORIZON_QT
     elif chosen == "signal":
         default_qt = SIGNAL_QT
     else:
@@ -294,6 +299,8 @@ def build_path_a_protocol_baseline(
         raise PathAProtocolBaselineError("QT is not the protocol signal-flow book")
     if chosen == "signal_industry" and meta.get("signal_family") != SIGNAL_INDUSTRY_FAMILY:
         raise PathAProtocolBaselineError("QT is not the protocol signal-industry book")
+    if chosen == "signal_horizon" and meta.get("signal_family") != SIGNAL_HORIZON_FAMILY:
+        raise PathAProtocolBaselineError("QT is not the protocol signal-horizon book")
     if chosen == "signal_value":
         all_trades = _load_value_attached_trades(root)
     else:
@@ -385,6 +392,13 @@ def build_path_a_protocol_baseline(
             holdout_trades,
             variants=iter_protocol_signal_industry_variants(),
             stage_goal_id="path-a-protocol-signal-industry/v1",
+        )
+    elif chosen == "signal_horizon":
+        report = score_protocol_baseline(
+            train_trades,
+            holdout_trades,
+            variants=iter_protocol_signal_horizon_variants(),
+            stage_goal_id="path-a-protocol-signal-horizon/v1",
         )
     elif chosen == "signal_value":
         report = score_protocol_baseline(

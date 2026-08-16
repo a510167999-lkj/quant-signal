@@ -21,8 +21,11 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     GAP_OPEN_TAG,
     GAP_TRUE_TAG,
     HAMMER_TAG,
+    HOLD1_TAG,
     HOLD10_TAG,
+    HOLD3_TAG,
     HOLD5_TAG,
+    HOLD7_TAG,
     INSIDE_UP_TAG,
     KDJ_OVERSOLD_TAG,
     LIMIT_FOLLOW_TAG,
@@ -44,6 +47,7 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     iter_protocol_signal_turn_variants,
     iter_protocol_signal_value_variants,
     iter_protocol_signal_hold_variants,
+    iter_protocol_signal_horizon_variants,
     iter_protocol_signal_shape_variants,
     iter_protocol_signal_variants,
 )
@@ -217,6 +221,26 @@ def test_signal_variants_are_new_identity() -> None:
         "ind_enter",
         "ind_enter_negext",
     ]
+    horizon_ids = [row["candidate_id"] for row in iter_protocol_signal_horizon_variants()]
+    assert horizon_ids == [
+        "bounce_dn2_h1_negext",
+        "bounce_dn2_h3_negext",
+        "bounce_dn2_h7_negext",
+        "bounce_dn2_h10_negext",
+        "bounce_dn2_cd0_negext",
+        "bounce_dn2_cd1_negext",
+        "bounce_dn2_cd3_negext",
+        "bounce_dn2_cd10_negext",
+    ]
+    assert "bounce_dn2_negext" not in horizon_ids
+    assert set(horizon_ids).isdisjoint(CONTAMINATED_CANDIDATE_IDS)
+    for row in iter_protocol_signal_horizon_variants():
+        kernel = row.get("kernel") or {}
+        required = set(kernel.get("required_signal_tags") or ())
+        assert DN2_BOUNCE_TAG in required
+        assert PULLBACK_TAG not in required
+        assert "breakout_20d" not in required
+        assert required & {HOLD1_TAG, HOLD3_TAG, HOLD5_TAG, HOLD7_TAG, HOLD10_TAG}
 
 
 def test_bounce_masks_fire_two_day_down_then_up() -> None:
@@ -478,6 +502,38 @@ def test_build_signal_trades_can_emit_hold10() -> None:
     assert HOLD5_TAG in flat
     assert HOLD10_TAG in flat
     assert any(HOLD10_TAG in trade["signal_tags"] for trade in trades)
+
+
+def test_horizon_variants_tag_hold1_and_hold10() -> None:
+    closes = [80.0] * 40 + [100.0] * 20 + [98.0, 96.0, 97.5] + [97.5] * 16
+    highs = [value + 0.3 for value in closes]
+    lows = [value - 0.3 for value in closes]
+    dates = pd.bdate_range("2023-08-01", periods=len(closes)).strftime("%Y-%m-%d")
+    frame = pd.DataFrame(
+        {
+            "date": dates,
+            "open": closes,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": [1_000_000.0] * len(closes),
+            "amount": [200_000_000.0] * len(closes),
+        }
+    )
+    trades = build_signal_trades(
+        [({"symbol": "000001", "name": "test"}, frame)],
+        start_date=str(frame.at[62, "date"]),
+        end_date=str(frame.at[62, "date"]),
+        hold_horizons=(1, 3, 5, 7, 10),
+        book="bounce",
+    )
+    flat = {tag for trade in trades for tag in trade["signal_tags"]}
+    assert HOLD1_TAG in flat
+    assert HOLD3_TAG in flat
+    assert HOLD5_TAG in flat
+    assert HOLD7_TAG in flat
+    assert HOLD10_TAG in flat
+    assert all(DN2_BOUNCE_TAG in trade["signal_tags"] for trade in trades)
 
 
 def test_entry_masks_limit_follow_and_60d_breakout() -> None:

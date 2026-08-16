@@ -45,6 +45,8 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     SIGNAL_GAP_STAGE_GOAL_ID,
     SIGNAL_HOLD_FAMILY,
     SIGNAL_HOLD_STAGE_GOAL_ID,
+    SIGNAL_HORIZON_FAMILY,
+    SIGNAL_HORIZON_STAGE_GOAL_ID,
     SIGNAL_SHAPE_FAMILY,
     SIGNAL_SHAPE_STAGE_GOAL_ID,
     STAGE_GOAL_ID,
@@ -109,6 +111,9 @@ DEFAULT_FLOW_QT_PATH = Path(
 )
 DEFAULT_INDUSTRY_QT_PATH = Path(
     "data/research_cache/qualified_hold5_stop5_3y_jiaoch_industry.json"
+)
+DEFAULT_HORIZON_QT_PATH = Path(
+    "data/research_cache/qualified_hold1_3_5_7_10_stop5_3y_jiaoch_horizon.json"
 )
 
 
@@ -862,6 +867,8 @@ def build_path_a_protocol_signal_qt(
         stage = SIGNAL_FLOW_STAGE_GOAL_ID
     elif family == SIGNAL_INDUSTRY_FAMILY:
         stage = SIGNAL_INDUSTRY_STAGE_GOAL_ID
+    elif family == SIGNAL_HORIZON_FAMILY:
+        stage = SIGNAL_HORIZON_STAGE_GOAL_ID
     else:
         stage = STAGE_GOAL_ID
     payload = {

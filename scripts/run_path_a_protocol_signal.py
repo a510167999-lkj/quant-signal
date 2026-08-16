@@ -17,6 +17,7 @@ from app.factor_v3_path_a_protocol_signal import (  # noqa: E402
     DEFAULT_CACHE_DIR,
     DEFAULT_ENTRY_QT_PATH,
     DEFAULT_HOLD_QT_PATH,
+    DEFAULT_HORIZON_QT_PATH,
     DEFAULT_QT_PATH,
     DEFAULT_CLASSIC_QT_PATH,
     DEFAULT_FLOW_QT_PATH,
@@ -33,6 +34,7 @@ from app.factor_v3_path_a_protocol_signal_specs import (  # noqa: E402
     SIGNAL_ENTRY_FAMILY,
     SIGNAL_FAMILY,
     SIGNAL_HOLD_FAMILY,
+    SIGNAL_HORIZON_FAMILY,
     SIGNAL_CLASSIC_FAMILY,
     SIGNAL_FLOW_FAMILY,
     SIGNAL_GAP_FAMILY,
@@ -61,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
             "turn",
             "flow",
             "industry",
+            "horizon",
         ),
         default="signal",
     )
@@ -116,6 +119,11 @@ def main(argv: list[str] | None = None) -> int:
         signal_family = SIGNAL_INDUSTRY_FAMILY
         default_qt = DEFAULT_INDUSTRY_QT_PATH
         book = "industry"
+    elif args.family == "horizon":
+        hold_horizons = (1, 3, 5, 7, 10)
+        signal_family = SIGNAL_HORIZON_FAMILY
+        default_qt = DEFAULT_HORIZON_QT_PATH
+        book = "bounce"
     else:
         hold_horizons = (5,)
         signal_family = SIGNAL_FAMILY
