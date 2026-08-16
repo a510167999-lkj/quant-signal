@@ -819,6 +819,181 @@ def iter_protocol_signal_value_variants() -> tuple[dict[str, Any], ...]:
     return PROTOCOL_SIGNAL_VALUE_VARIANTS
 
 
+TURN_X2_TAG = "turnover_expand_x2"
+TURN_CS90_TAG = "turnover_cs90"
+SIGNAL_TURN_FAMILY = "path-a-protocol-signal-turn/v1"
+SIGNAL_TURN_STAGE_GOAL_ID = "path-a-protocol-signal-turn/v1"
+PROTOCOL_SIGNAL_TURN_VARIANTS: tuple[dict[str, Any], ...] = (
+    {
+        "candidate_id": "turn_x2",
+        "role": "protocol_signal_turn",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (TURN_X2_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Own turnover >= 2x 20-day median in a 20/60 uptrend.",
+    },
+    {
+        "candidate_id": "turn_x2_negext",
+        "role": "protocol_signal_turn",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (TURN_X2_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "2x turnover expansion, anti-chase rank.",
+    },
+    {
+        "candidate_id": "turn_cs90",
+        "role": "protocol_signal_turn",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (TURN_CS90_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Same-day turnover at or above the 90th percentile.",
+    },
+    {
+        "candidate_id": "turn_cs90_negext",
+        "role": "protocol_signal_turn",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (TURN_CS90_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Crowded high-turnover, anti-chase rank.",
+    },
+)
+
+
+def iter_protocol_signal_turn_variants() -> tuple[dict[str, Any], ...]:
+    return PROTOCOL_SIGNAL_TURN_VARIANTS
+
+
+FLOW_IN_TAG = "moneyflow_in_cross"
+SIGNAL_FLOW_FAMILY = "path-a-protocol-signal-flow/v1"
+SIGNAL_FLOW_STAGE_GOAL_ID = "path-a-protocol-signal-flow/v1"
+PROTOCOL_SIGNAL_FLOW_VARIANTS: tuple[dict[str, Any], ...] = (
+    {
+        "candidate_id": "flow_in",
+        "role": "protocol_signal_flow",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (FLOW_IN_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Net moneyflow turns from <=0 to >0 in a 20/60 uptrend.",
+    },
+    {
+        "candidate_id": "flow_in_negext",
+        "role": "protocol_signal_flow",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (FLOW_IN_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Moneyflow inflow cross, anti-chase rank.",
+    },
+)
+
+
+def iter_protocol_signal_flow_variants() -> tuple[dict[str, Any], ...]:
+    return PROTOCOL_SIGNAL_FLOW_VARIANTS
+
+
+IND_LEAD_TAG = "industry_lead_top20"
+IND_ENTER_TAG = "industry_enter_top20"
+SIGNAL_INDUSTRY_FAMILY = "path-a-protocol-signal-industry/v1"
+SIGNAL_INDUSTRY_STAGE_GOAL_ID = "path-a-protocol-signal-industry/v1"
+PROTOCOL_SIGNAL_INDUSTRY_VARIANTS: tuple[dict[str, Any], ...] = (
+    {
+        "candidate_id": "ind_lead",
+        "role": "protocol_signal_industry",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (IND_LEAD_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Industry 20d return in the top 20%, uptrend, not breakout.",
+    },
+    {
+        "candidate_id": "ind_lead_negext",
+        "role": "protocol_signal_industry",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (IND_LEAD_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Leading industry, anti-chase name rank.",
+    },
+    {
+        "candidate_id": "ind_enter",
+        "role": "protocol_signal_industry",
+        "rank_key": "rank_score",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (IND_ENTER_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Industry just entered the top 20% 20d-return ranks.",
+    },
+    {
+        "candidate_id": "ind_enter_negext",
+        "role": "protocol_signal_industry",
+        "rank_key": "neg_ext20",
+        "kernel": {
+            "top_n": 2,
+            "max_active_positions": 1,
+            "symbol_cooldown_days": 5,
+            "market_levels": ("favorable", "neutral"),
+            "required_signal_tags": (IND_ENTER_TAG,),
+            "excluded_signal_tags": ("price_gap_down",),
+        },
+        "rationale": "Industry rotation entry, anti-chase name rank.",
+    },
+)
+
+
+def iter_protocol_signal_industry_variants() -> tuple[dict[str, Any], ...]:
+    return PROTOCOL_SIGNAL_INDUSTRY_VARIANTS
+
+
 def assert_signal_variants_obey_protocol() -> None:
     for variants in (
         PROTOCOL_SIGNAL_VARIANTS,
@@ -829,6 +1004,9 @@ def assert_signal_variants_obey_protocol() -> None:
         PROTOCOL_SIGNAL_CLASSIC_VARIANTS,
         PROTOCOL_SIGNAL_GAP_VARIANTS,
         PROTOCOL_SIGNAL_VALUE_VARIANTS,
+        PROTOCOL_SIGNAL_TURN_VARIANTS,
+        PROTOCOL_SIGNAL_FLOW_VARIANTS,
+        PROTOCOL_SIGNAL_INDUSTRY_VARIANTS,
     ):
         assert_variants_obey_protocol(variants)
         for row in variants:

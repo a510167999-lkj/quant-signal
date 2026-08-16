@@ -20,7 +20,10 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     GAP_OPEN_RECLAIM_FRAC,
     GAP_OPEN_TAG,
     GAP_TRUE_TAG,
+    FLOW_IN_TAG,
     HAMMER_TAG,
+    IND_ENTER_TAG,
+    IND_LEAD_TAG,
     INSIDE_UP_TAG,
     KDJ_OVERSOLD_TAG,
     LIMIT_FOLLOW_TAG,
@@ -46,6 +49,14 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     SIGNAL_SHAPE_STAGE_GOAL_ID,
     STAGE_GOAL_ID,
     TIGHT5_UP_TAG,
+    TURN_CS90_TAG,
+    TURN_X2_TAG,
+    SIGNAL_FLOW_FAMILY,
+    SIGNAL_FLOW_STAGE_GOAL_ID,
+    SIGNAL_INDUSTRY_FAMILY,
+    SIGNAL_INDUSTRY_STAGE_GOAL_ID,
+    SIGNAL_TURN_FAMILY,
+    SIGNAL_TURN_STAGE_GOAL_ID,
 )
 from app.indicators import add_indicators
 from app.jiaoch_live_market import JIAOCH_DAILY_CACHE_SOURCE_VERSION
@@ -89,6 +100,15 @@ DEFAULT_CLASSIC_QT_PATH = Path(
 )
 DEFAULT_GAP_QT_PATH = Path(
     "data/research_cache/qualified_hold5_stop5_3y_jiaoch_gap.json"
+)
+DEFAULT_TURN_QT_PATH = Path(
+    "data/research_cache/qualified_hold5_stop5_3y_jiaoch_turn.json"
+)
+DEFAULT_FLOW_QT_PATH = Path(
+    "data/research_cache/qualified_hold5_stop5_3y_jiaoch_flow.json"
+)
+DEFAULT_INDUSTRY_QT_PATH = Path(
+    "data/research_cache/qualified_hold5_stop5_3y_jiaoch_industry.json"
 )
 
 
@@ -325,6 +345,69 @@ def classic_masks(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def turn_masks(frame: pd.DataFrame) -> pd.DataFrame:
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    high = pd.to_numeric(frame["high"], errors="coerce")
+    ma20 = close.rolling(20, min_periods=20).mean()
+    ma60 = close.rolling(60, min_periods=60).mean()
+    prior_high20 = high.shift(1).rolling(20, min_periods=20).max()
+    uptrend = ma60.notna() & (ma20 > ma60)
+    not_breakout = (close <= prior_high20).fillna(False)
+    turnover = pd.to_numeric(frame.get("turnover_rate"), errors="coerce")
+    med20 = turnover.rolling(20, min_periods=10).median()
+    x2 = (uptrend & (med20 > 0) & (turnover >= (2.0 * med20)) & not_breakout).fillna(
+        False
+    )
+    cs90 = pd.Series(False, index=frame.index)
+    if "turnover_cs90" in frame.columns:
+        cs90 = (
+            uptrend
+            & pd.Series(frame["turnover_cs90"], index=frame.index).fillna(False)
+            & not_breakout
+        ).fillna(False)
+    out = pd.DataFrame(index=frame.index)
+    out["turn_x2"] = x2
+    out["turn_cs90"] = cs90
+    out["fire"] = (x2 | cs90).fillna(False)
+    return out
+
+
+def flow_masks(frame: pd.DataFrame) -> pd.DataFrame:
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    high = pd.to_numeric(frame["high"], errors="coerce")
+    ma20 = close.rolling(20, min_periods=20).mean()
+    ma60 = close.rolling(60, min_periods=60).mean()
+    prior_high20 = high.shift(1).rolling(20, min_periods=20).max()
+    uptrend = ma60.notna() & (ma20 > ma60)
+    not_breakout = (close <= prior_high20).fillna(False)
+    net = pd.to_numeric(frame.get("net_mf_amount"), errors="coerce")
+    cross = (
+        uptrend & (net.shift(1) <= 0) & (net > 0) & not_breakout
+    ).fillna(False)
+    out = pd.DataFrame(index=frame.index)
+    out["flow_in"] = cross
+    out["fire"] = cross
+    return out
+
+
+def industry_masks(frame: pd.DataFrame) -> pd.DataFrame:
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    high = pd.to_numeric(frame["high"], errors="coerce")
+    ma20 = close.rolling(20, min_periods=20).mean()
+    ma60 = close.rolling(60, min_periods=60).mean()
+    prior_high20 = high.shift(1).rolling(20, min_periods=20).max()
+    uptrend = ma60.notna() & (ma20 > ma60)
+    not_breakout = (close <= prior_high20).fillna(False)
+    rank = pd.to_numeric(frame.get("industry_rank"), errors="coerce")
+    lead = (uptrend & (rank >= 0.8) & not_breakout).fillna(False)
+    enter = (lead & (rank.shift(1) < 0.8)).fillna(False)
+    out = pd.DataFrame(index=frame.index)
+    out["ind_lead"] = lead
+    out["ind_enter"] = enter
+    out["fire"] = (lead | enter).fillna(False)
+    return out
+
+
 def gap_masks(frame: pd.DataFrame) -> pd.DataFrame:
     """Same-day true gap fill, 3% low-open reclaim, next-day gap fill."""
 
@@ -436,6 +519,24 @@ def _bar_tags(row: pd.Series, masks: pd.Series, *, book: str = "reclaim") -> lis
         if bool(masks.get("gap_delay")):
             tags.add(GAP_DELAY_TAG)
             tags.add("ma_structure")
+    elif book == "turn":
+        if bool(masks.get("turn_x2")):
+            tags.add(TURN_X2_TAG)
+            tags.add("ma_structure")
+        if bool(masks.get("turn_cs90")):
+            tags.add(TURN_CS90_TAG)
+            tags.add("ma_structure")
+    elif book == "flow":
+        if bool(masks.get("flow_in")):
+            tags.add(FLOW_IN_TAG)
+            tags.add("ma_structure")
+    elif book == "industry":
+        if bool(masks.get("ind_lead")):
+            tags.add(IND_LEAD_TAG)
+            tags.add("ma_structure")
+        if bool(masks.get("ind_enter")):
+            tags.add(IND_ENTER_TAG)
+            tags.add("ma_structure")
     else:
         tags.add(RECLAIM_TAG)
         tags.add("ma_structure")
@@ -526,6 +627,18 @@ def build_signal_trades(
             gap_up, locked_gap = 6.0, 9.3
         elif book == "gap":
             masks = gap_masks(frame)
+            fire = masks["fire"]
+            gap_up, locked_gap = 6.0, 9.3
+        elif book == "turn":
+            masks = turn_masks(frame)
+            fire = masks["fire"]
+            gap_up, locked_gap = 6.0, 9.3
+        elif book == "flow":
+            masks = flow_masks(frame)
+            fire = masks["fire"]
+            gap_up, locked_gap = 6.0, 9.3
+        elif book == "industry":
+            masks = industry_masks(frame)
             fire = masks["fire"]
             gap_up, locked_gap = 6.0, 9.3
         else:
@@ -668,6 +781,60 @@ def build_path_a_protocol_signal_qt(
             )
     if not prepared:
         raise PathAProtocolSignalError("no Jiaoch v2 cache_ok holdout names")
+    if book in {"turn", "flow", "industry"}:
+        from app.factor_v3_path_a_protocol_xsec import (
+            attach_industry_ranks,
+            attach_numeric_column,
+            load_flow_panel,
+            load_industry_membership,
+            load_turnover_panel,
+        )
+
+        if book == "turn":
+            panel = load_turnover_panel(root)
+            by_day: dict[str, list[float]] = {}
+            for (_code, day), value in panel.items():
+                if value is None:
+                    continue
+                by_day.setdefault(day, []).append(value)
+            cuts = {
+                day: sorted(vals)[int(0.9 * (len(vals) - 1))]
+                for day, vals in by_day.items()
+                if vals
+            }
+            attached = []
+            for item, frame in prepared:
+                work = attach_numeric_column(
+                    frame, panel, str(item.get("ts_code") or ""), "turnover_rate"
+                )
+                dates = work["date"].astype(str).str.slice(0, 10)
+                codes = [str(item.get("ts_code") or "")] * len(work)
+                work["turnover_cs90"] = [
+                    (panel.get((code, day)) is not None)
+                    and (cuts.get(day) is not None)
+                    and (panel.get((code, day)) >= cuts[day])
+                    for code, day in zip(codes, dates)
+                ]
+                attached.append((item, work))
+            prepared = attached
+        elif book == "flow":
+            panel = load_flow_panel(root)
+            if not panel:
+                raise PathAProtocolSignalError("moneyflow panel is empty")
+            prepared = [
+                (
+                    item,
+                    attach_numeric_column(
+                        frame, panel, str(item.get("ts_code") or ""), "net_mf_amount"
+                    ),
+                )
+                for item, frame in prepared
+            ]
+        else:
+            layers = load_industry_membership(root)
+            if not layers:
+                raise PathAProtocolSignalError("industry membership is empty")
+            prepared = attach_industry_ranks(prepared, layers)
     print(f"building trades names={len(prepared)} skipped={skipped}", flush=True)
     trades = build_signal_trades(
         prepared,
@@ -689,6 +856,12 @@ def build_path_a_protocol_signal_qt(
         stage = SIGNAL_CLASSIC_STAGE_GOAL_ID
     elif family == SIGNAL_GAP_FAMILY:
         stage = SIGNAL_GAP_STAGE_GOAL_ID
+    elif family == SIGNAL_TURN_FAMILY:
+        stage = SIGNAL_TURN_STAGE_GOAL_ID
+    elif family == SIGNAL_FLOW_FAMILY:
+        stage = SIGNAL_FLOW_STAGE_GOAL_ID
+    elif family == SIGNAL_INDUSTRY_FAMILY:
+        stage = SIGNAL_INDUSTRY_STAGE_GOAL_ID
     else:
         stage = STAGE_GOAL_ID
     payload = {

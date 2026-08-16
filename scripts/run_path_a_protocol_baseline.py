@@ -26,8 +26,11 @@ from app.factor_v3_path_a_protocol_signal import (  # noqa: E402
     DEFAULT_HOLD_QT_PATH as SIGNAL_HOLD_QT,
     DEFAULT_QT_PATH as SIGNAL_QT,
     DEFAULT_CLASSIC_QT_PATH as SIGNAL_CLASSIC_QT,
+    DEFAULT_FLOW_QT_PATH as SIGNAL_FLOW_QT,
     DEFAULT_GAP_QT_PATH as SIGNAL_GAP_QT,
+    DEFAULT_INDUSTRY_QT_PATH as SIGNAL_INDUSTRY_QT,
     DEFAULT_SHAPE_QT_PATH as SIGNAL_SHAPE_QT,
+    DEFAULT_TURN_QT_PATH as SIGNAL_TURN_QT,
 )
 
 
@@ -51,6 +54,9 @@ def main(argv: list[str] | None = None) -> int:
             "signal_classic",
             "signal_gap",
             "signal_value",
+            "signal_turn",
+            "signal_flow",
+            "signal_industry",
         ),
         default="baseline",
     )
@@ -72,6 +78,12 @@ def main(argv: list[str] | None = None) -> int:
         qt = SIGNAL_CLASSIC_QT
     if args.family == "signal_gap" and qt == DEFAULT_QT:
         qt = SIGNAL_GAP_QT
+    if args.family == "signal_turn" and qt == DEFAULT_QT:
+        qt = SIGNAL_TURN_QT
+    if args.family == "signal_flow" and qt == DEFAULT_QT:
+        qt = SIGNAL_FLOW_QT
+    if args.family == "signal_industry" and qt == DEFAULT_QT:
+        qt = SIGNAL_INDUSTRY_QT
     report = build_path_a_protocol_baseline(
         repo_root=repo,
         qualified_trades_path=qt if qt.is_absolute() else (repo / qt),
@@ -90,6 +102,9 @@ def main(argv: list[str] | None = None) -> int:
         "signal_classic": Path("data/research_runs/path_a_protocol_signal_classic"),
         "signal_gap": Path("data/research_runs/path_a_protocol_signal_gap"),
         "signal_value": Path("data/research_runs/path_a_protocol_signal_value"),
+        "signal_turn": Path("data/research_runs/path_a_protocol_signal_turn"),
+        "signal_flow": Path("data/research_runs/path_a_protocol_signal_flow"),
+        "signal_industry": Path("data/research_runs/path_a_protocol_signal_industry"),
     }
     chosen_root = args.output_root
     if chosen_root == DEFAULT_OUTPUT_ROOT:

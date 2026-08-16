@@ -19,8 +19,11 @@ from app.factor_v3_path_a_protocol_signal import (  # noqa: E402
     DEFAULT_HOLD_QT_PATH,
     DEFAULT_QT_PATH,
     DEFAULT_CLASSIC_QT_PATH,
+    DEFAULT_FLOW_QT_PATH,
     DEFAULT_GAP_QT_PATH,
+    DEFAULT_INDUSTRY_QT_PATH,
     DEFAULT_SHAPE_QT_PATH,
+    DEFAULT_TURN_QT_PATH,
     STAGE_GOAL_ID,
     build_path_a_protocol_signal_qt,
     write_path_a_protocol_signal_qt,
@@ -31,8 +34,11 @@ from app.factor_v3_path_a_protocol_signal_specs import (  # noqa: E402
     SIGNAL_FAMILY,
     SIGNAL_HOLD_FAMILY,
     SIGNAL_CLASSIC_FAMILY,
+    SIGNAL_FLOW_FAMILY,
     SIGNAL_GAP_FAMILY,
+    SIGNAL_INDUSTRY_FAMILY,
     SIGNAL_SHAPE_FAMILY,
+    SIGNAL_TURN_FAMILY,
 )
 
 
@@ -44,7 +50,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-symbols", type=int, default=0)
     parser.add_argument(
         "--family",
-        choices=("signal", "hold", "entry", "bounce", "shape", "classic", "gap"),
+        choices=(
+            "signal",
+            "hold",
+            "entry",
+            "bounce",
+            "shape",
+            "classic",
+            "gap",
+            "turn",
+            "flow",
+            "industry",
+        ),
         default="signal",
     )
     parser.add_argument("--allow-any-role", action="store_true")
@@ -84,6 +101,21 @@ def main(argv: list[str] | None = None) -> int:
         signal_family = SIGNAL_GAP_FAMILY
         default_qt = DEFAULT_GAP_QT_PATH
         book = "gap"
+    elif args.family == "turn":
+        hold_horizons = (5,)
+        signal_family = SIGNAL_TURN_FAMILY
+        default_qt = DEFAULT_TURN_QT_PATH
+        book = "turn"
+    elif args.family == "flow":
+        hold_horizons = (5,)
+        signal_family = SIGNAL_FLOW_FAMILY
+        default_qt = DEFAULT_FLOW_QT_PATH
+        book = "flow"
+    elif args.family == "industry":
+        hold_horizons = (5,)
+        signal_family = SIGNAL_INDUSTRY_FAMILY
+        default_qt = DEFAULT_INDUSTRY_QT_PATH
+        book = "industry"
     else:
         hold_horizons = (5,)
         signal_family = SIGNAL_FAMILY

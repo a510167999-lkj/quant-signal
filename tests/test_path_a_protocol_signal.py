@@ -39,6 +39,9 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     iter_protocol_signal_classic_variants,
     iter_protocol_signal_entry_variants,
     iter_protocol_signal_gap_variants,
+    iter_protocol_signal_flow_variants,
+    iter_protocol_signal_industry_variants,
+    iter_protocol_signal_turn_variants,
     iter_protocol_signal_value_variants,
     iter_protocol_signal_hold_variants,
     iter_protocol_signal_shape_variants,
@@ -198,6 +201,22 @@ def test_signal_variants_are_new_identity() -> None:
         "val_gap_pb",
     ]
     assert set(value_ids).isdisjoint(CONTAMINATED_CANDIDATE_IDS)
+    assert [row["candidate_id"] for row in iter_protocol_signal_turn_variants()] == [
+        "turn_x2",
+        "turn_x2_negext",
+        "turn_cs90",
+        "turn_cs90_negext",
+    ]
+    assert [row["candidate_id"] for row in iter_protocol_signal_flow_variants()] == [
+        "flow_in",
+        "flow_in_negext",
+    ]
+    assert [row["candidate_id"] for row in iter_protocol_signal_industry_variants()] == [
+        "ind_lead",
+        "ind_lead_negext",
+        "ind_enter",
+        "ind_enter_negext",
+    ]
 
 
 def test_bounce_masks_fire_two_day_down_then_up() -> None:

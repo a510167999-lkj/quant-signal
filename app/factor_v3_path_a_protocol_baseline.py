@@ -28,8 +28,11 @@ from app.factor_v3_path_a_protocol_signal import (
     DEFAULT_HOLD_QT_PATH as SIGNAL_HOLD_QT,
     DEFAULT_QT_PATH as SIGNAL_QT,
     DEFAULT_CLASSIC_QT_PATH as SIGNAL_CLASSIC_QT,
+    DEFAULT_FLOW_QT_PATH as SIGNAL_FLOW_QT,
     DEFAULT_GAP_QT_PATH as SIGNAL_GAP_QT,
+    DEFAULT_INDUSTRY_QT_PATH as SIGNAL_INDUSTRY_QT,
     DEFAULT_SHAPE_QT_PATH as SIGNAL_SHAPE_QT,
+    DEFAULT_TURN_QT_PATH as SIGNAL_TURN_QT,
 )
 from app.factor_v3_path_a_protocol_signal_specs import (
     SIGNAL_BOUNCE_FAMILY,
@@ -37,15 +40,21 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     SIGNAL_FAMILY,
     SIGNAL_HOLD_FAMILY,
     SIGNAL_CLASSIC_FAMILY,
+    SIGNAL_FLOW_FAMILY,
     SIGNAL_GAP_FAMILY,
+    SIGNAL_INDUSTRY_FAMILY,
     SIGNAL_SHAPE_FAMILY,
+    SIGNAL_TURN_FAMILY,
     SIGNAL_VALUE_FAMILY,
     iter_protocol_signal_bounce_variants,
     iter_protocol_signal_classic_variants,
+    iter_protocol_signal_flow_variants,
     iter_protocol_signal_gap_variants,
+    iter_protocol_signal_industry_variants,
     iter_protocol_signal_entry_variants,
     iter_protocol_signal_hold_variants,
     iter_protocol_signal_shape_variants,
+    iter_protocol_signal_turn_variants,
     iter_protocol_signal_value_variants,
     iter_protocol_signal_variants,
 )
@@ -240,6 +249,12 @@ def build_path_a_protocol_baseline(
         default_qt = SIGNAL_GAP_QT
     elif chosen == "signal_value":
         default_qt = SIGNAL_BOUNCE_QT
+    elif chosen == "signal_turn":
+        default_qt = SIGNAL_TURN_QT
+    elif chosen == "signal_flow":
+        default_qt = SIGNAL_FLOW_QT
+    elif chosen == "signal_industry":
+        default_qt = SIGNAL_INDUSTRY_QT
     elif chosen == "signal":
         default_qt = SIGNAL_QT
     else:
@@ -273,6 +288,12 @@ def build_path_a_protocol_baseline(
         raise PathAProtocolBaselineError("QT is not the protocol signal-classic book")
     if chosen == "signal_gap" and meta.get("signal_family") != SIGNAL_GAP_FAMILY:
         raise PathAProtocolBaselineError("QT is not the protocol signal-gap book")
+    if chosen == "signal_turn" and meta.get("signal_family") != SIGNAL_TURN_FAMILY:
+        raise PathAProtocolBaselineError("QT is not the protocol signal-turn book")
+    if chosen == "signal_flow" and meta.get("signal_family") != SIGNAL_FLOW_FAMILY:
+        raise PathAProtocolBaselineError("QT is not the protocol signal-flow book")
+    if chosen == "signal_industry" and meta.get("signal_family") != SIGNAL_INDUSTRY_FAMILY:
+        raise PathAProtocolBaselineError("QT is not the protocol signal-industry book")
     if chosen == "signal_value":
         all_trades = _load_value_attached_trades(root)
     else:
@@ -343,6 +364,27 @@ def build_path_a_protocol_baseline(
             holdout_trades,
             variants=iter_protocol_signal_gap_variants(),
             stage_goal_id="path-a-protocol-signal-gap/v1",
+        )
+    elif chosen == "signal_turn":
+        report = score_protocol_baseline(
+            train_trades,
+            holdout_trades,
+            variants=iter_protocol_signal_turn_variants(),
+            stage_goal_id="path-a-protocol-signal-turn/v1",
+        )
+    elif chosen == "signal_flow":
+        report = score_protocol_baseline(
+            train_trades,
+            holdout_trades,
+            variants=iter_protocol_signal_flow_variants(),
+            stage_goal_id="path-a-protocol-signal-flow/v1",
+        )
+    elif chosen == "signal_industry":
+        report = score_protocol_baseline(
+            train_trades,
+            holdout_trades,
+            variants=iter_protocol_signal_industry_variants(),
+            stage_goal_id="path-a-protocol-signal-industry/v1",
         )
     elif chosen == "signal_value":
         report = score_protocol_baseline(
