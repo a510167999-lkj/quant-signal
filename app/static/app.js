@@ -47,10 +47,19 @@ const els = {
   hotIndustriesList: document.querySelector("#hotIndustriesList"),
   recommendationMeta: document.querySelector("#recommendationMeta"),
   recommendationEvidence: document.querySelector("#recommendationEvidence"),
+  bounceDailyHero: document.querySelector("#bounceDailyHero"),
+  bounceDailyStatus: document.querySelector("#bounceDailyStatus"),
   bounceDailyMeta: document.querySelector("#bounceDailyMeta"),
   bounceDailyHeadline: document.querySelector("#bounceDailyHeadline"),
   bounceDailyDetail: document.querySelector("#bounceDailyDetail"),
   bounceDailyList: document.querySelector("#bounceDailyList"),
+  bounceFactSignal: document.querySelector("#bounceFactSignal"),
+  bounceFactAction: document.querySelector("#bounceFactAction"),
+  bounceFactExt: document.querySelector("#bounceFactExt"),
+  bounceFactAsOf: document.querySelector("#bounceFactAsOf"),
+  bounceFactOos: document.querySelector("#bounceFactOos"),
+  bounceFactDue: document.querySelector("#bounceFactDue"),
+  analyzeWorkspace: document.querySelector("#analyzeWorkspace"),
   recommendationsList: document.querySelector("#recommendationsList"),
   performanceMeta: document.querySelector("#performanceMeta"),
   performanceList: document.querySelector("#performanceList"),
@@ -644,53 +653,57 @@ async function refreshHoldings() {
   }
 }
 
+function setText(el, value) {
+  if (el) {
+    el.textContent = value;
+  }
+}
+
 function renderBounceDaily(payload) {
+  const available = payload?.available === true;
+  const status = payload?.status || "missing";
+  const focus = payload?.pick || payload?.holding || {};
+  if (els.bounceDailyHero) {
+    els.bounceDailyHero.dataset.state = status;
+  }
+  const verb = { buy: "买入", holding: "持有", cash: "空仓", missing: "等待" }[status] || "等待";
+  setText(els.bounceDailyStatus, verb);
+  setText(
+    els.bounceDailyMeta,
+    available
+      ? `bounce_dn2_negext · 截至 ${payload.data_through || payload.look_date || "--"} · 不自动下单`
+      : "研究账本 · 非正式有效 · 不自动下单"
+  );
+  setText(
+    els.bounceDailyHeadline,
+    focus.symbol ? `${focus.symbol}  ${focus.name || ""}`.trim() : payload?.headline || "今日空仓"
+  );
+  setText(els.bounceDailyDetail, payload?.detail || "跑完盘后扫描后显示买谁或空仓。");
+  setText(els.bounceFactSignal, focus.signal_date || payload?.look_date || "--");
+  setText(
+    els.bounceFactAction,
+    status === "holding" ? focus.exit_date || "--" : focus.entry_date || "--"
+  );
+  setText(
+    els.bounceFactExt,
+    focus.stock_return_20d_pct == null ? "--" : `${focus.stock_return_20d_pct}`
+  );
+  setText(els.bounceFactAsOf, payload?.data_through || payload?.as_of || "--");
+  setText(
+    els.bounceFactOos,
+    payload?.days_until_twelve_month == null ? "--" : `还差 ${payload.days_until_twelve_month} 天`
+  );
+  setText(els.bounceFactDue, payload?.twelve_month_due || "2027-07-04");
   if (!els.bounceDailyList) {
     return;
   }
-  const available = payload?.available === true;
-  const status = payload?.status || "missing";
-  if (els.bounceDailyMeta) {
-    els.bounceDailyMeta.textContent = available
-      ? `研究账本 · ${payload.candidate_id || "bounce_dn2_negext"} · 截至 ${payload.data_through || payload.look_date || "--"} · 不自动下单`
-      : "研究账本 · 非正式有效 · 不自动下单";
-  }
-  if (els.bounceDailyHeadline) {
-    els.bounceDailyHeadline.textContent = payload?.headline || "等待账本";
-  }
-  if (els.bounceDailyDetail) {
-    els.bounceDailyDetail.textContent = payload?.detail || "跑完盘后扫描后显示买谁或空仓";
-  }
   clear(els.bounceDailyList);
-  const focus = payload?.pick || payload?.holding;
-  if (focus && focus.symbol) {
-    const row = node("button", "recommendation-item");
-    row.type = "button";
-    row.appendChild(
-      stack(
-        node("span", "recommendation-title", `${focus.name || ""} ${focus.symbol}`.trim()),
-        node(
-          "span",
-          "recommendation-reason",
-          status === "holding"
-            ? `持有中 · 计划卖出 ${focus.exit_date || "--"}`
-            : `次日开盘买入 ${focus.entry_date || "--"} · 20日涨幅 ${focus.stock_return_20d_pct ?? "--"}`
-        )
-      )
-    );
-    row.appendChild(node("span", "rank-badge", status === "holding" ? "持有" : "买入"));
-    row.addEventListener("click", () => {
-      els.symbol.value = focus.symbol;
-      setMarket("a");
-      analyze(focus.symbol, "a", focus.name || null);
-    });
-    els.bounceDailyList.appendChild(row);
-  } else {
-    els.bounceDailyList.appendChild(
-      node("div", "recommendation-item empty-row", available ? payload?.detail || "今日空仓" : "尚未扫描")
-    );
-  }
   const ledger = payload?.ledger || [];
+  if (!ledger.length) {
+    els.bounceDailyList.hidden = true;
+    return;
+  }
+  els.bounceDailyList.hidden = false;
   ledger
     .slice()
     .reverse()
@@ -701,7 +714,7 @@ function renderBounceDaily(payload) {
       const row = node("div", "recommendation-item");
       row.appendChild(
         stack(
-          node("span", "recommendation-title", `${item.signal_date || ""} ${item.symbol} ${item.name || ""}`.trim()),
+          node("span", "recommendation-title", `${item.signal_date || ""}  ${item.symbol} ${item.name || ""}`.trim()),
           node("span", "recommendation-reason", `入 ${item.entry_date || "--"} · 出 ${item.exit_date || "--"}`)
         )
       );
@@ -907,6 +920,9 @@ function drawChart(candles, result) {
 }
 
 async function analyze(symbol = els.symbol.value, market = state.market, name = null) {
+  if (els.analyzeWorkspace) {
+    els.analyzeWorkspace.open = true;
+  }
   setBusy(true);
   try {
     const result = await api("/api/analyze", {

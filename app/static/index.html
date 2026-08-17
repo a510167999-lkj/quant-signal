@@ -3,115 +3,108 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>A 股量化信号台</title>
+    <title>连跌反弹 · 日决策</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
     <header class="topbar">
       <div class="brand-block">
-        <div class="brand">A 股量化信号台</div>
-        <div id="lastRunValue" class="subtle">等待交易日扫描</div>
+        <div class="brand">日决策台</div>
+        <div id="lastRunValue" class="subtle">bounce_dn2_negext · 非正式有效</div>
       </div>
       <div class="topbar-actions">
+        <span class="law-pill">不自动下单</span>
         <div id="serviceStatus" class="status-pill">连接中</div>
       </div>
     </header>
 
-    <main class="workspace">
-      <section class="panel controls-panel" aria-label="分析控制">
-        <div class="panel-title">
-          <h2>标的分析</h2>
-          <span class="subtle">A 股 / ETF</span>
-        </div>
-        <form id="analyzeForm" class="control-grid">
-          <label>
-            <span>代码</span>
-            <input id="symbolInput" name="symbol" value="600519" autocomplete="off" />
-          </label>
-
-          <div>
-            <span class="field-label">市场</span>
-            <div class="segment" role="group" aria-label="市场">
-              <button type="button" class="segment-button active" data-market="a">A 股</button>
-              <button type="button" class="segment-button" data-market="etf">ETF</button>
-            </div>
-          </div>
-
-          <label>
-            <span>复权</span>
-            <select id="adjustSelect" name="adjust">
-              <option value="qfq">前复权</option>
-              <option value="">不复权</option>
-              <option value="hfq">后复权</option>
-            </select>
-          </label>
-
-          <label>
-            <span>区间</span>
-            <select id="lookbackSelect" name="lookback">
-              <option value="240">约 1 年</option>
-              <option value="360" selected>约 18 月</option>
-              <option value="720">约 3 年</option>
-              <option value="1200">约 5 年</option>
-            </select>
-          </label>
-
-          <button id="analyzeButton" class="primary-button" type="submit">分析</button>
-        </form>
-
-        <div class="watch-header">
-          <h2>观察池</h2>
-          <button id="scanButton" class="ghost-button" type="button">批量扫描</button>
-        </div>
-        <div id="watchlist" class="watchlist"></div>
-
-        <form id="watchForm" class="watch-form">
-          <input id="watchSymbol" placeholder="代码" autocomplete="off" />
-          <select id="watchMarket">
-            <option value="a">A 股</option>
-            <option value="etf">ETF</option>
-          </select>
-          <input id="watchName" placeholder="名称" autocomplete="off" />
-          <button class="icon-button" type="submit" aria-label="加入观察池">+</button>
-        </form>
+    <main class="stage">
+      <section class="decision" id="bounceDailyHero" data-state="missing" aria-label="今日策略决策">
+        <p class="decision-kicker" id="bounceDailyMeta">研究账本 · 等待扫描</p>
+        <p class="decision-verb" id="bounceDailyStatus">—</p>
+        <h1 class="decision-name" id="bounceDailyHeadline">等待账本</h1>
+        <p class="decision-line" id="bounceDailyDetail">跑完盘后扫描后，这里只显示买谁、拿着谁、或空仓。</p>
+        <dl class="decision-facts" id="bounceDailyFacts">
+          <div><dt>信号日</dt><dd id="bounceFactSignal">--</dd></div>
+          <div><dt>动作日</dt><dd id="bounceFactAction">--</dd></div>
+          <div><dt>20日涨幅</dt><dd id="bounceFactExt">--</dd></div>
+          <div><dt>数据截至</dt><dd id="bounceFactAsOf">--</dd></div>
+          <div><dt>独立 OOS</dt><dd id="bounceFactOos">--</dd></div>
+          <div><dt>满 12 月</dt><dd id="bounceFactDue">2027-07-04</dd></div>
+        </dl>
+        <div id="bounceDailyList" class="ledger" hidden></div>
       </section>
 
-      <section class="main-stack">
-        <section class="summary-strip" aria-label="今日状态">
-          <div class="summary-tile">
-            <span>大盘环境</span>
-            <strong id="marketStateValue">--</strong>
+      <details class="toolbox">
+        <summary>个股分析 / 观察池</summary>
+        <section class="panel controls-panel" aria-label="分析控制">
+          <div class="panel-title">
+            <h2>标的分析</h2>
+            <span class="subtle">A 股 / ETF</span>
           </div>
-          <div class="summary-tile">
-            <span>热门板块</span>
-            <strong id="hotIndustryValue">--</strong>
+          <form id="analyzeForm" class="control-grid">
+            <label>
+              <span>代码</span>
+              <input id="symbolInput" name="symbol" value="600519" autocomplete="off" />
+            </label>
+            <div>
+              <span class="field-label">市场</span>
+              <div class="segment" role="group" aria-label="市场">
+                <button type="button" class="segment-button active" data-market="a">A 股</button>
+                <button type="button" class="segment-button" data-market="etf">ETF</button>
+              </div>
+            </div>
+            <label>
+              <span>复权</span>
+              <select id="adjustSelect" name="adjust">
+                <option value="qfq">前复权</option>
+                <option value="">不复权</option>
+                <option value="hfq">后复权</option>
+              </select>
+            </label>
+            <label>
+              <span>区间</span>
+              <select id="lookbackSelect" name="lookback">
+                <option value="240">约 1 年</option>
+                <option value="360" selected>约 18 月</option>
+                <option value="720">约 3 年</option>
+                <option value="1200">约 5 年</option>
+              </select>
+            </label>
+            <button id="analyzeButton" class="primary-button" type="submit">分析</button>
+          </form>
+          <div class="watch-header">
+            <h2>观察池</h2>
+            <button id="scanButton" class="ghost-button" type="button">批量扫描</button>
           </div>
-          <div class="summary-tile">
-            <span>深扫候选</span>
-            <strong id="candidateValue">--</strong>
-          </div>
-          <div class="summary-tile">
-            <span>入选机会</span>
-            <strong id="qualifiedValue">--</strong>
-          </div>
-          <div class="summary-tile">
-            <span>10日胜率</span>
-            <strong id="performanceWinValue">--</strong>
-          </div>
-          <div class="summary-tile">
-            <span>验证样本</span>
-            <strong id="performanceSampleValue">--</strong>
-          </div>
-          <div class="summary-tile">
-            <span>提醒</span>
-            <strong id="alertValue">--</strong>
-          </div>
-          <div class="summary-tile">
-            <span>持仓状态</span>
-            <strong id="holdingsStateValue">--</strong>
-          </div>
+          <div id="watchlist" class="watchlist"></div>
+          <form id="watchForm" class="watch-form">
+            <input id="watchSymbol" placeholder="代码" autocomplete="off" />
+            <select id="watchMarket">
+              <option value="a">A 股</option>
+              <option value="etf">ETF</option>
+            </select>
+            <input id="watchName" placeholder="名称" autocomplete="off" />
+            <button class="icon-button" type="submit" aria-label="加入观察池">+</button>
+          </form>
         </section>
+      </details>
 
+      <details class="toolbox">
+        <summary>旧生产推荐 / 提醒 / 持仓</summary>
+        <section class="summary-strip" aria-label="今日状态">
+          <div class="summary-tile"><span>大盘环境</span><strong id="marketStateValue">--</strong></div>
+          <div class="summary-tile"><span>热门板块</span><strong id="hotIndustryValue">--</strong></div>
+          <div class="summary-tile"><span>深扫候选</span><strong id="candidateValue">--</strong></div>
+          <div class="summary-tile"><span>入选机会</span><strong id="qualifiedValue">--</strong></div>
+          <div class="summary-tile"><span>10日胜率</span><strong id="performanceWinValue">--</strong></div>
+          <div class="summary-tile"><span>验证样本</span><strong id="performanceSampleValue">--</strong></div>
+          <div class="summary-tile"><span>提醒</span><strong id="alertValue">--</strong></div>
+          <div class="summary-tile"><span>持仓状态</span><strong id="holdingsStateValue">--</strong></div>
+        </section>
         <section class="panel holdings-panel">
           <div class="section-head">
             <div>
@@ -122,7 +115,6 @@
           </div>
           <div id="holdingsList" class="holdings-list"></div>
         </section>
-
         <section class="panel hot-industries-panel">
           <div class="section-head">
             <div>
@@ -132,24 +124,11 @@
           </div>
           <div id="hotIndustriesList" class="hot-industries-list"></div>
         </section>
-
-        <section class="panel bounce-daily-panel">
-          <div class="section-head">
-            <div>
-              <h2>连跌反弹决策</h2>
-              <div id="bounceDailyMeta" class="subtle">研究账本 · 非正式有效 · 不自动下单</div>
-            </div>
-          </div>
-          <div id="bounceDailyHeadline" class="result-title">等待账本</div>
-          <div id="bounceDailyDetail" class="subtle">跑完盘后扫描后显示买谁或空仓</div>
-          <div id="bounceDailyList" class="recommendations-list"></div>
-        </section>
-
         <section class="ops-grid">
           <article class="panel ops-panel">
             <div class="section-head">
               <div>
-                <h2>A 股推荐 / 目标交易日</h2>
+                <h2>旧生产推荐</h2>
                 <div id="recommendationMeta" class="subtle">等待调度生成</div>
                 <div id="recommendationEvidence" class="subtle">研究开发候选 · 不自动下单</div>
               </div>
@@ -157,7 +136,6 @@
             </div>
             <div id="recommendationsList" class="recommendations-list"></div>
           </article>
-
           <article class="panel ops-panel">
             <div class="section-head">
               <div>
@@ -169,7 +147,6 @@
             <div id="alertsList" class="alerts-list"></div>
           </article>
         </section>
-
         <section class="panel performance-panel">
           <div class="section-head">
             <div>
@@ -178,18 +155,15 @@
             </div>
           </div>
           <div class="performance-summary">
-            <div>
-              <span>平均10日收益</span>
-              <strong id="performanceReturnValue">--</strong>
-            </div>
-            <div>
-              <span>平均不利波动</span>
-              <strong id="performanceAdverseValue">--</strong>
-            </div>
+            <div><span>平均10日收益</span><strong id="performanceReturnValue">--</strong></div>
+            <div><span>平均不利波动</span><strong id="performanceAdverseValue">--</strong></div>
           </div>
           <div id="performanceList" class="performance-list"></div>
         </section>
+      </details>
 
+      <details class="toolbox" id="analyzeWorkspace">
+        <summary>K 线与买卖区间</summary>
         <section class="panel signal-panel">
           <div class="signal-head">
             <div>
@@ -198,31 +172,16 @@
             </div>
             <div id="actionBadge" class="action-badge neutral">--</div>
           </div>
-
           <div class="metrics-grid">
-            <div class="metric">
-              <span>收盘价</span>
-              <strong id="lastClose">--</strong>
-            </div>
-            <div class="metric">
-              <span>评分</span>
-              <strong id="scoreValue">--</strong>
-            </div>
-            <div class="metric">
-              <span>信心</span>
-              <strong id="confidenceValue">--</strong>
-            </div>
-            <div class="metric">
-              <span>止损</span>
-              <strong id="stopLoss">--</strong>
-            </div>
+            <div class="metric"><span>收盘价</span><strong id="lastClose">--</strong></div>
+            <div class="metric"><span>评分</span><strong id="scoreValue">--</strong></div>
+            <div class="metric"><span>信心</span><strong id="confidenceValue">--</strong></div>
+            <div class="metric"><span>止损</span><strong id="stopLoss">--</strong></div>
           </div>
-
           <div class="chart-shell">
             <canvas id="priceChart" width="960" height="420"></canvas>
           </div>
         </section>
-
         <section class="detail-grid">
           <article class="panel">
             <h2>买卖区间</h2>
@@ -233,7 +192,6 @@
               <div><dt>止盈</dt><dd id="takeProfit">--</dd></div>
             </dl>
           </article>
-
           <article class="panel">
             <h2>短线计划</h2>
             <dl class="levels">
@@ -244,7 +202,6 @@
             </dl>
             <ul id="shortPlanList" class="note-list"></ul>
           </article>
-
           <article class="panel">
             <h2>长期计划</h2>
             <dl class="levels">
@@ -255,17 +212,14 @@
             </dl>
             <ul id="longPlanList" class="note-list"></ul>
           </article>
-
           <article class="panel">
             <h2>信号原因</h2>
             <ul id="reasonList" class="note-list"></ul>
           </article>
-
           <article class="panel">
             <h2>风险提示</h2>
             <ul id="riskList" class="note-list"></ul>
           </article>
-
           <article class="panel">
             <h2>回测摘要</h2>
             <dl class="levels">
@@ -276,10 +230,10 @@
             </dl>
           </article>
         </section>
-      </section>
+      </details>
     </main>
 
-    <footer class="footer">仅供个人量化研究和交易辅助，不构成投资建议。</footer>
+    <footer class="footer">仅供个人量化研究。连跌反弹不是有效策略，网页不构成下单。</footer>
     <script src="/static/app.js"></script>
   </body>
 </html>

@@ -1,19 +1,21 @@
 :root {
-  color-scheme: light;
-  --bg: #eef2f4;
-  --surface: #ffffff;
-  --surface-soft: #f8fafb;
-  --ink: #172026;
-  --muted: #64717d;
-  --line: #dbe3e8;
-  --line-strong: #c8d3da;
-  --blue: #205ec8;
-  --green: #0e8a61;
-  --red: #c43b3b;
-  --amber: #a66c17;
-  --violet: #5d5ac9;
-  --shadow: 0 10px 24px rgba(23, 32, 38, 0.07);
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color-scheme: dark;
+  --bg: #10120f;
+  --surface: #171a16;
+  --surface-soft: #1e221c;
+  --ink: #ece7d8;
+  --muted: #9a937f;
+  --line: #2b3128;
+  --line-strong: #3b4336;
+  --blue: #d7ff3c;
+  --green: #d7ff3c;
+  --red: #ff6b4a;
+  --amber: #e4c56a;
+  --violet: #d7ff3c;
+  --shadow: none;
+  --cash: #ece7d8;
+  --buy: #d7ff3c;
+  font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
 }
 
 * {
@@ -43,13 +45,146 @@ select {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 14px 20px;
+  padding: 18px 28px;
   border-bottom: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.96);
+  background: rgba(16, 18, 15, 0.92);
   position: sticky;
   top: 0;
   z-index: 10;
-  backdrop-filter: blur(10px);
+  backdrop-filter: blur(16px);
+}
+
+.law-pill {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--amber);
+  border: 1px solid #5b4d28;
+  padding: 5px 10px;
+  border-radius: 999px;
+}
+
+.stage {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 28px 28px 48px;
+  display: grid;
+  gap: 28px;
+}
+
+.decision {
+  min-height: calc(100svh - 92px);
+  display: grid;
+  align-content: center;
+  gap: 14px;
+  animation: rise 0.6s ease both;
+}
+
+.decision-kicker,
+.decision-facts dt {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.decision-verb {
+  margin: 0;
+  font-size: clamp(72px, 16vw, 168px);
+  line-height: 0.86;
+  font-weight: 700;
+  letter-spacing: -0.06em;
+}
+
+.decision[data-state="cash"] .decision-verb,
+.decision[data-state="missing"] .decision-verb {
+  color: var(--cash);
+}
+
+.decision[data-state="buy"] .decision-verb {
+  color: var(--buy);
+}
+
+.decision[data-state="holding"] .decision-verb {
+  color: var(--amber);
+}
+
+.decision-name {
+  margin: 8px 0 0;
+  font-size: clamp(28px, 4vw, 44px);
+  font-weight: 600;
+  letter-spacing: -0.03em;
+}
+
+.decision-line {
+  margin: 0;
+  max-width: 42rem;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+.decision-facts {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 18px 20px;
+  margin: 22px 0 0;
+  padding: 22px 0 0;
+  border-top: 1px solid var(--line);
+}
+
+.decision-facts div {
+  min-width: 0;
+}
+
+.decision-facts dd {
+  margin: 6px 0 0;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.ledger {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.toolbox {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.toolbox summary {
+  cursor: pointer;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  list-style: none;
+}
+
+.toolbox summary::-webkit-details-marker {
+  display: none;
+}
+
+.toolbox[open] summary {
+  color: var(--ink);
+  margin-bottom: 16px;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .brand-block {
@@ -140,7 +275,7 @@ select {
   border: 1px solid var(--line-strong);
   border-radius: 6px;
   padding: 0 11px;
-  background: #fff;
+  background: var(--surface-soft);
   color: var(--ink);
   outline: none;
 }
@@ -162,7 +297,7 @@ select:focus {
 .segment-button {
   height: 38px;
   border: 0;
-  background: #fff;
+  background: var(--surface-soft);
   color: var(--muted);
   cursor: pointer;
 }
@@ -172,8 +307,8 @@ select:focus {
 }
 
 .segment-button.active {
-  background: #e9f0ff;
-  color: var(--blue);
+  background: #2a3118;
+  color: var(--buy);
   font-weight: 760;
 }
 
@@ -194,7 +329,7 @@ select:focus {
 }
 
 .ghost-button {
-  background: #fff;
+  background: var(--surface);
   border-color: var(--line-strong);
   color: var(--ink);
   padding: 0 12px;
@@ -221,7 +356,7 @@ select:focus {
   font-size: 12px;
   border: 1px solid var(--line);
   color: var(--muted);
-  background: #fff;
+  background: var(--surface);
 }
 
 .status-pill[data-state="ok"] {
@@ -449,7 +584,7 @@ dt {
   gap: 4px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: #fff;
+  background: var(--surface);
   padding: 8px;
 }
 
@@ -727,7 +862,7 @@ dt {
   border: 1px solid var(--line);
   border-radius: 8px;
   overflow: hidden;
-  background: #fff;
+  background: #11140f;
 }
 
 canvas {
@@ -787,6 +922,10 @@ dd {
 }
 
 @media (max-width: 1080px) {
+  .decision-facts {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
   .workspace {
     grid-template-columns: 1fr;
   }
@@ -797,9 +936,17 @@ dd {
 }
 
 @media (max-width: 780px) {
-  .topbar {
-    align-items: flex-start;
-    padding: 12px;
+  .topbar,
+  .stage {
+    padding: 16px;
+  }
+
+  .decision-verb {
+    font-size: 72px;
+  }
+
+  .decision-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .workspace {
