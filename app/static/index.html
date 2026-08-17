@@ -6,14 +6,14 @@
     <title>连跌反弹 · 日决策</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
     <header class="topbar">
       <div class="brand-block">
-        <div class="brand">日决策台</div>
-        <div id="lastRunValue" class="subtle">bounce_dn2_negext · 非正式有效</div>
+        <div class="brand">连跌反弹</div>
+        <div id="lastRunValue" class="subtle">研究账本 · 非正式有效</div>
       </div>
       <div class="topbar-actions">
         <span class="law-pill">不自动下单</span>
@@ -21,29 +21,50 @@
       </div>
     </header>
 
-    <main class="stage">
-      <section class="decision" id="bounceDailyHero" data-state="missing" aria-label="今日策略决策">
-        <p class="decision-kicker" id="bounceDailyMeta">研究账本 · 等待扫描</p>
-        <p class="decision-verb" id="bounceDailyStatus">—</p>
-        <h1 class="decision-name" id="bounceDailyHeadline">等待账本</h1>
-        <p class="decision-line" id="bounceDailyDetail">跑完盘后扫描后，这里只显示买谁、拿着谁、或空仓。</p>
-        <dl class="decision-facts" id="bounceDailyFacts">
+    <main class="desk">
+      <section class="sheet" id="bounceDailyHero" data-state="missing" aria-label="今日策略决策">
+        <div class="sheet-head">
+          <p class="eyebrow" id="bounceDailyMeta">今日决策</p>
+          <p class="stamp" id="bounceDailyStatus">—</p>
+        </div>
+        <h1 class="sheet-title" id="bounceDailyHeadline">等待账本</h1>
+        <p class="sheet-copy" id="bounceDailyDetail">盘后扫描完成后，这里只写买谁、拿着谁，或空仓。</p>
+
+        <dl class="facts">
           <div><dt>信号日</dt><dd id="bounceFactSignal">--</dd></div>
-          <div><dt>动作日</dt><dd id="bounceFactAction">--</dd></div>
-          <div><dt>20日涨幅</dt><dd id="bounceFactExt">--</dd></div>
+          <div><dt>下一步</dt><dd id="bounceFactAction">--</dd></div>
+          <div><dt>20 日涨幅</dt><dd id="bounceFactExt">--</dd></div>
           <div><dt>数据截至</dt><dd id="bounceFactAsOf">--</dd></div>
           <div><dt>独立 OOS</dt><dd id="bounceFactOos">--</dd></div>
           <div><dt>满 12 月</dt><dd id="bounceFactDue">2027-07-04</dd></div>
         </dl>
-        <div id="bounceDailyList" class="ledger" hidden></div>
+
+        <div class="ledger-wrap">
+          <div class="ledger-head">
+            <h2>独立 OOS 记录</h2>
+            <p class="subtle">2026-07-04 起 · 满窗 2027-07-04</p>
+          </div>
+          <table class="ledger">
+            <thead>
+              <tr>
+                <th>信号日</th>
+                <th>代码</th>
+                <th>名称</th>
+                <th>买入日</th>
+                <th>卖出日</th>
+              </tr>
+            </thead>
+            <tbody id="bounceDailyList"></tbody>
+          </table>
+          <p class="ledger-empty" id="bounceLedgerEmpty">独立 OOS 以来还没有选出。</p>
+        </div>
       </section>
 
-      <details class="toolbox">
-        <summary>个股分析 / 观察池</summary>
-        <section class="panel controls-panel" aria-label="分析控制">
+      <aside class="rail">
+        <section class="rail-block" aria-label="分析控制">
           <div class="panel-title">
-            <h2>标的分析</h2>
-            <span class="subtle">A 股 / ETF</span>
+            <h2>查一只</h2>
+            <span class="subtle">对照用</span>
           </div>
           <form id="analyzeForm" class="control-grid">
             <label>
@@ -78,7 +99,7 @@
           </form>
           <div class="watch-header">
             <h2>观察池</h2>
-            <button id="scanButton" class="ghost-button" type="button">批量扫描</button>
+            <button id="scanButton" class="ghost-button" type="button">扫描</button>
           </div>
           <div id="watchlist" class="watchlist"></div>
           <form id="watchForm" class="watch-form">
@@ -91,80 +112,79 @@
             <button class="icon-button" type="submit" aria-label="加入观察池">+</button>
           </form>
         </section>
-      </details>
-
-      <details class="toolbox" id="analyzeWorkspace">
-        <summary>K 线与买卖区间</summary>
-        <section class="panel signal-panel">
-          <div class="signal-head">
-            <div>
-              <div id="resultTitle" class="result-title">等待分析</div>
-              <div id="resultMeta" class="subtle">输入代码后开始</div>
-            </div>
-            <div id="actionBadge" class="action-badge neutral">--</div>
-          </div>
-          <div class="metrics-grid">
-            <div class="metric"><span>收盘价</span><strong id="lastClose">--</strong></div>
-            <div class="metric"><span>评分</span><strong id="scoreValue">--</strong></div>
-            <div class="metric"><span>信心</span><strong id="confidenceValue">--</strong></div>
-            <div class="metric"><span>止损</span><strong id="stopLoss">--</strong></div>
-          </div>
-          <div class="chart-shell">
-            <canvas id="priceChart" width="960" height="420"></canvas>
-          </div>
-        </section>
-        <section class="detail-grid">
-          <article class="panel">
-            <h2>买卖区间</h2>
-            <dl class="levels">
-              <div><dt>入场</dt><dd id="entryZone">--</dd></div>
-              <div><dt>支撑</dt><dd id="supportLevel">--</dd></div>
-              <div><dt>压力</dt><dd id="resistanceLevel">--</dd></div>
-              <div><dt>止盈</dt><dd id="takeProfit">--</dd></div>
-            </dl>
-          </article>
-          <article class="panel">
-            <h2>短线计划</h2>
-            <dl class="levels">
-              <div><dt>周期</dt><dd id="shortPlanHorizon">--</dd></div>
-              <div><dt>动作</dt><dd id="shortPlanAction">--</dd></div>
-              <div><dt>止损</dt><dd id="shortPlanStop">--</dd></div>
-              <div><dt>止盈</dt><dd id="shortPlanTarget">--</dd></div>
-            </dl>
-            <ul id="shortPlanList" class="note-list"></ul>
-          </article>
-          <article class="panel">
-            <h2>长期计划</h2>
-            <dl class="levels">
-              <div><dt>周期</dt><dd id="longPlanHorizon">--</dd></div>
-              <div><dt>动作</dt><dd id="longPlanAction">--</dd></div>
-              <div><dt>建仓区</dt><dd id="longPlanZone">--</dd></div>
-              <div><dt>趋势止损</dt><dd id="longPlanStop">--</dd></div>
-            </dl>
-            <ul id="longPlanList" class="note-list"></ul>
-          </article>
-          <article class="panel">
-            <h2>信号原因</h2>
-            <ul id="reasonList" class="note-list"></ul>
-          </article>
-          <article class="panel">
-            <h2>风险提示</h2>
-            <ul id="riskList" class="note-list"></ul>
-          </article>
-          <article class="panel">
-            <h2>回测摘要</h2>
-            <dl class="levels">
-              <div><dt>策略收益</dt><dd id="btStrategy">--</dd></div>
-              <div><dt>持有收益</dt><dd id="btHold">--</dd></div>
-              <div><dt>最大回撤</dt><dd id="btDrawdown">--</dd></div>
-              <div><dt>交易次数</dt><dd id="btTrades">--</dd></div>
-            </dl>
-          </article>
-        </section>
-      </details>
+      </aside>
     </main>
 
-    <footer class="footer">仅供个人量化研究。连跌反弹不是有效策略，网页不构成下单。</footer>
+    <section class="lab" id="analyzeWorkspace">
+      <section class="signal-panel">
+        <div class="signal-head">
+          <div>
+            <div id="resultTitle" class="result-title">等待分析</div>
+            <div id="resultMeta" class="subtle">输入代码后开始</div>
+          </div>
+          <div id="actionBadge" class="action-badge neutral">--</div>
+        </div>
+        <div class="metrics-grid">
+          <div class="metric"><span>收盘价</span><strong id="lastClose">--</strong></div>
+          <div class="metric"><span>评分</span><strong id="scoreValue">--</strong></div>
+          <div class="metric"><span>信心</span><strong id="confidenceValue">--</strong></div>
+          <div class="metric"><span>止损</span><strong id="stopLoss">--</strong></div>
+        </div>
+        <div class="chart-shell">
+          <canvas id="priceChart" width="960" height="420"></canvas>
+        </div>
+      </section>
+      <section class="detail-grid">
+        <article>
+          <h2>买卖区间</h2>
+          <dl class="levels">
+            <div><dt>入场</dt><dd id="entryZone">--</dd></div>
+            <div><dt>支撑</dt><dd id="supportLevel">--</dd></div>
+            <div><dt>压力</dt><dd id="resistanceLevel">--</dd></div>
+            <div><dt>止盈</dt><dd id="takeProfit">--</dd></div>
+          </dl>
+        </article>
+        <article>
+          <h2>短线计划</h2>
+          <dl class="levels">
+            <div><dt>周期</dt><dd id="shortPlanHorizon">--</dd></div>
+            <div><dt>动作</dt><dd id="shortPlanAction">--</dd></div>
+            <div><dt>止损</dt><dd id="shortPlanStop">--</dd></div>
+            <div><dt>止盈</dt><dd id="shortPlanTarget">--</dd></div>
+          </dl>
+          <ul id="shortPlanList" class="note-list"></ul>
+        </article>
+        <article>
+          <h2>长期计划</h2>
+          <dl class="levels">
+            <div><dt>周期</dt><dd id="longPlanHorizon">--</dd></div>
+            <div><dt>动作</dt><dd id="longPlanAction">--</dd></div>
+            <div><dt>建仓区</dt><dd id="longPlanZone">--</dd></div>
+            <div><dt>趋势止损</dt><dd id="longPlanStop">--</dd></div>
+          </dl>
+          <ul id="longPlanList" class="note-list"></ul>
+        </article>
+        <article>
+          <h2>信号原因</h2>
+          <ul id="reasonList" class="note-list"></ul>
+        </article>
+        <article>
+          <h2>风险提示</h2>
+          <ul id="riskList" class="note-list"></ul>
+        </article>
+        <article>
+          <h2>回测摘要</h2>
+          <dl class="levels">
+            <div><dt>策略收益</dt><dd id="btStrategy">--</dd></div>
+            <div><dt>持有收益</dt><dd id="btHold">--</dd></div>
+            <div><dt>最大回撤</dt><dd id="btDrawdown">--</dd></div>
+            <div><dt>交易次数</dt><dd id="btTrades">--</dd></div>
+          </dl>
+        </article>
+      </section>
+    </section>
+
+    <footer class="footer">仅供个人研究。连跌反弹不是有效策略，这里不是下单回执。</footer>
     <script src="/static/app.js"></script>
   </body>
 </html>

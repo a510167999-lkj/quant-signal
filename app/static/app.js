@@ -59,6 +59,7 @@ const els = {
   bounceFactAsOf: document.querySelector("#bounceFactAsOf"),
   bounceFactOos: document.querySelector("#bounceFactOos"),
   bounceFactDue: document.querySelector("#bounceFactDue"),
+  bounceLedgerEmpty: document.querySelector("#bounceLedgerEmpty"),
   analyzeWorkspace: document.querySelector("#analyzeWorkspace"),
   recommendationsList: document.querySelector("#recommendationsList"),
   performanceMeta: document.querySelector("#performanceMeta"),
@@ -670,26 +671,27 @@ function renderBounceDaily(payload) {
     els.bounceDailyHero.dataset.state = status;
   }
   const verb = { buy: "买入", holding: "持有", cash: "空仓", missing: "等待" }[status] || "等待";
+  const nextAction =
+    status === "buy"
+      ? `次日开盘买 ${focus.entry_date || ""}`.trim()
+      : status === "holding"
+        ? `拿到 ${focus.exit_date || ""}`.trim()
+        : "今日不开仓";
   setText(els.bounceDailyStatus, verb);
   setText(
     els.bounceDailyMeta,
-    available
-      ? `bounce_dn2_negext · 截至 ${payload.data_through || payload.look_date || "--"} · 不自动下单`
-      : "研究账本 · 非正式有效 · 不自动下单"
+    available ? `今日决策 · 数据截至 ${payload.data_through || payload.look_date || "--"}` : "今日决策"
   );
   setText(
     els.bounceDailyHeadline,
-    focus.symbol ? `${focus.symbol}  ${focus.name || ""}`.trim() : payload?.headline || "今日空仓"
+    focus.symbol ? `${focus.name || ""} ${focus.symbol}`.trim() : "没有符合条件的票"
   );
-  setText(els.bounceDailyDetail, payload?.detail || "跑完盘后扫描后显示买谁或空仓。");
+  setText(els.bounceDailyDetail, payload?.detail || "盘后扫描完成后，这里只写买谁、拿着谁，或空仓。");
   setText(els.bounceFactSignal, focus.signal_date || payload?.look_date || "--");
-  setText(
-    els.bounceFactAction,
-    status === "holding" ? focus.exit_date || "--" : focus.entry_date || "--"
-  );
+  setText(els.bounceFactAction, nextAction);
   setText(
     els.bounceFactExt,
-    focus.stock_return_20d_pct == null ? "--" : `${focus.stock_return_20d_pct}`
+    focus.stock_return_20d_pct == null ? "—" : `${Number(focus.stock_return_20d_pct).toFixed(2)}%`
   );
   setText(els.bounceFactAsOf, payload?.data_through || payload?.as_of || "--");
   setText(
@@ -702,11 +704,9 @@ function renderBounceDaily(payload) {
   }
   clear(els.bounceDailyList);
   const ledger = payload?.ledger || [];
-  if (!ledger.length) {
-    els.bounceDailyList.hidden = true;
-    return;
+  if (els.bounceLedgerEmpty) {
+    els.bounceLedgerEmpty.hidden = ledger.length > 0;
   }
-  els.bounceDailyList.hidden = false;
   ledger
     .slice()
     .reverse()
@@ -714,13 +714,12 @@ function renderBounceDaily(payload) {
       if (!item?.symbol) {
         return;
       }
-      const row = node("div", "recommendation-item");
-      row.appendChild(
-        stack(
-          node("span", "recommendation-title", `${item.signal_date || ""}  ${item.symbol} ${item.name || ""}`.trim()),
-          node("span", "recommendation-reason", `入 ${item.entry_date || "--"} · 出 ${item.exit_date || "--"}`)
-        )
-      );
+      const row = document.createElement("tr");
+      [item.signal_date, item.symbol, item.name || "—", item.entry_date, item.exit_date].forEach((value) => {
+        const cell = document.createElement("td");
+        cell.textContent = value || "—";
+        row.appendChild(cell);
+      });
       els.bounceDailyList.appendChild(row);
     });
 }
@@ -737,7 +736,7 @@ async function loadRecommendations() {
 async function loadProductionStatus() {
   const data = await api("/api/production/status");
   const status = data?.status || "unknown";
-  setStatus(`服务在线 · 生产检查 ${status}`, status === "healthy");
+  setStatus(status === "healthy" ? "网页在线" : "网页在线 · 非正式有效", true);
 }
 
 async function loadAlerts() {
