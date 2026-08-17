@@ -47,6 +47,10 @@ const els = {
   hotIndustriesList: document.querySelector("#hotIndustriesList"),
   recommendationMeta: document.querySelector("#recommendationMeta"),
   recommendationEvidence: document.querySelector("#recommendationEvidence"),
+  bounceDailyMeta: document.querySelector("#bounceDailyMeta"),
+  bounceDailyHeadline: document.querySelector("#bounceDailyHeadline"),
+  bounceDailyDetail: document.querySelector("#bounceDailyDetail"),
+  bounceDailyList: document.querySelector("#bounceDailyList"),
   recommendationsList: document.querySelector("#recommendationsList"),
   performanceMeta: document.querySelector("#performanceMeta"),
   performanceList: document.querySelector("#performanceList"),
@@ -640,6 +644,76 @@ async function refreshHoldings() {
   }
 }
 
+function renderBounceDaily(payload) {
+  if (!els.bounceDailyList) {
+    return;
+  }
+  const available = payload?.available === true;
+  const status = payload?.status || "missing";
+  if (els.bounceDailyMeta) {
+    els.bounceDailyMeta.textContent = available
+      ? `研究账本 · ${payload.candidate_id || "bounce_dn2_negext"} · 截至 ${payload.data_through || payload.look_date || "--"} · 不自动下单`
+      : "研究账本 · 非正式有效 · 不自动下单";
+  }
+  if (els.bounceDailyHeadline) {
+    els.bounceDailyHeadline.textContent = payload?.headline || "等待账本";
+  }
+  if (els.bounceDailyDetail) {
+    els.bounceDailyDetail.textContent = payload?.detail || "跑完盘后扫描后显示买谁或空仓";
+  }
+  clear(els.bounceDailyList);
+  const focus = payload?.pick || payload?.holding;
+  if (focus && focus.symbol) {
+    const row = node("button", "recommendation-item");
+    row.type = "button";
+    row.appendChild(
+      stack(
+        node("span", "recommendation-title", `${focus.name || ""} ${focus.symbol}`.trim()),
+        node(
+          "span",
+          "recommendation-reason",
+          status === "holding"
+            ? `持有中 · 计划卖出 ${focus.exit_date || "--"}`
+            : `次日开盘买入 ${focus.entry_date || "--"} · 20日涨幅 ${focus.stock_return_20d_pct ?? "--"}`
+        )
+      )
+    );
+    row.appendChild(node("span", "rank-badge", status === "holding" ? "持有" : "买入"));
+    row.addEventListener("click", () => {
+      els.symbol.value = focus.symbol;
+      setMarket("a");
+      analyze(focus.symbol, "a", focus.name || null);
+    });
+    els.bounceDailyList.appendChild(row);
+  } else {
+    els.bounceDailyList.appendChild(
+      node("div", "recommendation-item empty-row", available ? payload?.detail || "今日空仓" : "尚未扫描")
+    );
+  }
+  const ledger = payload?.ledger || [];
+  ledger
+    .slice()
+    .reverse()
+    .forEach((item) => {
+      if (!item?.symbol) {
+        return;
+      }
+      const row = node("div", "recommendation-item");
+      row.appendChild(
+        stack(
+          node("span", "recommendation-title", `${item.signal_date || ""} ${item.symbol} ${item.name || ""}`.trim()),
+          node("span", "recommendation-reason", `入 ${item.entry_date || "--"} · 出 ${item.exit_date || "--"}`)
+        )
+      );
+      els.bounceDailyList.appendChild(row);
+    });
+}
+
+async function loadBounceDaily() {
+  const data = await api("/api/research/bounce-daily");
+  renderBounceDaily(data);
+}
+
 async function loadRecommendations() {
   return requestRecommendationSnapshot("/api/recommendations/latest");
 }
@@ -954,7 +1028,7 @@ renderResult = (result) => {
   try {
     const health = await api("/health");
     setStatus(health.auth === "enabled" ? "需认证" : "已连接", true);
-    await Promise.allSettled([loadRecommendations(), loadProductionStatus(), loadAlerts(), loadPerformance(), loadHoldings()]);
+    await Promise.allSettled([loadBounceDaily(), loadRecommendations(), loadProductionStatus(), loadAlerts(), loadPerformance(), loadHoldings()]);
     await loadWatchlist();
     analyze();
   } catch (error) {

@@ -24,6 +24,10 @@ from app.schemas import (
     RecommendationSnapshot,
     WatchlistUpdate,
 )
+from app.factor_v3_path_a_protocol_bounce_daily import (
+    DEFAULT_LATEST_PATH as BOUNCE_DAILY_LATEST_PATH,
+    load_public_bounce_daily_view,
+)
 from app.storage import read_json
 from app.watchlist import load_watchlist, save_watchlist
 
@@ -177,6 +181,10 @@ def create_app() -> FastAPI:
         items = [model_to_dict(item) for item in payload.items]
         save_holdings(SETTINGS.holdings_path, items)
         return {"items": load_holdings(SETTINGS.holdings_path)}
+
+    @app.get("/api/research/bounce-daily", dependencies=[Depends(require_basic_auth)])
+    def bounce_daily_research_view():
+        return load_public_bounce_daily_view(Path(BOUNCE_DAILY_LATEST_PATH))
 
     @app.get(
         "/api/recommendations/latest",

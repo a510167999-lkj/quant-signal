@@ -162,6 +162,48 @@ def test_recommendations_api_rejects_incomplete_operation_contract(
     assert response.status_code == 500
 
 
+def test_bounce_daily_api_is_research_ledger_not_an_order(monkeypatch, tmp_path):
+    missing = tmp_path / "missing.json"
+    monkeypatch.setattr(main, "BOUNCE_DAILY_LATEST_PATH", missing)
+    client = TestClient(main.create_app())
+    empty = client.get("/api/research/bounce-daily")
+    assert empty.status_code == 200
+    assert empty.json()["available"] is False
+    assert empty.json()["auto_order"] is False
+    assert empty.json()["effective_strategy"] is False
+
+    report = tmp_path / "LATEST.json"
+    write_json(
+        str(report),
+        {
+            "status": "buy",
+            "as_of": "2026-08-14",
+            "look_date": "2026-08-14",
+            "data_through": "2026-08-14",
+            "empty_reason": None,
+            "pick": {
+                "symbol": "000001",
+                "name": "平安银行",
+                "signal_date": "2026-08-14",
+                "entry_date": "2026-08-17",
+                "stock_return_20d_pct": -2.0,
+            },
+            "holding": None,
+            "ledger": [],
+            "qualified_signal_count": 1,
+            "selected_trade_count": 1,
+        },
+    )
+    monkeypatch.setattr(main, "BOUNCE_DAILY_LATEST_PATH", report)
+    filled = client.get("/api/research/bounce-daily")
+    assert filled.status_code == 200
+    body = filled.json()
+    assert body["status"] == "buy"
+    assert body["pick"]["symbol"] == "000001"
+    assert body["auto_order"] is False
+    assert "不自动下单" in body["detail"]
+
+
 def test_recommendation_performance_endpoint(monkeypatch, tmp_path):
     history_path = tmp_path / "recommendations_history.jsonl"
     append_jsonl(

@@ -31,13 +31,14 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     iter_protocol_signal_bounce_variants,
 )
 from app import research_goal_contract as goal
-from app.storage import write_json
+from app.storage import read_json, write_json
 
 STAGE_GOAL_ID = "path-a-protocol-bounce-daily/v1"
 REPORT_SCHEMA = "path-a-protocol-bounce-daily-report/v1"
 CANDIDATE_ID = "bounce_dn2_negext"
 DEFAULT_TZ = "Asia/Shanghai"
 DEFAULT_OUTPUT_ROOT = Path("data/research_runs/path_a_protocol_bounce_daily")
+DEFAULT_LATEST_PATH = DEFAULT_OUTPUT_ROOT / "LATEST.json"
 DEFAULT_CACHE_DIR_PATH = DEFAULT_CACHE_DIR
 
 
@@ -242,6 +243,75 @@ def format_bounce_daily_table(report: dict[str, Any]) -> str:
                 f"  {row.get('signal_date')}  {row.get('symbol')} {row.get('name') or ''}  入={row.get('entry_date')}"
             )
     return "\n".join(lines) + "\n"
+
+
+def public_bounce_daily_view(report: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Website-safe view. Never claims a live order or production profile."""
+
+    if not report:
+        return {
+            "available": False,
+            "candidate_id": CANDIDATE_ID,
+            "status": "missing",
+            "headline": "尚未扫描",
+            "detail": "还没有连跌反弹日账本。跑完盘后扫描后这里会显示买谁或空仓。",
+            "pick": None,
+            "holding": None,
+            "ledger": [],
+            "automatic_trading_allowed": False,
+            "effective_strategy": False,
+            "development_only": True,
+            "auto_order": False,
+        }
+    pick = report.get("pick")
+    held = report.get("holding")
+    status = str(report.get("status") or "cash")
+    if status == "buy" and pick:
+        headline = f"计划买入 {pick.get('symbol')} {pick.get('name') or ''}".strip()
+        detail = (
+            f"信号日 {pick.get('signal_date')}，次日开盘 {pick.get('entry_date')} 买入，"
+            f"持有约 5 日。非正式有效，不自动下单。"
+        )
+    elif status == "holding" and held:
+        headline = f"仍持有 {held.get('symbol')} {held.get('name') or ''}".strip()
+        detail = f"计划卖出日 {held.get('exit_date')}。非正式有效，不自动下单。"
+    else:
+        headline = "今日空仓"
+        detail = (
+            f"原因 {report.get('empty_reason') or 'no_pick'}。"
+            f"数据截至 {report.get('data_through') or report.get('look_date') or '--'}。"
+            "非正式有效，不自动下单。"
+        )
+    return {
+        "available": True,
+        "candidate_id": CANDIDATE_ID,
+        "status": status,
+        "as_of": report.get("as_of"),
+        "look_date": report.get("look_date"),
+        "data_through": report.get("data_through"),
+        "empty_reason": report.get("empty_reason"),
+        "headline": headline,
+        "detail": detail,
+        "pick": pick,
+        "holding": held,
+        "ledger": list(report.get("ledger") or [])[-12:],
+        "qualified_signal_count": report.get("qualified_signal_count"),
+        "selected_trade_count": report.get("selected_trade_count"),
+        "days_until_twelve_month": report.get("days_until_twelve_month"),
+        "twelve_month_due": report.get("twelve_month_due"),
+        "oos_start": report.get("oos_start"),
+        "automatic_trading_allowed": False,
+        "effective_strategy": False,
+        "development_only": True,
+        "auto_order": False,
+    }
+
+
+def load_public_bounce_daily_view(path: Path | None = None) -> dict[str, Any]:
+    payload = read_json(str(path or DEFAULT_LATEST_PATH), None)
+    if not isinstance(payload, dict):
+        return public_bounce_daily_view(None)
+    return public_bounce_daily_view(payload)
 
 
 def write_bounce_daily_report(report: dict[str, Any], *, output_root: Path) -> dict[str, Any]:

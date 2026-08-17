@@ -76,6 +76,22 @@ def test_holding_blocks_new_name_same_slot() -> None:
     assert report["pick"] is None
 
 
+def test_public_view_never_looks_like_an_order() -> None:
+    missing = daily.public_bounce_daily_view(None)
+    assert missing["available"] is False
+    assert missing["auto_order"] is False
+    assert missing["effective_strategy"] is False
+    trades = [_trade("000001", "2026-08-14", ret20=-1.0, name="平安银行")]
+    view = daily.public_bounce_daily_view(
+        daily.build_bounce_daily_report(trades, as_of="2026-08-14")
+    )
+    assert view["available"] is True
+    assert view["status"] == "buy"
+    assert "000001" in view["headline"]
+    assert view["auto_order"] is False
+    assert "不自动下单" in view["detail"]
+
+
 def test_table_names_the_stock() -> None:
     trades = [_trade("000001", "2026-08-14", ret20=-1.0, name="平安银行")]
     text = daily.format_bounce_daily_table(
