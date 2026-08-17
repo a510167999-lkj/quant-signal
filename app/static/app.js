@@ -439,6 +439,9 @@ function renderHotIndustries(payload) {
 }
 
 function renderRecommendations(payload) {
+  if (!els.recommendationsList) {
+    return;
+  }
   const rawItems = Array.isArray(payload?.items) ? payload.items : [];
   const summary = payload?.summary || {};
   const marketLabel = summary.market_context?.label ? ` · ${summary.market_context.label}` : "";
@@ -1009,9 +1012,15 @@ els.form.addEventListener("submit", (event) => {
 });
 
 els.scanButton.addEventListener("click", scanWatchlist);
-els.runRecommendationsButton.addEventListener("click", runRecommendations);
-els.monitorButton.addEventListener("click", runMonitor);
-els.holdingsRefreshButton.addEventListener("click", refreshHoldings);
+if (els.runRecommendationsButton) {
+  els.runRecommendationsButton.addEventListener("click", runRecommendations);
+}
+if (els.monitorButton) {
+  els.monitorButton.addEventListener("click", runMonitor);
+}
+if (els.holdingsRefreshButton) {
+  els.holdingsRefreshButton.addEventListener("click", refreshHoldings);
+}
 
 els.watchForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1044,9 +1053,8 @@ renderResult = (result) => {
   try {
     const health = await api("/health");
     setStatus(health.auth === "enabled" ? "需认证" : "已连接", true);
-    await Promise.allSettled([loadBounceDaily(), loadRecommendations(), loadProductionStatus(), loadAlerts(), loadPerformance(), loadHoldings()]);
+    await Promise.allSettled([loadBounceDaily(), loadProductionStatus()]);
     await loadWatchlist();
-    analyze();
   } catch (error) {
     setStatus("离线", false);
     renderList(els.riskList, [error.message], "risk");
