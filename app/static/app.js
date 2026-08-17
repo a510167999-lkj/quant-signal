@@ -670,7 +670,7 @@ function renderBounceDaily(payload) {
   if (els.bounceDailyHero) {
     els.bounceDailyHero.dataset.state = status;
   }
-  const verb = { buy: "买入", holding: "持有", cash: "空仓", missing: "等待" }[status] || "等待";
+  const verb = { buy: "买入", holding: "持有", cash: "空仓", missing: "待印" }[status] || "待印";
   const nextAction =
     status === "buy"
       ? `次日开盘买 ${focus.entry_date || ""}`.trim()

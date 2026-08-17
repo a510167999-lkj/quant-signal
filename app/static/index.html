@@ -6,14 +6,15 @@
     <title>连跌反弹 · 日决策</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;500;600&family=Noto+Serif+SC:wght@500;600;700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
+    <div class="grain" aria-hidden="true"></div>
     <header class="topbar">
       <div class="brand-block">
         <div class="brand">连跌反弹</div>
-        <div id="lastRunValue" class="subtle">研究账本 · 非正式有效</div>
+        <div id="lastRunValue" class="subtle">抗追高 · 非正式有效</div>
       </div>
       <div class="topbar-actions">
         <span class="law-pill">不自动下单</span>
@@ -21,119 +22,121 @@
       </div>
     </header>
 
-    <main class="desk">
-      <section class="sheet" id="bounceDailyHero" data-state="missing" aria-label="今日策略决策">
-        <div class="sheet-head">
-          <p class="eyebrow" id="bounceDailyMeta">今日决策</p>
-          <p class="stamp" id="bounceDailyStatus">—</p>
-        </div>
-        <h1 class="sheet-title" id="bounceDailyHeadline">等待账本</h1>
-        <p class="sheet-copy" id="bounceDailyDetail">盘后扫描完成后，这里只写买谁、拿着谁，或空仓。</p>
-
-        <dl class="facts">
-          <div><dt>信号日</dt><dd id="bounceFactSignal">--</dd></div>
-          <div><dt>下一步</dt><dd id="bounceFactAction">--</dd></div>
-          <div><dt>20 日涨幅</dt><dd id="bounceFactExt">--</dd></div>
-          <div><dt>数据截至</dt><dd id="bounceFactAsOf">--</dd></div>
-          <div><dt>独立 OOS</dt><dd id="bounceFactOos">--</dd></div>
-          <div><dt>满 12 月</dt><dd id="bounceFactDue">2027-07-04</dd></div>
-        </dl>
-
-        <div class="ledger-wrap">
-          <div class="ledger-head">
-            <h2>独立 OOS 记录</h2>
-            <p class="subtle">2026-07-04 起 · 满窗 2027-07-04</p>
+    <main class="floor">
+      <article class="ticket" id="bounceDailyHero" data-state="missing">
+        <div class="ticket-spine" aria-hidden="true"></div>
+        <div class="ticket-body">
+          <div class="ticket-meta">
+            <p class="eyebrow" id="bounceDailyMeta">今日委托</p>
+            <p class="serial">No. DN2-NEGEXT</p>
           </div>
-          <table class="ledger">
-            <thead>
-              <tr>
-                <th>信号日</th>
-                <th>代码</th>
-                <th>名称</th>
-                <th>买入日</th>
-                <th>卖出日</th>
-              </tr>
-            </thead>
-            <tbody id="bounceDailyList"></tbody>
-          </table>
-          <p class="ledger-empty" id="bounceLedgerEmpty">独立 OOS 以来还没有选出。</p>
-        </div>
-      </section>
 
-      <aside class="rail">
-        <section class="rail-block" aria-label="分析控制">
-          <div class="panel-title">
-            <h2>查一只</h2>
-            <span class="subtle">对照用</span>
+          <div class="stamp-wrap">
+            <p class="stamp" id="bounceDailyStatus">—</p>
           </div>
-          <form id="analyzeForm" class="control-grid">
-            <label>
-              <span>代码</span>
-              <input id="symbolInput" name="symbol" value="600519" autocomplete="off" />
-            </label>
-            <div>
-              <span class="field-label">市场</span>
-              <div class="segment" role="group" aria-label="市场">
-                <button type="button" class="segment-button active" data-market="a">A 股</button>
-                <button type="button" class="segment-button" data-market="etf">ETF</button>
-              </div>
+
+          <h1 class="subject" id="bounceDailyHeadline">等待账本</h1>
+          <p class="instruction" id="bounceDailyDetail">盘后扫描完成后，这里只写买谁、拿着谁，或空仓。</p>
+
+          <dl class="slip">
+            <div><dt>信号日</dt><dd id="bounceFactSignal">--</dd></div>
+            <div><dt>指令</dt><dd id="bounceFactAction">--</dd></div>
+            <div><dt>20日涨幅</dt><dd id="bounceFactExt">--</dd></div>
+            <div><dt>数据截至</dt><dd id="bounceFactAsOf">--</dd></div>
+            <div><dt>独立OOS</dt><dd id="bounceFactOos">--</dd></div>
+            <div><dt>满12月</dt><dd id="bounceFactDue">2027-07-04</dd></div>
+          </dl>
+
+          <section class="stub">
+            <div class="stub-head">
+              <h2>存根</h2>
+              <p class="subtle">2026-07-04 起 · 满窗 2027-07-04</p>
             </div>
-            <label>
-              <span>复权</span>
-              <select id="adjustSelect" name="adjust">
-                <option value="qfq">前复权</option>
-                <option value="">不复权</option>
-                <option value="hfq">后复权</option>
-              </select>
-            </label>
-            <label>
-              <span>区间</span>
-              <select id="lookbackSelect" name="lookback">
-                <option value="240">约 1 年</option>
-                <option value="360" selected>约 18 月</option>
-                <option value="720">约 3 年</option>
-                <option value="1200">约 5 年</option>
-              </select>
-            </label>
-            <button id="analyzeButton" class="primary-button" type="submit">分析</button>
-          </form>
-          <div class="watch-header">
-            <h2>观察池</h2>
-            <button id="scanButton" class="ghost-button" type="button">扫描</button>
+            <table class="stub-table">
+              <thead>
+                <tr>
+                  <th>信号日</th>
+                  <th>代码</th>
+                  <th>名称</th>
+                  <th>买入</th>
+                  <th>卖出</th>
+                </tr>
+              </thead>
+              <tbody id="bounceDailyList"></tbody>
+            </table>
+            <p class="stub-empty" id="bounceLedgerEmpty">独立 OOS 以来还没有选出。</p>
+          </section>
+        </div>
+      </article>
+
+      <aside class="counter">
+        <form id="analyzeForm" class="counter-form">
+          <p class="eyebrow">对照查询</p>
+          <label>
+            <span>代码</span>
+            <input id="symbolInput" name="symbol" value="600519" autocomplete="off" />
+          </label>
+          <div>
+            <span class="field-label">市场</span>
+            <div class="segment" role="group" aria-label="市场">
+              <button type="button" class="segment-button active" data-market="a">A 股</button>
+              <button type="button" class="segment-button" data-market="etf">ETF</button>
+            </div>
           </div>
-          <div id="watchlist" class="watchlist"></div>
-          <form id="watchForm" class="watch-form">
-            <input id="watchSymbol" placeholder="代码" autocomplete="off" />
-            <select id="watchMarket">
-              <option value="a">A 股</option>
-              <option value="etf">ETF</option>
+          <label>
+            <span>复权</span>
+            <select id="adjustSelect" name="adjust">
+              <option value="qfq">前复权</option>
+              <option value="">不复权</option>
+              <option value="hfq">后复权</option>
             </select>
-            <input id="watchName" placeholder="名称" autocomplete="off" />
-            <button class="icon-button" type="submit" aria-label="加入观察池">+</button>
-          </form>
-        </section>
+          </label>
+          <label>
+            <span>区间</span>
+            <select id="lookbackSelect" name="lookback">
+              <option value="240">约 1 年</option>
+              <option value="360" selected>约 18 月</option>
+              <option value="720">约 3 年</option>
+              <option value="1200">约 5 年</option>
+            </select>
+          </label>
+          <button id="analyzeButton" class="primary-button" type="submit">分析</button>
+        </form>
+
+        <div class="watch-header">
+          <h2>观察池</h2>
+          <button id="scanButton" class="ghost-button" type="button">扫描</button>
+        </div>
+        <div id="watchlist" class="watchlist"></div>
+        <form id="watchForm" class="watch-form">
+          <input id="watchSymbol" placeholder="代码" autocomplete="off" />
+          <select id="watchMarket">
+            <option value="a">A 股</option>
+            <option value="etf">ETF</option>
+          </select>
+          <input id="watchName" placeholder="名称" autocomplete="off" />
+          <button class="icon-button" type="submit" aria-label="加入观察池">+</button>
+        </form>
       </aside>
     </main>
 
     <section class="lab" id="analyzeWorkspace">
-      <section class="signal-panel">
-        <div class="signal-head">
-          <div>
-            <div id="resultTitle" class="result-title">等待分析</div>
-            <div id="resultMeta" class="subtle">输入代码后开始</div>
-          </div>
-          <div id="actionBadge" class="action-badge neutral">--</div>
+      <div class="signal-head">
+        <div>
+          <div id="resultTitle" class="result-title">等待分析</div>
+          <div id="resultMeta" class="subtle">输入代码后开始</div>
         </div>
-        <div class="metrics-grid">
-          <div class="metric"><span>收盘价</span><strong id="lastClose">--</strong></div>
-          <div class="metric"><span>评分</span><strong id="scoreValue">--</strong></div>
-          <div class="metric"><span>信心</span><strong id="confidenceValue">--</strong></div>
-          <div class="metric"><span>止损</span><strong id="stopLoss">--</strong></div>
-        </div>
-        <div class="chart-shell">
-          <canvas id="priceChart" width="960" height="420"></canvas>
-        </div>
-      </section>
+        <div id="actionBadge" class="action-badge neutral">--</div>
+      </div>
+      <div class="metrics-grid">
+        <div class="metric"><span>收盘价</span><strong id="lastClose">--</strong></div>
+        <div class="metric"><span>评分</span><strong id="scoreValue">--</strong></div>
+        <div class="metric"><span>信心</span><strong id="confidenceValue">--</strong></div>
+        <div class="metric"><span>止损</span><strong id="stopLoss">--</strong></div>
+      </div>
+      <div class="chart-shell">
+        <canvas id="priceChart" width="960" height="420"></canvas>
+      </div>
       <section class="detail-grid">
         <article>
           <h2>买卖区间</h2>
@@ -184,7 +187,7 @@
       </section>
     </section>
 
-    <footer class="footer">仅供个人研究。连跌反弹不是有效策略，这里不是下单回执。</footer>
+    <footer class="footer">仅供个人研究。连跌反弹不是有效策略，这张票不是下单回执。</footer>
     <script src="/static/app.js"></script>
   </body>
 </html>
