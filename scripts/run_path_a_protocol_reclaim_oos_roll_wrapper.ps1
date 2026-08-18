@@ -13,5 +13,22 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 Add-Content -LiteralPath $LogFile -Value "==== reclaim OOS roll $stamp ===="
 & $Python -u $Runner *>> $LogFile 2>&1
-Add-Content -LiteralPath $LogFile -Value "exit=$LASTEXITCODE"
-exit $LASTEXITCODE
+$rollExit = $LASTEXITCODE
+Add-Content -LiteralPath $LogFile -Value "roll_exit=$rollExit"
+
+$Bounce = Join-Path $RepoRoot "scripts\run_path_a_protocol_bounce_daily.py"
+Add-Content -LiteralPath $LogFile -Value "==== bounce daily $stamp ===="
+& $Python -u $Bounce *>> $LogFile 2>&1
+$bounceExit = $LASTEXITCODE
+Add-Content -LiteralPath $LogFile -Value "bounce_exit=$bounceExit"
+
+$Sync = Join-Path $RepoRoot "scripts\sync_bounce_daily_to_vps.py"
+if (Test-Path $Sync) {
+    Add-Content -LiteralPath $LogFile -Value "==== bounce daily sync $stamp ===="
+    & $Python -u $Sync *>> $LogFile 2>&1
+    Add-Content -LiteralPath $LogFile -Value "sync_exit=$LASTEXITCODE"
+}
+
+if ($rollExit -ne 0) { exit $rollExit }
+if ($bounceExit -ne 0) { exit $bounceExit }
+exit 0

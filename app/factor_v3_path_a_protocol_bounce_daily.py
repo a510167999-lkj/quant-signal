@@ -355,7 +355,13 @@ def build_path_a_protocol_bounce_daily(
         slice_name="bounce-daily",
     )
     trades = list(payload.get("qualified_trades") or [])
-    cache_end = latest_signal_date(trades)
+    from app.factor_v3_path_a_protocol_reclaim_oos_roll import cache_frontier_snapshot
+
+    cache_dir_path = Path(cache_dir or (root / DEFAULT_CACHE_DIR_PATH))
+    if not cache_dir_path.is_absolute():
+        cache_dir_path = root / cache_dir_path
+    frontier = cache_frontier_snapshot(cache_dir_path).get("latest")
+    cache_end = frontier or latest_signal_date(trades)
     meta = (payload.get("summary") or {}).get("path_a_3y_clean_replay") or {}
     report = build_bounce_daily_report(trades, as_of=day, cache_end=cache_end)
     report["source_version"] = meta.get("source_version")

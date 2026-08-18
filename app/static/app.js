@@ -727,6 +727,8 @@ function renderBounceDaily(payload) {
 async function loadBounceDaily() {
   const data = await api("/api/research/bounce-daily");
   renderBounceDaily(data);
+  window.clearTimeout(window.__bounceDailyPollTimer);
+  window.__bounceDailyPollTimer = window.setTimeout(loadBounceDaily, 60_000);
 }
 
 async function loadRecommendations() {
