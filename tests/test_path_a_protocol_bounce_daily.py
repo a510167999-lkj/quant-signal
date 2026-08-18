@@ -92,6 +92,17 @@ def test_public_view_never_looks_like_an_order() -> None:
     assert "不自动下单" in view["detail"]
 
 
+def test_cash_view_does_not_invent_a_signal_day() -> None:
+    report = daily.build_bounce_daily_report([], as_of="2026-08-18", cache_end="2026-08-14")
+    assert report["status"] == "cash"
+    assert report["generated_at"]
+    view = daily.public_bounce_daily_view(report)
+    assert view["look_date"] == "2026-08-18"
+    assert view["data_through"] == "2026-08-14"
+    assert view["pick"] is None
+    assert view["generated_at"]
+
+
 def test_table_names_the_stock() -> None:
     trades = [_trade("000001", "2026-08-14", ret20=-1.0, name="平安银行")]
     text = daily.format_bounce_daily_table(

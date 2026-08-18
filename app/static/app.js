@@ -678,16 +678,21 @@ function renderBounceDaily(payload) {
         ? `拿到 ${focus.exit_date || ""}`.trim()
         : "今日不开仓";
   setText(els.bounceDailyStatus, verb);
+  const scanned = payload?.generated_at
+    ? payload.generated_at.replace("T", " ").slice(0, 16)
+    : "--";
   setText(
     els.bounceDailyMeta,
-    available ? `今日决策 · 数据截至 ${payload.data_through || payload.look_date || "--"}` : "今日决策"
+    available
+      ? `日历 ${payload.as_of || "--"} · 数据截至 ${payload.data_through || "--"} · 账本 ${scanned}`
+      : "今日决策"
   );
   setText(
     els.bounceDailyHeadline,
     focus.symbol ? `${focus.name || ""} ${focus.symbol}`.trim() : "没有符合条件的票"
   );
   setText(els.bounceDailyDetail, payload?.detail || "盘后扫描完成后，这里只写买谁、拿着谁，或空仓。");
-  setText(els.bounceFactSignal, focus.signal_date || payload?.look_date || "--");
+  setText(els.bounceFactSignal, focus.signal_date || "无");
   setText(els.bounceFactAction, nextAction);
   setText(
     els.bounceFactExt,

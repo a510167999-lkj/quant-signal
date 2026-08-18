@@ -196,6 +196,7 @@ def build_bounce_daily_report(
         "effective_strategy": False,
         "automatic_trading_allowed": goal.AUTOMATIC_TRADING_ALLOWED,
         "refit": False,
+        "generated_at": datetime.now(ZoneInfo(DEFAULT_TZ)).isoformat(timespec="seconds"),
         "ledger": [
             _compact_trade(row)
             for row in selected
@@ -258,6 +259,7 @@ def public_bounce_daily_view(report: dict[str, Any] | None = None) -> dict[str, 
             "pick": None,
             "holding": None,
             "ledger": [],
+            "generated_at": None,
             "automatic_trading_allowed": False,
             "effective_strategy": False,
             "development_only": True,
@@ -300,6 +302,7 @@ def public_bounce_daily_view(report: dict[str, Any] | None = None) -> dict[str, 
         "days_until_twelve_month": report.get("days_until_twelve_month"),
         "twelve_month_due": report.get("twelve_month_due"),
         "oos_start": report.get("oos_start"),
+        "generated_at": report.get("generated_at"),
         "automatic_trading_allowed": False,
         "effective_strategy": False,
         "development_only": True,
@@ -308,10 +311,16 @@ def public_bounce_daily_view(report: dict[str, Any] | None = None) -> dict[str, 
 
 
 def load_public_bounce_daily_view(path: Path | None = None) -> dict[str, Any]:
-    payload = read_json(str(path or DEFAULT_LATEST_PATH), None)
+    report_path = Path(path or DEFAULT_LATEST_PATH)
+    payload = read_json(str(report_path), None)
     if not isinstance(payload, dict):
         return public_bounce_daily_view(None)
-    return public_bounce_daily_view(payload)
+    view = public_bounce_daily_view(payload)
+    if not view.get("generated_at") and report_path.is_file():
+        view["generated_at"] = datetime.fromtimestamp(
+            report_path.stat().st_mtime, ZoneInfo(DEFAULT_TZ)
+        ).isoformat(timespec="seconds")
+    return view
 
 
 def write_bounce_daily_report(report: dict[str, Any], *, output_root: Path) -> dict[str, Any]:
