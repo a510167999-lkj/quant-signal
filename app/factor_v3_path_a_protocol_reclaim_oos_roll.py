@@ -17,8 +17,8 @@ from app import factor_v3_path_a_protocol_reclaim_oos as oos
 from app import research_goal_contract as goal
 from app.jiaoch_live_market import (
     ADJ_FACTOR_FIELDS,
+    DAILY_FIELDS,
     JiaochHttpClient,
-    _aggregate_daily_from_minutes,
     _apply_qfq,
     _daily_frame,
     _wire_date,
@@ -144,19 +144,21 @@ def probe_new_jiaoch_days(
     last = date.fromisoformat(end_date)
     if start > last:
         return []
-    rows = client.fetch_stk_mins(
-        ts_code=_tushare_ts_code(symbol),
-        start_date=_wire_date(start.isoformat()),
-        end_date=_wire_date(last.isoformat()),
-        freq="5min",
+    rows = client.fetch(
+        "daily",
+        params={
+            "ts_code": _tushare_ts_code(symbol),
+            "start_date": _wire_date(start.isoformat()),
+            "end_date": _wire_date(last.isoformat()),
+        },
+        fields=DAILY_FIELDS,
     )
-    daily = _aggregate_daily_from_minutes(rows)
     return sorted(
         {
             f"{str(row.get('trade_date') or '')[:4]}-"
             f"{str(row.get('trade_date') or '')[4:6]}-"
             f"{str(row.get('trade_date') or '')[6:8]}"
-            for row in daily
+            for row in rows
             if len(str(row.get("trade_date") or "")) == 8
             and str(row.get("trade_date")) >= start.strftime("%Y%m%d")
         }
@@ -171,13 +173,15 @@ def fetch_tail_bars(
     end_date: str,
 ) -> list[dict[str, Any]]:
     ts_code = _tushare_ts_code(symbol)
-    minutes = client.fetch_stk_mins(
-        ts_code=ts_code,
-        start_date=_wire_date(start_date),
-        end_date=_wire_date(end_date),
-        freq="5min",
+    daily_rows = client.fetch(
+        "daily",
+        params={
+            "ts_code": ts_code,
+            "start_date": _wire_date(start_date),
+            "end_date": _wire_date(end_date),
+        },
+        fields=DAILY_FIELDS,
     )
-    daily_rows = _aggregate_daily_from_minutes(minutes)
     if not daily_rows:
         return []
     frame = _daily_frame(daily_rows, symbol=symbol, market="a")

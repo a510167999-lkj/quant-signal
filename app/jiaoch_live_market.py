@@ -59,7 +59,7 @@ _TOKEN_ENV_BY_SLOT = {
     "historical-minute": "JIAOCH_STK_MINS_TOKEN",
 }
 _API_SLOT = {
-    "daily": "historical-minute",
+    "daily": "points-primary",
     "adj_factor": "points-primary",
     "bak_basic": "points-primary",
 }

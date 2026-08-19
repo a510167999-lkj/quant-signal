@@ -133,6 +133,47 @@ def test_merge_no_new_when_tail_already_covered() -> None:
     assert merged == old
 
 
+def test_probe_and_tail_use_points_daily_not_stk_mins() -> None:
+    calls: list[str] = []
+
+    class Client:
+        def fetch(self, api_name, *, params, fields):
+            calls.append(api_name)
+            if api_name == "daily":
+                return [
+                    {
+                        "ts_code": "000001.SZ",
+                        "trade_date": "20260817",
+                        "open": 10.0,
+                        "high": 10.2,
+                        "low": 9.9,
+                        "close": 10.1,
+                        "pre_close": 10.0,
+                        "change": 0.1,
+                        "pct_chg": 1.0,
+                        "vol": 1000,
+                        "amount": 10000,
+                    }
+                ]
+            if api_name == "adj_factor":
+                return [{"ts_code": "000001.SZ", "trade_date": "20260817", "adj_factor": 1.0}]
+            raise AssertionError(api_name)
+
+        def fetch_stk_mins(self, **kwargs):
+            raise AssertionError("stk_mins must not be used for daily roll extend")
+
+    days = roll.probe_new_jiaoch_days(
+        Client(), symbol="000001", after_date="2026-08-14", end_date="2026-08-18"
+    )
+    assert days == ["2026-08-17"]
+    tail = roll.fetch_tail_bars(
+        Client(), symbol="000001", start_date="2026-08-09", end_date="2026-08-18"
+    )
+    assert tail[0]["date"] == "2026-08-17"
+    assert "stk_mins" not in calls
+    assert calls.count("daily") == 2
+
+
 def test_roll_table_never_claims_effective() -> None:
     table = roll.format_reclaim_oos_roll_table(
         {

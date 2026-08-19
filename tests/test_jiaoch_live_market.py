@@ -111,6 +111,42 @@ def test_client_requires_exact_jiaoch_response_contract_and_keeps_token_out_of_r
     assert b"points-secret" in transport.calls[0]["body"]
 
 
+def test_daily_route_uses_points_token_not_minute_token():
+    transport = _Transport(
+        _envelope(
+            DAILY_FIELDS,
+            [
+                [
+                    "000001.SZ",
+                    "20260817",
+                    10.0,
+                    10.2,
+                    9.9,
+                    10.1,
+                    10.0,
+                    0.1,
+                    1.0,
+                    1000,
+                    10000,
+                ]
+            ],
+        )
+    )
+    client = JiaochHttpClient(
+        transport=transport,
+        points_token="points-secret",
+        historical_minute_token="minute-secret",
+    )
+    rows = client.fetch(
+        "daily",
+        params={"ts_code": "000001.SZ", "start_date": "20260817", "end_date": "20260817"},
+        fields=DAILY_FIELDS,
+    )
+    assert rows[0]["trade_date"] == "20260817"
+    assert b"points-secret" in transport.calls[0]["body"]
+    assert b"minute-secret" not in transport.calls[0]["body"]
+
+
 @pytest.mark.parametrize(
     "body",
     [
