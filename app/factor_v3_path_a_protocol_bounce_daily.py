@@ -31,6 +31,7 @@ from app.factor_v3_path_a_protocol_signal_specs import (
     iter_protocol_signal_bounce_variants,
 )
 from app import research_goal_contract as goal
+from app.research_equity import _equity_points_from_slot_daily_returns
 from app.storage import read_json, write_json
 
 STAGE_GOAL_ID = "path-a-protocol-bounce-daily/v1"
@@ -134,10 +135,48 @@ def _compact_trade(trade: dict[str, Any] | None) -> dict[str, Any] | None:
         "signal_date": str(trade.get("signal_date") or "")[:10],
         "entry_date": str(trade.get("entry_date") or "")[:10],
         "exit_date": str(trade.get("exit_date") or "")[:10],
+        "return_pct": trade.get("return_pct"),
         "rank_score": trade.get("rank_score"),
         "stock_return_20d_pct": relative.get("stock_return_20d_pct"),
         "market_level": trade.get("market_level"),
         "signal_tags": list(trade.get("signal_tags") or []),
+    }
+
+
+def summarize_oos_book(selected: list[dict[str, Any]], *, as_of: str) -> dict[str, Any]:
+    kernel = _kernel()
+    cutoff = str(as_of)[:10]
+    rows = [
+        row
+        for row in selected
+        if INDEPENDENT_OOS_START <= str(row.get("signal_date") or "")[:10] <= cutoff
+    ]
+    points = (
+        _equity_points_from_slot_daily_returns(
+            rows,
+            max_active_positions=int(kernel["max_active_positions"]),
+            exposure_multiplier=float(kernel.get("exposure_multiplier") or 1.0),
+            roundtrip_cost_bps=float(kernel["roundtrip_cost_bps"]),
+            slippage_bps=float(kernel["slippage_bps"]),
+        )
+        if rows
+        else []
+    )
+    equity = float(points[-1]["equity"]) if points else 1.0
+    closed = sum(
+        1 for row in rows if str(row.get("exit_date") or "")[:10] <= cutoff
+    )
+    return {
+        "window_start": INDEPENDENT_OOS_START,
+        "as_of": cutoff,
+        "trade_count": len(rows),
+        "closed_count": closed,
+        "equity": round(equity, 6),
+        "net_return_pct": round((equity - 1.0) * 100, 2),
+        "roundtrip_cost_bps": float(kernel["roundtrip_cost_bps"]),
+        "slippage_bps": float(kernel["slippage_bps"]),
+        "capital_model": str(kernel.get("capital_model") or "slot-daily"),
+        "cash_return_pct": 0.0,
     }
 
 
@@ -197,6 +236,7 @@ def build_bounce_daily_report(
         "automatic_trading_allowed": goal.AUTOMATIC_TRADING_ALLOWED,
         "refit": False,
         "generated_at": datetime.now(ZoneInfo(DEFAULT_TZ)).isoformat(timespec="seconds"),
+        "oos_book": summarize_oos_book(selected, as_of=str(as_of)[:10]),
         "ledger": [
             _compact_trade(row)
             for row in selected
@@ -233,6 +273,15 @@ def format_bounce_daily_table(report: dict[str, Any]) -> str:
         )
     else:
         lines.append(f"今日空仓 原因={report.get('empty_reason')}")
+    book = report.get("oos_book") or {}
+    lines.append(
+        "独立OOS账本 净收益={net}%  笔数={n}  含{rt}+{slip}bps  现金不计息".format(
+            net=book.get("net_return_pct"),
+            n=book.get("trade_count"),
+            rt=book.get("roundtrip_cost_bps"),
+            slip=book.get("slippage_bps"),
+        )
+    )
     lines.append(
         f"独立OOS起={report.get('oos_start')}  满12月={report.get('twelve_month_due')}  还差={report.get('days_until_twelve_month')}天"
     )
@@ -259,6 +308,7 @@ def public_bounce_daily_view(report: dict[str, Any] | None = None) -> dict[str, 
             "pick": None,
             "holding": None,
             "ledger": [],
+            "oos_book": None,
             "generated_at": None,
             "automatic_trading_allowed": False,
             "effective_strategy": False,
@@ -268,21 +318,29 @@ def public_bounce_daily_view(report: dict[str, Any] | None = None) -> dict[str, 
     pick = report.get("pick")
     held = report.get("holding")
     status = str(report.get("status") or "cash")
+    book = report.get("oos_book") or {}
     if status == "buy" and pick:
         headline = f"计划买入 {pick.get('symbol')} {pick.get('name') or ''}".strip()
         detail = (
             f"信号日 {pick.get('signal_date')}，次日开盘 {pick.get('entry_date')} 买入，"
-            f"持有约 5 日。非正式有效，不自动下单。"
+            f"持有约 5 日。独立OOS账本 {book.get('net_return_pct')}%。"
+            "非正式有效，不自动下单。"
         )
     elif status == "holding" and held:
         headline = f"仍持有 {held.get('symbol')} {held.get('name') or ''}".strip()
-        detail = f"计划卖出日 {held.get('exit_date')}。非正式有效，不自动下单。"
+        detail = (
+            f"计划卖出日 {held.get('exit_date')}。"
+            f"独立OOS账本 {book.get('net_return_pct')}%。非正式有效，不自动下单。"
+        )
     else:
-        headline = "今日空仓"
+        net = book.get("net_return_pct")
+        headline = "今日空仓" if net is None else f"账本 {net:+.2f}%"
         detail = (
             f"原因 {report.get('empty_reason') or 'no_pick'}。"
+            f"独立OOS {book.get('trade_count') or 0} 笔，"
+            f"净收益 {net if net is not None else '--'}%。"
             f"数据截至 {report.get('data_through') or report.get('look_date') or '--'}。"
-            "非正式有效，不自动下单。"
+            "非正式有效，不自动下单。满12月前不能评 26/15。"
         )
     return {
         "available": True,
@@ -297,6 +355,7 @@ def public_bounce_daily_view(report: dict[str, Any] | None = None) -> dict[str, 
         "pick": pick,
         "holding": held,
         "ledger": list(report.get("ledger") or [])[-12:],
+        "oos_book": report.get("oos_book"),
         "qualified_signal_count": report.get("qualified_signal_count"),
         "selected_trade_count": report.get("selected_trade_count"),
         "days_until_twelve_month": report.get("days_until_twelve_month"),

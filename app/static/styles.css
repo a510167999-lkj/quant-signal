@@ -227,6 +227,8 @@ button, input, select {
   font-family: "Martian Mono", ui-monospace, monospace;
   font-size: 12px;
 }
+.stub-table td[data-pnl="up"] { color: var(--green); }
+.stub-table td[data-pnl="down"] { color: var(--red); }
 .stub-empty {
   margin: 14px 0 0;
   color: var(--muted);

@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;500;600&family=Noto+Serif+SC:wght@500;600;700&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260820" />
   </head>
   <body>
     <div class="grain" aria-hidden="true"></div>
@@ -41,7 +41,7 @@
           <dl class="slip">
             <div><dt>信号日</dt><dd id="bounceFactSignal">--</dd></div>
             <div><dt>指令</dt><dd id="bounceFactAction">--</dd></div>
-            <div><dt>20日涨幅</dt><dd id="bounceFactExt">--</dd></div>
+            <div><dt>账本</dt><dd id="bounceFactBook">--</dd></div>
             <div><dt>数据截至</dt><dd id="bounceFactAsOf">--</dd></div>
             <div><dt>独立OOS</dt><dd id="bounceFactOos">--</dd></div>
             <div><dt>满12月</dt><dd id="bounceFactDue">2027-07-04</dd></div>
@@ -50,7 +50,7 @@
           <section class="stub">
             <div class="stub-head">
               <h2>存根</h2>
-              <p class="subtle">2026-07-04 起 · 满窗 2027-07-04</p>
+              <p class="subtle" id="bounceLedgerMeta">2026-07-04 起 · 满窗 2027-07-04 · 含 25+10bps</p>
             </div>
             <table class="stub-table">
               <thead>
@@ -60,6 +60,7 @@
                   <th>名称</th>
                   <th>买入</th>
                   <th>卖出</th>
+                  <th>盈亏</th>
                 </tr>
               </thead>
               <tbody id="bounceDailyList"></tbody>
@@ -188,6 +189,6 @@
     </section>
 
     <footer class="footer">仅供个人研究。连跌反弹不是有效策略，这张票不是下单回执。</footer>
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260820"></script>
   </body>
 </html>

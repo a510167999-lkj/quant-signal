@@ -55,8 +55,9 @@ const els = {
   bounceDailyList: document.querySelector("#bounceDailyList"),
   bounceFactSignal: document.querySelector("#bounceFactSignal"),
   bounceFactAction: document.querySelector("#bounceFactAction"),
-  bounceFactExt: document.querySelector("#bounceFactExt"),
+  bounceFactBook: document.querySelector("#bounceFactBook"),
   bounceFactAsOf: document.querySelector("#bounceFactAsOf"),
+  bounceLedgerMeta: document.querySelector("#bounceLedgerMeta"),
   bounceFactOos: document.querySelector("#bounceFactOos"),
   bounceFactDue: document.querySelector("#bounceFactDue"),
   bounceLedgerEmpty: document.querySelector("#bounceLedgerEmpty"),
@@ -687,16 +688,22 @@ function renderBounceDaily(payload) {
       ? `日历 ${payload.as_of || "--"} · 数据截至 ${payload.data_through || "--"} · 账本 ${scanned}`
       : "今日决策"
   );
+  const book = payload?.oos_book || {};
+  const bookNet = book.net_return_pct;
   setText(
     els.bounceDailyHeadline,
-    focus.symbol ? `${focus.name || ""} ${focus.symbol}`.trim() : "没有符合条件的票"
+    focus.symbol
+      ? `${focus.name || ""} ${focus.symbol}`.trim()
+      : bookNet == null
+        ? "没有符合条件的票"
+        : `账本 ${Number(bookNet) >= 0 ? "+" : ""}${Number(bookNet).toFixed(2)}%`
   );
   setText(els.bounceDailyDetail, payload?.detail || "盘后扫描完成后，这里只写买谁、拿着谁，或空仓。");
   setText(els.bounceFactSignal, focus.signal_date || "无");
   setText(els.bounceFactAction, nextAction);
   setText(
-    els.bounceFactExt,
-    focus.stock_return_20d_pct == null ? "—" : `${Number(focus.stock_return_20d_pct).toFixed(2)}%`
+    els.bounceFactBook,
+    bookNet == null ? "—" : `${Number(bookNet) >= 0 ? "+" : ""}${Number(bookNet).toFixed(2)}%`
   );
   setText(els.bounceFactAsOf, payload?.data_through || payload?.as_of || "--");
   setText(
@@ -712,6 +719,14 @@ function renderBounceDaily(payload) {
   if (els.bounceLedgerEmpty) {
     els.bounceLedgerEmpty.hidden = ledger.length > 0;
   }
+  if (els.bounceLedgerMeta) {
+    const n = book.trade_count;
+    const netText = bookNet == null ? "--" : `${Number(bookNet) >= 0 ? "+" : ""}${Number(bookNet).toFixed(2)}%`;
+    els.bounceLedgerMeta.textContent =
+      n == null
+        ? "2026-07-04 起 · 满窗 2027-07-04 · 含 25+10bps"
+        : `2026-07-04 起 · ${n} 笔 · 净 ${netText} · 含 25+10bps · 现金不计息`;
+  }
   ledger
     .slice()
     .reverse()
@@ -720,9 +735,14 @@ function renderBounceDaily(payload) {
         return;
       }
       const row = document.createElement("tr");
-      [item.signal_date, item.symbol, item.name || "—", item.entry_date, item.exit_date].forEach((value) => {
+      const pnl =
+        item.return_pct == null ? "—" : `${Number(item.return_pct) >= 0 ? "+" : ""}${Number(item.return_pct).toFixed(2)}%`;
+      [item.signal_date, item.symbol, item.name || "—", item.entry_date, item.exit_date, pnl].forEach((value) => {
         const cell = document.createElement("td");
         cell.textContent = value || "—";
+        if (value === pnl && item.return_pct != null) {
+          cell.dataset.pnl = Number(item.return_pct) >= 0 ? "up" : "down";
+        }
         row.appendChild(cell);
       });
       els.bounceDailyList.appendChild(row);
