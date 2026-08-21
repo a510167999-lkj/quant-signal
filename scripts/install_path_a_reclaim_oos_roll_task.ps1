@@ -6,7 +6,7 @@
 
 param(
     [string]$TaskName = "quant-signal-lkj-path-a-reclaim-oos-roll",
-    [string]$Time = "18:30",
+    [string[]]$Times = @("15:45", "16:30", "18:30"),
     [switch]$Uninstall
 )
 
@@ -32,13 +32,17 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $Action = New-ScheduledTaskAction `
     -Execute "powershell.exe" `
     -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$Wrapper`""
-$Trigger = New-ScheduledTaskTrigger -Weekly `
-    -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday `
-    -At $Time
+$Triggers = @()
+foreach ($Time in $Times) {
+    $Triggers += New-ScheduledTaskTrigger -Weekly `
+        -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday `
+        -At $Time
+}
 $Settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
-    -StartWhenAvailable
+    -StartWhenAvailable `
+    -MultipleInstances IgnoreNew
 $Principal = New-ScheduledTaskPrincipal `
     -UserId $env:USERNAME `
     -LogonType Interactive `
@@ -47,13 +51,13 @@ $Principal = New-ScheduledTaskPrincipal `
 Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $Action `
-    -Trigger $Trigger `
+    -Trigger $Triggers `
     -Settings $Settings `
     -Principal $Principal `
     -Force | Out-Null
 
 Write-Host "Installed scheduled task: $TaskName"
-Write-Host "  When: weekdays at $Time (local)"
+Write-Host "  When: weekdays at $($Times -join ', ') (local)"
 Write-Host "  Repo: $RepoRoot"
 Write-Host "  Log:  $(Join-Path $LogDir 'scheduled_task.log')"
 Write-Host "  Due:  2027-07-04 (12-month independent OOS)"
