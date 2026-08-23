@@ -37,6 +37,10 @@ from app.personal_book import (
     public_view as public_personal_view,
     record_event as record_personal_event,
 )
+from app.personal_daily_sleeve import (
+    DEFAULT_LATEST_PATH as DAILY_SLEEVE_LATEST_PATH,
+    load_public_view as load_daily_sleeve_view,
+)
 from app.storage import read_json
 from app.watchlist import load_watchlist, save_watchlist
 
@@ -223,6 +227,10 @@ def create_app() -> FastAPI:
             price=price,
         )
         return public_personal_view(ticket, state)
+
+    @app.get("/api/personal/daily-sleeve", dependencies=[Depends(require_basic_auth)])
+    def personal_daily_sleeve_view():
+        return load_daily_sleeve_view(Path(DAILY_SLEEVE_LATEST_PATH))
 
     @app.get(
         "/api/recommendations/latest",

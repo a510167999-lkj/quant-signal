@@ -95,7 +95,8 @@ button, input, select {
   gap: 28px;
   align-items: start;
 }
-.floor > .ticket.personal {
+.floor > .ticket.personal,
+.floor > .ticket.daily {
   grid-column: 1;
 }
   max-width: 1180px;

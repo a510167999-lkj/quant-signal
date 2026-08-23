@@ -62,6 +62,12 @@ def main() -> int:
         client.exec_command(f"mkdir -p {personal_remote_dir}", timeout=10)
         sftp.put(str(personal_local), f"{personal_remote_dir}/LATEST.json")
         print("synced", f"{personal_remote_dir}/LATEST.json")
+    sleeve_local = ROOT / "data/personal_daily_sleeve/LATEST.json"
+    sleeve_remote_dir = "/home/ubuntu/quant-signal/data/personal_daily_sleeve"
+    if sleeve_local.is_file():
+        client.exec_command(f"mkdir -p {sleeve_remote_dir}", timeout=10)
+        sftp.put(str(sleeve_local), f"{sleeve_remote_dir}/LATEST.json")
+        print("synced", f"{sleeve_remote_dir}/LATEST.json")
     sftp.close()
     client.close()
     print("synced", remote)

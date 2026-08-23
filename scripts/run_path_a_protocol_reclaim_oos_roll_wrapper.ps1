@@ -27,6 +27,11 @@ Add-Content -LiteralPath $LogFile -Value "==== personal book $stamp ===="
 & $Python -u $Personal *>> $LogFile 2>&1
 Add-Content -LiteralPath $LogFile -Value "personal_exit=$LASTEXITCODE"
 
+$Daily = Join-Path $RepoRoot "scripts\run_personal_daily_sleeve.py"
+Add-Content -LiteralPath $LogFile -Value "==== personal daily sleeve $stamp ===="
+& $Python -u $Daily *>> $LogFile 2>&1
+Add-Content -LiteralPath $LogFile -Value "daily_sleeve_exit=$LASTEXITCODE"
+
 $Sync = Join-Path $RepoRoot "scripts\sync_bounce_daily_to_vps.py"
 if (Test-Path $Sync) {
     Add-Content -LiteralPath $LogFile -Value "==== bounce daily sync $stamp ===="

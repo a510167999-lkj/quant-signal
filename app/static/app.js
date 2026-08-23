@@ -79,6 +79,13 @@ const els = {
   personalFillPrice: document.querySelector("#personalFillPrice"),
   personalFillShares: document.querySelector("#personalFillShares"),
   personalFillCommission: document.querySelector("#personalFillCommission"),
+  dailySleeveHero: document.querySelector("#dailySleeveHero"),
+  dailySleeveStatus: document.querySelector("#dailySleeveStatus"),
+  dailySleeveMeta: document.querySelector("#dailySleeveMeta"),
+  dailySleeveHeadline: document.querySelector("#dailySleeveHeadline"),
+  dailySleeveDetail: document.querySelector("#dailySleeveDetail"),
+  dailySleeveList: document.querySelector("#dailySleeveList"),
+  dailySleeveEmpty: document.querySelector("#dailySleeveEmpty"),
   analyzeWorkspace: document.querySelector("#analyzeWorkspace"),
   recommendationsList: document.querySelector("#recommendationsList"),
   performanceMeta: document.querySelector("#performanceMeta"),
@@ -822,6 +829,53 @@ function renderPersonal(payload) {
   window.__personalTicket = payload || {};
 }
 
+function renderDailySleeve(payload) {
+  const picks = payload?.picks || [];
+  if (els.dailySleeveHero) {
+    els.dailySleeveHero.dataset.state = picks.length ? "open" : "cash";
+  }
+  setText(els.dailySleeveStatus, picks.length ? "持有" : "空");
+  setText(
+    els.dailySleeveMeta,
+    payload?.available
+      ? `日历 ${payload.as_of || "--"} · 不是连跌反弹`
+      : "每日持仓袖"
+  );
+  setText(els.dailySleeveHeadline, payload?.headline || "尚无每日持仓袖");
+  setText(els.dailySleeveDetail, payload?.detail || "");
+  if (els.dailySleeveEmpty) {
+    els.dailySleeveEmpty.hidden = picks.length > 0;
+  }
+  if (!els.dailySleeveList) {
+    return;
+  }
+  clear(els.dailySleeveList);
+  picks.forEach((row) => {
+    const tr = document.createElement("tr");
+    const ret =
+      row.ret20 == null ? "—" : `${(Number(row.ret20) * 100).toFixed(1)}%`;
+    [
+      { enter: "新开", hold: "继续", exit: "卖出" }[row.action] || row.action,
+      row.symbol,
+      ret,
+      row.lots ? `${row.lots} 手` : "—",
+      row.notional == null ? "—" : `${Number(row.notional).toFixed(0)} 元`,
+    ].forEach((value) => {
+      const td = document.createElement("td");
+      td.textContent = value || "—";
+      tr.appendChild(td);
+    });
+    els.dailySleeveList.appendChild(tr);
+  });
+}
+
+async function loadDailySleeve() {
+  const data = await api("/api/personal/daily-sleeve");
+  renderDailySleeve(data);
+  window.clearTimeout(window.__dailySleevePollTimer);
+  window.__dailySleevePollTimer = window.setTimeout(loadDailySleeve, 60_000);
+}
+
 async function loadPersonal() {
   const data = await api("/api/personal/book");
   renderPersonal(data);
@@ -1210,7 +1264,12 @@ renderResult = (result) => {
   try {
     const health = await api("/health");
     setStatus(health.auth === "enabled" ? "需认证" : "已连接", true);
-    await Promise.allSettled([loadBounceDaily(), loadPersonal(), loadProductionStatus()]);
+    await Promise.allSettled([
+      loadBounceDaily(),
+      loadPersonal(),
+      loadDailySleeve(),
+      loadProductionStatus(),
+    ]);
     await loadWatchlist();
   } catch (error) {
     setStatus("离线", false);

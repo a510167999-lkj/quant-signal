@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;500;600&family=Noto+Serif+SC:wght@500;600;700&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260821p" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260823d" />
   </head>
   <body>
     <div class="grain" aria-hidden="true"></div>
@@ -100,6 +100,34 @@
             <label>佣金 <input id="personalFillCommission" inputmode="decimal" placeholder="可空" /></label>
             <button type="submit" class="primary-button">记入账本</button>
           </form>
+        </div>
+      </article>
+
+      <article class="ticket daily" id="dailySleeveHero" data-state="missing">
+        <div class="ticket-spine" aria-hidden="true"></div>
+        <div class="ticket-body">
+          <div class="ticket-meta">
+            <p class="eyebrow" id="dailySleeveMeta">每日持仓袖 · 不是连跌反弹</p>
+            <p class="serial">No. DAILY-NEGEXT-M2</p>
+          </div>
+          <div class="stamp-wrap">
+            <p class="stamp" id="dailySleeveStatus">—</p>
+          </div>
+          <h1 class="subject" id="dailySleeveHeadline">等待扫描</h1>
+          <p class="instruction" id="dailySleeveDetail">按 −20 日收益取 Top 2。非正式有效。不要与连跌反弹同时打满本金。</p>
+          <table class="stub-table">
+            <thead>
+              <tr>
+                <th>动作</th>
+                <th>代码</th>
+                <th>20日</th>
+                <th>手数</th>
+                <th>金额</th>
+              </tr>
+            </thead>
+            <tbody id="dailySleeveList"></tbody>
+          </table>
+          <p class="stub-empty" id="dailySleeveEmpty">还没有每日持仓袖。</p>
         </div>
       </article>
 
@@ -222,6 +250,6 @@
     </section>
 
     <footer class="footer">仅供个人研究。连跌反弹不是有效策略，这张票不是下单回执。</footer>
-    <script src="/static/app.js?v=20260821p"></script>
+    <script src="/static/app.js?v=20260823d"></script>
   </body>
 </html>
