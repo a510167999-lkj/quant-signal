@@ -118,6 +118,74 @@ def test_skip_does_not_open_and_fill_uses_trade_price() -> None:
     assert closed["cash"] < 200_000
 
 
+def _open_600621() -> dict:
+    return book.apply_event(
+        book.empty_state(200_000),
+        {
+            "kind": "fill",
+            "as_of": "2026-08-11",
+            "symbol": "600621",
+            "name": "华鑫股份",
+            "side": "buy",
+            "price": 12.05,
+            "shares": 8300,
+            "commission": 25.0,
+            "planned_exit": "2026-08-18",
+        },
+    )
+
+
+def _buy_other() -> dict:
+    return {
+        "status": "buy",
+        "as_of": "2026-08-21",
+        "pick": {"symbol": "000001", "name": "平安银行", "entry_date": "2026-08-22"},
+        "holding": None,
+    }
+
+
+def test_halt_ratchets_peak_then_blocks_buy_after_drawdown() -> None:
+    opened = _open_600621()
+    peaked = book.mark_to_market(opened, {"600621": 18.0})
+    assert peaked["halt_peak"] == peaked["equity"]
+    assert peaked["halt_peak"] > float(opened["capital"])
+    pulled = book.mark_to_market(peaked, {"600621": 14.5})
+    assert pulled["halt"] == "pause_entries"
+    sold_pause = book.apply_event(
+        pulled,
+        {
+            "kind": "fill",
+            "as_of": "2026-08-18",
+            "symbol": "600621",
+            "side": "sell",
+            "price": 14.5,
+            "shares": 8300,
+        },
+    )
+    paused_buy = book.build_ticket(_buy_other(), sold_pause, price=10.0)
+    assert paused_buy["action"] == "halted"
+    deep = book.mark_to_market(peaked, {"600621": 12.0})
+    assert deep["halt"] == "flatten"
+    held_buy = book.build_ticket(_buy_other(), deep, price=12.0, closes={"600621": 12.0})
+    assert held_buy["action"] == "close"
+    assert held_buy["symbol"] == "600621"
+    sold_flat = book.apply_event(
+        deep,
+        {
+            "kind": "fill",
+            "as_of": "2026-08-18",
+            "symbol": "600621",
+            "side": "sell",
+            "price": 12.0,
+            "shares": 8300,
+        },
+    )
+    assert sold_flat["flatten_until_resume"] is True
+    flat_buy = book.build_ticket(_buy_other(), sold_flat, price=10.0)
+    assert flat_buy["action"] == "halted"
+    assert flat_buy["action"] != "open"
+
+
 def test_pause_entries_after_ten_percent_drawdown() -> None:
     opened = book.apply_event(
         book.empty_state(200_000),

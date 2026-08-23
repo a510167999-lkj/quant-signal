@@ -194,9 +194,7 @@ def refresh_halt(state: dict[str, Any]) -> dict[str, Any]:
     equity = float(out.get("equity") or 0.0)
     peak = max(float(out.get("peak_equity") or 0.0), equity, 1e-9)
     out["peak_equity"] = peak
-    halt_peak = max(float(out.get("halt_peak") or peak), 1e-9)
-    if halt_peak < 1e-9:
-        halt_peak = peak
+    halt_peak = max(float(out.get("halt_peak") or 0.0), equity, 1e-9)
     out["halt_peak"] = halt_peak
     dd = (peak - equity) / peak * 100.0 if peak else 0.0
     halt_dd = (halt_peak - equity) / halt_peak * 100.0 if halt_peak else 0.0
