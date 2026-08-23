@@ -42,6 +42,75 @@ def sell_costs_cny(notional: float, *, symbol: str) -> dict[str, float]:
     }
 
 
+def size_open_m2(
+    *,
+    capital_cny: float,
+    cash_cny: float,
+    names: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Personal two-slot sizer. Not the default ticket. Not Path A dual-pass."""
+
+    capital = c.clamp_capital(capital_cny)
+    cash = float(cash_cny)
+    cap = capital * c.M2_SLOT_FRACTION
+    slots: list[dict[str, Any]] = []
+    for item in list(names or [])[: c.M2_MAX_ACTIVE]:
+        symbol = str(item.get("symbol") or "")
+        price = float(item.get("price") or 0.0)
+        if not symbol or price <= 0:
+            slots.append(
+                {
+                    "action": "untradeable",
+                    "reason": "missing_price",
+                    "symbol": symbol or None,
+                    "notional": 0.0,
+                    "lots": 0,
+                    "shares": 0,
+                }
+            )
+            continue
+        budget = min(cash, cap)
+        shares = int(budget // price // c.LOT_SIZE) * c.LOT_SIZE
+        notional = shares * price
+        if shares < c.LOT_SIZE or notional < c.MIN_NOTIONAL_CNY:
+            slots.append(
+                {
+                    "action": "untradeable",
+                    "reason": "notional_too_small",
+                    "symbol": symbol,
+                    "shares": shares,
+                    "lots": shares // c.LOT_SIZE,
+                    "notional": notional,
+                }
+            )
+            continue
+        if notional > cap + 1e-6:
+            raise ValueError("personal m2 slot exceeds 30% of capital")
+        cash -= notional
+        slots.append(
+            {
+                "action": "open",
+                "symbol": symbol,
+                "name": item.get("name"),
+                "shares": shares,
+                "lots": shares // c.LOT_SIZE,
+                "notional": notional,
+                "commission": commission_cny(notional),
+                "price": price,
+            }
+        )
+    return {
+        "candidate_id": c.M2_CANDIDATE_ID,
+        "effective_strategy": False,
+        "production_profile": False,
+        "automatic_trading_allowed": False,
+        "auto_order": False,
+        "max_active": c.M2_MAX_ACTIVE,
+        "slot_fraction": c.M2_SLOT_FRACTION,
+        "slots": slots,
+    }
+
+
 def size_open(*, capital_cny: float, price: float, cash_cny: float) -> dict[str, Any]:
     capital = c.clamp_capital(capital_cny)
     px = float(price)
@@ -78,22 +147,67 @@ def empty_state(capital_cny: float = c.DEFAULT_CAPITAL_CNY) -> dict[str, Any]:
         "positions": [],
         "equity": capital,
         "peak_equity": capital,
+        "halt_peak": capital,
         "drawdown_pct": 0.0,
         "halt": "none",
+        "flatten_until_resume": False,
+        "equity_mark": {},
         "fills": [],
     }
 
 
+def mark_to_market(
+    state: dict[str, Any],
+    closes: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """NAV = cash + shares × given close. Close is a mark, not a fill."""
+
+    out = dict(state)
+    out["positions"] = [dict(row) for row in (state.get("positions") or [])]
+    marks: dict[str, Any] = {}
+    marked = 0.0
+    for row in out["positions"]:
+        symbol = str(row.get("symbol") or "")
+        shares = int(row.get("shares") or 0)
+        avg = float(row.get("avg_price") or 0.0)
+        raw = (closes or {}).get(symbol) if symbol else None
+        if raw is not None and float(raw) > 0:
+            price = float(raw)
+            source = "jiaoch_close"
+        else:
+            price = avg
+            source = "avg_price"
+        marked += shares * price
+        marks[symbol] = {
+            "price": price,
+            "source": source,
+            "fill_avg_price": avg,
+            "not_a_fill": source == "jiaoch_close",
+        }
+    out["equity"] = round(float(out.get("cash") or 0.0) + marked, 2)
+    out["equity_mark"] = marks
+    return refresh_halt(out)
+
+
 def refresh_halt(state: dict[str, Any]) -> dict[str, Any]:
     out = dict(state)
-    peak = max(float(out.get("peak_equity") or 0.0), float(out.get("equity") or 0.0), 1e-9)
     equity = float(out.get("equity") or 0.0)
+    peak = max(float(out.get("peak_equity") or 0.0), equity, 1e-9)
     out["peak_equity"] = peak
+    halt_peak = max(float(out.get("halt_peak") or peak), 1e-9)
+    if halt_peak < 1e-9:
+        halt_peak = peak
+    out["halt_peak"] = halt_peak
     dd = (peak - equity) / peak * 100.0 if peak else 0.0
+    halt_dd = (halt_peak - equity) / halt_peak * 100.0 if halt_peak else 0.0
     out["drawdown_pct"] = round(dd, 2)
-    if dd >= c.FLATTEN_DRAWDOWN_PCT:
+    if out.get("flatten_until_resume"):
         out["halt"] = "flatten"
-    elif dd >= c.PAUSE_DRAWDOWN_PCT:
+        return out
+    if halt_dd >= c.FLATTEN_DRAWDOWN_PCT:
+        out["flatten_until_resume"] = True
+        out["halt"] = "flatten"
+    elif halt_dd >= c.PAUSE_DRAWDOWN_PCT:
         out["halt"] = "pause_entries"
     else:
         out["halt"] = "none"
@@ -151,12 +265,18 @@ def build_ticket(
     state: dict[str, Any],
     *,
     price: float | None,
+    closes: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    state = refresh_halt(dict(state))
+    marks = dict(closes or {})
     status = str(bounce.get("status") or "cash")
     focus = _focus(bounce)
     symbol = str(focus.get("symbol") or "")
-    held = _position(state, symbol) if symbol else (state.get("positions") or [None])[0]
+    if price is not None and symbol:
+        marks.setdefault(symbol, float(price))
+    state = mark_to_market(dict(state), marks)
+    held = _position(state, symbol) if symbol else None
+    if held is None and state.get("positions"):
+        held = dict(state["positions"][0])
     halt = str(state.get("halt") or "none")
     base = {
         "schema": c.PERSONAL_BOOK_SCHEMA,
@@ -172,6 +292,7 @@ def build_ticket(
         "halt": halt,
         "cash": state.get("cash"),
         "equity": state.get("equity"),
+        "equity_mark": state.get("equity_mark") or {},
         "drawdown_pct": state.get("drawdown_pct"),
         "capital": state.get("capital"),
         "positions_match": True,
@@ -195,9 +316,9 @@ def build_ticket(
             "lots": int(held.get("shares") or 0) // c.LOT_SIZE,
             "shares": int(held.get("shares") or 0),
             "headline": "停机平仓",
-            "detail": "个人账本回撤达到 15%，只许按计划卖出，不再新开。",
+            "detail": "个人账本回撤达到 15%，只许按计划卖出，不再新开。手动恢复前保持停机。",
         }
-    if status == "buy" and halt in {"pause_entries", "flatten"}:
+    if halt in {"pause_entries", "flatten"} and status == "buy":
         return {**base, "action": "halted", "headline": "停机，不开新仓"}
     if status == "buy" and focus and _already_skipped(state, bounce.get("as_of"), symbol):
         return {
@@ -279,6 +400,12 @@ def apply_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
     out["positions"] = [dict(row) for row in (state.get("positions") or [])]
     fills = list(state.get("fills") or [])
     kind = str(event.get("kind") or "")
+    if kind == "resume":
+        out["flatten_until_resume"] = False
+        out["halt_peak"] = float(out.get("equity") or 0.0)
+        fills.append({**event, "kind": "resume"})
+        out["fills"] = fills[-50:]
+        return refresh_halt(out)
     if kind == "skip":
         fills.append({**event, "kind": "skip"})
         out["fills"] = fills[-50:]
@@ -324,13 +451,10 @@ def apply_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
         out["positions"] = [row for row in out["positions"] if str(row.get("symbol")) != symbol]
     else:
         raise ValueError("personal fill side rejected")
-    mtm = 0.0
-    for row in out["positions"]:
-        mtm += int(row.get("shares") or 0) * float(row.get("avg_price") or 0.0)
-    out["equity"] = round(float(out["cash"]) + mtm, 2)
     fills.append({**event, "kind": "fill", "notional": notional, "commission": commission})
     out["fills"] = fills[-50:]
-    return refresh_halt(out)
+    closes = event.get("mark_closes") if isinstance(event.get("mark_closes"), dict) else None
+    return mark_to_market(out, closes)
 
 
 def public_view(ticket: dict[str, Any] | None, state: dict[str, Any] | None) -> dict[str, Any]:
@@ -363,6 +487,7 @@ def public_view(ticket: dict[str, Any] | None, state: dict[str, Any] | None) -> 
         "halt": ticket.get("halt") or st.get("halt"),
         "cash": st.get("cash"),
         "equity": st.get("equity"),
+        "equity_mark": st.get("equity_mark") or ticket.get("equity_mark") or {},
         "drawdown_pct": st.get("drawdown_pct"),
         "capital": st.get("capital"),
         "positions": st.get("positions") or [],
@@ -401,10 +526,19 @@ def build_and_store(
             state["cash"] = state["capital"]
             state["equity"] = state["capital"]
             state["peak_equity"] = max(float(state.get("peak_equity") or 0), state["capital"])
+    cache = cache_dir or Path(DEFAULT_CACHE_DIR)
     focus = _focus(bounce)
     symbol = str(focus.get("symbol") or "")
-    price = last_close_from_cache(cache_dir or Path(DEFAULT_CACHE_DIR), symbol) if symbol else None
-    ticket = build_ticket(bounce, state, price=price)
+    closes: dict[str, float] = {}
+    for row in state.get("positions") or []:
+        marked = last_close_from_cache(cache, str(row.get("symbol") or ""))
+        if marked:
+            closes[str(row.get("symbol"))] = marked
+    price = last_close_from_cache(cache, symbol) if symbol else None
+    if price and symbol:
+        closes[symbol] = price
+    state = mark_to_market(state, closes)
+    ticket = build_ticket(bounce, state, price=price, closes=closes)
     ticket["generated_at"] = datetime.now(ZoneInfo(DEFAULT_TZ)).isoformat(timespec="seconds")
     write_json(str(root / "LATEST.json"), ticket)
     write_json(str(state_path), state)

@@ -5,7 +5,11 @@ from pathlib import Path
 
 from app import personal_book as book
 from app import personal_capital_contract as contract
+from app import personal_notify as notify
 from app import research_goal_contract as goal
+from app.factor_v3_path_a_3y_book_round_specs import merged_kernel
+from app.factor_v3_path_a_protocol_bounce_daily import bounce_dn2_negext_variant
+from app.factor_v3_path_a_protocol_signal_specs import iter_protocol_signal_bounce_variants
 
 
 def test_contract_stays_off_the_research_gate() -> None:
@@ -115,18 +119,30 @@ def test_skip_does_not_open_and_fill_uses_trade_price() -> None:
 
 
 def test_pause_entries_after_ten_percent_drawdown() -> None:
-    state = book.empty_state(200_000)
-    state["equity"] = 179_000.0
-    state["peak_equity"] = 200_000.0
-    halted = book.refresh_halt(state)
-    assert halted["halt"] == "pause_entries"
+    opened = book.apply_event(
+        book.empty_state(200_000),
+        {
+            "kind": "fill",
+            "as_of": "2026-08-11",
+            "symbol": "600621",
+            "name": "华鑫股份",
+            "side": "buy",
+            "price": 12.05,
+            "shares": 8300,
+            "commission": 25.0,
+        },
+    )
+    cash = float(opened["cash"])
+    close = (179_000.0 - cash) / 8300
+    marked = book.mark_to_market(opened, {"600621": close})
+    assert marked["halt"] == "pause_entries"
     bounce = {
         "status": "buy",
         "as_of": "2026-08-21",
         "pick": {"symbol": "000001", "name": "平安银行", "entry_date": "2026-08-22"},
         "holding": None,
     }
-    ticket = book.build_ticket(bounce, halted, price=10.0)
+    ticket = book.build_ticket(bounce, marked, price=close, closes={"600621": close})
     assert ticket["action"] == "halted"
 
 
@@ -164,6 +180,161 @@ def test_skipped_buy_does_not_become_a_hold() -> None:
     ticket = book.build_ticket(bounce, book.empty_state(200_000), price=12.0)
     assert ticket["action"] == "mismatch"
     assert ticket["positions_match"] is False
+
+
+def test_skip_versus_fill_forks_personal_equity_not_research_oos() -> None:
+    bounce = {
+        "status": "buy",
+        "as_of": "2026-08-11",
+        "oos_book": {"net_return_pct": -2.64, "trade_count": 1},
+        "ledger": [{"symbol": "600621", "return_pct": -2.1903}],
+        "pick": {"symbol": "600621", "name": "华鑫股份", "entry_date": "2026-08-12"},
+        "holding": None,
+    }
+    frozen = json.dumps(bounce, sort_keys=True)
+    start = book.empty_state(200_000)
+    skipped = book.apply_event(
+        start,
+        {"kind": "skip", "as_of": "2026-08-11", "symbol": "600621", "side": "buy"},
+    )
+    filled = book.apply_event(
+        start,
+        {
+            "kind": "fill",
+            "as_of": "2026-08-11",
+            "symbol": "600621",
+            "name": "华鑫股份",
+            "side": "buy",
+            "price": 12.05,
+            "shares": 8300,
+            "commission": 25.0,
+        },
+    )
+    assert json.dumps(bounce, sort_keys=True) == frozen
+    assert skipped["cash"] == 200_000
+    assert skipped["equity"] == 200_000
+    assert filled["cash"] < skipped["cash"]
+    assert filled["positions"][0]["avg_price"] == 12.05
+
+
+def test_mark_to_market_uses_close_not_avg_price() -> None:
+    opened = book.apply_event(
+        book.empty_state(200_000),
+        {
+            "kind": "fill",
+            "as_of": "2026-08-11",
+            "symbol": "600621",
+            "side": "buy",
+            "price": 12.05,
+            "shares": 8300,
+            "commission": 25.0,
+        },
+    )
+    cost_nav = float(opened["cash"]) + 8300 * 12.05
+    marked = book.mark_to_market(opened, {"600621": 10.0})
+    assert marked["equity"] == round(float(opened["cash"]) + 8300 * 10.0, 2)
+    assert marked["equity"] != round(cost_nav, 2)
+    assert marked["equity_mark"]["600621"]["source"] == "jiaoch_close"
+    assert marked["equity_mark"]["600621"]["not_a_fill"] is True
+    assert marked["equity_mark"]["600621"]["fill_avg_price"] == 12.05
+
+
+def test_fifteen_percent_drawdown_closes_held_name_until_resume() -> None:
+    opened = book.apply_event(
+        book.empty_state(200_000),
+        {
+            "kind": "fill",
+            "as_of": "2026-08-11",
+            "symbol": "600621",
+            "name": "华鑫股份",
+            "side": "buy",
+            "price": 12.05,
+            "shares": 8300,
+            "commission": 25.0,
+            "planned_exit": "2026-08-18",
+        },
+    )
+    marked = book.mark_to_market(opened, {"600621": 8.0})
+    assert marked["halt"] == "flatten"
+    bounce_buy = {
+        "status": "buy",
+        "as_of": "2026-08-21",
+        "pick": {"symbol": "000001", "name": "平安银行", "entry_date": "2026-08-22"},
+        "holding": None,
+    }
+    ticket = book.build_ticket(bounce_buy, marked, price=8.0, closes={"600621": 8.0})
+    assert ticket["action"] == "close"
+    assert ticket["symbol"] == "600621"
+    resumed = book.apply_event(marked, {"kind": "resume", "as_of": "2026-08-21"})
+    assert resumed["flatten_until_resume"] is False
+    after = book.build_ticket(bounce_buy, resumed, price=10.0)
+    assert after["action"] in {"open", "cash", "untradeable", "halted"}
+    assert after["action"] != "close"
+
+
+def test_m2_sizer_caps_each_name_at_thirty_percent_and_is_not_default() -> None:
+    default = book.build_ticket(
+        {
+            "status": "buy",
+            "as_of": "2026-08-21",
+            "pick": {"symbol": "600621", "name": "华鑫股份", "entry_date": "2026-08-22"},
+            "holding": None,
+        },
+        book.empty_state(200_000),
+        price=12.0,
+    )
+    assert default["candidate_id"] == "bounce_dn2_negext"
+    assert default.get("slots") is None
+    sized = book.size_open_m2(
+        capital_cny=200_000,
+        cash_cny=200_000,
+        names=[
+            {"symbol": "600621", "name": "华鑫股份", "price": 12.0},
+            {"symbol": "000001", "name": "平安银行", "price": 10.0},
+        ],
+    )
+    assert sized["candidate_id"] == "personal_bounce_m2"
+    assert sized["effective_strategy"] is False
+    assert len(sized["slots"]) == 2
+    for slot in sized["slots"]:
+        assert slot["action"] == "open"
+        assert slot["notional"] <= 200_000 * 0.30 + 1e-6
+    from app.factor_v3_path_a_protocol_signal_specs import iter_protocol_signal_bounce_variants
+
+    assert "personal_bounce_m2" not in {
+        row["candidate_id"] for row in iter_protocol_signal_bounce_variants()
+    }
+
+
+def test_notify_formatter_does_not_change_lots_or_cash(monkeypatch) -> None:
+    ticket = {
+        "action": "open",
+        "symbol": "600621",
+        "lots": 83,
+        "cash": 100000.0,
+    }
+    before = dict(ticket)
+    text = notify.format_ticket_notice(ticket)
+    assert ticket == before
+    assert "83" in text
+    assert "100000" in text
+    assert "600621" in text
+    monkeypatch.delenv("PERSONAL_NOTIFY_WEBHOOK", raising=False)
+    sent = notify.send_ticket_notice(ticket)
+    assert sent["sent"] is False
+    assert sent["reason"] == "missing_credentials"
+    assert sent["text"] == text
+
+
+def test_ui_keeps_follow_skip_and_bounce_kernel_untouched() -> None:
+    html = Path("app/static/index.html").read_text(encoding="utf-8")
+    assert "跳过" in html
+    assert "我跟了" in html
+    assert 'id="personalFillPrice"' in html
+    full = merged_kernel(bounce_dn2_negext_variant())
+    assert full["hold_days"] == 5
+    assert full["symbol_cooldown_days"] == 5
+    assert full["max_active_positions"] == 1
 
 
 def test_cache_last_close(tmp_path: Path) -> None:

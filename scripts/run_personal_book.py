@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from app.personal_book import DEFAULT_OUTPUT_ROOT, build_and_store  # noqa: E402
 from app.personal_capital_contract import DEFAULT_CAPITAL_CNY, STAGE_GOAL_ID  # noqa: E402
+from app.personal_notify import send_ticket_notice  # noqa: E402
 
 
 def _load_dotenv(path: Path) -> None:
@@ -52,6 +53,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(ticket.get("headline") or "")
     print("非正式有效；不自动下单；个人线")
+    notice = send_ticket_notice(ticket)
+    if notice.get("sent"):
+        print("notify_sent")
     return 0
 
 

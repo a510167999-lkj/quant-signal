@@ -39,8 +39,8 @@ class HoldingsUpdate(BaseModel):
 
 
 class PersonalFillRequest(BaseModel):
-    kind: Literal["fill", "skip"]
-    symbol: str = Field(min_length=1, max_length=16)
+    kind: Literal["fill", "skip", "resume"]
+    symbol: str = Field("", max_length=16)
     side: Optional[Literal["buy", "sell"]] = None
     name: Optional[str] = Field(None, max_length=32)
     price: Optional[float] = Field(None, gt=0)
@@ -48,6 +48,12 @@ class PersonalFillRequest(BaseModel):
     commission: Optional[float] = Field(None, ge=0)
     as_of: Optional[str] = Field(None, min_length=10, max_length=10)
     planned_exit: Optional[str] = Field(None, min_length=10, max_length=10)
+
+    @model_validator(mode="after")
+    def _fill_skip_need_symbol(self) -> "PersonalFillRequest":
+        if self.kind in {"fill", "skip"} and not str(self.symbol or "").strip():
+            raise ValueError("symbol is required")
+        return self
 
 
 class PricePoint(BaseModel):
