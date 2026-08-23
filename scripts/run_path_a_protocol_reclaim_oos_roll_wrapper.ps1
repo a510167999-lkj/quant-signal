@@ -22,6 +22,11 @@ Add-Content -LiteralPath $LogFile -Value "==== bounce daily $stamp ===="
 $bounceExit = $LASTEXITCODE
 Add-Content -LiteralPath $LogFile -Value "bounce_exit=$bounceExit"
 
+$Personal = Join-Path $RepoRoot "scripts\run_personal_book.py"
+Add-Content -LiteralPath $LogFile -Value "==== personal book $stamp ===="
+& $Python -u $Personal *>> $LogFile 2>&1
+Add-Content -LiteralPath $LogFile -Value "personal_exit=$LASTEXITCODE"
+
 $Sync = Join-Path $RepoRoot "scripts\sync_bounce_daily_to_vps.py"
 if (Test-Path $Sync) {
     Add-Content -LiteralPath $LogFile -Value "==== bounce daily sync $stamp ===="

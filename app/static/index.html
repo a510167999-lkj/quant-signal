@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Martian+Mono:wght@400;500;600&family=Noto+Serif+SC:wght@500;600;700&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="/static/styles.css?v=20260820" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260821p" />
   </head>
   <body>
     <div class="grain" aria-hidden="true"></div>
@@ -67,6 +67,39 @@
             </table>
             <p class="stub-empty" id="bounceLedgerEmpty">独立 OOS 以来还没有选出。</p>
           </section>
+        </div>
+      </article>
+
+      <article class="ticket personal" id="personalHero" data-state="missing">
+        <div class="ticket-spine" aria-hidden="true"></div>
+        <div class="ticket-body">
+          <div class="ticket-meta">
+            <p class="eyebrow" id="personalMeta">个人凭证 · 半自动</p>
+            <p class="serial">No. PERSONAL-20W</p>
+          </div>
+          <div class="stamp-wrap">
+            <p class="stamp" id="personalStatus">—</p>
+          </div>
+          <h1 class="subject" id="personalHeadline">等待凭证</h1>
+          <p class="instruction" id="personalDetail">研究线仍记 26/15。这里只写你账户的手数。不自动下单。</p>
+          <dl class="slip">
+            <div><dt>代码</dt><dd id="personalSymbol">--</dd></div>
+            <div><dt>手数</dt><dd id="personalLots">--</dd></div>
+            <div><dt>金额</dt><dd id="personalNotional">--</dd></div>
+            <div><dt>现金</dt><dd id="personalCash">--</dd></div>
+            <div><dt>净值</dt><dd id="personalEquity">--</dd></div>
+            <div><dt>回撤</dt><dd id="personalDrawdown">--</dd></div>
+          </dl>
+          <div class="personal-actions" id="personalActions">
+            <button type="button" class="ghost-button" id="personalSkip">跳过</button>
+            <button type="button" class="primary-button" id="personalFollow">我跟了</button>
+          </div>
+          <form class="personal-fill" id="personalFillForm" hidden>
+            <label>成交价 <input id="personalFillPrice" inputmode="decimal" /></label>
+            <label>股数 <input id="personalFillShares" inputmode="numeric" /></label>
+            <label>佣金 <input id="personalFillCommission" inputmode="decimal" placeholder="可空" /></label>
+            <button type="submit" class="primary-button">记入账本</button>
+          </form>
         </div>
       </article>
 
@@ -189,6 +222,6 @@
     </section>
 
     <footer class="footer">仅供个人研究。连跌反弹不是有效策略，这张票不是下单回执。</footer>
-    <script src="/static/app.js?v=20260820"></script>
+    <script src="/static/app.js?v=20260821p"></script>
   </body>
 </html>

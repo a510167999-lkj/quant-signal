@@ -61,6 +61,24 @@ const els = {
   bounceFactOos: document.querySelector("#bounceFactOos"),
   bounceFactDue: document.querySelector("#bounceFactDue"),
   bounceLedgerEmpty: document.querySelector("#bounceLedgerEmpty"),
+  personalHero: document.querySelector("#personalHero"),
+  personalStatus: document.querySelector("#personalStatus"),
+  personalMeta: document.querySelector("#personalMeta"),
+  personalHeadline: document.querySelector("#personalHeadline"),
+  personalDetail: document.querySelector("#personalDetail"),
+  personalSymbol: document.querySelector("#personalSymbol"),
+  personalLots: document.querySelector("#personalLots"),
+  personalNotional: document.querySelector("#personalNotional"),
+  personalCash: document.querySelector("#personalCash"),
+  personalEquity: document.querySelector("#personalEquity"),
+  personalDrawdown: document.querySelector("#personalDrawdown"),
+  personalActions: document.querySelector("#personalActions"),
+  personalSkip: document.querySelector("#personalSkip"),
+  personalFollow: document.querySelector("#personalFollow"),
+  personalFillForm: document.querySelector("#personalFillForm"),
+  personalFillPrice: document.querySelector("#personalFillPrice"),
+  personalFillShares: document.querySelector("#personalFillShares"),
+  personalFillCommission: document.querySelector("#personalFillCommission"),
   analyzeWorkspace: document.querySelector("#analyzeWorkspace"),
   recommendationsList: document.querySelector("#recommendationsList"),
   performanceMeta: document.querySelector("#performanceMeta"),
@@ -756,6 +774,77 @@ async function loadBounceDaily() {
   window.__bounceDailyPollTimer = window.setTimeout(loadBounceDaily, 60_000);
 }
 
+function money(value) {
+  if (value == null || Number.isNaN(Number(value))) {
+    return "—";
+  }
+  return `${Number(value).toFixed(0)} 元`;
+}
+
+function renderPersonal(payload) {
+  const action = payload?.action || "missing";
+  const verb = {
+    open: "买入",
+    hold: "持有",
+    close: "卖出",
+    cash: "空仓",
+    halted: "停机",
+    mismatch: "未跟",
+    untradeable: "不能买",
+    missing: "待印",
+  }[action] || action;
+  if (els.personalHero) {
+    els.personalHero.dataset.state = action;
+  }
+  setText(els.personalStatus, verb);
+  setText(
+    els.personalMeta,
+    payload?.available ? `日历 ${payload.as_of || "--"} · 半自动 · 不发单` : "个人凭证"
+  );
+  setText(els.personalHeadline, payload?.headline || "尚无个人凭证");
+  setText(els.personalDetail, payload?.detail || "非正式有效。不自动下单。");
+  setText(els.personalSymbol, payload?.symbol ? `${payload.name || ""} ${payload.symbol}`.trim() : "—");
+  setText(els.personalLots, payload?.lots ? `${payload.lots} 手 / ${payload.shares} 股` : "—");
+  setText(els.personalNotional, money(payload?.notional));
+  setText(els.personalCash, money(payload?.cash));
+  setText(els.personalEquity, money(payload?.equity));
+  setText(
+    els.personalDrawdown,
+    payload?.drawdown_pct == null ? "—" : `${Number(payload.drawdown_pct).toFixed(2)}%`
+  );
+  const tradable = action === "open" || action === "close";
+  if (els.personalActions) {
+    els.personalActions.hidden = !tradable;
+  }
+  if (els.personalFillForm) {
+    els.personalFillForm.hidden = true;
+  }
+  window.__personalTicket = payload || {};
+}
+
+async function loadPersonal() {
+  const data = await api("/api/personal/book");
+  renderPersonal(data);
+  window.clearTimeout(window.__personalPollTimer);
+  window.__personalPollTimer = window.setTimeout(loadPersonal, 60_000);
+}
+
+async function submitPersonal(kind, extra = {}) {
+  const ticket = window.__personalTicket || {};
+  const side = ticket.action === "close" ? "sell" : "buy";
+  const payload = {
+    kind,
+    symbol: extra.symbol || ticket.symbol,
+    side,
+    name: ticket.name,
+    as_of: ticket.as_of,
+    planned_exit: ticket.exit_date,
+    ...extra,
+  };
+  const data = await api("/api/personal/fill", { method: "POST", body: JSON.stringify(payload) });
+  renderPersonal(data);
+}
+
 async function loadRecommendations() {
   return requestRecommendationSnapshot("/api/recommendations/latest");
 }
@@ -1048,6 +1137,48 @@ if (els.holdingsRefreshButton) {
   els.holdingsRefreshButton.addEventListener("click", refreshHoldings);
 }
 
+if (els.personalSkip) {
+  els.personalSkip.addEventListener("click", async () => {
+    try {
+      await submitPersonal("skip");
+    } catch (error) {
+      setText(els.personalDetail, error.message);
+    }
+  });
+}
+if (els.personalFollow) {
+  els.personalFollow.addEventListener("click", () => {
+    const ticket = window.__personalTicket || {};
+    if (els.personalFillForm) {
+      els.personalFillForm.hidden = false;
+    }
+    if (els.personalFillPrice) {
+      els.personalFillPrice.value = ticket.reference_price || "";
+    }
+    if (els.personalFillShares) {
+      els.personalFillShares.value = ticket.shares || "";
+    }
+    if (els.personalFillCommission) {
+      els.personalFillCommission.value = ticket.commission || "";
+    }
+  });
+}
+if (els.personalFillForm) {
+  els.personalFillForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      await submitPersonal("fill", {
+        price: Number(els.personalFillPrice.value),
+        shares: Number(els.personalFillShares.value),
+        commission: els.personalFillCommission.value
+          ? Number(els.personalFillCommission.value)
+          : undefined,
+      });
+    } catch (error) {
+      setText(els.personalDetail, error.message);
+    }
+  });
+}
 els.watchForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const item = {
@@ -1079,7 +1210,7 @@ renderResult = (result) => {
   try {
     const health = await api("/health");
     setStatus(health.auth === "enabled" ? "需认证" : "已连接", true);
-    await Promise.allSettled([loadBounceDaily(), loadProductionStatus()]);
+    await Promise.allSettled([loadBounceDaily(), loadPersonal(), loadProductionStatus()]);
     await loadWatchlist();
   } catch (error) {
     setStatus("离线", false);

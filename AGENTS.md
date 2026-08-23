@@ -68,11 +68,13 @@ Zcode 的 7 月接管与 8 月初路径 A 有效，但 **Codex 分支更新**。
 23. **行业轮动**：`ind_enter` holdout +30.4% / -13.4% 数字过，train -38.8%。不拧。
 24. **有利市开关**：favorable 才做连跌反弹。train 双过，holdout +11.5% / -6.4%。仓位太少。
 25. **持有/冷却**：同一套连跌反弹抗追高，预注册持有 1/3/7/10、冷却 0/1/3/10。换持有期全灭。换冷却与原 5/5 数字完全相同（单槽稀疏，冷却绑不上）。不是新身份。
-26. **每日选股**：`scripts/run_path_a_protocol_bounce_daily.py` 按 `bounce_dn2_negext` 零改参记账。只打印/落盘当天选了谁，不注册生产。2026-07-04 起独立 OOS 至今合格信号 0（市场不在 favorable/neutral）。
+26. **每日选股**：`scripts/run_path_a_protocol_bounce_daily.py` 按 `bounce_dn2_negext` 零改参记账。只打印/落盘当天选了谁，不注册生产。独立 OOS 账本另见日账本，不以本条旧数字为准。
+27. **个人小资金线**（与 26/15 隔离）：`app/personal_capital_contract.py`。半自动：bounce 日账本译成手数/金额，你自己去券商点，再 `POST /api/personal/fill` 记账。默认 20 万、单槽 50%、佣金 floor 5 元。不自动下单，不注册生产，不改 bounce 核。回撤 10% 停新开、15% 只许卖。
 
 **明确不做**
 
 - 不自动交易；不放宽 market_level 去凑短 OOS。
+- 不把个人账本盈亏写进 Path A 双过；不把 26/15 当个人上线门槛。
 - 不把 TCB / formal materializer / 728-session v3 capture lineage 当本阶段门槛。
 - 不把 development 数字写成已证实有效。
 

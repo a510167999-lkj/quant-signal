@@ -21,12 +21,21 @@ from app.schemas import (
     AnalyzeRequest,
     AnalyzeResponse,
     HoldingsUpdate,
+    PersonalFillRequest,
     RecommendationSnapshot,
     WatchlistUpdate,
 )
 from app.factor_v3_path_a_protocol_bounce_daily import (
     DEFAULT_LATEST_PATH as BOUNCE_DAILY_LATEST_PATH,
     load_public_bounce_daily_view,
+)
+from app.personal_book import (
+    DEFAULT_LATEST_PATH as PERSONAL_LATEST_PATH,
+    DEFAULT_STATE_PATH as PERSONAL_STATE_PATH,
+    build_ticket as build_personal_ticket,
+    load_state as load_personal_state,
+    public_view as public_personal_view,
+    record_event as record_personal_event,
 )
 from app.storage import read_json
 from app.watchlist import load_watchlist, save_watchlist
@@ -185,6 +194,35 @@ def create_app() -> FastAPI:
     @app.get("/api/research/bounce-daily", dependencies=[Depends(require_basic_auth)])
     def bounce_daily_research_view():
         return load_public_bounce_daily_view(Path(BOUNCE_DAILY_LATEST_PATH))
+
+    @app.get("/api/personal/book", dependencies=[Depends(require_basic_auth)])
+    def personal_book_view():
+        bounce = read_json(str(Path(BOUNCE_DAILY_LATEST_PATH)), {}) or {}
+        state = load_personal_state(Path(PERSONAL_STATE_PATH))
+        latest = read_json(str(Path(PERSONAL_LATEST_PATH)), {}) or {}
+        price = latest.get("reference_price") if isinstance(latest, dict) else None
+        ticket = build_personal_ticket(
+            bounce if isinstance(bounce, dict) else {},
+            state,
+            price=price,
+        )
+        return public_personal_view(ticket, state)
+
+    @app.post("/api/personal/fill", dependencies=[Depends(require_basic_auth)])
+    def personal_book_fill(payload: PersonalFillRequest):
+        try:
+            state = record_personal_event(payload.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        bounce = read_json(str(Path(BOUNCE_DAILY_LATEST_PATH)), {}) or {}
+        latest = read_json(str(Path(PERSONAL_LATEST_PATH)), {}) or {}
+        price = latest.get("reference_price") if isinstance(latest, dict) else None
+        ticket = build_personal_ticket(
+            bounce if isinstance(bounce, dict) else {},
+            state,
+            price=price,
+        )
+        return public_personal_view(ticket, state)
 
     @app.get(
         "/api/recommendations/latest",

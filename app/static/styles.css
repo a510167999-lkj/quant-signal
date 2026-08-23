@@ -93,6 +93,11 @@ button, input, select {
   display: grid;
   grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.65fr);
   gap: 28px;
+  align-items: start;
+}
+.floor > .ticket.personal {
+  grid-column: 1;
+}
   max-width: 1180px;
   margin: 0 auto;
   padding: 12px 32px 24px;
@@ -164,6 +169,37 @@ button, input, select {
 .ticket[data-state="holding"] .stamp { color: var(--hold); }
 .ticket[data-state="cash"] .stamp,
 .ticket[data-state="missing"] .stamp { color: #d9cbb3; }
+.ticket[data-state="open"] .stamp { color: var(--stamp); }
+.ticket[data-state="hold"] .stamp { color: var(--hold); }
+.ticket[data-state="close"] .stamp { color: var(--green); }
+.ticket[data-state="halted"] .stamp,
+.ticket[data-state="mismatch"] .stamp,
+.ticket[data-state="untradeable"] .stamp { color: var(--amber); }
+
+.personal-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 18px;
+}
+.personal-fill {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr auto;
+  gap: 10px;
+  align-items: end;
+  margin-top: 14px;
+}
+.personal-fill[hidden] { display: none; }
+.personal-fill label {
+  color: var(--muted);
+  font-size: 12px;
+}
+.personal-fill input {
+  width: 100%;
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  padding: 8px 10px;
+}
 
 .subject {
   margin: 8px 0 10px;

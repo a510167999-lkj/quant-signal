@@ -56,6 +56,12 @@ def main() -> int:
     client.exec_command(f"mkdir -p {remote_dir}", timeout=10)
     sftp = client.open_sftp()
     sftp.put(str(local), remote)
+    personal_local = ROOT / "data/personal_book/LATEST.json"
+    personal_remote_dir = "/home/ubuntu/quant-signal/data/personal_book"
+    if personal_local.is_file():
+        client.exec_command(f"mkdir -p {personal_remote_dir}", timeout=10)
+        sftp.put(str(personal_local), f"{personal_remote_dir}/LATEST.json")
+        print("synced", f"{personal_remote_dir}/LATEST.json")
     sftp.close()
     client.close()
     print("synced", remote)

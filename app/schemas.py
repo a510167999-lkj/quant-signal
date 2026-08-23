@@ -38,6 +38,18 @@ class HoldingsUpdate(BaseModel):
     items: List[HoldingItem] = Field(default_factory=list, max_length=50)
 
 
+class PersonalFillRequest(BaseModel):
+    kind: Literal["fill", "skip"]
+    symbol: str = Field(min_length=1, max_length=16)
+    side: Optional[Literal["buy", "sell"]] = None
+    name: Optional[str] = Field(None, max_length=32)
+    price: Optional[float] = Field(None, gt=0)
+    shares: Optional[int] = Field(None, gt=0)
+    commission: Optional[float] = Field(None, ge=0)
+    as_of: Optional[str] = Field(None, min_length=10, max_length=10)
+    planned_exit: Optional[str] = Field(None, min_length=10, max_length=10)
+
+
 class PricePoint(BaseModel):
     date: str
     open: float
